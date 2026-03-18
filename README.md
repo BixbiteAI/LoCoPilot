@@ -1,99 +1,140 @@
 # LoCoPilot
 
-LoCoPilot is a powerful code editor by **Bixbite AI**. It combines the simplicity of a code editor with what developers need for their core edit-build-debug cycle: comprehensive code editing, navigation, and understanding, lightweight debugging, a rich extensibility model, and integration with existing tools. LoCoPilot supports **local and cloud** language models so you can code with the AI that fits your workflow.
+**The offline AI coding assistant.** Autocomplete, chat, and agent mode—all running locally. No internet, no API keys, no data leaving your machine.
 
-## About LoCoPilot
+LoCoPilot by **Bixbite AI** brings AI pair programming to your desktop. Use local language models for private, offline development, or add cloud models when you want. Built on VS Code—familiar editor, full control.
 
-LoCoPilot is developed and maintained by **Bixbite AI**.
+<p align="center">
+  <a href="https://youtu.be/_HHLXmmzt3Q">
+    <img src="https://img.youtube.com/vi/_HHLXmmzt3Q/maxresdefault.jpg" alt="Watch LoCoPilot demo" width="800"/>
+  </a>
+  <br/>
+  <a href="https://youtu.be/_HHLXmmzt3Q">▶ Watch demo on YouTube</a>
+</p>
 
-**Repository:** [https://github.com/BixBiteAi/LoCoPilot](https://github.com/BixBiteAi/LoCoPilot)
+---
 
-- **Bugs** – [Report a bug](https://github.com/BixBiteAi/LoCoPilot/issues/new?template=bug_report.md) or [search existing issues](https://github.com/BixBiteAi/LoCoPilot/issues)
-- **Feature requests** – [Open a feature request](https://github.com/BixBiteAi/LoCoPilot/issues/new?template=feature_request.md) or [see existing ideas](https://github.com/BixBiteAi/LoCoPilot/issues?q=is%3Aissue+label%3Aenhancement)
-- **Community** – [GitHub Discussions](https://github.com/BixBiteAi/LoCoPilot/discussions) for questions and chat
+## Why LoCoPilot?
 
-## Install and run
 
-**Prerequisites:** [Node.js](https://nodejs.org/) (LTS recommended), npm.
+|                   | LoCoPilot                                                        |
+| ----------------- | ---------------------------------------------------------------- |
+| **Privacy**       | Code stays on your machine                                       |
+| **Offline**       | Works without internet                                           |
+| **Cost**          | Free with local models                                           |
+| **Private repos** | No policy concerns                                               |
+| **Model choice**  | Local (HuggingFace, Ollama) or cloud (OpenAI, Anthropic, Google) |
 
-1. **Clone and enter the repo**
-   ```bash
-   git clone https://github.com/BixBiteAi/LoCoPilot.git
-   cd LoCoPilot
-   ```
 
-2. **Install dependencies**
-   ```bash
-   npm install
-   ```
+---
 
-3. **Run LoCoPilot**
-   - **macOS / Linux:** from the repo root, run:
-     ```bash
-     ./scripts/code.sh
-     ```
-     This will compile if needed, then launch LoCoPilot.
-   - **Windows:** from the repo root, run:
-     ```bash
-     scripts\code.bat
-     ```
+## Use Cases
 
-**Development (with auto-compile on save):** Run `npm run dev` (or `./scripts/dev.sh` on macOS/Linux). This starts the watch tasks and launches the app so code changes are picked up automatically.
+- **Private & sensitive code** – Work on proprietary or confidential projects without sending code to third parties
+- **Offline development** – Code on planes, trains, or anywhere without reliable internet
+- **Zero API cost** – Run local models and avoid per-token pricing
+- **Air-gapped / restricted environments** – Deploy where cloud AI services aren’t allowed
 
-**Web / server:** To run as a web app or code-server, use `./scripts/code-web.sh` or `./scripts/code-server.sh` (and their `.bat` equivalents on Windows). See the script files for usage.
+---
 
-## How to use LoCoPilot
+## Quick Start
 
-LoCoPilot lets you use **local or cloud** language models in the editor. You add models in **LoCoPilot Settings**, then choose which model to use in the **Chat** panel.
+**Runs locally in minutes.** Prerequisites: [Node.js](https://nodejs.org/) (LTS), npm.
+
+```bash
+git clone https://github.com/BixbiteAI/LoCoPilot.git
+cd LoCoPilot
+npm install
+./scripts/code.sh          # macOS/Linux — or scripts\code.bat on Windows
+```
+
+LoCoPilot compiles if needed, then launches. Add a local model in **LoCoPilot Settings** (Chat panel → model dropdown → Add Language Models) and start coding.
+
+---
+
+## Roadmap
+
+- Improved local model discovery and one-click setup
+- Broader model support (Ollama, LM Studio, etc.)
+- Performance and latency improvements for inline suggestions
+- Optional desktop installers for easier distribution
+
+---
+
+## Try it now
+
+
+| Action                   | Link                                                                                           |
+| ------------------------ | ---------------------------------------------------------------------------------------------- |
+| ⭐ **Star**               | [GitHub](https://github.com/BixbiteAI/LoCoPilot)                                               |
+| 🐛 **Report a bug**      | [Open an issue](https://github.com/BixbiteAI/LoCoPilot/issues/new?template=bug_report.md)      |
+| 💡 **Request a feature** | [Open an issue](https://github.com/BixbiteAI/LoCoPilot/issues/new?template=feature_request.md) |
+| 💬 **Discuss**           | [GitHub Discussions](https://github.com/BixbiteAI/LoCoPilot/discussions)                       |
+| 🤝 **Contribute**        | [CONTRIBUTING.md](CONTRIBUTING.md)                                                             |
+
+
+---
+
+## Installation (detailed)
+
+**macOS / Linux:**
+
+```bash
+./scripts/code.sh
+```
+
+**Windows:**
+
+```bash
+scripts\code.bat
+```
+
+**Development (auto-compile on save):** `npm run dev` or `./scripts/dev.sh`
+
+---
+
+## How to Use LoCoPilot
+
+LoCoPilot supports **local and cloud** language models. Add models in **LoCoPilot Settings**, then choose which model to use in the **Chat** panel.
 
 ### Adding a model (local or cloud)
 
-1. Open the **Chat** panel (e.g. from the activity bar or View menu).
-2. In the chat header, open the **model dropdown** (the current model name).
-3. Click **"Add Language Models"** (or **"Add Premium Models"**). This opens **LoCoPilot Settings** on the **Add Language Model** tab.
+1. Open the **Chat** panel (activity bar or View menu).
+2. In the chat header, open the **model dropdown** (current model name).
+3. Click **"Add Language Models"**. This opens **LoCoPilot Settings** on the **Add Language Model** tab.
 4. In LoCoPilot Settings:
-   - **Model Type:** choose **Cloud** or **Local**.
-   - **Model Provider:**  
-     - Cloud: Anthropic, OpenAI, or Google (API key required).  
-     - Local: HuggingFace or Localhost (for models running on your machine).
-   - Fill in the required fields (API key or token, model name/ID, etc.) and optional limits (max input/output tokens) if needed.
-   - Click **Add** to save. The new model appears in your **Language Models** list.
+  - **Model Type:** choose **Cloud** or **Local**.
+  - **Model Provider:** Cloud (Anthropic, OpenAI, Google—API key required) or Local (HuggingFace, Localhost).
+  - Fill in required fields (API key or token, model name/ID, etc.) and optional limits if needed.
+  - Click **Add** to save.
 
 ### Using a model in chat
 
-- In the **Chat** panel, open the **model dropdown** again. All models you added (and any built-in ones) appear in the list.
-- Select the model you want. You can now use **Ask** (chat only) or **Agent** (chat with tools, e.g. terminal, edits).
+- In the **Chat** panel, open the **model dropdown**. All added models appear in the list.
+- Select a model. Use **Ask** (chat only) or **Agent** (chat with tools: terminal, edits).
 
 ### Agent settings
 
-In **LoCoPilot Settings**, open the **Agent Settings** section to:
+In **LoCoPilot Settings** → **Agent Settings**:
 
-- **Max iterations per request** – limit how many steps the agent can take per request.
-- **Auto approve terminal commands** – when on, terminal commands from the agent run without asking (in a sandbox). Default: off.
-- **System prompts** – customize the system prompt for **Agent** mode and for **Ask** mode (Markdown supported).
-- Use **Save** to apply, **Cancel** to discard, or **Restore to default** to reset prompts and options.
+- **Max iterations per request** – limit agent steps per request.
+- **Auto approve terminal commands** – when on, agent terminal commands run without confirmation (sandboxed). Default: off.
+- **System prompts** – customize prompts for **Agent** and **Ask** modes (Markdown supported).
+- Use **Save**, **Cancel**, or **Restore to default** as needed.
 
-You can open LoCoPilot Settings anytime from the model dropdown in the Chat panel (**Add Language Models**) or via the command palette: search for **LoCoPilot Settings**.
+Open LoCoPilot Settings from the model dropdown (**Add Language Models**) or via the command palette: **LoCoPilot Settings**.
 
-## Contributing
-
-We welcome contributions. See [CONTRIBUTING.md](CONTRIBUTING.md) for how to report issues, ask questions, and submit pull requests.
-
-## Feedback
-
-For feedback and support related to LoCoPilot, please contact Bixbite AI.
+---
 
 ## Bundled Extensions
 
-LoCoPilot includes built-in extensions in the [extensions](extensions) folder (grammars, snippets, and language support). Extensions that provide rich language support (e.g. inline suggestions, Go to Definition) use the suffix `language-features`.
+LoCoPilot includes built-in extensions in the [extensions](extensions) folder (grammars, snippets, language support). Rich language features (inline suggestions, Go to Definition) use the `language-features` suffix.
 
-## Development Container
-
-This repository includes a development container for [Dev Containers](https://aka.ms/vscode-remote/download/containers) and [GitHub Codespaces](https://github.com/features/codespaces). Use **Dev Containers: Clone Repository in Container Volume...** or **Codespaces: Create New Codespace**. Docker / the Codespace should have at least **4 Cores and 6 GB of RAM (8 GB recommended)**. See the [development container README](.devcontainer/README.md) for details.
+---
 
 ## License
 
-Copyright (c) 2015 - present Microsoft Corporation. All rights reserved.
+Copyright (c) 2015 - present Microsoft Corporation. All rights reserved.  
 Copyright (c) Bixbite AI. All rights reserved.
 
 Licensed under the [MIT](LICENSE.txt) license. This project uses source code from the [MIT-licensed VS Code project](https://github.com/microsoft/vscode).
