@@ -39,8 +39,7 @@ import { IContextViewService } from '../../../../../platform/contextview/browser
 import { defaultButtonStyles, getInputBoxStyle, getSelectBoxStyles, defaultToggleStyles } from '../../../../../platform/theme/browser/defaultStyles.js';
 import { settingsSelectBackground, settingsSelectBorder, settingsSelectForeground, settingsSelectListBorder, settingsTextInputBackground, settingsTextInputBorder, settingsTextInputForeground } from '../../../preferences/common/settingsEditorColorRegistry.js';
 import { Toggle } from '../../../../../base/browser/ui/toggle/toggle.js';
-import { SelectBox } from '../../../../../base/browser/ui/selectBox/selectBox.js';
-import { ISelectOptionItem, ISelectData } from '../../../../../base/browser/ui/selectBox/selectBox.js';
+import { SelectBox, ISelectOptionItem, ISelectData } from '../../../../../base/browser/ui/selectBox/selectBox.js';
 import { ICustomLanguageModelsService, ICustomLanguageModel } from '../../common/customLanguageModelsService.js';
 import { IDialogService } from '../../../../../platform/dialogs/common/dialogs.js';
 import { ICommandService } from '../../../../../platform/commands/common/commands.js';
@@ -105,6 +104,7 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 	private addFormProviderSelectBox!: SelectBox;
 	private addFormApiKeyInputBox!: InputBox;
 	private addFormTokenInputBox!: InputBox;
+	private addFormTokenLabel!: HTMLElement;
 	private addFormModelFormatInputBox!: InputBox;
 	private addFormModelFormatContainer!: HTMLElement;
 	private addFormModelNameInputBox!: InputBox;
@@ -345,8 +345,8 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 
 		const tokenContainer = DOM.append(formContainer, $('.form-field'));
 		tokenContainer.style.display = 'none';
-		const tokenLabel = DOM.append(tokenContainer, $('label.form-label'));
-		tokenLabel.textContent = localize('addCustomModel.token', 'Token (Optional)');
+		this.addFormTokenLabel = DOM.append(tokenContainer, $('label.form-label'));
+		this.addFormTokenLabel.textContent = localize('addCustomModel.token', 'Token (Optional)');
 		const tokenInputContainer = DOM.append(tokenContainer, $('.form-input-container'));
 		this.addFormTokenInputBox = this._register(new InputBox(tokenInputContainer, this.contextViewService, {
 			placeholder: localize('addCustomModel.tokenPlaceholder', 'Enter your token (e.g., HuggingFace token)'),
@@ -444,14 +444,11 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 			// For Ollama, we reuse the token field for the Base URL
 			if (tokenContainer) {
 				tokenContainer.style.display = (isHuggingFace || isOllama) ? '' : 'none';
-				const label = tokenContainer.querySelector('label.form-label');
-				if (label) {
-					label.textContent = isOllama 
-						? localize('addCustomModel.ollamaUrl', 'Ollama Base URL (Optional)')
-						: localize('addCustomModel.token', 'Token (Optional)');
-				}
-				this.addFormTokenInputBox.setPlaceHolder(isOllama 
-					? 'http://localhost:11434' 
+				this.addFormTokenLabel.textContent = isOllama
+					? localize('addCustomModel.ollamaUrl', 'Ollama Base URL (Optional)')
+					: localize('addCustomModel.token', 'Token (Optional)');
+				this.addFormTokenInputBox.setPlaceHolder(isOllama
+					? 'http://localhost:11434'
 					: localize('addCustomModel.tokenPlaceholder', 'Enter your token (e.g., HuggingFace token)'));
 			}
 			if (this.addFormModelFormatContainer) { this.addFormModelFormatContainer.style.display = isHuggingFace ? '' : 'none'; }
@@ -539,7 +536,7 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 		const apiKey = this.addFormCurrentModelType === 'cloud' ? this.addFormApiKeyInputBox.value.trim() : undefined;
 		const token = (this.addFormCurrentModelType === 'local' && !isLocalhost) ? this.addFormTokenInputBox.value.trim() : undefined;
 		const format = (this.addFormCurrentModelType === 'local' && providerValue === 'huggingface') ? this.addFormModelFormatInputBox.value.trim() : undefined;
-		
+
 		// For Ollama, token field holds the Base URL
 		const ollamaUrl = (providerValue === 'ollama' && token) ? token : 'http://localhost:11434';
 
@@ -602,7 +599,7 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 					this.sectionsList.setFocus([listIdx]);
 				}
 				this.renderSelectedSection();
-				const infoMsg = providerValue === 'ollama' 
+				const infoMsg = providerValue === 'ollama'
 					? localize('addCustomModel.ollamaPullStarted', 'Ollama pull started')
 					: localize('addCustomModel.downloadStarted', 'Download started');
 				const infoDetail = providerValue === 'ollama'
@@ -664,7 +661,12 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 		if (model.provider === 'huggingface' && model.localPath) {
 			const runServerButton = this._register(new Button(runSlot, { ...defaultButtonStyles, secondary: true }));
 			runServerButton.label = localize('customLanguageModels.runServer', 'Run server');
-			this._register(runServerButton.onDidClick(() => {
+			this._register(runServerButton.onDidClick(async () => {
+				const currentPath = this.llamaCppServerPathInput.value.trim();
+				const savedPath = this.configurationService.getValue<string>(ChatConfiguration.LocopilotLlamaCppServerPath);
+				if (currentPath !== (savedPath ?? '').trim()) {
+					await this.configurationService.updateValue(ChatConfiguration.LocopilotLlamaCppServerPath, currentPath);
+				}
 				this.commandService.executeCommand('locopilot.startLlamaServer', model.id);
 			}));
 		} else if (isOllama && model.localPath) {

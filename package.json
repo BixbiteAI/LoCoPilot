@@ -20,7 +20,7 @@
     "postinstall": "node build/npm/postinstall.ts",
     "compile": "npm run gulp compile",
     "compile-check-ts-native": "tsgo --project ./src/tsconfig.json --noEmit --skipLibCheck",
-    "dev": "./scripts/dev.sh",
+    "dev": "node -e \"require('child_process').execSync(process.platform==='win32'?'.\\\\scripts\\\\dev.bat':'./scripts/dev.sh',{stdio:'inherit',shell:true})\"",
     "watch": "npm-run-all2 -lp watch-client watch-extensions",
     "watchd": "deemon npm run watch",
     "watch-webd": "deemon npm run watch-web",

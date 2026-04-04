@@ -146,7 +146,56 @@ for (const dir of dirs) {
 		if (process.env['LDFLAGS']) { opts.env!['LDFLAGS'] = ''; }
 
 		setNpmrcConfig('build', opts.env!);
-		npmInstall('build', opts);
+
+		if (process.platform === 'win32') {
+			// On Windows with VS 2026+, node-gyp doesn't detect the new VS version.
+			// Step 1: Install all packages without running native build scripts.
+			const buildDir = path.join(root, 'build');
+			const runOpts: child_process.SpawnSyncOptions = { ...opts, cwd: buildDir, stdio: 'inherit', shell: true };
+			run(npm, ['install', '--ignore-scripts'], runOpts);
+
+			// Step 2: Patch node-gyp in build/node_modules to support VS 2026 (major 18, toolset v145).
+			const findVsPath = path.join(root, 'build', 'node_modules', 'node-gyp', 'lib', 'find-visualstudio.js');
+			if (fs.existsSync(findVsPath)) {
+				let src = fs.readFileSync(findVsPath, 'utf8');
+				if (!src.includes('versionYear = 2026')) {
+					src = src
+						.replace(/findVSFromSpecifiedLocation\(\[2019, 2022\]\)/g, 'findVSFromSpecifiedLocation([2019, 2022, 2026])')
+						.replace(/findNewVSUsingSetupModule\(\[2019, 2022\]\)/g, 'findNewVSUsingSetupModule([2019, 2022, 2026])')
+						.replace(/findNewVS\(\[2019, 2022\]\)/g, 'findNewVS([2019, 2022, 2026])')
+						.replace(
+							'if (ret.versionMajor === 17) {\n      ret.versionYear = 2022\n      return ret\n    }',
+							'if (ret.versionMajor === 17) {\n      ret.versionYear = 2022\n      return ret\n    }\n    if (ret.versionMajor === 18) {\n      ret.versionYear = 2026\n      return ret\n    }'
+						)
+						.replace(
+							`} else if (versionYear === 2022) {\n      return 'v143'\n    }`,
+							`} else if (versionYear === 2022) {\n      return 'v143'\n    } else if (versionYear === 2026) {\n      return 'v145'\n    }`
+						);
+					fs.writeFileSync(findVsPath, src);
+					log('build', 'Patched node-gyp for Visual Studio 2026 support');
+				}
+			}
+
+			// Step 3: Patch tree-sitter binding.gyp to use C++20 (required by Node.js v22+).
+			const treeSitterBindingPath = path.join(root, 'build', 'node_modules', 'tree-sitter', 'binding.gyp');
+			if (fs.existsSync(treeSitterBindingPath)) {
+				let src = fs.readFileSync(treeSitterBindingPath, 'utf8');
+				if (src.includes('c++17') || src.includes('/std:c++17')) {
+					src = src.replace(/"-std:c\+\+17"/g, '"-std:c++20"')
+						.replace(/"-std=c\+\+17"/g, '"-std=c++20"')
+						.replace(/\/std:c\+\+17/g, '/std:c++20')
+						.replace(/"CLANG_CXX_LANGUAGE_STANDARD": "c\+\+17"/g, '"CLANG_CXX_LANGUAGE_STANDARD": "c++20"');
+					fs.writeFileSync(treeSitterBindingPath, src);
+					log('build', 'Patched tree-sitter binding.gyp for C++20 compatibility');
+				}
+			}
+
+			// Step 4: Rebuild native modules using the patched node-gyp.
+			run(npm, ['rebuild'], runOpts);
+			removeParcelWatcherPrebuild('build');
+		} else {
+			npmInstall('build', opts);
+		}
 		continue;
 	}
 
