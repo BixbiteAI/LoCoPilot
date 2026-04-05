@@ -68,12 +68,18 @@ async function main(buildDir?: string): Promise<void> {
 	const identity = process.env['CODESIGN_IDENTITY'];
 
 	if (!buildDir) {
-		throw new Error('$AGENT_BUILDDIRECTORY not set');
+		throw new Error('Build directory argument is required (parent of LoCoPilot-darwin-<arch>, e.g. ..)');
 	}
 
-	if (!tempDir) {
-		throw new Error('$AGENT_TEMPDIRECTORY not set');
+	if (!arch) {
+		throw new Error('$VSCODE_ARCH not set (e.g. arm64 or x64)');
 	}
+
+	if (!identity) {
+		throw new Error('$CODESIGN_IDENTITY not set (Developer ID Application: … from `security find-identity -v -p codesigning`)');
+	}
+
+	const keychainPath = tempDir ? path.join(tempDir, 'buildagent.keychain') : undefined;
 
 	const appRoot = path.join(buildDir, `LoCoPilot-darwin-${arch}`);
 	const appName = product.nameLong + '.app';
@@ -88,7 +94,7 @@ async function main(buildDir?: string): Promise<void> {
 		}),
 		preAutoEntitlements: false,
 		preEmbedProvisioningProfile: false,
-		keychain: path.join(tempDir, 'buildagent.keychain'),
+		...(keychainPath ? { keychain: keychainPath } : {}),
 		version: getElectronVersion(),
 		identity,
 	};
@@ -96,25 +102,26 @@ async function main(buildDir?: string): Promise<void> {
 	// Only overwrite plist entries for x64 and arm64 builds,
 	// universal will get its copy from the x64 build.
 	if (arch !== 'universal') {
+		const longName = product.nameLong;
 		await spawn('plutil', [
 			'-insert',
 			'NSAppleEventsUsageDescription',
 			'-string',
-			'An application in Visual Studio Code wants to use AppleScript.',
+			`An application in ${longName} wants to use AppleScript.`,
 			`${infoPlistPath}`
 		]);
 		await spawn('plutil', [
 			'-replace',
 			'NSMicrophoneUsageDescription',
 			'-string',
-			'An application in Visual Studio Code wants to use the Microphone.',
+			`An application in ${longName} wants to use the Microphone.`,
 			`${infoPlistPath}`
 		]);
 		await spawn('plutil', [
 			'-replace',
 			'NSCameraUsageDescription',
 			'-string',
-			'An application in Visual Studio Code wants to use the Camera.',
+			`An application in ${longName} wants to use the Camera.`,
 			`${infoPlistPath}`
 		]);
 	}
@@ -126,12 +133,19 @@ if (import.meta.main) {
 	main(process.argv[2]).catch(async err => {
 		console.error(err);
 		const tempDir = process.env['AGENT_TEMPDIRECTORY'];
-		if (tempDir) {
-			const keychain = path.join(tempDir, 'buildagent.keychain');
-			const identities = await spawn('security', ['find-identity', '-p', 'codesigning', '-v', keychain]);
+		try {
+			const keychain = tempDir ? path.join(tempDir, 'buildagent.keychain') : undefined;
+			const args = keychain
+				? ['find-identity', '-p', 'codesigning', '-v', keychain]
+				: ['find-identity', '-v', '-p', 'codesigning'];
+			const identities = await spawn('security', args);
 			console.error(`Available identities:\n${identities}`);
-			const dump = await spawn('security', ['dump-keychain', keychain]);
-			console.error(`Keychain dump:\n${dump}`);
+			if (keychain) {
+				const dump = await spawn('security', ['dump-keychain', keychain]);
+				console.error(`Keychain dump:\n${dump}`);
+			}
+		} catch {
+			// ignore diagnostics failures
 		}
 		process.exit(1);
 	});
