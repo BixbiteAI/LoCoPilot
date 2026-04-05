@@ -1,4 +1,4 @@
-name: Monaco Editor checks
+name: LoCoPilot / Monaco Editor checks
 
 # Disabled on push/PR: run manually from Actions if needed (takes ~40 min).
 on:
@@ -15,7 +15,7 @@ permissions: {}
 
 jobs:
   main:
-    name: Monaco Editor checks
+    name: Monaco (manual)
     runs-on: ubuntu-latest
     timeout-minutes: 40
     env:

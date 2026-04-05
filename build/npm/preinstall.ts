@@ -60,7 +60,8 @@ if (process.arch !== os.arch()) {
 function hasSupportedVisualStudioVersion() {
 	// Translated over from
 	// https://source.chromium.org/chromium/chromium/src/+/master:build/vs_toolchain.py;l=140-175
-	const supportedVersions = ['2022', '2019'];
+	// Version '18' is the folder name used by Visual Studio 2026
+	const supportedVersions = ['2022', '2019', '18'];
 
 	const availableVersions = [];
 	for (const version of supportedVersions) {
