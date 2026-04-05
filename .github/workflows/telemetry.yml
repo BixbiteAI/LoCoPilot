@@ -1,4 +1,4 @@
-name: 'Telemetry'
+name: 'LoCoPilot / Telemetry'
 on: pull_request
 permissions: {}
 jobs:

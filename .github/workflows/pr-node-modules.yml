@@ -1,4 +1,4 @@
-name: Code OSS (node_modules)
+name: LoCoPilot (node_modules)
 
 # Disabled on push: this workflow requires Microsoft's self-hosted runners and
 # VSCODE_OSS secret. Use workflow_dispatch to run manually if you have them.
@@ -15,7 +15,7 @@ jobs:
     name: Compile
     runs-on: [ self-hosted, 1ES.Pool=1es-vscode-oss-ubuntu-22.04-x64 ]
     steps:
-      - name: Checkout microsoft/vscode
+      - name: Checkout
         uses: actions/checkout@v6
 
       - name: Setup Node.js
@@ -94,7 +94,7 @@ jobs:
       NPM_ARCH: x64
       VSCODE_ARCH: x64
     steps:
-      - name: Checkout microsoft/vscode
+      - name: Checkout
         uses: actions/checkout@v6
 
       - name: Setup Node.js
@@ -166,7 +166,7 @@ jobs:
       NPM_ARCH: arm64
       VSCODE_ARCH: arm64
     steps:
-      - name: Checkout microsoft/vscode
+      - name: Checkout
         uses: actions/checkout@v6
 
       - name: Setup Node.js
@@ -227,7 +227,7 @@ jobs:
       NPM_ARCH: x64
       VSCODE_ARCH: x64
     steps:
-      - name: Checkout microsoft/vscode
+      - name: Checkout
         uses: actions/checkout@v6
 
       - name: Setup Node.js

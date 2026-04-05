@@ -23,7 +23,7 @@ jobs:
       NPM_ARCH: x64
       VSCODE_ARCH: x64
     steps:
-      - name: Checkout microsoft/vscode
+      - name: Checkout
         uses: actions/checkout@v6
 
       - name: Setup Node.js
