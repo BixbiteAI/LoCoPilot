@@ -9,7 +9,7 @@ LoCoPilot by **Bixbite AI** brings AI pair programming to your desktop. Use loca
     <img src="https://img.youtube.com/vi/_HHLXmmzt3Q/maxresdefault.jpg" alt="Watch LoCoPilot demo" width="800"/>
   </a>
   <br/>
-  <a href="https://youtu.be/_HHLXmmzt3Q">▶ Watch demo on YouTube</a>
+  <a href="https://youtu.be/2yGY0glkj4E">▶ Watch demo on YouTube</a>
 </p>
 
 ---
