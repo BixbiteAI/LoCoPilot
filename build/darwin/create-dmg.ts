@@ -74,16 +74,16 @@ async function main(buildDir?: string, outDir?: string): Promise<void> {
 	const artifactPath = path.join(outDir, `${dmgName}.dmg`);
 	const backgroundPath = path.join(import.meta.dirname, `dmg-background-${quality}.tiff`);
 	const appIconPath = path.join(appPath, 'Contents', 'Resources', `${product.nameShort}.icns`);
-	let title = 'Code OSS';
+	let title = product.nameLong;
 	switch (quality) {
 		case 'stable':
-			title = 'VS Code';
+			title = product.nameLong;
 			break;
 		case 'insider':
-			title = 'VS Code Insiders';
+			title = `${product.nameLong} Insiders`;
 			break;
 		case 'exploration':
-			title = 'VS Code Exploration';
+			title = `${product.nameLong} Exploration`;
 			break;
 	}
 

@@ -5,14 +5,8 @@
 	<project_license>@@LICENSE@@</project_license>
 	<name>@@NAME_LONG@@</name>
 	<url type="homepage">https://platform.bixbite.ai/</url>
-	<summary>LoCoPilot. Code editing. Redefined.</summary>
+	<summary>LoCoPilot — AI-native code editing by Bixbite AI</summary>
 	<description>
-		<p>LoCoPilot is a powerful code editor developed by Bixbite AI that combines the simplicity of a code editor with what developers need for the core edit-build-debug cycle.</p>
+		<p>LoCoPilot is a powerful code editor from Bixbite AI that combines a familiar editing experience with local and cloud AI for the core edit-build-debug cycle.</p>
 	</description>
-	<screenshots>
-		<screenshot type="default">
-			<image>https://code.visualstudio.com/home/home-screenshot-linux-lg.png</image>
-			<caption>Editing TypeScript and searching for extensions</caption>
-		</screenshot>
-	</screenshots>
 </component>

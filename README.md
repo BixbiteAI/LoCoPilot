@@ -2,7 +2,7 @@
 
 **The offline AI coding assistant.** Autocomplete, chat, and agent mode—all running locally. No internet, no API keys, no data leaving your machine.
 
-LoCoPilot by **Bixbite AI** brings AI pair programming to your desktop. Use local language models for private, offline development, or add cloud models when you want. Built on VS Code—familiar editor, full control.
+LoCoPilot by **Bixbite AI** brings AI pair programming to your desktop. Use local language models for private, offline development, or add cloud models when you want. Familiar editor experience, full control—now branded and tuned as LoCoPilot.
 
 <p align="center">
   <a href="https://youtu.be/2yGY0glkj4E">

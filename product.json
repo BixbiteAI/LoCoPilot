@@ -1,6 +1,10 @@
 {
 	"nameShort": "LoCoPilot",
 	"nameLong": "LoCoPilot",
+	"crashReporter": {
+		"companyName": "Bixbite AI",
+		"productName": "LoCoPilot"
+	},
 	"applicationName": "locopilot",
 	"dataFolderName": ".locopilot",
 	"win32MutexName": "locopilot",
@@ -44,10 +48,10 @@
 				"publisherId": {
 					"publisherId": "5f5636e7-69ed-4afe-b5d6-8d231fb3d3ee",
 					"publisherName": "ms-vscode",
-					"displayName": "Microsoft",
+					"displayName": "Bixbite AI",
 					"flags": "verified"
 				},
-				"publisherDisplayName": "Microsoft"
+				"publisherDisplayName": "Bixbite AI"
 			}
 		},
 		{
@@ -60,10 +64,10 @@
 				"publisherId": {
 					"publisherId": "5f5636e7-69ed-4afe-b5d6-8d231fb3d3ee",
 					"publisherName": "ms-vscode",
-					"displayName": "Microsoft",
+					"displayName": "Bixbite AI",
 					"flags": "verified"
 				},
-				"publisherDisplayName": "Microsoft"
+				"publisherDisplayName": "Bixbite AI"
 			}
 		},
 		{
@@ -76,10 +80,10 @@
 				"publisherId": {
 					"publisherId": "5f5636e7-69ed-4afe-b5d6-8d231fb3d3ee",
 					"publisherName": "ms-vscode",
-					"displayName": "Microsoft",
+					"displayName": "Bixbite AI",
 					"flags": "verified"
 				},
-				"publisherDisplayName": "Microsoft"
+				"publisherDisplayName": "Bixbite AI"
 			}
 		}
 	],

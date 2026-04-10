@@ -1,10 +1,9 @@
 name: @@NAME@@
 version: '@@VERSION@@'
-summary: Code editing. Redefined.
+summary: LoCoPilot — AI-native code editing
 description: |
-  Visual Studio Code is a new choice of tool that combines the
-  simplicity of a code editor with what developers need for the core
-  edit-build-debug cycle.
+  LoCoPilot by Bixbite AI is a desktop code editor with local and cloud
+  AI assistance for the edit-build-debug workflow.
 
 architectures:
   - build-on: amd64

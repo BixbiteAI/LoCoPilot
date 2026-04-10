@@ -107,7 +107,7 @@ if (crashReporterDirectory) {
 	app.setPath('crashDumps', crashReporterDirectory);
 
 	crashReporter.start({
-		companyName: 'Microsoft',
+		companyName: 'Bixbite AI',
 		productName: process.env['VSCODE_DEV'] ? `${product.nameShort} Dev` : product.nameShort,
 		uploadToServer: false,
 		compress: true

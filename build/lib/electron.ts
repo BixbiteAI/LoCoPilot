@@ -107,6 +107,7 @@ export const config = {
 	version: electronVersion,
 	tag: product.electronRepository ? `v${electronVersion}-${msBuildId}` : undefined,
 	productAppName: product.nameLong,
+	productDisplayName: product.nameLong,
 	companyName: 'Bixbite AI',
 	copyright: 'Copyright (C) 2026 Bixbite AI. All rights reserved.',
 	darwinIcon: 'resources/darwin/locopilot.icns',
@@ -154,7 +155,7 @@ export const config = {
 		// Default icon with specified names
 		...darwinBundleDocumentTypes({
 			'Clojure source code': ['clj', 'cljs', 'cljx', 'clojure'],
-			'VS Code workspace file': 'code-workspace',
+			'LoCoPilot workspace file': 'code-workspace',
 			'CoffeeScript source code': 'coffee',
 			'Comma Separated Values': 'csv',
 			'CMake script': 'cmake',

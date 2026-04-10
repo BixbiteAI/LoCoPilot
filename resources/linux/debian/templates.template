@@ -1,6 +1,6 @@
 Template: @@NAME@@/add-microsoft-repo
 Type: boolean
 Default: true
-Description: Add Microsoft apt repository for Visual Studio Code?
- The installer would like to add the Microsoft repository and signing
- key to update VS Code through apt.
+Description: Add apt repository for LoCoPilot updates?
+ The installer can add the package repository and signing key to update
+ LoCoPilot through apt (when your distribution uses this update channel).
