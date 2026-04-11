@@ -762,7 +762,9 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 			details += ` • ${model.format}`;
 		}
 		if (model.isDownloading) {
-			details += ` • ${isOllama ? localize('customLanguageModels.pulling', 'Pulling') : localize('customLanguageModels.downloading', 'Downloading')} ${model.downloadProgress ?? 0}%`;
+			details += isOllama
+				? ` • ${localize('customLanguageModels.pullingInProgress', 'Pulling…')}`
+				: ` • ${localize('customLanguageModels.downloading', 'Downloading')} ${model.downloadProgress ?? 0}%`;
 		} else if ((model.provider === 'huggingface' || isOllama) && model.localPath) {
 			details += ` • ${isOllama ? localize('customLanguageModels.ready', 'Ready') : localize('customLanguageModels.downloaded', 'Downloaded')}`;
 		}
@@ -831,21 +833,29 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 			}
 		}));
 
-		// Row 3: local path or download progress
-		if (model.isDownloading) {
+		// Row 3: local path or download progress (Ollama: indeterminate spinner; Hugging Face: % bar)
+		if (model.isDownloading && isOllama) {
+			const row3 = DOM.append(itemContainer, $('.model-item-row.model-item-row3'));
+			const loadingWrap = DOM.append(row3, $('.model-ollama-pull-loading'));
+			const loadingLabel = DOM.append(loadingWrap, $('.model-ollama-pull-label'));
+			loadingLabel.textContent = localize('customLanguageModels.ollamaPullLoading', 'Pulling model from Ollama…');
+			const activity = DOM.append(loadingWrap, $('.model-ollama-activity'));
+			activity.setAttribute('aria-hidden', 'true');
+			for (let i = 0; i < 8; i++) {
+				DOM.append(activity, $('.model-ollama-activity-tick'));
+			}
+			loadingWrap.setAttribute('aria-busy', 'true');
+			loadingWrap.setAttribute('aria-label', localize('customLanguageModels.ollamaPullLoadingAria', 'Pulling model from Ollama, please wait'));
+		} else if (model.isDownloading) {
 			const row3 = DOM.append(itemContainer, $('.model-item-row.model-item-row3'));
 			const progressWrap = DOM.append(row3, $('.model-download-progress-wrap'));
 			const progressLabel = DOM.append(progressWrap, $('.model-download-progress-label'));
-			progressLabel.textContent = isOllama
-				? localize('customLanguageModels.pullProgressShort', 'Pulling… {0}%', model.downloadProgress ?? 0)
-				: localize('customLanguageModels.downloadProgressShort', 'Downloading… {0}%', model.downloadProgress ?? 0);
+			progressLabel.textContent = localize('customLanguageModels.downloadProgressShort', 'Downloading… {0}%', model.downloadProgress ?? 0);
 			const progressTrack = DOM.append(progressWrap, $('.model-download-progress-track'));
 			const progressFill = DOM.append(progressTrack, $('.model-download-progress-fill'));
 			const pct = Math.min(100, Math.max(0, model.downloadProgress ?? 0));
 			progressFill.style.setProperty('width', `${pct}%`);
-			progressWrap.setAttribute('aria-label', isOllama
-				? localize('customLanguageModels.pullProgress', 'Pull progress {0}%', pct)
-				: localize('customLanguageModels.downloadProgress', 'Download progress {0}%', pct));
+			progressWrap.setAttribute('aria-label', localize('customLanguageModels.downloadProgress', 'Download progress {0}%', pct));
 		}
 		if ((model.provider === 'huggingface' || isOllama) && model.localPath && !model.isDownloading) {
 			const row3 = DOM.append(itemContainer, $('.model-item-row.model-item-row3'));

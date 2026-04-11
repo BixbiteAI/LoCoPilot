@@ -187,6 +187,94 @@
 	background-color: var(--vscode-charts-green, #2dd4bf);
 }
 
+/* Ollama pull: activity indicator (clockwise tick chase) after label */
+.model-ollama-pull-loading {
+	display: flex;
+	flex-direction: row;
+	align-items: center;
+	gap: 10px;
+	margin-top: 8px;
+	width: 100%;
+}
+
+.model-ollama-pull-label {
+	font-size: 12px;
+	color: var(--vscode-descriptionForeground);
+	flex-shrink: 0;
+}
+
+.model-ollama-activity {
+	position: relative;
+	width: 18px;
+	height: 18px;
+	flex-shrink: 0;
+}
+
+.model-ollama-activity-tick {
+	position: absolute;
+	left: 50%;
+	top: 50%;
+	width: 2px;
+	height: 6px;
+	margin-left: -1px;
+	margin-top: -6px;
+	border-radius: 1px;
+	background-color: var(--vscode-descriptionForeground);
+	transform-origin: 50% 100%;
+	opacity: 0.25;
+	animation: model-ollama-tick-chase 0.9s linear infinite;
+}
+
+@keyframes model-ollama-tick-chase {
+	0%,
+	100% {
+		opacity: 0.2;
+	}
+	50% {
+		opacity: 1;
+	}
+}
+
+.model-ollama-activity-tick:nth-child(1) {
+	transform: rotate(0deg);
+	animation-delay: 0s;
+}
+.model-ollama-activity-tick:nth-child(2) {
+	transform: rotate(45deg);
+	animation-delay: -0.1125s;
+}
+.model-ollama-activity-tick:nth-child(3) {
+	transform: rotate(90deg);
+	animation-delay: -0.225s;
+}
+.model-ollama-activity-tick:nth-child(4) {
+	transform: rotate(135deg);
+	animation-delay: -0.3375s;
+}
+.model-ollama-activity-tick:nth-child(5) {
+	transform: rotate(180deg);
+	animation-delay: -0.45s;
+}
+.model-ollama-activity-tick:nth-child(6) {
+	transform: rotate(225deg);
+	animation-delay: -0.5625s;
+}
+.model-ollama-activity-tick:nth-child(7) {
+	transform: rotate(270deg);
+	animation-delay: -0.675s;
+}
+.model-ollama-activity-tick:nth-child(8) {
+	transform: rotate(315deg);
+	animation-delay: -0.7875s;
+}
+
+@media (prefers-reduced-motion: reduce) {
+	.model-ollama-activity-tick {
+		animation: none;
+		opacity: 0.65;
+	}
+}
+
 .model-saved-path {
 	margin-top: 4px;
 	font-size: 11px;

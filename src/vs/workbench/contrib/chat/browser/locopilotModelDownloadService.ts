@@ -247,7 +247,8 @@ export class LoCoPilotModelDownloadService extends Disposable implements IWorkbe
 
 		this._log(`[LoCoPilot Ollama] Starting pull for ${repoId} at ${baseUrl}`);
 		try {
-			await this.customLanguageModelsService.updateCustomModel(modelId, { isDownloading: true, downloadProgress: 0 });
+			// UI shows an indeterminate spinner while pulling (no percentage).
+			await this.customLanguageModelsService.updateCustomModel(modelId, { isDownloading: true });
 
 			const url = `${baseUrl}/api/pull`;
 			const body = JSON.stringify({ name: repoId, stream: true });
@@ -265,7 +266,6 @@ export class LoCoPilotModelDownloadService extends Disposable implements IWorkbe
 
 			return new Promise<void>((resolve, reject) => {
 				let buffer = '';
-				const layerProgress = new Map<string, { completed: number; total: number }>();
 
 				listenStream(response.stream, {
 					onData: (chunk: any) => {
@@ -276,40 +276,9 @@ export class LoCoPilotModelDownloadService extends Disposable implements IWorkbe
 						for (const line of lines) {
 							if (!line.trim()) continue;
 							try {
-								const json = JSON.parse(line);
-								
-								if (json.digest && json.total) {
-									layerProgress.set(json.digest, { 
-										completed: json.completed || 0, 
-										total: json.total 
-									});
-									
-									let totalBytes = 0;
-									let completedBytes = 0;
-									for (const layer of layerProgress.values()) {
-										totalBytes += layer.total;
-										completedBytes += layer.completed;
-									}
-									
-									if (totalBytes > 0) {
-										const pct = Math.round((completedBytes / totalBytes) * 100);
-										// Only update if percentage increased to avoid UI flicker
-										this.customLanguageModelsService.updateCustomModel(modelId, { downloadProgress: pct });
-									}
-								} else if (json.status && !json.digest) {
-									// If we have a status but no digest (e.g. "pulling manifest", "verifying sha256"), 
-									// it means we are in a transition state. We don't have byte progress yet,
-									// but we should show something other than 0% if we want to indicate progress.
-									// We set it to 1% to show that something is happening.
-									this.customLanguageModelsService.updateCustomModel(modelId, { downloadProgress: 1 });
-								}
-
+								const json = JSON.parse(line) as { status?: string; completed?: number; total?: number };
 								if (json.status) {
-									this._log(`[LoCoPilot Ollama] Pull status: ${json.status}${json.completed ? ` (${json.completed}/${json.total})` : ''}`);
-								}
-								
-								if (json.status === 'success') {
-									// Done
+									this._log(`[LoCoPilot Ollama] Pull status: ${json.status}${typeof json.completed === 'number' && typeof json.total === 'number' ? ` (${json.completed}/${json.total})` : ''}`);
 								}
 							} catch (e) {
 								// Ignore parse errors for partial lines
@@ -319,8 +288,7 @@ export class LoCoPilotModelDownloadService extends Disposable implements IWorkbe
 					onError: (error: any) => reject(error),
 					onEnd: async () => {
 						await this.customLanguageModelsService.updateCustomModel(modelId, {
-							isDownloading: false,
-							downloadProgress: 100
+							isDownloading: false
 							// localPath still holds the Base URL
 						});
 						this._log(`[LoCoPilot Ollama] ${repoId} pulled successfully.`);
