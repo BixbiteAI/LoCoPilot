@@ -49,6 +49,7 @@ import { Codicon } from '../../../../../base/common/codicons.js';
 import { renderIcon } from '../../../../../base/browser/ui/iconLabel/iconLabels.js';
 import { MarkdownString } from '../../../../../base/common/htmlContent.js';
 import { IMarkdownRendererService } from '../../../../../platform/markdown/browser/markdownRenderer.js';
+import { ILoCoPilotLocalModelRunner } from '../locopilotLocalModelRunner.js';
 
 const $ = DOM.$;
 
@@ -139,6 +140,7 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 	private llamaCppServerPathInput!: InputBox;
 	private agentSettingsService!: ILoCoPilotAgentSettingsService;
 	private customLanguageModelsService!: ICustomLanguageModelsService;
+	private localModelRunner!: ILoCoPilotLocalModelRunner;
 
 	private dimension: Dimension | undefined;
 	private selectedSection: string = LOCOPILOT_SETTINGS_SECTION_ADD_MODEL;
@@ -158,10 +160,16 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 		@ICommandService private readonly commandService: ICommandService,
 		@ILogService private readonly logService: ILogService,
 		@IMarkdownRendererService private readonly markdownRendererService: IMarkdownRendererService,
+		@ILoCoPilotLocalModelRunner localModelRunner: ILoCoPilotLocalModelRunner,
 	) {
 		super(LoCoPilotSettingsEditor.ID, group, telemetryService, themeService, storageService);
 		this.agentSettingsService = agentSettingsService;
 		this.customLanguageModelsService = customLanguageModelsService;
+		this.localModelRunner = localModelRunner;
+
+		this._register(this.localModelRunner.onDidServerStateChange(() => {
+			this.renderListModels();
+		}));
 	}
 
 	protected override createEditor(parent: HTMLElement): void {
@@ -689,21 +697,31 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 		const actionsContainer = DOM.append(row1, $('.model-actions'));
 		const runSlot = DOM.append(actionsContainer, $('.model-actions-run-slot'));
 		if (model.provider === 'huggingface' && model.localPath) {
+			const isRunning = this.localModelRunner.isServerRunning(model.id);
 			const runServerButton = this._register(new Button(runSlot, { ...defaultButtonStyles, secondary: true }));
-			runServerButton.label = localize('customLanguageModels.runServer', 'Run server');
+			runServerButton.label = isRunning ? localize('customLanguageModels.stopServer', 'Stop server') : localize('customLanguageModels.runServer', 'Run server');
 			this._register(runServerButton.onDidClick(async () => {
-				const currentPath = this.llamaCppServerPathInput.value.trim();
-				const savedPath = this.configurationService.getValue<string>(ChatConfiguration.LocopilotLlamaCppServerPath);
-				if (currentPath !== (savedPath ?? '').trim()) {
-					await this.configurationService.updateValue(ChatConfiguration.LocopilotLlamaCppServerPath, currentPath);
+				if (isRunning) {
+					this.localModelRunner.stopServer(model.id);
+				} else {
+					const currentPath = this.llamaCppServerPathInput.value.trim();
+					const savedPath = this.configurationService.getValue<string>(ChatConfiguration.LocopilotLlamaCppServerPath);
+					if (currentPath !== (savedPath ?? '').trim()) {
+						await this.configurationService.updateValue(ChatConfiguration.LocopilotLlamaCppServerPath, currentPath);
+					}
+					this.commandService.executeCommand('locopilot.startLlamaServer', model.id);
 				}
-				this.commandService.executeCommand('locopilot.startLlamaServer', model.id);
 			}));
 		} else if (isOllama && model.localPath) {
+			const isRunning = this.localModelRunner.isServerRunning(model.id);
 			const runServerButton = this._register(new Button(runSlot, { ...defaultButtonStyles, secondary: true }));
-			runServerButton.label = localize('customLanguageModels.runOllama', 'Run model');
+			runServerButton.label = isRunning ? localize('customLanguageModels.stopServer', 'Stop server') : localize('customLanguageModels.runOllama', 'Run model');
 			this._register(runServerButton.onDidClick(() => {
-				this.commandService.executeCommand('locopilot.runOllamaModel', model.id);
+				if (isRunning) {
+					this.localModelRunner.stopServer(model.id);
+				} else {
+					this.commandService.executeCommand('locopilot.runOllamaModel', model.id);
+				}
 			}));
 		}
 		const hideWrap = DOM.append(actionsContainer, $('.model-action-hide'));

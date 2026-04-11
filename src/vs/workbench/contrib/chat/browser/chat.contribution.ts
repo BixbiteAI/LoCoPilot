@@ -64,7 +64,7 @@ import { ILoCoPilotFileLog, LoCoPilotFileLog } from './locopilotFileLog.js';
 import { ILoCoPilotAgentSettingsService, LoCoPilotAgentSettingsService } from './locopilotAgentSettingsService.js';
 import { LoCoPilotLanguageModelProvider } from './locopilotLanguageModelProvider.js';
 import { LoCoPilotModelDownloadService } from './locopilotModelDownloadService.js';
-import { LoCoPilotLocalModelRunner } from './locopilotLocalModelRunner.js';
+import { ILoCoPilotLocalModelRunner, LoCoPilotLocalModelRunner } from './locopilotLocalModelRunner.js';
 import { LanguageModelToolsExtensionPointHandler } from '../common/tools/languageModelToolsContribution.js';
 import { BuiltinToolsContribution } from '../common/tools/builtinTools/tools.js';
 import { IVoiceChatService, VoiceChatService } from '../common/voiceChatService.js';
@@ -1366,7 +1366,6 @@ registerWorkbenchContribution2(LanguageModelToolsExtensionPointHandler.ID, Langu
 registerWorkbenchContribution2(ChatPromptFilesExtensionPointHandler.ID, ChatPromptFilesExtensionPointHandler, WorkbenchPhase.BlockRestore);
 registerWorkbenchContribution2('locopilot.languageModelProvider', LoCoPilotLanguageModelProvider, WorkbenchPhase.AfterRestored);
 registerWorkbenchContribution2(LoCoPilotModelDownloadService.ID, LoCoPilotModelDownloadService, WorkbenchPhase.Eventually);
-registerWorkbenchContribution2(LoCoPilotLocalModelRunner.ID, LoCoPilotLocalModelRunner, WorkbenchPhase.Eventually);
 registerWorkbenchContribution2(ChatCompatibilityNotifier.ID, ChatCompatibilityNotifier, WorkbenchPhase.Eventually);
 registerWorkbenchContribution2(CodeBlockActionRendering.ID, CodeBlockActionRendering, WorkbenchPhase.BlockRestore);
 registerWorkbenchContribution2(ChatImplicitContextContribution.ID, ChatImplicitContextContribution, WorkbenchPhase.Eventually);
@@ -1449,5 +1448,6 @@ registerSingleton(IChatOutputRendererService, ChatOutputRendererService, Instant
 registerSingleton(IChatLayoutService, ChatLayoutService, InstantiationType.Delayed);
 registerSingleton(ILoCoPilotFileLog, LoCoPilotFileLog, InstantiationType.Delayed);
 registerSingleton(ILoCoPilotAgentSettingsService, LoCoPilotAgentSettingsService, InstantiationType.Delayed);
+registerSingleton(ILoCoPilotLocalModelRunner, LoCoPilotLocalModelRunner, InstantiationType.Delayed);
 
 ChatWidget.CONTRIBS.push(ChatDynamicVariableModel);

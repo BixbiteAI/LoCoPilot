@@ -19,6 +19,8 @@ import { IChatMessage, ILanguageModelChatInfoOptions, ILanguageModelChatMetadata
 import { IWorkbenchContribution } from '../../../common/contributions.js';
 import { LOCOPILOT_SETTINGS_SECTION_LIST_MODELS } from './chatManagement/locopilotSettingsEditorInput.js';
 
+import { ILoCoPilotLocalModelRunner } from './locopilotLocalModelRunner.js';
+
 export class LoCoPilotLanguageModelProvider extends Disposable implements ILanguageModelChatProvider, IWorkbenchContribution {
 	private readonly _onDidChange = this._register(new Emitter<void>());
 	readonly onDidChange = this._onDidChange.event;
@@ -29,6 +31,7 @@ export class LoCoPilotLanguageModelProvider extends Disposable implements ILangu
 		@IRequestService private readonly requestService: IRequestService,
 		@ILogService private readonly logService: ILogService,
 		@ILoCoPilotFileLog private readonly locopilotFileLog: ILoCoPilotFileLog,
+		@ILoCoPilotLocalModelRunner private readonly localModelRunner: ILoCoPilotLocalModelRunner,
 	) {
 		super();
 		this._log('[LoCoPilot] Initializing Language Model Provider');
@@ -578,8 +581,10 @@ export class LoCoPilotLanguageModelProvider extends Disposable implements ILangu
 			this._log(`[LoCoPilot Provider] Model ${model.modelName} is not downloaded yet.`);
 			throw new Error(`The model "${model.modelName}" is not downloaded yet. Add it in LoCoPilot Settings with provider HuggingFace and wait for the download to complete.`);
 		}
-		const { getLlamaServerBaseUrl } = await import('./locopilotLlamaCppServer.js');
-		const baseUrl = getLlamaServerBaseUrl();
+		const baseUrl = this.localModelRunner.getServerBaseUrl(model.id);
+		if (!baseUrl) {
+			throw new Error(this._getLocalLlamaServerNotRunningMessage(model.modelName));
+		}
 		const url = `${baseUrl}/chat/completions`;
 		const mappedMessages = messages.flatMap(m => this._mapMessageToOpenAI(m));
 		const maxOutputTokens = model.maxOutputTokens ?? 1000;

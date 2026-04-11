@@ -6,13 +6,11 @@
 import { Disposable } from '../../../../base/common/lifecycle.js';
 import { URI } from '../../../../base/common/uri.js';
 import { ILogService } from '../../../../platform/log/common/log.js';
-import { ICommandService } from '../../../../platform/commands/common/commands.js';
 import { IConfigurationService } from '../../../../platform/configuration/common/configuration.js';
 import { IFileService } from '../../../../platform/files/common/files.js';
 import { ICustomLanguageModelsService } from '../common/customLanguageModelsService.js';
 import { ChatConfiguration } from '../common/constants.js';
 import { ILoCoPilotFileLog } from './locopilotFileLog.js';
-import { IWorkbenchContribution } from '../../../common/contributions.js';
 import { registerAction2, Action2 } from '../../../../platform/actions/common/actions.js';
 import { ServicesAccessor } from '../../../../platform/instantiation/common/instantiation.js';
 import {
@@ -25,22 +23,41 @@ import {
 	LlamaBackend
 } from './locopilotLlamaCppServer.js';
 import { IPathService } from '../../../services/path/common/pathService.js';
+import { ITerminalService, ITerminalInstance } from '../../terminal/browser/terminal.js';
+import { createDecorator } from '../../../../platform/instantiation/common/instantiation.js';
+import { Event, Emitter } from '../../../../base/common/event.js';
 
-/** Command IDs for terminal (avoid direct terminal contrib import for compile). */
-const CMD_TERMINAL_NEW = 'workbench.action.terminal.new';
-const CMD_TERMINAL_SEND_SEQUENCE = 'workbench.action.terminal.sendSequence';
+export const ILoCoPilotLocalModelRunner = createDecorator<ILoCoPilotLocalModelRunner>('locopilotLocalModelRunner');
 
-export class LoCoPilotLocalModelRunner extends Disposable implements IWorkbenchContribution {
+export interface ILoCoPilotLocalModelRunner {
+	readonly _serviceBrand: undefined;
+	readonly onDidServerStateChange: Event<string>;
+	getBackend(): LlamaBackend;
+	getBackendPriority(): LlamaBackend[];
+	getServerBaseUrl(modelId: string): string | undefined;
+	startServerInTerminal(modelId: string): Promise<void>;
+	stopServer(modelId: string): void;
+	runOllamaModelInTerminal(modelId: string): Promise<void>;
+	isServerRunning(modelId: string): boolean;
+}
+
+export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotLocalModelRunner {
+	declare readonly _serviceBrand: undefined;
 	static readonly ID = 'locopilot.localModelRunner';
+
+	private readonly _onDidServerStateChange = this._register(new Emitter<string>());
+	readonly onDidServerStateChange = this._onDidServerStateChange.event;
+
+	private runningServers = new Map<string, { port: number, terminal: ITerminalInstance }>();
 
 	constructor(
 		@ICustomLanguageModelsService private readonly customLanguageModelsService: ICustomLanguageModelsService,
-		@ICommandService private readonly commandService: ICommandService,
 		@IConfigurationService private readonly configurationService: IConfigurationService,
 		@IFileService private readonly fileService: IFileService,
 		@IPathService private readonly pathService: IPathService,
 		@ILogService private readonly logService: ILogService,
 		@ILoCoPilotFileLog private readonly locopilotFileLog: ILoCoPilotFileLog,
+		@ITerminalService private readonly terminalService: ITerminalService,
 	) {
 		super();
 		this._registerCommands();
@@ -88,8 +105,26 @@ export class LoCoPilotLocalModelRunner extends Disposable implements IWorkbenchC
 	/**
 	 * Base URL for the local llama server (OpenAI-compatible). Use this when sending chat requests.
 	 */
-	getServerBaseUrl(): string {
-		return getLlamaServerBaseUrl(LOCOPILOT_LLAMA_SERVER_PORT);
+	getServerBaseUrl(modelId: string): string | undefined {
+		const running = this.runningServers.get(modelId);
+		if (running) {
+			return getLlamaServerBaseUrl(running.port);
+		}
+		return undefined;
+	}
+
+	isServerRunning(modelId: string): boolean {
+		return this.runningServers.has(modelId);
+	}
+
+	stopServer(modelId: string): void {
+		const running = this.runningServers.get(modelId);
+		if (running) {
+			running.terminal.dispose();
+			this.runningServers.delete(modelId);
+			this._onDidServerStateChange.fire(modelId);
+			this._log(`[LoCoPilot Runner] Stopped server for model ${modelId}`);
+		}
 	}
 
 	/**
@@ -163,11 +198,28 @@ export class LoCoPilotLocalModelRunner extends Disposable implements IWorkbenchC
 		return localPath;
 	}
 
+	private async findAvailablePort(startPort: number): Promise<number> {
+		// A simple heuristic for now. In a real scenario, we'd bind to port 0 to get an OS-assigned port,
+		// or test if the port is in use. Since we're in the renderer, we can just pick an unused port from our registry
+		// and assume it's free. We'll increment from LOCOPILOT_LLAMA_SERVER_PORT.
+		let port = startPort;
+		const usedPorts = new Set(Array.from(this.runningServers.values()).map(s => s.port));
+		while (usedPorts.has(port)) {
+			port++;
+		}
+		return port;
+	}
+
 	/**
 	 * Starts the llama.cpp server for the given model in a new terminal.
 	 * Uses recommended backend (GPU/Metal/CPU). The server runs until the terminal is closed.
 	 */
 	async startServerInTerminal(modelId: string): Promise<void> {
+		if (this.runningServers.has(modelId)) {
+			this._log(`[LoCoPilot Runner] Server for model ${modelId} is already running.`);
+			return;
+		}
+
 		const model = this.customLanguageModelsService.getCustomModels().find(m => m.id === modelId);
 		if (!model || !model.localPath) {
 			this._log(`[LoCoPilot Runner] Model ${modelId} not found or has no local path.`);
@@ -176,8 +228,10 @@ export class LoCoPilotLocalModelRunner extends Disposable implements IWorkbenchC
 		const modelPath = await this.resolveModelFilePath(model.localPath);
 		const backend = getRecommendedBackend();
 		const serverPath = await this.resolveServerPath();
-		const { command, args } = getLlamaCppServerCommand(modelPath, backend, serverPath);
-		this._log(`[LoCoPilot Runner] Starting llama.cpp server for model ${modelId} with backend: ${backend}`);
+		
+		const port = await this.findAvailablePort(LOCOPILOT_LLAMA_SERVER_PORT);
+		const { command, args } = getLlamaCppServerCommand(modelPath, backend, serverPath, port);
+		this._log(`[LoCoPilot Runner] Starting llama.cpp server for model ${modelId} on port ${port} with backend: ${backend}`);
 		// Build command line for the user's shell (path with spaces/quotes escaped)
 		const modelPathArg = args[args.indexOf('-m') + 1];
 		const escapedPath = modelPathArg && (modelPathArg.includes(' ') || modelPathArg.includes('"'))
@@ -196,10 +250,26 @@ export class LoCoPilotLocalModelRunner extends Disposable implements IWorkbenchC
 		}
 		
 		try {
-			await this.commandService.executeCommand(CMD_TERMINAL_NEW);
-			// Brief delay so the new terminal is focused before we send the command
+			const terminal = await this.terminalService.createTerminal({
+				config: {
+					name: `Llama Server - ${model.modelName}`,
+				}
+			});
+			this.terminalService.setActiveInstance(terminal);
 			await new Promise<void>(resolve => setTimeout(resolve, 400));
-			await this.commandService.executeCommand(CMD_TERMINAL_SEND_SEQUENCE, { text: cmdLine + '\n' });
+			await terminal.sendText(cmdLine, true);
+
+			this.runningServers.set(modelId, { port, terminal });
+			this._onDidServerStateChange.fire(modelId);
+
+			this._register(terminal.onDisposed(() => {
+				if (this.runningServers.has(modelId)) {
+					this.runningServers.delete(modelId);
+					this._onDidServerStateChange.fire(modelId);
+					this._log(`[LoCoPilot Runner] Terminal closed for model ${modelId}`);
+				}
+			}));
+
 			this._log(`[LoCoPilot Runner] Terminal started with: ${cmdLine}`);
 		} catch (e) {
 			this._log(`[LoCoPilot Runner] Failed to start terminal: ${e}`);
@@ -211,6 +281,11 @@ export class LoCoPilotLocalModelRunner extends Disposable implements IWorkbenchC
 	 * Runs the Ollama model in a new terminal.
 	 */
 	async runOllamaModelInTerminal(modelId: string): Promise<void> {
+		if (this.runningServers.has(modelId)) {
+			this._log(`[LoCoPilot Runner] Ollama model ${modelId} is already running.`);
+			return;
+		}
+
 		const model = this.customLanguageModelsService.getCustomModels().find(m => m.id === modelId);
 		if (!model || model.provider !== 'ollama') {
 			this._log(`[LoCoPilot Runner] Ollama model ${modelId} not found.`);
@@ -222,9 +297,26 @@ export class LoCoPilotLocalModelRunner extends Disposable implements IWorkbenchC
 		const cmdLine = `${hostEnv}ollama run ${model.modelName}`;
 		this._log(`[LoCoPilot Runner] Running Ollama model: ${cmdLine}`);
 		try {
-			await this.commandService.executeCommand(CMD_TERMINAL_NEW);
+			const terminal = await this.terminalService.createTerminal({
+				config: {
+					name: `Ollama - ${model.modelName}`,
+				}
+			});
+			this.terminalService.setActiveInstance(terminal);
 			await new Promise<void>(resolve => setTimeout(resolve, 400));
-			await this.commandService.executeCommand(CMD_TERMINAL_SEND_SEQUENCE, { text: cmdLine + '\n' });
+			await terminal.sendText(cmdLine, true);
+
+			// For Ollama, we don't manage the port, it's always the baseUrl port, but we track the terminal
+			this.runningServers.set(modelId, { port: 11434, terminal });
+			this._onDidServerStateChange.fire(modelId);
+
+			this._register(terminal.onDisposed(() => {
+				if (this.runningServers.has(modelId)) {
+					this.runningServers.delete(modelId);
+					this._onDidServerStateChange.fire(modelId);
+					this._log(`[LoCoPilot Runner] Terminal closed for Ollama model ${modelId}`);
+				}
+			}));
 		} catch (e) {
 			this._log(`[LoCoPilot Runner] Failed to run Ollama in terminal: ${e}`);
 			throw e;

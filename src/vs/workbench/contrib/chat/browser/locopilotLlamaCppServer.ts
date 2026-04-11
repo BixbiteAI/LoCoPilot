@@ -80,8 +80,8 @@ export function resolveLlamaServerCommand(serverPath: string | undefined): strin
  * serverPath: optional path from settings (locopilot.llamaCpp.serverPath). Empty = use binary from PATH.
  * User can install via: https://github.com/ggerganov/llama.cpp or pip install llama-cpp-python (server).
  */
-export function getLlamaCppServerCommand(modelPath: string, backend: LlamaBackend, serverPath?: string): { command: string; args: string[] } {
-	const args: string[] = ['-m', modelPath, '-c', '32768', '--host', '127.0.0.1', '--port', '38452'];
+export function getLlamaCppServerCommand(modelPath: string, backend: LlamaBackend, serverPath?: string, port: number = LOCOPILOT_LLAMA_SERVER_PORT): { command: string; args: string[] } {
+	const args: string[] = ['-m', modelPath, '-c', '32768', '--host', '127.0.0.1', '--port', port.toString()];
 	switch (backend) {
 		case 'cuda':
 			args.push('--n-gpu-layers', '999');
