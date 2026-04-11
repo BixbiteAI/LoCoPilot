@@ -14,7 +14,7 @@
 
 .locopilot-settings-editor .locopilot-settings-header {
 	box-sizing: border-box;
-	margin-left: 20px;
+	margin-left: 8px;
 	padding: 10px 15px 5px 15px;
 	border-bottom: 1px solid var(--vscode-settings-headerBorder);
 	flex-shrink: 0;
@@ -32,6 +32,34 @@
 	overflow: hidden;
 }
 
+/* Section nav pane: soft corners (selection/focus still use theme colors) */
+.locopilot-settings-editor .sidebar-view {
+	border-radius: 6px;
+	outline: none;
+}
+
+.locopilot-settings-editor .sidebar-view:focus,
+.locopilot-settings-editor .sidebar-view:focus-within {
+	outline: none;
+}
+
+.locopilot-settings-editor .sidebar-container .monaco-list .monaco-list-row {
+	border-radius: 6px;
+}
+
+.locopilot-settings-editor .sidebar-container .monaco-list:focus {
+	outline: none !important;
+}
+
+/*
+ * Workbench (style.css) draws a full-list focus ring via ::before on .monaco-list:focus
+ * when the list has no row keyboard focus — theme color on all sides. Hide it here; row
+ * selection/focus styling still comes from .monaco-list-row.focused.
+ */
+.monaco-workbench .locopilot-settings-editor .sidebar-container .monaco-list:not(.element-focused):not(:active):focus:before {
+	display: none !important;
+}
+
 .locopilot-settings-editor .contents-container {
 	height: 100%;
 	overflow-y: auto;
@@ -40,7 +68,7 @@
 }
 
 .locopilot-settings-editor .sidebar-container {
-	padding-left: 20px;
+	padding-left: 8px;
 	padding-top: 15px;
 	height: 100%;
 	overflow: hidden;
@@ -48,7 +76,7 @@
 }
 
 .locopilot-settings-editor .sidebar-container .section-list-item {
-	padding-left: 20px;
+	padding-left: 8px;
 	display: flex;
 	align-items: center;
 }
@@ -145,6 +173,7 @@
 	font-weight: 600;
 	color: var(--vscode-foreground);
 	min-width: 180px;
+	cursor: default;
 }
 
 /* Agent setting rows: fixed label width so max iteration, toggle, and path input align in one column */
@@ -154,14 +183,16 @@
 	flex-shrink: 0;
 }
 
-.locopilot-settings-editor .agent-setting-input-wrap {
+/* Narrow width for single fields (e.g. max iterations); path row uses .agent-setting-path-wrap instead */
+.locopilot-settings-editor .agent-setting-input-wrap:not(.agent-setting-path-wrap) {
 	width: 80px;
 }
 
-/* Wider input for path fields (e.g. Llama.cpp server path); +100px from previous for better path entry */
+/* Llama.cpp server path: wide enough for long filesystem paths */
 .locopilot-settings-editor .agent-setting-path-wrap {
-	min-width: 300px;
-	max-width: 520px;
+	flex: 1 1 auto;
+	min-width: 200px;
+	max-width: 360px;
 }
 
 .locopilot-settings-editor .agent-setting-toggle-wrap {
@@ -404,7 +435,7 @@
 
 .locopilot-settings-editor .form-field-tokens .form-input-container,
 .add-custom-model-editor .form-field-tokens .form-input-container {
-	max-width: 120px;
+	max-width: 80px;
 }
 
 /* LoCoPilot Settings tab icon: Bixbite logo (black in light theme, white in dark) - same as Welcome */

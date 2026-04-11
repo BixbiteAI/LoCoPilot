@@ -5,6 +5,7 @@
 
 import { AsyncIterableSource } from '../../../../base/common/async.js';
 import { encodeBase64, streamToBuffer } from '../../../../base/common/buffer.js';
+import { createMarkdownCommandLink } from '../../../../base/common/htmlContent.js';
 import { CancellationToken } from '../../../../base/common/cancellation.js';
 import { Emitter } from '../../../../base/common/event.js';
 import { Disposable } from '../../../../base/common/lifecycle.js';
@@ -16,6 +17,7 @@ import { ILoCoPilotFileLog } from './locopilotFileLog.js';
 import { ICustomLanguageModelsService, ICustomLanguageModel } from '../common/customLanguageModelsService.js';
 import { IChatMessage, ILanguageModelChatInfoOptions, ILanguageModelChatMetadataAndIdentifier, ILanguageModelChatProvider, ILanguageModelChatResponse, ILanguageModelsService, IChatResponsePart, ChatMessageRole } from '../common/languageModels.js';
 import { IWorkbenchContribution } from '../../../common/contributions.js';
+import { LOCOPILOT_SETTINGS_SECTION_LIST_MODELS } from './chatManagement/locopilotSettingsEditorInput.js';
 
 export class LoCoPilotLanguageModelProvider extends Disposable implements ILanguageModelChatProvider, IWorkbenchContribution {
 	private readonly _onDidChange = this._register(new Emitter<void>());
@@ -115,6 +117,16 @@ export class LoCoPilotLanguageModelProvider extends Disposable implements ILangu
 			default:
 				return `Something went wrong while calling ${provider} (error ${statusCode}). Please try again.`;
 		}
+	}
+
+	/** Chat error panel renders this as Markdown; includes a command link (see chatListRenderer trusted command for this id). */
+	private _getLocalLlamaServerNotRunningMessage(modelName: string): string {
+		const openLanguageModels = createMarkdownCommandLink({
+			title: 'Open Language Models',
+			id: 'workbench.action.chat.openLoCoPilotSettings',
+			arguments: [{ section: LOCOPILOT_SETTINGS_SECTION_LIST_MODELS }],
+		});
+		return `Local model server is not running. ${openLanguageModels} — find **${modelName}** and click **Run server** to start the llama.cpp server.`;
 	}
 
 	async provideLanguageModelChatInfo(options: ILanguageModelChatInfoOptions, token: CancellationToken): Promise<ILanguageModelChatMetadataAndIdentifier[]> {
@@ -666,7 +678,7 @@ export class LoCoPilotLanguageModelProvider extends Disposable implements ILangu
 
 			if (response.res.statusCode !== 200) {
 				const msg = response.res.statusCode === 404 || response.res.statusCode === 502 || response.res.statusCode === 503
-					? `Local model server is not running. Open LoCoPilot Settings → Language Models, find "${model.modelName}", and click "Run server" to start the llama.cpp server.`
+					? this._getLocalLlamaServerNotRunningMessage(model.modelName)
 					: `Local model "${model.modelName}" request failed (${response.res.statusCode}).`;
 				throw new Error(msg);
 			}
@@ -796,7 +808,7 @@ export class LoCoPilotLanguageModelProvider extends Disposable implements ILangu
 			}
 			const isConnectionRefused = /ECONNREFUSED|ERR_CONNECTION_REFUSED|net::ERR_CONNECTION_REFUSED|fetch failed|Failed to fetch/i.test(errMsg);
 			const msg = isConnectionRefused
-				? `Local model server is not running. Open LoCoPilot Settings → Language Models, find "${model.modelName}", and click "Run server" to start the llama.cpp server.`
+				? this._getLocalLlamaServerNotRunningMessage(model.modelName)
 				: `Local model "${model.modelName}" error: ${errMsg}`;
 			throw new Error(msg);
 		}

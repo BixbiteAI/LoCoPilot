@@ -125,6 +125,8 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 	private static readonly MAX_INPUT = 2000000;
 	private static readonly MIN_OUTPUT_TOKENS = 0;
 	private static readonly MAX_OUTPUT_TOKENS = 32000;
+	/** Compact width for token fields (hover shows full value). */
+	private static readonly TOKEN_LIMIT_INPUT_WIDTH_PX = 80;
 
 	private askPromptTextarea!: HTMLTextAreaElement;
 	private agentPromptTextarea!: HTMLTextAreaElement;
@@ -381,9 +383,14 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 		const maxInputInputContainer = DOM.append(maxInputWrap, $('.form-input-container'));
 		this.addFormMaxInputTokensInput = this._register(new InputBox(maxInputInputContainer, this.contextViewService, {
 			placeholder: String(LoCoPilotSettingsEditor.DEFAULT_MAX_INPUT),
+			tooltip: '',
 			inputBoxStyles: locopilotSettingsInputBoxStyles
 		}));
+		this.addFormMaxInputTokensInput.element.style.minWidth = `${LoCoPilotSettingsEditor.TOKEN_LIMIT_INPUT_WIDTH_PX}px`;
+		this.addFormMaxInputTokensInput.element.style.width = `${LoCoPilotSettingsEditor.TOKEN_LIMIT_INPUT_WIDTH_PX}px`;
 		this.addFormMaxInputTokensInput.value = String(LoCoPilotSettingsEditor.DEFAULT_MAX_INPUT);
+		this.syncAddFormMaxInputTokenTooltip();
+		this._register(this.addFormMaxInputTokensInput.onDidChange(() => this.syncAddFormMaxInputTokenTooltip()));
 		// const maxInputSuffix = DOM.append(maxInputWrap, $('.form-input-suffix'));
 		// maxInputSuffix.textContent = 'K';
 
@@ -394,9 +401,14 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 		const maxOutputInputContainer = DOM.append(maxOutputRow, $('.form-input-container'));
 		this.addFormMaxOutputTokensInput = this._register(new InputBox(maxOutputInputContainer, this.contextViewService, {
 			placeholder: localize('addCustomModel.maxOutputTokensPlaceholder', '50 - 32000'),
+			tooltip: '',
 			inputBoxStyles: locopilotSettingsInputBoxStyles
 		}));
+		this.addFormMaxOutputTokensInput.element.style.minWidth = `${LoCoPilotSettingsEditor.TOKEN_LIMIT_INPUT_WIDTH_PX}px`;
+		this.addFormMaxOutputTokensInput.element.style.width = `${LoCoPilotSettingsEditor.TOKEN_LIMIT_INPUT_WIDTH_PX}px`;
 		this.addFormMaxOutputTokensInput.value = String(LoCoPilotSettingsEditor.DEFAULT_MAX_OUTPUT_TOKENS);
+		this.syncAddFormMaxOutputTokenTooltip();
+		this._register(this.addFormMaxOutputTokensInput.onDidChange(() => this.syncAddFormMaxOutputTokenTooltip()));
 
 		// Use Native Tools toggle (for local models)
 		this.addFormUseNativeToolsContainer = DOM.append(formContainer, $('.form-field'));
@@ -416,6 +428,22 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 		this.addFormAddButton.label = localize('addCustomModel.add', 'Add Model');
 		this._register(this.addFormAddButton.onDidClick(() => this.handleAddModel()));
 		this.addFormUpdateModelNameLabel();
+	}
+
+	private maxInputTokensTooltip(value: string): string {
+		return localize('customLanguageModels.maxInputTokenTooltipWithValue', 'Max input tokens: {0}', value);
+	}
+
+	private maxOutputTokensTooltip(value: string): string {
+		return localize('customLanguageModels.maxOutputTokenTooltipWithValue', 'Max output tokens: {0}', value);
+	}
+
+	private syncAddFormMaxInputTokenTooltip(): void {
+		this.addFormMaxInputTokensInput.setTooltip(this.maxInputTokensTooltip(this.addFormMaxInputTokensInput.value));
+	}
+
+	private syncAddFormMaxOutputTokenTooltip(): void {
+		this.addFormMaxOutputTokensInput.setTooltip(this.maxOutputTokensTooltip(this.addFormMaxOutputTokensInput.value));
 	}
 
 	private addFormUpdateProviderOptions(): void {
@@ -462,6 +490,8 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 				this.addFormMaxOutputTokensInput.value = String(LoCoPilotSettingsEditor.DEFAULT_MAX_OUTPUT_TOKENS);
 			}
 		}
+		this.syncAddFormMaxInputTokenTooltip();
+		this.syncAddFormMaxOutputTokenTooltip();
 		this.addFormUpdateModelNameLabel();
 	}
 
@@ -739,36 +769,44 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 			}));
 		}
 		const maxInputContainer = DOM.append(secondarySettingsContainer, $('.model-max-input-container'));
-		maxInputContainer.title = localize('customLanguageModels.maxInputTokenTooltip', 'Max input tokens');
 		const maxInputIcon = DOM.append(maxInputContainer, $('span.model-max-input-icon'));
 		maxInputIcon.appendChild(renderIcon(Codicon.arrowDown));
-		maxInputIcon.title = localize('customLanguageModels.maxInputTokenTooltip', 'Max input tokens');
 		const maxInputInput = this._register(new InputBox(maxInputContainer, this.contextViewService, {
 			placeholder: String(LoCoPilotSettingsEditor.DEFAULT_MAX_INPUT),
+			tooltip: '',
 			inputBoxStyles: locopilotSettingsInputBoxStyles
 		}));
-		maxInputInput.element.style.width = '56px';
-		maxInputInput.element.title = localize('customLanguageModels.maxInputTokenTooltip', 'Max input tokens');
+		maxInputInput.element.style.minWidth = `${LoCoPilotSettingsEditor.TOKEN_LIMIT_INPUT_WIDTH_PX}px`;
+		maxInputInput.element.style.width = `${LoCoPilotSettingsEditor.TOKEN_LIMIT_INPUT_WIDTH_PX}px`;
 		maxInputInput.value = String(model.maxInputTokens ?? LoCoPilotSettingsEditor.DEFAULT_MAX_INPUT);
+		const syncMaxInputTooltip = () => {
+			maxInputInput.setTooltip(this.maxInputTokensTooltip(maxInputInput.value));
+		};
+		syncMaxInputTooltip();
 		this._register(maxInputInput.onDidChange(async () => {
+			syncMaxInputTooltip();
 			const result = this.parseMaxInputK(maxInputInput.value);
 			if (result.valid) {
 				await this.customLanguageModelsService.updateCustomModel(model.id, { maxInputTokens: result.value });
 			}
 		}));
 		const maxOutputContainer = DOM.append(secondarySettingsContainer, $('.model-max-output-container'));
-		maxOutputContainer.title = localize('customLanguageModels.maxOutputTokenTooltip', 'Max output tokens');
 		const maxOutputIcon = DOM.append(maxOutputContainer, $('span.model-max-output-icon'));
 		maxOutputIcon.appendChild(renderIcon(Codicon.arrowUp));
-		maxOutputIcon.title = localize('customLanguageModels.maxOutputTokenTooltip', 'Max output tokens');
 		const maxOutputInput = this._register(new InputBox(maxOutputContainer, this.contextViewService, {
 			placeholder: String(LoCoPilotSettingsEditor.DEFAULT_MAX_OUTPUT_TOKENS),
+			tooltip: '',
 			inputBoxStyles: locopilotSettingsInputBoxStyles
 		}));
-		maxOutputInput.element.style.width = '56px';
-		maxOutputInput.element.title = localize('customLanguageModels.maxOutputTokenTooltip', 'Max output tokens');
+		maxOutputInput.element.style.minWidth = `${LoCoPilotSettingsEditor.TOKEN_LIMIT_INPUT_WIDTH_PX}px`;
+		maxOutputInput.element.style.width = `${LoCoPilotSettingsEditor.TOKEN_LIMIT_INPUT_WIDTH_PX}px`;
 		maxOutputInput.value = String(model.maxOutputTokens ?? LoCoPilotSettingsEditor.DEFAULT_MAX_OUTPUT_TOKENS);
+		const syncMaxOutputTooltip = () => {
+			maxOutputInput.setTooltip(this.maxOutputTokensTooltip(maxOutputInput.value));
+		};
+		syncMaxOutputTooltip();
 		this._register(maxOutputInput.onDidChange(async () => {
+			syncMaxOutputTooltip();
 			const result = this.parseMaxOutputTokens(maxOutputInput.value);
 			if (result.valid) {
 				await this.customLanguageModelsService.updateCustomModel(model.id, { maxOutputTokens: result.value });

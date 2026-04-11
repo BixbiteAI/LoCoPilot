@@ -160,6 +160,9 @@ export interface IChatRendererDelegate {
 
 const mostRecentResponseClassName = 'chat-most-recent-response';
 
+/** Allows LoCoPilot chat errors to use [label](command:...) links to open settings (see locopilotLanguageModelProvider). */
+const chatErrorDetailsMarkdownOpts = { isTrusted: { enabledCommands: ['workbench.action.chat.openLoCoPilotSettings'] } };
+
 export class ChatListItemRenderer extends Disposable implements ITreeRenderer<ChatTreeItem, FuzzyScore, IChatListItemTemplate> {
 	static readonly ID = 'item';
 
@@ -1602,11 +1605,11 @@ export class ChatListItemRenderer extends Disposable implements ITreeRenderer<Ch
 			return renderedError;
 		} else if (content.errorDetails.confirmationButtons && isLast) {
 			const level = content.errorDetails.level ?? ChatErrorLevel.Error;
-			const errorConfirmation = this.instantiationService.createInstance(ChatErrorConfirmationContentPart, level, new MarkdownString(content.errorDetails.message), content, content.errorDetails.confirmationButtons, this.chatContentMarkdownRenderer, context);
+			const errorConfirmation = this.instantiationService.createInstance(ChatErrorConfirmationContentPart, level, new MarkdownString(content.errorDetails.message, chatErrorDetailsMarkdownOpts), content, content.errorDetails.confirmationButtons, this.chatContentMarkdownRenderer, context);
 			return errorConfirmation;
 		} else {
 			const level = content.errorDetails.level ?? ChatErrorLevel.Error;
-			return this.instantiationService.createInstance(ChatErrorContentPart, level, new MarkdownString(content.errorDetails.message), content, this.chatContentMarkdownRenderer);
+			return this.instantiationService.createInstance(ChatErrorContentPart, level, new MarkdownString(content.errorDetails.message, chatErrorDetailsMarkdownOpts), content, this.chatContentMarkdownRenderer);
 		}
 	}
 

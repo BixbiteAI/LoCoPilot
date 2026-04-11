@@ -605,7 +605,7 @@ class TokenLimitsColumnRenderer extends ModelsTableColumnRenderer<ITokenLimitsCo
 				const inputText = DOM.append(inputDiv, $('span'));
 				inputText.textContent = formatTokenCount(modelEntry.metadata.maxInputTokens);
 
-				markdown.appendMarkdown(`$(arrow-down) ${modelEntry.metadata.maxInputTokens} (${localize('models.input', 'Input')})`);
+				markdown.appendMarkdown(`$(arrow-down) ${formatTokenCount(modelEntry.metadata.maxInputTokens)} (${localize('models.input', 'Input')})`);
 				addSeparator = true;
 			}
 			if (modelEntry.metadata.maxOutputTokens) {
@@ -616,7 +616,7 @@ class TokenLimitsColumnRenderer extends ModelsTableColumnRenderer<ITokenLimitsCo
 				if (addSeparator) {
 					markdown.appendText(`  |  `);
 				}
-				markdown.appendMarkdown(`$(arrow-up) ${modelEntry.metadata.maxOutputTokens} (${localize('models.output', 'Output')})`);
+				markdown.appendMarkdown(`$(arrow-up) ${formatTokenCount(modelEntry.metadata.maxOutputTokens)} (${localize('models.output', 'Output')})`);
 			}
 		}
 
