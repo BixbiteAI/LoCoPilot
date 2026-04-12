@@ -824,14 +824,265 @@ export class LoCoPilotLanguageModelProvider extends Disposable implements ILangu
 	}
 
 	/**
-	 * Calls an Ollama model via its OpenAI-compatible API.
+	 * Ollama native `/api/chat` expects string `content` per message; OpenAI-style multimodal arrays need `/v1/chat/completions`.
+	 */
+	private _ollamaMessagesNeedOpenAiCompat(mappedMessages: unknown[]): boolean {
+		for (const m of mappedMessages) {
+			if (m && typeof m === 'object' && 'content' in m) {
+				const c = (m as { content?: unknown }).content;
+				if (c !== undefined && c !== null && typeof c !== 'string') {
+					return true;
+				}
+			}
+		}
+		return false;
+	}
+
+	/**
+	 * Calls an Ollama model via native `/api/chat` (NDJSON) so `message.thinking` streams to the thinking UI.
+	 * Falls back to OpenAI-compatible `/v1/chat/completions` for multimodal / non-string message content.
 	 */
 	private async _callOllamaModel(model: ICustomLanguageModel, messages: IChatMessage[], options: { [name: string]: unknown }, stream: AsyncIterableSource<IChatResponsePart | IChatResponsePart[]>, token: CancellationToken): Promise<any> {
 		const baseUrl = (model.localPath || 'http://localhost:11434').replace(/\/$/, '');
-		const url = `${baseUrl}/v1/chat/completions`;
-		this._log(`[LoCoPilot Provider] Calling Ollama model: ${model.modelName} at ${baseUrl}`);
 		const mappedMessages = messages.flatMap(m => this._mapMessageToOpenAI(m));
 		const maxOutputTokens = model.maxOutputTokens ?? 1000;
+
+		const excludedTools = [
+			'setup_tools_createNewWorkspace',
+			'inline_chat_exit',
+			'vscode_searchExtensions_internal',
+			'vscode_get_terminal_confirmation',
+			'get_terminal_output',
+			'await_terminal',
+			'terminal_selection',
+			'terminal_last_command',
+			'create_and_run_task',
+			'vscode_fetchWebPage_internal',
+			'manage_todo_list',
+			'vscode_get_confirmation',
+			'runSubagent'
+		];
+
+		let filteredTools: unknown[] | undefined;
+		if (options.tools && Array.isArray(options.tools) && options.tools.length > 0) {
+			filteredTools = options.tools.filter((t: any) => {
+				const name = t.function?.name || t.name;
+				return name && !excludedTools.includes(name);
+			});
+			if (filteredTools.length === 0) {
+				filteredTools = undefined;
+			}
+		}
+
+		if (this._ollamaMessagesNeedOpenAiCompat(mappedMessages)) {
+			this._log(`[LoCoPilot Provider] Ollama: using OpenAI-compatible endpoint (multimodal or non-string content)`);
+			return this._callOllamaOpenAICompat(model, baseUrl, mappedMessages, options, stream, token, maxOutputTokens, filteredTools);
+		}
+
+		this._log(`[LoCoPilot Provider] Calling Ollama native API: ${model.modelName} at ${baseUrl}/api/chat`);
+		return this._callOllamaNativeChat(model, baseUrl, mappedMessages, options, stream, token, maxOutputTokens, filteredTools);
+	}
+
+	/**
+	 * Ollama `/api/chat` — streams `application/x-ndjson` with `message.thinking` and `message.content` deltas.
+	 */
+	private async _callOllamaNativeChat(
+		model: ICustomLanguageModel,
+		baseUrl: string,
+		mappedMessages: unknown[],
+		options: { [name: string]: unknown },
+		stream: AsyncIterableSource<IChatResponsePart | IChatResponsePart[]>,
+		token: CancellationToken,
+		maxOutputTokens: number,
+		filteredTools: unknown[] | undefined,
+	): Promise<void> {
+		const url = `${baseUrl}/api/chat`;
+		const body: Record<string, unknown> = {
+			model: model.modelName,
+			messages: mappedMessages,
+			stream: true,
+			think: true,
+			options: {
+				temperature: 0.3,
+				num_predict: maxOutputTokens,
+			},
+		};
+
+		if (filteredTools && filteredTools.length > 0 && model.useNativeTools) {
+			body.tools = filteredTools;
+			this._log(`[LoCoPilot Provider] Ollama native request: ${filteredTools.length} tools`);
+		}
+
+		const headers: Record<string, string> = {
+			'Content-Type': 'application/json',
+			Accept: 'application/x-ndjson, application/json;q=0.9, */*;q=0.8',
+		};
+
+		try {
+			const response = await this.requestService.request({
+				type: 'POST',
+				url,
+				headers,
+				data: JSON.stringify(body),
+			}, token);
+
+			if (response.res.statusCode !== 200) {
+				const errorBody = await streamToBuffer(response.stream).then(b => b.toString());
+				throw new Error(this._getApiErrorMessage('Ollama', response.res.statusCode ?? 0) + (errorBody ? `: ${errorBody}` : ''));
+			}
+
+			let lineBuffer = '';
+			let hasEmittedAnything = false;
+			let ndjsonError: Error | undefined;
+
+			return new Promise<void>((resolve, reject) => {
+				const accumulatedToolCalls = new Map<number, { id?: string; name?: string; args: string }>();
+
+				const mergeToolCallDeltas = (toolCalls: unknown[]) => {
+					for (const tc of toolCalls) {
+						if (!tc || typeof tc !== 'object') {
+							continue;
+						}
+						const t = tc as { index?: number; id?: string; function?: { name?: string; arguments?: string } };
+						const idx = t.index ?? 0;
+						let acc = accumulatedToolCalls.get(idx);
+						if (!acc) {
+							acc = { args: '' };
+							accumulatedToolCalls.set(idx, acc);
+						}
+						if (t.id) {
+							acc.id = t.id;
+						}
+						if (t.function?.name) {
+							acc.name = t.function.name;
+						}
+						if (t.function?.arguments !== undefined) {
+							acc.args += t.function.arguments;
+						}
+					}
+				};
+
+				const emitToolCallsEnd = () => {
+					const indices = Array.from(accumulatedToolCalls.keys()).sort((a, b) => a - b);
+					for (const idx of indices) {
+						const acc = accumulatedToolCalls.get(idx)!;
+						if (acc.id && acc.name) {
+							try {
+								const parameters = acc.args ? JSON.parse(acc.args) : {};
+								stream.emitOne({
+									type: 'tool_use',
+									name: acc.name,
+									toolCallId: acc.id,
+									parameters,
+								});
+							} catch (_e) {
+								stream.emitOne({
+									type: 'tool_use',
+									name: acc.name,
+									toolCallId: acc.id,
+									parameters: {},
+								});
+							}
+						}
+					}
+				};
+
+				listenStream(response.stream, {
+					onData: chunk => {
+						lineBuffer += chunk.toString();
+						const lines = lineBuffer.split('\n');
+						lineBuffer = lines.pop() || '';
+						for (const line of lines) {
+							const trimmed = line.trim();
+							if (!trimmed) {
+								continue;
+							}
+							try {
+								const json = JSON.parse(trimmed) as {
+									error?: unknown;
+									message?: {
+										content?: string;
+										thinking?: string;
+										reasoning?: string;
+										tool_calls?: unknown[];
+									};
+								};
+
+								if (json.error !== undefined) {
+									const msg = typeof json.error === 'string' ? json.error : JSON.stringify(json.error);
+									ndjsonError = new Error(msg);
+									return;
+								}
+
+								const msg = json.message;
+								if (!msg) {
+									continue;
+								}
+
+								// Reasoning trace: native `thinking` (optional alias `reasoning` for compatibility)
+								const thinkingDelta = msg.thinking ?? msg.reasoning;
+								if (typeof thinkingDelta === 'string' && thinkingDelta.length > 0) {
+									stream.emitOne({ type: 'thinking', value: thinkingDelta });
+									hasEmittedAnything = true;
+								}
+
+								if (typeof msg.content === 'string' && msg.content.length > 0) {
+									stream.emitOne({ type: 'text', value: msg.content });
+									hasEmittedAnything = true;
+								}
+
+								if (msg.tool_calls && Array.isArray(msg.tool_calls) && msg.tool_calls.length > 0) {
+									mergeToolCallDeltas(msg.tool_calls);
+								}
+							} catch {
+								// Incomplete line or non-JSON — wait for more data
+							}
+						}
+					},
+					onError: error => reject(error),
+					onEnd: () => {
+						if (ndjsonError) {
+							reject(ndjsonError);
+							return;
+						}
+						emitToolCallsEnd();
+						if (!hasEmittedAnything && accumulatedToolCalls.size === 0 && !options.tools) {
+							stream.emitOne({ type: 'text', value: 'The model did not return a response. Please try again or try with another model.' });
+						} else if (!hasEmittedAnything && accumulatedToolCalls.size === 0 && options.tools) {
+							this._log(`[LoCoPilot Provider] Ollama native model returned empty response for tool-calling request. This might trigger a nudge.`);
+						}
+						resolve();
+					},
+				}, token);
+			});
+		} catch (e: unknown) {
+			const errMsg = e && typeof (e as Error).message === 'string' ? (e as Error).message : String(e);
+			if (this._isCanceledError(errMsg)) {
+				throw new Error(this._getCanceledMessage());
+			}
+			const isConnectionRefused = /ECONNREFUSED|fetch failed|Failed to fetch/i.test(errMsg);
+			const msg = isConnectionRefused
+				? `Ollama server is not running at ${baseUrl}. Please start Ollama and try again.`
+				: `Ollama model "${model.modelName}" error: ${errMsg}`;
+			throw new Error(msg);
+		}
+	}
+
+	/**
+	 * Ollama `/v1/chat/completions` — OpenAI-compatible SSE (e.g. `delta.reasoning_content`); used for multimodal prompts.
+	 */
+	private async _callOllamaOpenAICompat(
+		model: ICustomLanguageModel,
+		baseUrl: string,
+		mappedMessages: unknown[],
+		options: { [name: string]: unknown },
+		stream: AsyncIterableSource<IChatResponsePart | IChatResponsePart[]>,
+		token: CancellationToken,
+		maxOutputTokens: number,
+		filteredTools: unknown[] | undefined,
+	): Promise<void> {
+		const url = `${baseUrl}/v1/chat/completions`;
+		this._log(`[LoCoPilot Provider] Calling Ollama OpenAI-compat: ${model.modelName} at ${baseUrl}`);
 		const body: any = {
 			model: model.modelName,
 			messages: mappedMessages,
@@ -840,53 +1091,9 @@ export class LoCoPilotLanguageModelProvider extends Disposable implements ILangu
 			max_tokens: maxOutputTokens
 		};
 
-		// Add tools if provided
-		if (options.tools && Array.isArray(options.tools) && options.tools.length > 0) {
-			const excludedTools = [
-				'setup_tools_createNewWorkspace',
-				'inline_chat_exit',
-				'vscode_searchExtensions_internal',
-				'vscode_get_terminal_confirmation',
-				'get_terminal_output',
-				'await_terminal',
-				'terminal_selection',
-				'terminal_last_command',
-				'create_and_run_task',
-				'vscode_fetchWebPage_internal',
-				'manage_todo_list',
-				'vscode_get_confirmation',
-				'runSubagent'
-			];
-
-			const filteredTools = options.tools.filter((t: any) => {
-				const name = t.function?.name || t.name;
-				return name && !excludedTools.includes(name);
-			});
-
-			if (filteredTools.length > 0) {
-				// const useManualTools = !model.useNativeTools;
-				// if (useManualTools) {
-				// 	const toolDefinitions = filteredTools.map((t: any) => {
-				// 		const func = t.function || t;
-				// 		return `- ${func.name}: ${func.description}\n  Parameters: ${JSON.stringify(func.parameters)}`;
-				// 	}).join('\n');
-				// 	
-				// 	// Use the exact same prompt as llama.cpp since it's proven to work
-				// 	const systemPromptExtension = `\n\nYou have access to the following tools. To call a tool, respond ONLY with a JSON object in this format: {"tool_calls": [{"id": "call_abc123", "type": "function", "function": {"name": "tool_name", "arguments": "{\\"arg1\\": \\"val1\\"}"}}]}. \n\nIMPORTANT: After outputting the JSON tool call, you MUST STOP your response immediately. Do not provide any explanation or tool response yourself.\n\nAvailable tools:\n${toolDefinitions}`;
-				// 	
-				// 	let systemMessage = mappedMessages.find(m => m.role === 'system');
-				// 	if (systemMessage) {
-				// 		systemMessage.content += systemPromptExtension;
-				// 	} else {
-				// 		mappedMessages.unshift({ role: 'system', content: `You are a helpful assistant.${systemPromptExtension}` });
-				// 	}
-				// 	this._log(`[LoCoPilot Provider] Injected ${filteredTools.length} tools into system prompt for Ollama model`);
-				// } else {
-				if (model.useNativeTools) {
-					body.tools = filteredTools;
-					this._log(`[LoCoPilot Provider] Ollama model request: ${filteredTools.length} native tools`);
-				}
-			}
+		if (filteredTools && filteredTools.length > 0 && model.useNativeTools) {
+			body.tools = filteredTools;
+			this._log(`[LoCoPilot Provider] Ollama OpenAI-compat request: ${filteredTools.length} native tools`);
 		}
 
 		const headers: Record<string, string> = { 'Content-Type': 'application/json', 'Accept': 'text/event-stream' };
@@ -922,70 +1129,18 @@ export class LoCoPilotLanguageModelProvider extends Disposable implements ILangu
 								if (data === '[DONE]') continue;
 								try {
 									const json = JSON.parse(data);
-									// Debug log for thinking content
 									if (json.choices?.[0]?.delta?.reasoning_content) {
 										this._log(`[LoCoPilot Provider] Reasoning delta: ${json.choices[0].delta.reasoning_content}`);
 									}
 									const choice = json.choices?.[0];
 									if (choice?.delta?.content) {
 										const content = choice.delta.content;
-										// accumulatedContent += content;
-										// 
-										// // If we see the start of a JSON block, wait before emitting text
-										// if (accumulatedContent.includes('"tool_calls"')) {
-										// 	try {
-										// 		const match = accumulatedContent.match(/\{[\s\S]*"tool_calls"[\s\S]*\}/);
-										// 		if (match) {
-										// 			const potentialJson = JSON.parse(match[0]);
-										// 			if (potentialJson.tool_calls) {
-										// 				for (const tc of potentialJson.tool_calls) {
-										// 					const idx = tc.index ?? 0;
-										// 					let acc = accumulatedToolCalls.get(idx);
-										// 					if (!acc) {
-										// 						acc = { args: '' };
-										// 						accumulatedToolCalls.set(idx, acc);
-										// 					}
-										// 					if (tc.id) acc.id = tc.id;
-										// 					if (tc.function?.name) acc.name = tc.function.name;
-										// 					if (tc.function?.arguments) {
-										// 						acc.args = typeof tc.function.arguments === 'string' 
-										// 							? tc.function.arguments 
-										// 							: JSON.stringify(tc.function.arguments);
-										// 					}
-										// 				}
-										// 				
-										// 				// Emit everything BEFORE the match as text
-										// 				const beforeMatch = accumulatedContent.substring(0, match.index);
-										// 				if (beforeMatch.trim()) {
-										// 					stream.emitOne({ type: 'text', value: beforeMatch });
-										// 					hasEmittedAnything = true;
-										// 				}
-										// 				
-										// 				// Remove the match and everything before it
-										// 				accumulatedContent = accumulatedContent.substring(match.index! + match[0].length);
-										// 				continue;
-										// 			}
-										// 		}
-										// 	} catch {
-										// 		// Incomplete JSON, continue accumulating
-										// 	}
-										// }
-										// 
-										// // Emit text if it's not looking like a tool call or if it's getting too long
-										// if (!accumulatedContent.trim().startsWith('{') || accumulatedContent.length > 500) {
-										// 	if (accumulatedContent) {
-										// 		stream.emitOne({ type: 'text', value: accumulatedContent });
-										// 		accumulatedContent = '';
-										// 		hasEmittedAnything = true;
-										// 	}
-										// }
 										stream.emitOne({ type: 'text', value: content });
 										hasEmittedAnything = true;
 									}
 									if (choice?.delta?.reasoning_content) {
 										stream.emitOne({ type: 'thinking', value: choice.delta.reasoning_content });
 									}
-									// Accumulate tool call deltas by index (id, function.name, function.arguments stream separately)
 									if (choice?.delta?.tool_calls) {
 										for (const tc of choice.delta.tool_calls) {
 											const idx = tc.index ?? 0;
@@ -1006,7 +1161,6 @@ export class LoCoPilotLanguageModelProvider extends Disposable implements ILangu
 					},
 					onError: error => reject(error),
 					onEnd: () => {
-						// Final check for tool calls in remaining content
 						if (accumulatedContent.includes('"tool_calls"')) {
 							try {
 								const match = accumulatedContent.match(/\{[\s\S]*"tool_calls"[\s\S]*\}/);
@@ -1023,24 +1177,22 @@ export class LoCoPilotLanguageModelProvider extends Disposable implements ILangu
 											if (tc.id) acc.id = tc.id;
 											if (tc.function?.name) acc.name = tc.function.name;
 											if (tc.function?.arguments) {
-												acc.args = typeof tc.function.arguments === 'string' 
-													? tc.function.arguments 
+												acc.args = typeof tc.function.arguments === 'string'
+													? tc.function.arguments
 													: JSON.stringify(tc.function.arguments);
 											}
 										}
 										accumulatedContent = accumulatedContent.replace(match[0], '');
 									}
 								}
-							} catch {}
+							} catch { /* empty */ }
 						}
 
-						// Emit any remaining text
 						if (accumulatedContent.trim()) {
 							stream.emitOne({ type: 'text', value: accumulatedContent });
 							hasEmittedAnything = true;
 						}
 
-						// If nothing was emitted at all, and it's a small model, it might have failed to follow instructions
 						if (!hasEmittedAnything && accumulatedToolCalls.size === 0 && !options.tools) {
 							stream.emitOne({ type: 'text', value: 'The model did not return a response. Please try again or try with another model.' });
 						} else if (!hasEmittedAnything && accumulatedToolCalls.size === 0 && options.tools) {
