@@ -622,6 +622,16 @@ export class Response extends AbstractResponse implements IDisposable {
 		this._updateRepr(true);
 	}
 
+	/** Last index of a response part with the given kind (for merging interleaved streaming chunks). */
+	private _lastPartIndexOfKind(kind: 'markdownContent' | 'thinking'): number {
+		for (let i = this._responseParts.length - 1; i >= 0; i--) {
+			if (this._responseParts[i].kind === kind) {
+				return i;
+			}
+		}
+		return -1;
+	}
+
 	clearToPreviousToolInvocation(message?: string): void {
 		// look through the response parts and find the last tool invocation, then slice the response parts to that point
 		let lastToolInvocationIndex = -1;
@@ -655,45 +665,40 @@ export class Response extends AbstractResponse implements IDisposable {
 			return;
 		} else if (progress.kind === 'markdownContent') {
 
-			// last response which is NOT a text edit group because we do want to support heterogenous streaming but not have
-			// the MD be chopped up by text edit groups (and likely other non-renderable parts)
-			const lastResponsePart = this._responseParts
-				.filter(p => p.kind !== 'textEditGroup')
-				.at(-1);
+			// Merge into the last markdown part anywhere in the response so interleaved streams
+			// (e.g. reasoning_content then content then reasoning again) still produce one answer block.
+			const lastMdIdx = this._lastPartIndexOfKind('markdownContent');
+			const lastMarkdownPart = lastMdIdx >= 0 ? this._responseParts[lastMdIdx] : undefined;
 
-			if (!lastResponsePart || lastResponsePart.kind !== 'markdownContent' || !canMergeMarkdownStrings(lastResponsePart.content, progress.content)) {
-				// The last part can't be merged with- not markdown, or markdown with different permissions
+			if (!lastMarkdownPart || lastMarkdownPart.kind !== 'markdownContent' || !canMergeMarkdownStrings(lastMarkdownPart.content, progress.content)) {
 				this._responseParts.push(progress);
 			} else {
 				// Don't modify the current object, since it's being diffed by the renderer
-				const idx = this._responseParts.indexOf(lastResponsePart);
-				this._responseParts[idx] = { ...lastResponsePart, content: appendMarkdownString(lastResponsePart.content, progress.content) };
+				this._responseParts[lastMdIdx] = { ...lastMarkdownPart, content: appendMarkdownString(lastMarkdownPart.content, progress.content) };
 			}
 			this._updateRepr(quiet);
 		} else if (progress.kind === 'thinking') {
 
 			// tries to split thinking chunks if it is an array. only while certain models give us array chunks.
-			const lastResponsePart = this._responseParts
-				.filter(p => p.kind !== 'textEditGroup')
-				.at(-1);
+			const lastThinkingIdx = this._lastPartIndexOfKind('thinking');
+			const lastThinkingPart = lastThinkingIdx >= 0 ? this._responseParts[lastThinkingIdx] : undefined;
 
-			const lastText = lastResponsePart && lastResponsePart.kind === 'thinking'
-				? (Array.isArray(lastResponsePart.value) ? lastResponsePart.value.join('') : (lastResponsePart.value || ''))
+			const lastText = lastThinkingPart && lastThinkingPart.kind === 'thinking'
+				? (Array.isArray(lastThinkingPart.value) ? lastThinkingPart.value.join('') : (lastThinkingPart.value || ''))
 				: '';
 			const currText = Array.isArray(progress.value) ? progress.value.join('') : (progress.value || '');
 			const isEmpty = (s: string) => s.length === 0;
 
 			// Do not merge if either the current or last thinking chunk is empty; empty chunks separate thinking
-			if (!lastResponsePart
-				|| lastResponsePart.kind !== 'thinking'
+			if (!lastThinkingPart
+				|| lastThinkingPart.kind !== 'thinking'
 				|| isEmpty(currText)
 				|| isEmpty(lastText)
 				|| !canMergeMarkdownStrings(new MarkdownString(lastText), new MarkdownString(currText))) {
 				this._responseParts.push(progress);
 			} else {
-				const idx = this._responseParts.indexOf(lastResponsePart);
-				this._responseParts[idx] = {
-					...lastResponsePart,
+				this._responseParts[lastThinkingIdx] = {
+					...lastThinkingPart,
 					value: appendMarkdownString(new MarkdownString(lastText), new MarkdownString(currText)).value
 				};
 			}
