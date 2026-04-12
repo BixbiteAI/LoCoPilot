@@ -13,8 +13,7 @@ import { ChatConfiguration } from '../common/constants.js';
 import { ILoCoPilotFileLog } from './locopilotFileLog.js';
 import { registerAction2, Action2 } from '../../../../platform/actions/common/actions.js';
 import { ServicesAccessor } from '../../../../platform/instantiation/common/instantiation.js';
-import {
-	detectLlamaBackend,
+import { detectLlamaBackend,
 	getRecommendedBackend,
 	getDefaultLlamaServerPaths,
 	getLlamaCppServerCommand,
@@ -26,6 +25,10 @@ import { IPathService } from '../../../services/path/common/pathService.js';
 import { ITerminalService, ITerminalInstance, ITerminalGroupService } from '../../terminal/browser/terminal.js';
 import { createDecorator } from '../../../../platform/instantiation/common/instantiation.js';
 import { Event, Emitter } from '../../../../base/common/event.js';
+import { INotificationService, Severity } from '../../../../platform/notification/common/notification.js';
+import { ICommandService } from '../../../../platform/commands/common/commands.js';
+import { IOpenerService } from '../../../../platform/opener/common/opener.js';
+import { LOCOPILOT_SETTINGS_SECTION_AGENT_SETTINGS } from './chatManagement/locopilotSettingsEditorInput.js';
 
 export const ILoCoPilotLocalModelRunner = createDecorator<ILoCoPilotLocalModelRunner>('locopilotLocalModelRunner');
 
@@ -59,6 +62,9 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 		@ILoCoPilotFileLog private readonly locopilotFileLog: ILoCoPilotFileLog,
 		@ITerminalService private readonly terminalService: ITerminalService,
 		@ITerminalGroupService private readonly terminalGroupService: ITerminalGroupService,
+		@INotificationService private readonly notificationService: INotificationService,
+		@ICommandService private readonly commandService: ICommandService,
+		@IOpenerService private readonly openerService: IOpenerService,
 	) {
 		super();
 		this._registerCommands();
@@ -226,9 +232,32 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 			this._log(`[LoCoPilot Runner] Model ${modelId} not found or has no local path.`);
 			return;
 		}
+
+		const serverPath = await this.resolveServerPath();
+		if (!serverPath) {
+			this.notificationService.prompt(
+				Severity.Error,
+				'llama.cpp server was not found. Please clone and build it from https://github.com/ggerganov/llama.cpp, then set the path in Agent Settings (e.g., ~/llama.cpp/build/bin/llama-server).',
+				[
+					{
+						label: 'Open Agent Settings',
+						run: () => {
+							this.commandService.executeCommand('workbench.action.chat.openLoCoPilotSettings', { section: LOCOPILOT_SETTINGS_SECTION_AGENT_SETTINGS });
+						}
+					},
+					{
+						label: 'Get llama.cpp',
+						run: () => {
+							this.openerService.open('https://github.com/ggerganov/llama.cpp');
+						}
+					}
+				]
+			);
+			return;
+		}
+
 		const modelPath = await this.resolveModelFilePath(model.localPath);
 		const backend = getRecommendedBackend();
-		const serverPath = await this.resolveServerPath();
 		
 		const port = await this.findAvailablePort(LOCOPILOT_LLAMA_SERVER_PORT);
 		const { command, args } = getLlamaCppServerCommand(modelPath, backend, serverPath, port);

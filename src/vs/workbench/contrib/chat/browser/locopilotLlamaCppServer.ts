@@ -28,7 +28,19 @@ export function getDefaultLlamaServerPaths(userHomeFsPath: string): string[] {
 	const binName = isWindows ? LLAMA_SERVER_BIN_WIN : LLAMA_SERVER_BIN;
 	const dirPath = pathJoin(userHomeFsPath, ...LLAMA_CPP_REL_BIN);
 	const binaryPath = pathJoin(dirPath, binName);
-	return [binaryPath, dirPath];
+	
+	const paths = [binaryPath, dirPath];
+	
+	if (isMacintosh) {
+		paths.push('/opt/homebrew/bin/' + binName); // Apple Silicon Homebrew
+		paths.push('/usr/local/bin/' + binName);    // Intel Mac Homebrew
+		paths.push('/opt/local/bin/' + binName);    // MacPorts
+	} else if (!isWindows) {
+		paths.push('/usr/local/bin/' + binName);    // Linux common
+		paths.push('/usr/bin/' + binName);          // Linux system
+	}
+	
+	return paths;
 }
 
 /**
