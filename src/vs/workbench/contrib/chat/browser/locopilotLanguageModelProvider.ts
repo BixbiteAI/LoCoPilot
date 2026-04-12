@@ -226,7 +226,8 @@ export class LoCoPilotLanguageModelProvider extends Disposable implements ILangu
 		const url = 'https://api.openai.com/v1/chat/completions';
 		const headers: Record<string, string> = {
 			'Authorization': `Bearer ${model.apiKey}`,
-			'Content-Type': 'application/json'
+			'Content-Type': 'application/json',
+			'Accept': 'text/event-stream'
 		};
 
 		const mappedMessages = messages.flatMap(m => this._mapMessageToOpenAI(m));
@@ -348,7 +349,8 @@ export class LoCoPilotLanguageModelProvider extends Disposable implements ILangu
 		const headers: Record<string, string> = {
 			'x-api-key': model.apiKey || '',
 			'anthropic-version': '2023-06-01',
-			'content-type': 'application/json'
+			'content-type': 'application/json',
+			'Accept': 'text/event-stream'
 		};
 
 		const systemMessage = messages.find(m => m.role === ChatMessageRole.System);
@@ -450,7 +452,8 @@ export class LoCoPilotLanguageModelProvider extends Disposable implements ILangu
 	private async _callGoogle(model: ICustomLanguageModel, messages: IChatMessage[], options: { [name: string]: unknown }, stream: AsyncIterableSource<IChatResponsePart | IChatResponsePart[]>, token: CancellationToken): Promise<any> {
 		const url = `https://generativelanguage.googleapis.com/v1beta/models/${model.modelName}:streamGenerateContent?key=${model.apiKey}&alt=sse`;
 		const headers: Record<string, string> = {
-			'Content-Type': 'application/json'
+			'Content-Type': 'application/json',
+			'Accept': 'text/event-stream'
 		};
 
 		const systemMessage = messages.find(m => m.role === ChatMessageRole.System);
@@ -633,24 +636,25 @@ export class LoCoPilotLanguageModelProvider extends Disposable implements ILangu
 
 			if (filteredTools.length > 0) {
 				// Check if we should use manual tool injection as fallback or primary for local
-				const useManualTools = !model.useNativeTools;
-				if (useManualTools) {
-					const toolDefinitions = filteredTools.map((t: any) => {
-						const func = t.function || t;
-						return `- ${func.name}: ${func.description}\n  Parameters: ${JSON.stringify(func.parameters)}`;
-					}).join('\n');
-					
-					const systemPromptExtension = `\n\nYou have access to the following tools. To call a tool, respond ONLY with a JSON object in this format: {"tool_calls": [{"id": "call_abc123", "type": "function", "function": {"name": "tool_name", "arguments": "{\\"arg1\\": \\"val1\\"}"}}]}. \n\nIMPORTANT: After outputting the JSON tool call, you MUST STOP your response immediately. Do not provide any explanation or tool response yourself.\n\nAvailable tools:\n${toolDefinitions}`;
-					
-					// Find system message or add one
-					let systemMessage = mappedMessages.find(m => m.role === 'system');
-					if (systemMessage) {
-						systemMessage.content += systemPromptExtension;
-					} else {
-						mappedMessages.unshift({ role: 'system', content: `You are a helpful assistant.${systemPromptExtension}` });
-					}
-					this._log(`[LoCoPilot Provider] Injected ${filteredTools.length} tools into system prompt for local model (Excluded: ${options.tools.length - filteredTools.length})`);
-				} else {
+				// const useManualTools = !model.useNativeTools;
+				// if (useManualTools) {
+				// 	const toolDefinitions = filteredTools.map((t: any) => {
+				// 		const func = t.function || t;
+				// 		return `- ${func.name}: ${func.description}\n  Parameters: ${JSON.stringify(func.parameters)}`;
+				// 	}).join('\n');
+				// 	
+				// 	const systemPromptExtension = `\n\nYou have access to the following tools. To call a tool, respond ONLY with a JSON object in this format: {"tool_calls": [{"id": "call_abc123", "type": "function", "function": {"name": "tool_name", "arguments": "{\\"arg1\\": \\"val1\\"}"}}]}. \n\nIMPORTANT: After outputting the JSON tool call, you MUST STOP your response immediately. Do not provide any explanation or tool response yourself.\n\nAvailable tools:\n${toolDefinitions}`;
+				// 	
+				// 	// Find system message or add one
+				// 	let systemMessage = mappedMessages.find(m => m.role === 'system');
+				// 	if (systemMessage) {
+				// 		systemMessage.content += systemPromptExtension;
+				// 	} else {
+				// 		mappedMessages.unshift({ role: 'system', content: `You are a helpful assistant.${systemPromptExtension}` });
+				// 	}
+				// 	this._log(`[LoCoPilot Provider] Injected ${filteredTools.length} tools into system prompt for local model (Excluded: ${options.tools.length - filteredTools.length})`);
+				// } else {
+				if (model.useNativeTools) {
 					body.tools = filteredTools;
 					this._log(`[LoCoPilot Provider] Local model request: ${filteredTools.length} tools`);
 				}
@@ -659,7 +663,7 @@ export class LoCoPilotLanguageModelProvider extends Disposable implements ILangu
 			}
 		}
 
-		const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+		const headers: Record<string, string> = { 'Content-Type': 'application/json', 'Accept': 'text/event-stream' };
 		try {
 			let response = await this.requestService.request({
 				type: 'POST',
@@ -688,7 +692,6 @@ export class LoCoPilotLanguageModelProvider extends Disposable implements ILangu
 				throw new Error(msg);
 			}
 			let buffer = '';
-			let accumulatedContent = ''; // Buffer for manual tool call detection
 			return new Promise<void>((resolve, reject) => {
 				// OpenAI streams tool_calls in deltas: id, function.name, and function.arguments arrive in separate chunks. Accumulate by index and emit on stream end.
 				const accumulatedToolCalls: Map<number, { id?: string; name?: string; args: string }> = new Map();
@@ -712,46 +715,47 @@ export class LoCoPilotLanguageModelProvider extends Disposable implements ILangu
 									const choice = json.choices?.[0];
 									if (choice?.delta?.content) {
 										const content = choice.delta.content;
-										accumulatedContent += content;
-										
-										// Check for manual tool call in accumulated content
-										if (accumulatedContent.includes('"tool_calls"')) {
-											try {
-												// Try to find a complete JSON block in the accumulated content
-												const match = accumulatedContent.match(/\{[\s\S]*"tool_calls"[\s\S]*\}/);
-												if (match) {
-													const potentialJson = JSON.parse(match[0]);
-													if (potentialJson.tool_calls) {
-														for (const tc of potentialJson.tool_calls) {
-															const idx = tc.index ?? 0;
-															let acc = accumulatedToolCalls.get(idx);
-															if (!acc) {
-																acc = { args: '' };
-																accumulatedToolCalls.set(idx, acc);
-															}
-															if (tc.id) acc.id = tc.id;
-															if (tc.function?.name) acc.name = tc.function.name;
-															if (tc.function?.arguments) {
-																acc.args = typeof tc.function.arguments === 'string' 
-																	? tc.function.arguments 
-																	: JSON.stringify(tc.function.arguments);
-															}
-														}
-														// If we successfully parsed a tool call, remove it from accumulatedContent so it's not emitted as text
-														accumulatedContent = accumulatedContent.replace(match[0], '');
-														continue;
-													}
-												}
-											} catch {
-												// JSON might be incomplete, wait for more chunks
-											}
-										}
-										
-										// Only emit content if it doesn't look like the start of a tool call
-										if (!accumulatedContent.trim().startsWith('{') || accumulatedContent.length > 1000) {
-											stream.emitOne({ type: 'text', value: accumulatedContent });
-											accumulatedContent = '';
-										}
+										// accumulatedContent += content;
+										// 
+										// // Check for manual tool call in accumulated content
+										// if (accumulatedContent.includes('"tool_calls"')) {
+										// 	try {
+										// 		// Try to find a complete JSON block in the accumulated content
+										// 		const match = accumulatedContent.match(/\{[\s\S]*"tool_calls"[\s\S]*\}/);
+										// 		if (match) {
+										// 			const potentialJson = JSON.parse(match[0]);
+										// 			if (potentialJson.tool_calls) {
+										// 				for (const tc of potentialJson.tool_calls) {
+										// 					const idx = tc.index ?? 0;
+										// 					let acc = accumulatedToolCalls.get(idx);
+										// 					if (!acc) {
+										// 						acc = { args: '' };
+										// 						accumulatedToolCalls.set(idx, acc);
+										// 					}
+										// 					if (tc.id) acc.id = tc.id;
+										// 					if (tc.function?.name) acc.name = tc.function.name;
+										// 					if (tc.function?.arguments) {
+										// 						acc.args = typeof tc.function.arguments === 'string' 
+										// 							? tc.function.arguments 
+										// 							: JSON.stringify(tc.function.arguments);
+										// 					}
+										// 				}
+										// 				// If we successfully parsed a tool call, remove it from accumulatedContent so it's not emitted as text
+										// 				accumulatedContent = accumulatedContent.replace(match[0], '');
+										// 				continue;
+										// 			}
+										// 		}
+										// 	} catch {
+										// 		// JSON might be incomplete, wait for more chunks
+										// 	}
+										// }
+										// 
+										// // Only emit content if it doesn't look like the start of a tool call
+										// if (!accumulatedContent.trim().startsWith('{') || accumulatedContent.length > 1000) {
+										// 	stream.emitOne({ type: 'text', value: accumulatedContent });
+										// 	accumulatedContent = '';
+										// }
+										stream.emitOne({ type: 'text', value: content });
 									}
 									if (choice?.delta?.reasoning_content) {
 										stream.emitOne({ type: 'thinking', value: choice.delta.reasoning_content });
@@ -860,31 +864,32 @@ export class LoCoPilotLanguageModelProvider extends Disposable implements ILangu
 			});
 
 			if (filteredTools.length > 0) {
-				const useManualTools = !model.useNativeTools;
-				if (useManualTools) {
-					const toolDefinitions = filteredTools.map((t: any) => {
-						const func = t.function || t;
-						return `- ${func.name}: ${func.description}\n  Parameters: ${JSON.stringify(func.parameters)}`;
-					}).join('\n');
-					
-					// Use the exact same prompt as llama.cpp since it's proven to work
-					const systemPromptExtension = `\n\nYou have access to the following tools. To call a tool, respond ONLY with a JSON object in this format: {"tool_calls": [{"id": "call_abc123", "type": "function", "function": {"name": "tool_name", "arguments": "{\\"arg1\\": \\"val1\\"}"}}]}. \n\nIMPORTANT: After outputting the JSON tool call, you MUST STOP your response immediately. Do not provide any explanation or tool response yourself.\n\nAvailable tools:\n${toolDefinitions}`;
-					
-					let systemMessage = mappedMessages.find(m => m.role === 'system');
-					if (systemMessage) {
-						systemMessage.content += systemPromptExtension;
-					} else {
-						mappedMessages.unshift({ role: 'system', content: `You are a helpful assistant.${systemPromptExtension}` });
-					}
-					this._log(`[LoCoPilot Provider] Injected ${filteredTools.length} tools into system prompt for Ollama model`);
-				} else {
+				// const useManualTools = !model.useNativeTools;
+				// if (useManualTools) {
+				// 	const toolDefinitions = filteredTools.map((t: any) => {
+				// 		const func = t.function || t;
+				// 		return `- ${func.name}: ${func.description}\n  Parameters: ${JSON.stringify(func.parameters)}`;
+				// 	}).join('\n');
+				// 	
+				// 	// Use the exact same prompt as llama.cpp since it's proven to work
+				// 	const systemPromptExtension = `\n\nYou have access to the following tools. To call a tool, respond ONLY with a JSON object in this format: {"tool_calls": [{"id": "call_abc123", "type": "function", "function": {"name": "tool_name", "arguments": "{\\"arg1\\": \\"val1\\"}"}}]}. \n\nIMPORTANT: After outputting the JSON tool call, you MUST STOP your response immediately. Do not provide any explanation or tool response yourself.\n\nAvailable tools:\n${toolDefinitions}`;
+				// 	
+				// 	let systemMessage = mappedMessages.find(m => m.role === 'system');
+				// 	if (systemMessage) {
+				// 		systemMessage.content += systemPromptExtension;
+				// 	} else {
+				// 		mappedMessages.unshift({ role: 'system', content: `You are a helpful assistant.${systemPromptExtension}` });
+				// 	}
+				// 	this._log(`[LoCoPilot Provider] Injected ${filteredTools.length} tools into system prompt for Ollama model`);
+				// } else {
+				if (model.useNativeTools) {
 					body.tools = filteredTools;
 					this._log(`[LoCoPilot Provider] Ollama model request: ${filteredTools.length} native tools`);
 				}
 			}
 		}
 
-		const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+		const headers: Record<string, string> = { 'Content-Type': 'application/json', 'Accept': 'text/event-stream' };
 		try {
 			let response = await this.requestService.request({
 				type: 'POST',
@@ -924,56 +929,58 @@ export class LoCoPilotLanguageModelProvider extends Disposable implements ILangu
 									const choice = json.choices?.[0];
 									if (choice?.delta?.content) {
 										const content = choice.delta.content;
-										accumulatedContent += content;
-										
-										// If we see the start of a JSON block, wait before emitting text
-										if (accumulatedContent.includes('"tool_calls"')) {
-											try {
-												const match = accumulatedContent.match(/\{[\s\S]*"tool_calls"[\s\S]*\}/);
-												if (match) {
-													const potentialJson = JSON.parse(match[0]);
-													if (potentialJson.tool_calls) {
-														for (const tc of potentialJson.tool_calls) {
-															const idx = tc.index ?? 0;
-															let acc = accumulatedToolCalls.get(idx);
-															if (!acc) {
-																acc = { args: '' };
-																accumulatedToolCalls.set(idx, acc);
-															}
-															if (tc.id) acc.id = tc.id;
-															if (tc.function?.name) acc.name = tc.function.name;
-															if (tc.function?.arguments) {
-																acc.args = typeof tc.function.arguments === 'string' 
-																	? tc.function.arguments 
-																	: JSON.stringify(tc.function.arguments);
-															}
-														}
-														
-														// Emit everything BEFORE the match as text
-														const beforeMatch = accumulatedContent.substring(0, match.index);
-														if (beforeMatch.trim()) {
-															stream.emitOne({ type: 'text', value: beforeMatch });
-															hasEmittedAnything = true;
-														}
-														
-														// Remove the match and everything before it
-														accumulatedContent = accumulatedContent.substring(match.index! + match[0].length);
-														continue;
-													}
-												}
-											} catch {
-												// Incomplete JSON, continue accumulating
-											}
-										}
-										
-										// Emit text if it's not looking like a tool call or if it's getting too long
-										if (!accumulatedContent.trim().startsWith('{') || accumulatedContent.length > 500) {
-											if (accumulatedContent) {
-												stream.emitOne({ type: 'text', value: accumulatedContent });
-												accumulatedContent = '';
-												hasEmittedAnything = true;
-											}
-										}
+										// accumulatedContent += content;
+										// 
+										// // If we see the start of a JSON block, wait before emitting text
+										// if (accumulatedContent.includes('"tool_calls"')) {
+										// 	try {
+										// 		const match = accumulatedContent.match(/\{[\s\S]*"tool_calls"[\s\S]*\}/);
+										// 		if (match) {
+										// 			const potentialJson = JSON.parse(match[0]);
+										// 			if (potentialJson.tool_calls) {
+										// 				for (const tc of potentialJson.tool_calls) {
+										// 					const idx = tc.index ?? 0;
+										// 					let acc = accumulatedToolCalls.get(idx);
+										// 					if (!acc) {
+										// 						acc = { args: '' };
+										// 						accumulatedToolCalls.set(idx, acc);
+										// 					}
+										// 					if (tc.id) acc.id = tc.id;
+										// 					if (tc.function?.name) acc.name = tc.function.name;
+										// 					if (tc.function?.arguments) {
+										// 						acc.args = typeof tc.function.arguments === 'string' 
+										// 							? tc.function.arguments 
+										// 							: JSON.stringify(tc.function.arguments);
+										// 					}
+										// 				}
+										// 				
+										// 				// Emit everything BEFORE the match as text
+										// 				const beforeMatch = accumulatedContent.substring(0, match.index);
+										// 				if (beforeMatch.trim()) {
+										// 					stream.emitOne({ type: 'text', value: beforeMatch });
+										// 					hasEmittedAnything = true;
+										// 				}
+										// 				
+										// 				// Remove the match and everything before it
+										// 				accumulatedContent = accumulatedContent.substring(match.index! + match[0].length);
+										// 				continue;
+										// 			}
+										// 		}
+										// 	} catch {
+										// 		// Incomplete JSON, continue accumulating
+										// 	}
+										// }
+										// 
+										// // Emit text if it's not looking like a tool call or if it's getting too long
+										// if (!accumulatedContent.trim().startsWith('{') || accumulatedContent.length > 500) {
+										// 	if (accumulatedContent) {
+										// 		stream.emitOne({ type: 'text', value: accumulatedContent });
+										// 		accumulatedContent = '';
+										// 		hasEmittedAnything = true;
+										// 	}
+										// }
+										stream.emitOne({ type: 'text', value: content });
+										hasEmittedAnything = true;
 									}
 									if (choice?.delta?.reasoning_content) {
 										stream.emitOne({ type: 'thinking', value: choice.delta.reasoning_content });
@@ -1133,24 +1140,25 @@ export class LoCoPilotLanguageModelProvider extends Disposable implements ILangu
 			});
 
 			if (filteredTools.length > 0) {
-				const useManualTools = !model.useNativeTools;
-				if (useManualTools) {
-					const toolDefinitions = filteredTools.map((t: any) => {
-						const func = t.function || t;
-						return `- ${func.name}: ${func.description}\n  Parameters: ${JSON.stringify(func.parameters)}`;
-					}).join('\n');
-					
-					const systemPromptExtension = `\n\nYou have access to the following tools. To call a tool, respond ONLY with a JSON object in this format: {"tool_calls": [{"id": "call_abc123", "type": "function", "function": {"name": "tool_name", "arguments": "{\\"arg1\\": \\"val1\\"}"}}]}. \n\nIMPORTANT: After outputting the JSON tool call, you MUST STOP your response immediately. Do not provide any explanation or tool response yourself.\n\nAvailable tools:\n${toolDefinitions}`;
-					
-					// Find system message or add one
-					let systemMessage = mappedMessages.find(m => m.role === 'system');
-					if (systemMessage) {
-						systemMessage.content += systemPromptExtension;
-					} else {
-						mappedMessages.unshift({ role: 'system', content: `You are a helpful assistant.${systemPromptExtension}` });
-					}
-					this._log(`[LoCoPilot Provider] Injected ${filteredTools.length} tools into system prompt for localhost model (Excluded: ${options.tools.length - filteredTools.length})`);
-				} else {
+				// const useManualTools = !model.useNativeTools;
+				// if (useManualTools) {
+				// 	const toolDefinitions = filteredTools.map((t: any) => {
+				// 		const func = t.function || t;
+				// 		return `- ${func.name}: ${func.description}\n  Parameters: ${JSON.stringify(func.parameters)}`;
+				// 	}).join('\n');
+				// 	
+				// 	const systemPromptExtension = `\n\nYou have access to the following tools. To call a tool, respond ONLY with a JSON object in this format: {"tool_calls": [{"id": "call_abc123", "type": "function", "function": {"name": "tool_name", "arguments": "{\\"arg1\\": \\"val1\\"}"}}]}. \n\nIMPORTANT: After outputting the JSON tool call, you MUST STOP your response immediately. Do not provide any explanation or tool response yourself.\n\nAvailable tools:\n${toolDefinitions}`;
+				// 	
+				// 	// Find system message or add one
+				// 	let systemMessage = mappedMessages.find(m => m.role === 'system');
+				// 	if (systemMessage) {
+				// 		systemMessage.content += systemPromptExtension;
+				// 	} else {
+				// 		mappedMessages.unshift({ role: 'system', content: `You are a helpful assistant.${systemPromptExtension}` });
+				// 	}
+				// 	this._log(`[LoCoPilot Provider] Injected ${filteredTools.length} tools into system prompt for localhost model (Excluded: ${options.tools.length - filteredTools.length})`);
+				// } else {
+				if (model.useNativeTools) {
 					body.tools = filteredTools;
 					this._log(`[LoCoPilot Provider] Localhost model request: ${filteredTools.length} native tools`);
 				}
@@ -1159,7 +1167,7 @@ export class LoCoPilotLanguageModelProvider extends Disposable implements ILangu
 			}
 		}
 
-		const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+		const headers: Record<string, string> = { 'Content-Type': 'application/json', 'Accept': 'text/event-stream' };
 		try {
 			let response = await this.requestService.request({
 				type: 'POST',
@@ -1188,7 +1196,6 @@ export class LoCoPilotLanguageModelProvider extends Disposable implements ILangu
 				throw new Error(msg);
 			}
 			let buffer = '';
-			let accumulatedContent = ''; // Buffer for manual tool call detection
 			return new Promise<void>((resolve, reject) => {
 				// OpenAI streams tool_calls in deltas: id, function.name, and function.arguments arrive in separate chunks. Accumulate by index and emit on stream end.
 				const accumulatedToolCalls: Map<number, { id?: string; name?: string; args: string }> = new Map();
@@ -1212,46 +1219,47 @@ export class LoCoPilotLanguageModelProvider extends Disposable implements ILangu
 									const choice = json.choices?.[0];
 									if (choice?.delta?.content) {
 										const content = choice.delta.content;
-										accumulatedContent += content;
-										
-										// Check for manual tool call in accumulated content
-										if (accumulatedContent.includes('"tool_calls"')) {
-											try {
-												// Try to find a complete JSON block in the accumulated content
-												const match = accumulatedContent.match(/\{[\s\S]*"tool_calls"[\s\S]*\}/);
-												if (match) {
-													const potentialJson = JSON.parse(match[0]);
-													if (potentialJson.tool_calls) {
-														for (const tc of potentialJson.tool_calls) {
-															const idx = tc.index ?? 0;
-															let acc = accumulatedToolCalls.get(idx);
-															if (!acc) {
-																acc = { args: '' };
-																accumulatedToolCalls.set(idx, acc);
-															}
-															if (tc.id) acc.id = tc.id;
-															if (tc.function?.name) acc.name = tc.function.name;
-															if (tc.function?.arguments) {
-																acc.args = typeof tc.function.arguments === 'string' 
-																	? tc.function.arguments 
-																	: JSON.stringify(tc.function.arguments);
-															}
-														}
-														// If we successfully parsed a tool call, remove it from accumulatedContent so it's not emitted as text
-														accumulatedContent = accumulatedContent.replace(match[0], '');
-														continue;
-													}
-												}
-											} catch {
-												// JSON might be incomplete, wait for more chunks
-											}
-										}
-										
-										// Only emit content if it doesn't look like the start of a tool call
-										if (!accumulatedContent.trim().startsWith('{') || accumulatedContent.length > 1000) {
-											stream.emitOne({ type: 'text', value: accumulatedContent });
-											accumulatedContent = '';
-										}
+										// accumulatedContent += content;
+										// 
+										// // Check for manual tool call in accumulated content
+										// if (accumulatedContent.includes('"tool_calls"')) {
+										// 	try {
+										// 		// Try to find a complete JSON block in the accumulated content
+										// 		const match = accumulatedContent.match(/\{[\s\S]*"tool_calls"[\s\S]*\}/);
+										// 		if (match) {
+										// 			const potentialJson = JSON.parse(match[0]);
+										// 			if (potentialJson.tool_calls) {
+										// 				for (const tc of potentialJson.tool_calls) {
+										// 					const idx = tc.index ?? 0;
+										// 					let acc = accumulatedToolCalls.get(idx);
+										// 					if (!acc) {
+										// 						acc = { args: '' };
+										// 						accumulatedToolCalls.set(idx, acc);
+										// 					}
+										// 					if (tc.id) acc.id = tc.id;
+										// 					if (tc.function?.name) acc.name = tc.function.name;
+										// 					if (tc.function?.arguments) {
+										// 						acc.args = typeof tc.function.arguments === 'string' 
+										// 							? tc.function.arguments 
+										// 							: JSON.stringify(tc.function.arguments);
+										// 					}
+										// 				}
+										// 				// If we successfully parsed a tool call, remove it from accumulatedContent so it's not emitted as text
+										// 				accumulatedContent = accumulatedContent.replace(match[0], '');
+										// 				continue;
+										// 			}
+										// 		}
+										// 	} catch {
+										// 		// JSON might be incomplete, wait for more chunks
+										// 	}
+										// }
+										// 
+										// // Only emit content if it doesn't look like the start of a tool call
+										// if (!accumulatedContent.trim().startsWith('{') || accumulatedContent.length > 1000) {
+										// 	stream.emitOne({ type: 'text', value: accumulatedContent });
+										// 	accumulatedContent = '';
+										// }
+										stream.emitOne({ type: 'text', value: content });
 									}
 									if (choice?.delta?.reasoning_content) {
 										stream.emitOne({ type: 'thinking', value: choice.delta.reasoning_content });
