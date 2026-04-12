@@ -23,7 +23,7 @@ import {
 	LlamaBackend
 } from './locopilotLlamaCppServer.js';
 import { IPathService } from '../../../services/path/common/pathService.js';
-import { ITerminalService, ITerminalInstance } from '../../terminal/browser/terminal.js';
+import { ITerminalService, ITerminalInstance, ITerminalGroupService } from '../../terminal/browser/terminal.js';
 import { createDecorator } from '../../../../platform/instantiation/common/instantiation.js';
 import { Event, Emitter } from '../../../../base/common/event.js';
 
@@ -58,6 +58,7 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 		@ILogService private readonly logService: ILogService,
 		@ILoCoPilotFileLog private readonly locopilotFileLog: ILoCoPilotFileLog,
 		@ITerminalService private readonly terminalService: ITerminalService,
+		@ITerminalGroupService private readonly terminalGroupService: ITerminalGroupService,
 	) {
 		super();
 		this._registerCommands();
@@ -256,6 +257,7 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 				}
 			});
 			this.terminalService.setActiveInstance(terminal);
+			await this.terminalGroupService.showPanel(true);
 			await new Promise<void>(resolve => setTimeout(resolve, 400));
 			await terminal.sendText(cmdLine, true);
 
@@ -303,6 +305,7 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 				}
 			});
 			this.terminalService.setActiveInstance(terminal);
+			await this.terminalGroupService.showPanel(true);
 			await new Promise<void>(resolve => setTimeout(resolve, 400));
 			await terminal.sendText(cmdLine, true);
 
