@@ -8,7 +8,7 @@ import { MarkdownString } from '../../../../../../base/common/htmlContent.js';
 import { IChatTerminalToolInvocationData } from '../../chatService/chatService.js';
 import { CountTokensCallback, IPreparedToolInvocation, IToolData, IToolImpl, IToolInvocation, IToolInvocationPreparationContext, IToolResult, ToolDataSource, ToolInvocationPresentation, ToolProgress } from '../languageModelToolsService.js';
 
-export const ConfirmationToolId = 'vscode_get_confirmation';
+export const ConfirmationToolId = 'get_confirmation';
 
 export const ConfirmationToolData: IToolData = {
 	id: ConfirmationToolId,

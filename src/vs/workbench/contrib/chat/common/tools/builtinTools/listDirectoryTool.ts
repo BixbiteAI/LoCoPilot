@@ -23,7 +23,7 @@ import {
 	ToolProgress
 } from '../languageModelToolsService.js';
 
-export const ListDirectoryToolId = 'vscode_listDirectory';
+export const ListDirectoryToolId = 'listDirectory';
 
 export function createListDirectoryToolData(): IToolData {
 	const inputSchema: IJSONSchema & { properties: IJSONSchemaMap } = {

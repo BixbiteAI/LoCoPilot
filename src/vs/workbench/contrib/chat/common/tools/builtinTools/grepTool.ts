@@ -24,7 +24,7 @@ import {
 	ToolProgress
 } from '../languageModelToolsService.js';
 
-export const GrepToolId = 'vscode_grep';
+export const GrepToolId = 'grep';
 
 export function createGrepToolData(): IToolData {
 	const inputSchema: IJSONSchema & { properties: IJSONSchemaMap } = {

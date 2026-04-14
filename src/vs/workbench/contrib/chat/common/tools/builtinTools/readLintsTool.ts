@@ -23,7 +23,7 @@ import {
 	ToolProgress
 } from '../languageModelToolsService.js';
 
-export const ReadLintsToolId = 'vscode_readLints';
+export const ReadLintsToolId = 'readLints';
 
 export function createReadLintsToolData(): IToolData {
 	const inputSchema: IJSONSchema & { properties: IJSONSchemaMap } = {

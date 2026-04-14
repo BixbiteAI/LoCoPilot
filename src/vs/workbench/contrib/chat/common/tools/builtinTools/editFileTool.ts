@@ -16,8 +16,8 @@ import { ChatModel } from '../../model/chatModel.js';
 import { IChatService } from '../../chatService/chatService.js';
 import { CountTokensCallback, IPreparedToolInvocation, IToolData, IToolImpl, IToolInvocation, IToolInvocationPreparationContext, IToolResult, ToolDataSource, ToolInvocationPresentation, ToolProgress } from '../languageModelToolsService.js';
 
-export const ExtensionEditToolId = 'vscode_editFile';
-export const InternalEditToolId = 'vscode_editFile_internal';
+export const ExtensionEditToolId = 'editFile';
+export const InternalEditToolId = 'editFile_internal';
 export const EditToolData: IToolData = {
 	id: InternalEditToolId,
 	displayName: '', // not used

@@ -23,7 +23,7 @@ import {
 	ToolProgress
 } from '../languageModelToolsService.js';
 
-export const ReadFileToolId = 'vscode_readFile';
+export const ReadFileToolId = 'readFile';
 
 /** Maximum lines allowed in a single read. Files larger than this require offset and limit. */
 const READ_FILE_MAX_LINES = 1000;

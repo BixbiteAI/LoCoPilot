@@ -156,10 +156,10 @@ suite('ComputeAutomaticInstructions', () => {
 		toolsService = {
 			getToolByName: (name: string) => {
 				if (name === 'readFile') {
-					return { id: 'vscode_readFile', name: 'readFile' };
+					return { id: 'readFile', name: 'readFile' };
 				}
 				if (name === 'runSubagent') {
-					return { id: 'vscode_runSubagent', name: 'runSubagent' };
+					return { id: 'runSubagent', name: 'runSubagent' };
 				}
 				return undefined;
 			},
@@ -785,7 +785,7 @@ suite('ComputeAutomaticInstructions', () => {
 			const contextComputer = instaService.createInstance(
 				ComputeAutomaticInstructions,
 				ChatMode.Agent,
-				{ 'vscode_readFile': true }, // Enable readFile tool
+				{ 'readFile': true }, // Enable readFile tool
 				undefined
 			);
 			const variables = new ChatRequestVariableSet();
@@ -831,7 +831,7 @@ suite('ComputeAutomaticInstructions', () => {
 			const contextComputer = instaService.createInstance(
 				ComputeAutomaticInstructions,
 				ChatMode.Agent,
-				{ 'vscode_runSubagent': true }, // Enable runSubagent tool
+				{ 'runSubagent': true }, // Enable runSubagent tool
 				['*'] // Enable all subagents
 			);
 			const variables = new ChatRequestVariableSet();
@@ -886,7 +886,7 @@ suite('ComputeAutomaticInstructions', () => {
 			const contextComputer = instaService.createInstance(
 				ComputeAutomaticInstructions,
 				ChatMode.Agent,
-				{ 'vscode_readFile': true }, // Enable readFile tool
+				{ 'readFile': true }, // Enable readFile tool
 				undefined
 			);
 			const variables = new ChatRequestVariableSet();
@@ -972,7 +972,7 @@ suite('ComputeAutomaticInstructions', () => {
 			const contextComputer = instaService.createInstance(
 				ComputeAutomaticInstructions,
 				ChatMode.Agent,
-				{ 'vscode_readFile': true }, // Enable readFile tool
+				{ 'readFile': true }, // Enable readFile tool
 				undefined
 			);
 			const variables = new ChatRequestVariableSet();
@@ -1025,7 +1025,7 @@ suite('ComputeAutomaticInstructions', () => {
 			const contextComputer = instaService.createInstance(
 				ComputeAutomaticInstructions,
 				ChatMode.Agent,
-				{ 'vscode_readFile': true }, // Enable readFile tool
+				{ 'readFile': true }, // Enable readFile tool
 				undefined
 			);
 			const variables = new ChatRequestVariableSet();

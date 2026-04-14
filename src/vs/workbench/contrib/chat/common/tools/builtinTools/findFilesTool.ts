@@ -24,7 +24,7 @@ import {
 	ToolProgress
 } from '../languageModelToolsService.js';
 
-export const FindFilesToolId = 'vscode_findFiles';
+export const FindFilesToolId = 'findFiles';
 
 export function createFindFilesToolData(): IToolData {
 	const inputSchema: IJSONSchema & { properties: IJSONSchemaMap } = {

@@ -23,7 +23,7 @@ import {
 } from '../languageModelToolsService.js';
 import { ChatConfiguration } from '../../constants.js';
 
-export const WebSearchToolId = 'vscode_webSearch';
+export const WebSearchToolId = 'webSearch';
 
 const BRAVE_WEB_SEARCH_URL = 'https://api.search.brave.com/res/v1/web/search';
 /** DuckDuckGo HTML search (no API key, no expiry, open/free). Returns plain HTML we parse for results. */

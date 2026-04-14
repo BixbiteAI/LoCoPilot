@@ -74,7 +74,7 @@ function buildReplaceEdits(content: string, oldString: string, newString: string
 	}));
 }
 
-export const StringReplaceToolId = 'vscode_stringReplace';
+export const StringReplaceToolId = 'stringReplace';
 
 export function createStringReplaceToolData(): IToolData {
 	const inputSchema: IJSONSchema & { properties: IJSONSchemaMap } = {

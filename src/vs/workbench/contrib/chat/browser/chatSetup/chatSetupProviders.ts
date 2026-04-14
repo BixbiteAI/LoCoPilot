@@ -1267,11 +1267,11 @@ Preserve: key facts, decisions, code changes, file names and paths, user prefere
 		}
 
 		context += `\n---\n\n**You have access to powerful tools** to explore and modify this codebase:\n`;
-		context += `- **Read files:** Use \`vscode_readFile\` to read any file\n`;
-		context += `- **Search code:** Use \`vscode_grep\` to search for patterns\n`;
-		context += `- **Find files:** Use \`vscode_findFiles\` to locate files by name\n`;
-		context += `- **List directories:** Use \`vscode_listDirectory\` to explore structure\n`;
-		context += `- **Modify code:** Use \`vscode_modifyFile\` to create or edit files (path, oldString, newString; use oldString "" to create or overwrite entire file)\n`;
+		context += `- **Read files:** Use \`readFile\` to read any file\n`;
+		context += `- **Search code:** Use \`grep\` to search for patterns\n`;
+		context += `- **Find files:** Use \`findFiles\` to locate files by name\n`;
+		context += `- **List directories:** Use \`listDirectory\` to explore structure\n`;
+		context += `- **Modify code:** Use \`modifyFile\` to create or edit files (path, oldString, newString; use oldString "" to create or overwrite entire file)\n`;
 		context += `- **Run commands:** Use \`run_in_terminal\` to execute shell commands\n\n`;
 		context += `**Start by exploring the codebase to understand its structure before making changes.**\n`;
 
@@ -1344,7 +1344,7 @@ Preserve: key facts, decisions, code changes, file names and paths, user prefere
 	/**
 	 * Convert variables/attachments to message content parts.
 	 * For file attachments: sends path (workspace-relative) and optional line range only — no file content.
-	 * LLM can use vscode_readFile(path) or vscode_readFile(path, offset, limit) when needed.
+	 * LLM can use readFile(path) or readFile(path, offset, limit) when needed.
 	 */
 	private async convertVariablesToContent(variables: IChatRequestVariableEntry[]): Promise<IChatMessage['content']> {
 		const content: IChatMessage['content'] = [];
@@ -1396,7 +1396,7 @@ Preserve: key facts, decisions, code changes, file names and paths, user prefere
 						});
 					}
 				} else {
-					// Text file: send path and optional line range only — no content; LLM can use vscode_readFile when needed
+					// Text file: send path and optional line range only — no content; LLM can use readFile when needed
 					content.push({
 						type: 'text',
 						value: `\n\n[Attached file: ${workspacePath}]${rangeStr}${cursorStr}\n`

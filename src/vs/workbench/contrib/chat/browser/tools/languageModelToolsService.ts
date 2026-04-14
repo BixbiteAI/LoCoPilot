@@ -220,9 +220,9 @@ export class LanguageModelToolsService extends Disposable implements ILanguageMo
 			}
 		}
 
-		// Special case for 'vscode_fetchWebPage_internal', which is allowed if we allow 'web' tools
+		// Special case for 'fetchWebPage_internal', which is allowed if we allow 'web' tools
 		// Fetch is implemented with two tools, this one and 'copilot_fetchWebPage'
-		if (toolOrToolSet.id === 'vscode_fetchWebPage_internal' && permittedInternalToolSetIds.includes(SpecedToolAliases.web)) {
+		if (toolOrToolSet.id === 'fetchWebPage_internal' && permittedInternalToolSetIds.includes(SpecedToolAliases.web)) {
 			this._logService.trace(`LanguageModelToolsService#isPermitted: Tool ${toolOrToolSet.id} (${toolOrToolSet.toolReferenceName}) permitted=true (special case)`);
 			return true;
 		}
@@ -772,7 +772,7 @@ export class LanguageModelToolsService extends Disposable implements ILanguageMo
 	}
 
 	private getEligibleForAutoApprovalSpecialCase(toolData: IToolData): string | undefined {
-		if (toolData.id === 'vscode_fetchWebPage_internal') {
+		if (toolData.id === 'fetchWebPage_internal') {
 			return 'fetch';
 		}
 		return undefined;
@@ -781,7 +781,7 @@ export class LanguageModelToolsService extends Disposable implements ILanguageMo
 	private isToolEligibleForAutoApproval(toolData: IToolData): boolean {
 		const fullReferenceName = this.getEligibleForAutoApprovalSpecialCase(toolData) ?? getToolFullReferenceName(toolData);
 		if (toolData.id === 'copilot_fetchWebPage') {
-			// Special case, this fetch will call an internal tool 'vscode_fetchWebPage_internal'
+			// Special case, this fetch will call an internal tool 'fetchWebPage_internal'
 			return true;
 		}
 		const eligibilityConfig = this._configurationService.getValue<Record<string, boolean>>(ChatConfiguration.EligibleForAutoApproval);

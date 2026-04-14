@@ -3339,13 +3339,13 @@ suite('LanguageModelToolsService', () => {
 		assert.ok(toolIds.includes('webToolInSet'), 'Tool in web toolset should be permitted when agent mode is disabled');
 	});
 
-	test('isPermitted allows vscode_fetchWebPage_internal special case when agent mode is disabled', () => {
+	test('isPermitted allows fetchWebPage_internal special case when agent mode is disabled', () => {
 		// Disable agent mode
 		configurationService.setUserConfiguration(ChatConfiguration.AgentEnabled, false);
 
 		// Register the special-cased fetch tool (not added to any toolset)
 		const fetchTool: IToolData = {
-			id: 'vscode_fetchWebPage_internal',
+			id: 'fetchWebPage_internal',
 			toolReferenceName: 'fetchWebPage',
 			modelDescription: 'Fetch Web Page',
 			displayName: 'Fetch Web Page',
@@ -3357,7 +3357,7 @@ suite('LanguageModelToolsService', () => {
 		const tools = Array.from(service.getTools(undefined));
 		const toolIds = tools.map(t => t.id);
 
-		assert.ok(toolIds.includes('vscode_fetchWebPage_internal'), 'vscode_fetchWebPage_internal should be permitted as special case when agent mode is disabled');
+		assert.ok(toolIds.includes('fetchWebPage_internal'), 'fetchWebPage_internal should be permitted as special case when agent mode is disabled');
 	});
 
 	test('isPermitted blocks extension tools not in permitted toolsets when agent mode is disabled', () => {

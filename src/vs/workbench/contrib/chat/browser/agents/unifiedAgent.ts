@@ -25,7 +25,7 @@ export { TASK_COMPLETE_SIGNAL };
  * Iterates until the LLM includes TASK_COMPLETE_SIGNAL in its response or max iterations.
  */
 /** Max times the same tool+args can be called before we force-stop to avoid loops. */
-const REPEATED_TOOL_CALL_THRESHOLD = 3;
+const REPEATED_TOOL_CALL_THRESHOLD = 5;
 
 /** Sliding window size for detecting repeated tool calls. */
 const REPEATED_TOOL_CALL_WINDOW = 6;

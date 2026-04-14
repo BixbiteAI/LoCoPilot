@@ -99,4 +99,4 @@ export class BuiltinToolsContribution extends Disposable implements IWorkbenchCo
 	}
 }
 
-export const InternalFetchWebPageToolId = 'vscode_fetchWebPage_internal';
+export const InternalFetchWebPageToolId = 'fetchWebPage_internal';

@@ -75,7 +75,7 @@ function buildReplaceEdits(content: string, oldString: string, newString: string
 	}));
 }
 
-export const ModifyFileToolId = 'vscode_modifyFile';
+export const ModifyFileToolId = 'modifyFile';
 
 export function createModifyFileToolData(): IToolData {
 	const inputSchema: IJSONSchema & { properties: IJSONSchemaMap } = {

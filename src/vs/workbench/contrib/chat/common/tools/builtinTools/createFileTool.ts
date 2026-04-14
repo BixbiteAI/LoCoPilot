@@ -24,7 +24,7 @@ import {
 	ToolProgress
 } from '../languageModelToolsService.js';
 
-export const CreateFileToolId = 'vscode_createFile';
+export const CreateFileToolId = 'createFile';
 
 export function createCreateFileToolData(): IToolData {
 	const inputSchema: IJSONSchema & { properties: IJSONSchemaMap } = {
