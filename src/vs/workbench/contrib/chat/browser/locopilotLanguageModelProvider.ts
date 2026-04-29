@@ -3,6 +3,9 @@
  *  Licensed under the MIT License. See License.txt in the project root for license information.
  *--------------------------------------------------------------------------------------------*/
 
+/* eslint-disable @typescript-eslint/no-explicit-any, curly, prefer-const */
+/* eslint-disable local/code-no-in-operator */
+
 import { AsyncIterableSource } from '../../../../base/common/async.js';
 import { encodeBase64, streamToBuffer } from '../../../../base/common/buffer.js';
 import { createMarkdownCommandLink } from '../../../../base/common/htmlContent.js';
@@ -14,7 +17,7 @@ import { ExtensionIdentifier } from '../../../../platform/extensions/common/exte
 import { ILogService } from '../../../../platform/log/common/log.js';
 import { IRequestService } from '../../../../platform/request/common/request.js';
 import { ILoCoPilotFileLog } from './locopilotFileLog.js';
-import { ICustomLanguageModelsService, ICustomLanguageModel } from '../common/customLanguageModelsService.js';
+import { ICustomLanguageModelsService, ICustomLanguageModel, getCustomModelListLabel } from '../common/customLanguageModelsService.js';
 import { IChatMessage, ILanguageModelChatInfoOptions, ILanguageModelChatMetadataAndIdentifier, ILanguageModelChatProvider, ILanguageModelChatResponse, ILanguageModelsService, IChatResponsePart, ChatMessageRole } from '../common/languageModels.js';
 import { IWorkbenchContribution } from '../../../common/contributions.js';
 import { LOCOPILOT_SETTINGS_SECTION_LIST_MODELS } from './chatManagement/locopilotSettingsEditorInput.js';
@@ -35,7 +38,7 @@ export class LoCoPilotLanguageModelProvider extends Disposable implements ILangu
 	) {
 		super();
 		this._log('[LoCoPilot] Initializing Language Model Provider');
-		
+
 		// Register the 'locopilot' vendor first, otherwise registerLanguageModelProvider will throw
 		this.languageModelsService.deltaLanguageModelChatProviderDescriptors([{
 			vendor: 'locopilot',
@@ -46,17 +49,17 @@ export class LoCoPilotLanguageModelProvider extends Disposable implements ILangu
 		}], []);
 
 		this._register(this.languageModelsService.registerLanguageModelProvider('locopilot', this));
-		
+
 		// Set up listener for custom model changes
 		this._register(this.customLanguageModelsService.onDidChangeCustomModels(() => {
 			this._log('[LoCoPilot] Custom models changed, refreshing');
 			this._onDidChange.fire();
 		}));
-		
+
 		// Trigger initial model resolution if we have custom models
 		// Use setTimeout to ensure the provider registration is fully complete
 		setTimeout(async () => {
-			const customModels = this.customLanguageModelsService.getVisibleCustomModels();
+			const customModels = this.customLanguageModelsService.getChatSelectableCustomModels();
 			if (customModels.length > 0) {
 				this._log(`[LoCoPilot] Found ${customModels.length} custom models, triggering resolution...`);
 				// Fire change event to trigger model resolution
@@ -67,7 +70,7 @@ export class LoCoPilotLanguageModelProvider extends Disposable implements ILangu
 					this._log(`[LoCoPilot] Resolved ${modelIds.length} models: ${modelIds.join(', ')}`);
 				} catch (e) {
 					this.logService.warn(`[LoCoPilot] Failed to trigger model resolution: ${e}`);
-				this.locopilotFileLog.log(`[LoCoPilot] Failed to trigger model resolution: ${e}`);
+					this.locopilotFileLog.log(`[LoCoPilot] Failed to trigger model resolution: ${e}`);
 				}
 			}
 		}, 0);
@@ -129,11 +132,22 @@ export class LoCoPilotLanguageModelProvider extends Disposable implements ILangu
 			id: 'workbench.action.chat.openLoCoPilotSettings',
 			arguments: [{ section: LOCOPILOT_SETTINGS_SECTION_LIST_MODELS }],
 		});
-		return `Local model server is not running. ${openLanguageModels} — find **${modelName}** and click **Run server** to start the llama.cpp server.`;
+		return `Local model server is not running. ${openLanguageModels} - find **${modelName}** and click **Run server** to start the local server (llama.cpp for GGUF, or mlx-lm for MLX on Apple Silicon).`;
+	}
+
+	/**
+	 * Many OpenAI-compatible local servers use `reasoning_content`; some (e.g. mlx_lm, Ollama) use `reasoning` or `thinking` in `delta` during SSE.
+	 */
+	private _reasoningTextFromOpenAiDelta(delta: { reasoning_content?: string; reasoning?: string; thinking?: string } | undefined): string | undefined {
+		if (!delta) {
+			return undefined;
+		}
+		const t = delta.reasoning_content ?? delta.reasoning ?? delta.thinking;
+		return typeof t === 'string' && t.length > 0 ? t : undefined;
 	}
 
 	async provideLanguageModelChatInfo(options: ILanguageModelChatInfoOptions, token: CancellationToken): Promise<ILanguageModelChatMetadataAndIdentifier[]> {
-		const customModels = this.customLanguageModelsService.getVisibleCustomModels();
+		const customModels = this.customLanguageModelsService.getChatSelectableCustomModels();
 		this._log(`[LoCoPilot Provider] provideLanguageModelChatInfo called, found ${customModels.length} custom models`);
 		const result = customModels.map(m => {
 			// Local llama.cpp models typically have a default context of 4096 unless configured otherwise.
@@ -146,7 +160,7 @@ export class LoCoPilotLanguageModelProvider extends Disposable implements ILangu
 				identifier: m.id,
 				metadata: {
 					extension: new ExtensionIdentifier('locopilot'),
-					name: m.name,
+					name: getCustomModelListLabel(m),
 					id: m.id,
 					vendor: 'locopilot',
 					version: '1.0.0',
@@ -176,7 +190,7 @@ export class LoCoPilotLanguageModelProvider extends Disposable implements ILangu
 			throw new Error(`Model ${modelId} not found`);
 		}
 
-		this._log(`[LoCoPilot Provider] Found model: ${customModel.name} (${customModel.provider}), sending request...`);
+		this._log(`[LoCoPilot Provider] Found model: ${getCustomModelListLabel(customModel)} (${customModel.provider}), sending request...`);
 		if (options.tools) {
 			this._log(`[LoCoPilot Provider] Tools provided: ${Array.isArray(options.tools) ? options.tools.length : 'unknown'}`);
 		}
@@ -289,8 +303,9 @@ export class LoCoPilotLanguageModelProvider extends Disposable implements ILangu
 								if (choice?.delta?.content) {
 									stream.emitOne({ type: 'text', value: choice.delta.content });
 								}
-								if (choice?.delta?.reasoning_content) {
-									stream.emitOne({ type: 'thinking', value: choice.delta.reasoning_content });
+								const openAiReasoning = this._reasoningTextFromOpenAiDelta(choice?.delta);
+								if (openAiReasoning) {
+									stream.emitOne({ type: 'thinking', value: openAiReasoning });
 								}
 								// Accumulate tool call deltas by index (id, function.name, function.arguments stream separately)
 								if (choice?.delta?.tool_calls) {
@@ -707,11 +722,11 @@ export class LoCoPilotLanguageModelProvider extends Disposable implements ILangu
 								if (data === '[DONE]') continue;
 								try {
 									const json = JSON.parse(data);
-									// Debug log for thinking content
-									if (json.choices?.[0]?.delta?.reasoning_content) {
-										this._log(`[LoCoPilot Provider] Reasoning delta: ${json.choices[0].delta.reasoning_content}`);
-									}
 									const choice = json.choices?.[0];
+									const localReasoning = this._reasoningTextFromOpenAiDelta(choice?.delta);
+									if (localReasoning) {
+										this._log(`[LoCoPilot Provider] Reasoning delta: ${localReasoning.substring(0, 200)}${localReasoning.length > 200 ? '...' : ''}`);
+									}
 									if (choice?.delta?.content) {
 										const content = choice.delta.content;
 										// accumulatedContent += content;
@@ -756,8 +771,8 @@ export class LoCoPilotLanguageModelProvider extends Disposable implements ILangu
 										// }
 										stream.emitOne({ type: 'text', value: content });
 									}
-									if (choice?.delta?.reasoning_content) {
-										stream.emitOne({ type: 'thinking', value: choice.delta.reasoning_content });
+									if (localReasoning) {
+										stream.emitOne({ type: 'thinking', value: localReasoning });
 									}
 									// Accumulate tool call deltas by index (id, function.name, function.arguments stream separately)
 									if (choice?.delta?.tool_calls) {
@@ -824,8 +839,8 @@ export class LoCoPilotLanguageModelProvider extends Disposable implements ILangu
 
 	/**
 	 * Calls an Ollama model via OpenAI-compatible `/v1/chat/completions` only (SSE).
-	 * Using one path for all requests (with or without tools) matches Ollama’s OpenAI wire format for messages and tool calls and avoids native `/api/chat` mismatches.
-	 * Reasoning streams as `delta.reasoning_content` when the server exposes it.
+	 * Using one path for all requests (with or without tools) matches Ollama's OpenAI wire format for messages and tool calls and avoids native `/api/chat` mismatches.
+	 * Reasoning streams as `delta.reasoning_content`, `delta.reasoning`, or `delta.thinking` depending on the server.
 	 */
 	private async _callOllamaModel(model: ICustomLanguageModel, messages: IChatMessage[], options: { [name: string]: unknown }, stream: AsyncIterableSource<IChatResponsePart | IChatResponsePart[]>, token: CancellationToken): Promise<any> {
 		const baseUrl = (model.localPath || 'http://localhost:11434').replace(/\/$/, '');
@@ -864,7 +879,7 @@ export class LoCoPilotLanguageModelProvider extends Disposable implements ILangu
 	}
 
 	/**
-	 * Ollama `/v1/chat/completions` — OpenAI-compatible SSE (`delta.content`, `delta.reasoning_content`, `delta.tool_calls`).
+	 * Ollama `/v1/chat/completions` - OpenAI-compatible SSE (`delta.content`, `delta.reasoning_content`, `delta.tool_calls`).
 	 */
 	private async _callOllamaOpenAICompat(
 		model: ICustomLanguageModel,
@@ -940,8 +955,7 @@ export class LoCoPilotLanguageModelProvider extends Disposable implements ILangu
 										stream.emitOne({ type: 'text', value: delta.content });
 										hasEmittedAnything = true;
 									}
-									// Ollama OpenAI-compat uses `reasoning` in deltas; other stacks use `reasoning_content`. Accept both (+ optional `thinking`).
-									const reasoningDelta = delta?.reasoning_content ?? delta?.reasoning ?? delta?.thinking;
+									const reasoningDelta = this._reasoningTextFromOpenAiDelta(delta);
 									if (reasoningDelta) {
 										stream.emitOne({ type: 'thinking', value: reasoningDelta });
 									}
@@ -1046,8 +1060,8 @@ export class LoCoPilotLanguageModelProvider extends Disposable implements ILangu
 	}
 
 	/**
-	 * Calls a user-configured localhost URL. model.modelName holds the complete endpoint URL
-	 * (e.g. http://localhost:1234/v1/chat/completions) as provided by the user.
+	 * Calls a user-configured localhost URL. `model.modelName` is the full endpoint URL; `model.localhostOpenAiModel`
+	 * (or `model.name` for legacy) is the OpenAI `model` field in the JSON body.
 	 */
 	private async _callLocalhostModel(model: ICustomLanguageModel, messages: IChatMessage[], options: { [name: string]: unknown }, stream: AsyncIterableSource<IChatResponsePart | IChatResponsePart[]>, token: CancellationToken): Promise<any> {
 		const url = model.modelName?.trim();
@@ -1057,8 +1071,14 @@ export class LoCoPilotLanguageModelProvider extends Disposable implements ILangu
 		this._log(`[LoCoPilot Provider] Calling localhost model at: ${url}`);
 		const mappedMessages = messages.flatMap(m => this._mapMessageToOpenAI(m));
 		const maxOutputTokens = model.maxOutputTokens ?? 1000;
+		let openAiModel = (model.localhostOpenAiModel ?? '').trim();
+		if (!openAiModel) {
+			const n = (model.name ?? '').trim();
+			// Legacy entries used the URL as `name`; don't send that as the `model` field.
+			openAiModel = n && !/^https?:\/\//i.test(n) ? n : 'local';
+		}
 		const body: any = {
-			model: model.name || 'local',
+			model: openAiModel,
 			messages: mappedMessages,
 			stream: true,
 			temperature: 0.3,
@@ -1170,11 +1190,11 @@ export class LoCoPilotLanguageModelProvider extends Disposable implements ILangu
 								if (data === '[DONE]') continue;
 								try {
 									const json = JSON.parse(data);
-									// Debug log for thinking content
-									if (json.choices?.[0]?.delta?.reasoning_content) {
-										this._log(`[LoCoPilot Provider] Reasoning delta: ${json.choices[0].delta.reasoning_content}`);
-									}
 									const choice = json.choices?.[0];
+									const localReasoning = this._reasoningTextFromOpenAiDelta(choice?.delta);
+									if (localReasoning) {
+										this._log(`[LoCoPilot Provider] Reasoning delta: ${localReasoning.substring(0, 200)}${localReasoning.length > 200 ? '...' : ''}`);
+									}
 									if (choice?.delta?.content) {
 										const content = choice.delta.content;
 										// accumulatedContent += content;
@@ -1219,8 +1239,8 @@ export class LoCoPilotLanguageModelProvider extends Disposable implements ILangu
 										// }
 										stream.emitOne({ type: 'text', value: content });
 									}
-									if (choice?.delta?.reasoning_content) {
-										stream.emitOne({ type: 'thinking', value: choice.delta.reasoning_content });
+									if (localReasoning) {
+										stream.emitOne({ type: 'thinking', value: localReasoning });
 									}
 									// Accumulate tool call deltas by index (id, function.name, function.arguments stream separately)
 									if (choice?.delta?.tool_calls) {

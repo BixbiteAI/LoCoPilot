@@ -3,6 +3,9 @@
  *  Licensed under the MIT License. See License.txt in the project root for license information.
  *--------------------------------------------------------------------------------------------*/
 
+/* eslint-disable @typescript-eslint/no-explicit-any */
+/* eslint-disable local/code-no-any-casts, local/code-no-in-operator */
+
 import { WorkbenchActionExecutedClassification, WorkbenchActionExecutedEvent } from '../../../../../base/common/actions.js';
 import { timeout } from '../../../../../base/common/async.js';
 import { CancellationToken } from '../../../../../base/common/cancellation.js';
@@ -29,11 +32,10 @@ import { ChatModel, ChatRequestModel, IChatRequestModel, IChatRequestVariableDat
 import { ChatMode } from '../../common/chatModes.js';
 import { ChatRequestAgentPart, ChatRequestToolPart } from '../../common/requestParser/chatParserTypes.js';
 import { IChatProgress, IChatService } from '../../common/chatService/chatService.js';
-import { IChatRequestToolEntry } from '../../common/attachments/chatVariableEntries.js';
+import { IChatRequestToolEntry, IChatRequestVariableEntry, isPromptFileVariableEntry, isPromptTextVariableEntry } from '../../common/attachments/chatVariableEntries.js';
 import { ChatAgentLocation, ChatConfiguration, ChatModeKind } from '../../common/constants.js';
 import { ChatMessageRole, IChatMessage, ILanguageModelsService } from '../../common/languageModels.js';
 import { ICustomLanguageModelsService } from '../../common/customLanguageModelsService.js';
-import { IChatRequestVariableEntry, isPromptFileVariableEntry, isPromptTextVariableEntry } from '../../common/attachments/chatVariableEntries.js';
 import { IFileService } from '../../../../../platform/files/common/files.js';
 import { ITextModelService } from '../../../../../editor/common/services/resolverService.js';
 import { basename, relativePath } from '../../../../../base/common/resources.js';
@@ -281,7 +283,7 @@ export class SetupAgent extends Disposable implements IChatAgentImplementation {
 		const widget = chatWidgetService.getWidgetBySessionResource(request.sessionResource);
 		const modeInfo = widget?.input.currentModeInfo;
 		const defaultAgent = chatAgentService.getDefaultAgent(this.location, modeInfo?.kind);
-		
+
 		// If we have a non-core agent available, use it directly
 		if (defaultAgent && !defaultAgent.isCore) {
 			return this.doInvokeWithoutSetup(request, progress, chatService, languageModelsService, chatWidgetService, chatAgentService, languageModelToolsService);
@@ -948,7 +950,7 @@ export class LoCoPilotBuiltInAgent extends Disposable implements IChatAgentImple
 			}
 
 			const disposables = new DisposableStore();
-			
+
 			// Register the agent
 			disposables.add(chatAgentService.registerAgent(id, {
 				id,
@@ -1247,7 +1249,7 @@ Preserve: key facts, decisions, code changes, file names and paths, user prefere
 
 		if (detectedConfigs.length > 0) {
 			context += `\n**Detected Project Files:** ${detectedConfigs.join(', ')}\n`;
-			
+
 			// Add project type hints
 			if (detectedConfigs.includes('package.json')) {
 				context += `- This appears to be a **JavaScript/TypeScript** project (Node.js/npm)\n`;
@@ -1343,7 +1345,7 @@ Preserve: key facts, decisions, code changes, file names and paths, user prefere
 
 	/**
 	 * Convert variables/attachments to message content parts.
-	 * For file attachments: sends path (workspace-relative) and optional line range only — no file content.
+	 * For file attachments: sends path (workspace-relative) and optional line range only - no file content.
 	 * LLM can use readFile(path) or readFile(path, offset, limit) when needed.
 	 */
 	private async convertVariablesToContent(variables: IChatRequestVariableEntry[]): Promise<IChatMessage['content']> {
@@ -1371,7 +1373,7 @@ Preserve: key facts, decisions, code changes, file names and paths, user prefere
 				const range = this.getFileRangeFromVariable(variable);
 				const rangeStr = range ? ` (lines ${range.startLineNumber}-${range.endLineNumber})` : '';
 				const isActiveFile = activeEditorInput?.resource && fileUri.toString() === activeEditorInput.resource.toString();
-				const cursorStr = isActiveFile && cursorPosition ? ` — cursor at line ${cursorPosition.lineNumber}, column ${cursorPosition.column}` : '';
+				const cursorStr = isActiveFile && cursorPosition ? ` - cursor at line ${cursorPosition.lineNumber}, column ${cursorPosition.column}` : '';
 
 				const ext = fileUri.path.split('.').pop()?.toLowerCase();
 				const imageExts = ['png', 'jpg', 'jpeg', 'gif', 'webp', 'bmp'];
@@ -1392,11 +1394,11 @@ Preserve: key facts, decisions, code changes, file names and paths, user prefere
 						this.logService.warn(`[LoCoPilot] Failed to read image ${fileUri}: ${e}`);
 						content.push({
 							type: 'text',
-							value: `\n\n[Attached image: ${workspacePath} — could not read]\n`
+							value: `\n\n[Attached image: ${workspacePath} - could not read]\n`
 						});
 					}
 				} else {
-					// Text file: send path and optional line range only — no content; LLM can use readFile when needed
+					// Text file: send path and optional line range only - no content; LLM can use readFile when needed
 					content.push({
 						type: 'text',
 						value: `\n\n[Attached file: ${workspacePath}]${rangeStr}${cursorStr}\n`
@@ -1451,7 +1453,7 @@ Preserve: key facts, decisions, code changes, file names and paths, user prefere
 			}
 		}
 
-		// Other open files (max 10) — for images: include actual image content so LLM can see them; for text files: paths only
+		// Other open files (max 10) - for images: include actual image content so LLM can see them; for text files: paths only
 		const editors = this.editorService.editors;
 		const imageExts = ['png', 'jpg', 'jpeg', 'gif', 'webp', 'bmp', 'tiff'];
 		const maxOpenImages = 3; // avoid huge payloads
@@ -1532,16 +1534,16 @@ Focus on making the exact changes requested while preserving code structure and 
 		modeInfo?: IChatRequestModeInfo
 	): Promise<IChatMessage[]> {
 		const messages: IChatMessage[] = [];
-		
+
 		// 1. Add system prompt from mode instructions or use default based on mode
 		let systemPrompt: string | undefined = request.modeInstructions?.content;
-		
+
 		// If no mode instructions in request, try to get from modeInfo
 		if (!systemPrompt && modeInfo?.modeInstructions?.content) {
 			systemPrompt = modeInfo.modeInstructions.content;
 			this._log(`[LoCoPilot] Got mode instructions from modeInfo: ${modeInfo.modeId}`);
 		}
-		
+
 		// If still no system prompt, add default based on mode kind
 		if (!systemPrompt) {
 			// Use modeInfo.kind if available, otherwise fallback based on location
@@ -1549,7 +1551,7 @@ Focus on making the exact changes requested while preserving code structure and 
 			systemPrompt = this.getDefaultSystemPrompt(modeKind);
 			this._log(`[LoCoPilot] Using default system prompt for mode: ${modeKind} (modeInfo.kind=${modeInfo?.kind}, location=${request.location})`);
 		}
-		
+
 		// Add workspace context for Agent mode
 		const modeKind = modeInfo?.kind ?? ChatModeKind.Ask;
 		if (modeKind === ChatModeKind.Agent) {
@@ -1558,33 +1560,33 @@ Focus on making the exact changes requested while preserving code structure and 
 				systemPrompt = systemPrompt + '\n\n' + workspaceContext;
 			}
 		}
-		
+
 		if (systemPrompt) {
 			messages.push({
 				role: ChatMessageRole.System,
 				content: [{ type: 'text', value: systemPrompt }]
 			});
 		}
-		
+
 		// 2. Reconstruct history with variables and tool calls
 		for (const h of history) {
 			// User message with variables
 			const userContent: IChatMessage['content'] = [];
-			
+
 			// Add variables/attachments to user message
 			if (h.request.variables?.variables) {
 				const variableContent = await this.convertVariablesToContent([...h.request.variables.variables]);
 				userContent.push(...variableContent);
 			}
-			
+
 			// Add the actual message text
 			userContent.push({ type: 'text', value: h.request.message });
-			
+
 			messages.push({
 				role: ChatMessageRole.User,
 				content: userContent
 			});
-			
+
 			// Assistant response - extract text from various response types
 			const assistantParts: string[] = [];
 			for (const r of h.response) {
@@ -1596,7 +1598,7 @@ Focus on making the exact changes requested while preserving code structure and 
 				// Note: Other response types (textEditGroup, treeData, etc.) are complex structures
 				// For now, we only extract simple text/markdown content
 			}
-			
+
 			if (assistantParts.length > 0) {
 				messages.push({
 					role: ChatMessageRole.Assistant,
@@ -1604,24 +1606,24 @@ Focus on making the exact changes requested while preserving code structure and 
 				});
 			}
 		}
-		
+
 		// 3. Add current request with variables
 		const currentContent: IChatMessage['content'] = [];
-		
+
 		// Add variables/attachments to current message
 		if (request.variables?.variables) {
 			const variableContent = await this.convertVariablesToContent([...request.variables.variables]);
 			currentContent.push(...variableContent);
 		}
-		
+
 		// Add the actual message text
 		currentContent.push({ type: 'text', value: request.message });
-		
+
 		messages.push({
 			role: ChatMessageRole.User,
 			content: currentContent
 		});
-		
+
 		return messages;
 	}
 
@@ -1715,23 +1717,23 @@ Message: ${firstMessage.substring(0, 500)}`;
 		// Try to use custom models if available
 		const allModelIds = this.languageModelsService.getLanguageModelIds();
 		const userSelectedModelId = request.userSelectedModelId;
-		
+
 		// Also check the widget's current language model selection
 		const widgetModelId = widget?.input.currentLanguageModel;
-		
+
 		// Check custom models service directly
-		const customModels = this.customLanguageModelsService.getVisibleCustomModels();
+		const customModels = this.customLanguageModelsService.getChatSelectableCustomModels();
 		const selectedCustomModelId = this.customLanguageModelsService.getSelectedCustomModelId();
-		
+
 		// Try to find a custom model - check userSelectedModelId first, then widget's selection, then selected custom model, then any custom model
 		let modelId = userSelectedModelId || widgetModelId || selectedCustomModelId;
-		
+
 		// If no explicit selection, try to find any custom model from the service
 		if (!modelId && customModels.length > 0) {
 			modelId = customModels[0].id;
 			this._log(`[LoCoPilot] No explicit model selected, using first available custom model: ${modelId}`);
 		}
-		
+
 		// Also check if the model exists by looking it up in the language models service
 		if (modelId) {
 			const modelMetadata = this.languageModelsService.lookupLanguageModel(modelId);
@@ -1748,7 +1750,7 @@ Message: ${firstMessage.substring(0, 500)}`;
 
 		if (modelId) {
 			this._log(`[LoCoPilot] Using model: ${modelId}`);
-			
+
 			// Check if model is in cache, if not, try to resolve it
 			let modelMetadata = this.languageModelsService.lookupLanguageModel(modelId);
 			if (!modelMetadata) {
@@ -1772,21 +1774,21 @@ Message: ${firstMessage.substring(0, 500)}`;
 				// Get mode info from widget if available
 				const widget = this.chatWidgetService.getWidgetBySessionResource(request.sessionResource);
 				const modeInfo = widget?.input.currentModeInfo;
-				
+
 				// Get attachments from widget's attachment model (files attached via UI)
 				const widgetAttachments = widget?.input.attachmentModel.attachments || [];
 				this._log(`[LoCoPilot] Widget attachments: ${widgetAttachments.length} items`);
 				for (const att of widgetAttachments) {
 					this._log(`[LoCoPilot]   - Widget attachment: ${att.kind} "${att.name}"`);
 				}
-				
+
 				// Merge widget attachments with request variables
 				const allVariables = [...(request.variables?.variables || [])];
 				// Add widget attachments that aren't already in variables
 				for (const widgetAtt of widgetAttachments) {
 					// Check if this attachment is already in variables
-					const alreadyIncluded = allVariables.some(v => 
-						v.id === widgetAtt.id || 
+					const alreadyIncluded = allVariables.some(v =>
+						v.id === widgetAtt.id ||
 						(v.kind === 'file' && widgetAtt.kind === 'file' && URI.isUri(v.value) && URI.isUri(widgetAtt.value) && v.value.toString() === widgetAtt.value.toString())
 					);
 					if (!alreadyIncluded) {
@@ -1794,7 +1796,7 @@ Message: ${firstMessage.substring(0, 500)}`;
 						this._log(`[LoCoPilot] Added widget attachment to variables: ${widgetAtt.kind} "${widgetAtt.name}"`);
 					}
 				}
-				
+
 				// Log what we're receiving
 				this._log(`[LoCoPilot] Request details:`);
 				this._log(`[LoCoPilot] - Message: "${request.message}"`);
@@ -1816,7 +1818,7 @@ Message: ${firstMessage.substring(0, 500)}`;
 				}
 				this._log(`[LoCoPilot] - User selected tools: ${request.userSelectedTools ? Object.keys(request.userSelectedTools).length : 0} tools`);
 				this._log(`[LoCoPilot] - History entries: ${history.length}`);
-				
+
 				// Build complete messages with system prompt, history, variables, and current message
 				// Create a modified request with merged variables
 				const requestWithMergedVars: IChatAgentRequest = {
@@ -1853,12 +1855,9 @@ Message: ${firstMessage.substring(0, 500)}`;
 		// If no external agent is available, provide a helpful message
 		progress([{
 			kind: 'markdownContent',
-			content: new MarkdownString(localize('locopilotNoAgentAvailable',
-				"Chat is ready! To get AI-powered responses:\n\n" +
-				"1. From the **Auto** dropdown, choose **Add language models**\n" +
-				"2. Add a model from cloud or local providers\n" +
-				"3. Select it from the Auto dropdown and use it\n\n" +
-				"The chat panel is now available for use."
+			content: new MarkdownString(localize(
+				'locopilotNoAgentAvailable',
+				"Chat is ready! To get AI-powered responses:\n\n1. From the **Auto** dropdown, choose **Add language models**\n2. Add a model from cloud or local providers\n3. Select it from the Auto dropdown and use it\n\nThe chat panel is now available for use."
 			))
 		}]);
 

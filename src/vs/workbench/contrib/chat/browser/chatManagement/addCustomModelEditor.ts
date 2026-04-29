@@ -17,15 +17,13 @@ import { IEditorGroup } from '../../../../services/editor/common/editorGroupsSer
 import { CancellationToken } from '../../../../../base/common/cancellation.js';
 import { AddCustomModelEditorInput } from './addCustomModelEditorInput.js';
 import { Button } from '../../../../../base/browser/ui/button/button.js';
-import { defaultButtonStyles } from '../../../../../platform/theme/browser/defaultStyles.js';
-import { SelectBox } from '../../../../../base/browser/ui/selectBox/selectBox.js';
 import { InputBox } from '../../../../../base/browser/ui/inputbox/inputBox.js';
-import { ICustomLanguageModelsService } from '../../common/customLanguageModelsService.js';
+import { ICustomLanguageModelsService, getCustomModelListLabel } from '../../common/customLanguageModelsService.js';
 import { IDialogService } from '../../../../../platform/dialogs/common/dialogs.js';
 import { Dimension } from '../../../../../base/browser/dom.js';
 import { IContextViewService } from '../../../../../platform/contextview/browser/contextView.js';
-import { ISelectOptionItem, ISelectData } from '../../../../../base/browser/ui/selectBox/selectBox.js';
-import { getInputBoxStyle, getSelectBoxStyles } from '../../../../../platform/theme/browser/defaultStyles.js';
+import { SelectBox, ISelectOptionItem, ISelectData } from '../../../../../base/browser/ui/selectBox/selectBox.js';
+import { defaultButtonStyles, getInputBoxStyle, getSelectBoxStyles } from '../../../../../platform/theme/browser/defaultStyles.js';
 import { settingsSelectBackground, settingsSelectBorder, settingsSelectForeground, settingsSelectListBorder, settingsTextInputBackground, settingsTextInputBorder, settingsTextInputForeground } from '../../../preferences/common/settingsEditorColorRegistry.js';
 import { toErrorMessage } from '../../../../../base/common/errorMessage.js';
 
@@ -69,6 +67,10 @@ export class AddCustomModelEditor extends EditorPane {
 	private tokenInputBox!: InputBox;
 	private modelNameInputBox!: InputBox;
 	private modelNameLabel!: HTMLElement;
+	private displayNameContainer!: HTMLElement;
+	private displayNameInputBox!: InputBox;
+	private localhostModelIdContainer!: HTMLElement;
+	private localhostModelIdInputBox!: InputBox;
 	private addButton!: Button;
 
 	private currentModelType: 'cloud' | 'local' = 'cloud';
@@ -170,12 +172,31 @@ export class AddCustomModelEditor extends EditorPane {
 			inputBoxStyles: settingsStyleInputBox
 		}));
 
+		this.localhostModelIdContainer = DOM.append(formContainer, $('.form-field'));
+		this.localhostModelIdContainer.style.display = 'none';
+		const lmLabel = DOM.append(this.localhostModelIdContainer, $('label.form-label'));
+		lmLabel.textContent = localize('addCustomModel.localhostServerModelId', 'Server model id');
+		const lmInputWrap = DOM.append(this.localhostModelIdContainer, $('.form-input-container'));
+		this.localhostModelIdInputBox = this._register(new InputBox(lmInputWrap, this.contextViewService, {
+			placeholder: localize('addCustomModel.localhostServerModelIdPlaceholder', 'e.g. Qwen/Qwen3-4B-MLX-4bit'),
+			inputBoxStyles: settingsStyleInputBox
+		}));
+
+		this.displayNameContainer = DOM.append(formContainer, $('.form-field'));
+		const dnLabel = DOM.append(this.displayNameContainer, $('label.form-label'));
+		dnLabel.textContent = localize('addCustomModel.displayNameOptional', 'Display name (optional)');
+		const dnInputWrap = DOM.append(this.displayNameContainer, $('.form-input-container'));
+		this.displayNameInputBox = this._register(new InputBox(dnInputWrap, this.contextViewService, {
+			placeholder: localize('addCustomModel.displayNamePlaceholder', 'Shown in the model list and Auto dropdown; must be unique if set'),
+			inputBoxStyles: settingsStyleInputBox
+		}));
+
 		// Add Button
 		const buttonContainer = DOM.append(formContainer, $('.form-actions'));
 		this.addButton = this._register(new Button(buttonContainer, { ...defaultButtonStyles }));
 		this.addButton.label = localize('addCustomModel.add', 'Add Model');
 		this._register(this.addButton.onDidClick(() => this.handleAddModel()));
-		
+
 		// Initialize label based on current selection (after all fields are created)
 		this.updateModelNameLabel();
 	}
@@ -211,7 +232,10 @@ export class AddCustomModelEditor extends EditorPane {
 				tokenContainer.style.display = isLocalhost ? 'none' : '';
 			}
 		}
-		
+		if (this.localhostModelIdContainer) {
+			this.localhostModelIdContainer.style.display = isLocalhost ? '' : 'none';
+		}
+
 		// Update model name label when fields change
 		this.updateModelNameLabel();
 	}
@@ -220,14 +244,14 @@ export class AddCustomModelEditor extends EditorPane {
 		if (!this.modelNameLabel) {
 			return;
 		}
-		
+
 		const providers = this.currentModelType === 'cloud' ? CLOUD_PROVIDERS : LOCAL_PROVIDERS;
 		const provider = providers[this.currentProviderIndex];
 		const isLocalhost = this.currentModelType === 'local' && provider.text.toLowerCase() === 'localhost';
 
 		if (isLocalhost) {
 			this.modelNameLabel.textContent = localize('addCustomModel.localhostUrl', 'Localhost URL');
-			this.modelNameInputBox.setPlaceHolder(localize('addCustomModel.localhostUrlPlaceholder', 'e.g., http://localhost:1234/v1'));
+			this.modelNameInputBox.setPlaceHolder(localize('addCustomModel.localhostUrlPlaceholder', 'e.g., http://localhost:8080/v1/chat/completions'));
 		} else {
 			this.modelNameLabel.textContent = localize('addCustomModel.modelName', 'Model Name');
 			this.modelNameInputBox.setPlaceHolder(localize('addCustomModel.modelNamePlaceholder', 'e.g., gpt-4, claude-3-opus, llama-2-7b'));
@@ -240,16 +264,24 @@ export class AddCustomModelEditor extends EditorPane {
 		const providerValue = provider.text.toLowerCase().replace(/\s+/g, '');
 		const isLocalhost = providerValue === 'localhost';
 		const modelName = this.modelNameInputBox.value.trim();
+		const localhostServerModelId = isLocalhost ? this.localhostModelIdInputBox.value.trim() : '';
+		const displayNameOpt = this.displayNameInputBox.value.trim();
 		const apiKey = this.currentModelType === 'cloud' ? this.apiKeyInputBox.value.trim() : undefined;
 		// Token is only needed for HuggingFace, not for localhost
 		const token = (this.currentModelType === 'local' && !isLocalhost) ? this.tokenInputBox.value.trim() : undefined;
 
 		// Validation
-		if (!modelName) {
-			const errorMessage = providerValue === 'localhost' 
-				? localize('addCustomModel.error.localhostUrlRequired', 'Localhost URL is required')
-				: localize('addCustomModel.error.modelNameRequired', 'Model name is required');
-			await this.dialogService.error(errorMessage);
+		if (isLocalhost) {
+			if (!modelName) {
+				await this.dialogService.error(localize('addCustomModel.error.localhostUrlRequired', 'Localhost URL is required'));
+				return;
+			}
+			if (!localhostServerModelId) {
+				await this.dialogService.error(localize('addCustomModel.error.localhostServerModelIdRequired', 'Server model id is required (OpenAI `model` field, e.g. from GET /v1/models).'));
+				return;
+			}
+		} else if (!modelName) {
+			await this.dialogService.error(localize('addCustomModel.error.modelNameRequired', 'Model name is required'));
 			return;
 		}
 
@@ -259,22 +291,27 @@ export class AddCustomModelEditor extends EditorPane {
 		}
 
 		try {
-			await this.customLanguageModelsService.addCustomModel({
-				name: modelName,
+			const nameFallback = isLocalhost ? localhostServerModelId : modelName;
+			const added = await this.customLanguageModelsService.addCustomModel({
+				name: nameFallback,
+				displayName: displayNameOpt || undefined,
 				type: this.currentModelType,
 				provider: providerValue,
 				apiKey,
 				token,
-				modelName
+				modelName: modelName,
+				localhostOpenAiModel: isLocalhost ? localhostServerModelId : undefined,
 			});
 
 			await this.dialogService.info(
 				localize('addCustomModel.success', 'Model added successfully'),
-				localize('addCustomModel.successDetail', 'The model "{0}" has been added and will appear in the "Auto" dropdown.', modelName)
+				localize('addCustomModel.successDetail', 'The model "{0}" has been added and will appear in the "Auto" dropdown.', getCustomModelListLabel(added))
 			);
 
 			// Clear form
 			this.modelNameInputBox.value = '';
+			this.displayNameInputBox.value = '';
+			this.localhostModelIdInputBox.value = '';
 			this.apiKeyInputBox.value = '';
 			this.tokenInputBox.value = '';
 		} catch (error) {

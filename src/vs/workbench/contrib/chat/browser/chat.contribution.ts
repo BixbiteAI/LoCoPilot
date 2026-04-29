@@ -613,6 +613,11 @@ configurationRegistry.registerConfiguration({
 			description: nls.localize('locopilot.llamaCpp.serverPath.description', "Path to the llama-server binary (from llama.cpp). Leave empty to use the binary from your PATH. You can set the full path to the binary (e.g. /path/to/llama-server or C:\\llama.cpp\\build\\bin\\llama-server.exe) or the directory that contains it. Required when running local GGUF models if llama-server is not on PATH."),
 			default: '',
 		},
+		[ChatConfiguration.LocopilotMlxPythonPath]: {
+			type: 'string',
+			description: nls.localize('locopilot.mlx.pythonPath.description', "Python interpreter used to run `python -m mlx_lm.server` for local Hugging Face MLX models on Apple Silicon. Leave empty to use `python3` from your PATH, or set a venv (e.g. /path/to/.venv/bin/python3)."),
+			default: '',
+		},
 		[ChatConfiguration.EditModeHidden]: {
 			type: 'boolean',
 			description: nls.localize('chat.editMode.hidden', "When enabled, hides the Edit mode from the chat mode picker."),

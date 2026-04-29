@@ -7,7 +7,7 @@ import * as dom from '../../../../../../base/browser/dom.js';
 import { IActionProvider } from '../../../../../../base/browser/ui/dropdown/dropdown.js';
 import { IManagedHoverContent } from '../../../../../../base/browser/ui/hover/hover.js';
 import { renderIcon, renderLabelWithIcons } from '../../../../../../base/browser/ui/iconLabel/iconLabels.js';
-import { IAction } from '../../../../../../base/common/actions.js';
+import { IAction, Separator } from '../../../../../../base/common/actions.js';
 import { IDisposable } from '../../../../../../base/common/lifecycle.js';
 import { autorun, IObservable } from '../../../../../../base/common/observable.js';
 import { localize } from '../../../../../../nls.js';
@@ -24,8 +24,7 @@ import { MANAGE_CHAT_COMMAND_ID } from '../../../common/constants.js';
 import { ILanguageModelChatMetadataAndIdentifier } from '../../../common/languageModels.js';
 import { DEFAULT_MODEL_PICKER_CATEGORY } from '../../../common/widget/input/modelPickerWidget.js';
 import { ChatInputPickerActionViewItem, IChatInputPickerOptions } from './chatInputPickerActionItem.js';
-import { ICustomLanguageModelsService } from '../../../common/customLanguageModelsService.js';
-import { Separator } from '../../../../../../base/common/actions.js';
+import { ICustomLanguageModelsService, getCustomModelListLabel, isCustomModelReadyForChat } from '../../../common/customLanguageModelsService.js';
 import { ExtensionIdentifier } from '../../../../../../platform/extensions/common/extensions.js';
 
 export interface IModelPickerDelegate {
@@ -51,8 +50,8 @@ function modelDelegateToWidgetActionsProvider(delegate: IModelPickerDelegate, te
 	return {
 		getActions: () => {
 			const models = delegate.getModels();
-			const customModels = customLanguageModelsService.getVisibleCustomModels();
-			
+			const customModels = customLanguageModelsService.getChatSelectableCustomModels();
+
 			// Convert custom models to ILanguageModelChatMetadataAndIdentifier format
 			const selectedCustomModelId = customLanguageModelsService.getSelectedCustomModelId();
 			const customModelActions: IActionWidgetDropdownAction[] = customModels.map(customModel => ({
@@ -61,9 +60,9 @@ function modelDelegateToWidgetActionsProvider(delegate: IModelPickerDelegate, te
 				checked: customModel.id === selectedCustomModelId,
 				category: { label: 'Custom Models', order: 100 },
 				class: undefined,
-				description: `${customModel.type === 'cloud' ? 'Cloud' : 'Local'} • ${customModel.provider}`,
-				tooltip: customModel.name,
-				label: customModel.name,
+				description: `${customModel.type === 'cloud' ? 'Cloud' : 'Local'} | ${customModel.provider}`,
+				tooltip: getCustomModelListLabel(customModel),
+				label: getCustomModelListLabel(customModel),
 				hover: { content: localize('chat.modelPicker.customModel.description', "Custom {0} model from {1}", customModel.type, customModel.provider) },
 				run: () => {
 					// Store selected custom model ID
@@ -102,16 +101,16 @@ function modelDelegateToWidgetActionsProvider(delegate: IModelPickerDelegate, te
 					tooltip: hoverContent ? '' : model.metadata.name,
 					hover: hoverContent ? { content: hoverContent } : undefined,
 					label: model.metadata.name,
-				run: () => {
-					const previousModel = delegate.currentModel.get();
-					// Clear custom model selection when selecting a standard model
-					customLanguageModelsService.setSelectedCustomModelId(undefined);
-					telemetryService.publicLog2<ChatModelChangeEvent, ChatModelChangeClassification>('chat.modelChange', {
-						fromModel: previousModel?.metadata.vendor === 'copilot' ? new TelemetryTrustedValue(previousModel.identifier) : 'unknown',
-						toModel: model.metadata.vendor === 'copilot' ? new TelemetryTrustedValue(model.identifier) : 'unknown'
-					});
-					delegate.setModel(model);
-				}
+					run: () => {
+						const previousModel = delegate.currentModel.get();
+						// Clear custom model selection when selecting a standard model
+						customLanguageModelsService.setSelectedCustomModelId(undefined);
+						telemetryService.publicLog2<ChatModelChangeEvent, ChatModelChangeClassification>('chat.modelChange', {
+							fromModel: previousModel?.metadata.vendor === 'copilot' ? new TelemetryTrustedValue(previousModel.identifier) : 'unknown',
+							toModel: model.metadata.vendor === 'copilot' ? new TelemetryTrustedValue(model.identifier) : 'unknown'
+						});
+						delegate.setModel(model);
+					}
 				} satisfies IActionWidgetDropdownAction;
 			});
 
@@ -126,7 +125,7 @@ function getModelPickerActionBarActionProvider(commandService: ICommandService, 
 	const actionProvider: IActionProvider = {
 		getActions: () => {
 			const additionalActions: IAction[] = [];
-			
+
 			// Add "Original" option (existing Language Models screen)
 			if (
 				chatEntitlementService.entitlement === ChatEntitlement.Free ||
@@ -153,7 +152,7 @@ function getModelPickerActionBarActionProvider(commandService: ICommandService, 
 				chatEntitlementService.entitlement === ChatEntitlement.Available ||
 				chatEntitlementService.anonymous ||
 				chatEntitlementService.entitlement === ChatEntitlement.Unknown;
-			
+
 			// Only add if user is not new/anonymous (to avoid duplicate with "moreModels" below)
 			if (!isNewOrAnonymousUser && chatEntitlementService.entitlement !== ChatEntitlement.Free) {
 				additionalActions.push({
@@ -221,16 +220,16 @@ export class ModelPickerActionItem extends ChatInputPickerActionViewItem {
 		const initialModel = delegate.currentModel.get();
 		const initialCustomModelId = customLanguageModelsService.getSelectedCustomModelId();
 		let initialLabel = localize('chat.modelPicker.auto', "Auto");
-		
+
 		if (initialCustomModelId) {
-			const customModel = customLanguageModelsService.getVisibleCustomModels().find(m => m.id === initialCustomModelId);
-			if (customModel && !customModel.hidden) {
-				initialLabel = customModel.name;
+			const customModel = customLanguageModelsService.getChatSelectableCustomModels().find(m => m.id === initialCustomModelId);
+			if (customModel && isCustomModelReadyForChat(customModel)) {
+				initialLabel = getCustomModelListLabel(customModel);
 			}
 		} else if (initialModel) {
 			initialLabel = initialModel.metadata.name;
 		}
-		
+
 		// Modify the original action with a different label and make it show the current model
 		const actionWithLabel: IAction = {
 			...action,
@@ -251,17 +250,17 @@ export class ModelPickerActionItem extends ChatInputPickerActionViewItem {
 		this._register(autorun(t => {
 			const model = delegate.currentModel.read(t);
 			const selectedCustomModelId = customLanguageModelsService.getSelectedCustomModelId();
-			
+
 			// If a custom model is selected, use it; otherwise use the standard model
 			if (selectedCustomModelId) {
-				const customModel = customLanguageModelsService.getVisibleCustomModels().find(m => m.id === selectedCustomModelId);
-				if (customModel && !customModel.hidden) {
+				const customModel = customLanguageModelsService.getChatSelectableCustomModels().find(m => m.id === selectedCustomModelId);
+				if (customModel && isCustomModelReadyForChat(customModel)) {
 					// Create a synthetic model metadata for display
 					this.currentModel = {
 						identifier: customModel.id,
 						metadata: {
 							extension: new ExtensionIdentifier('custom'),
-							name: customModel.name,
+							name: getCustomModelListLabel(customModel),
 							id: customModel.id,
 							vendor: customModel.provider,
 							version: '1.0.0',
@@ -274,34 +273,34 @@ export class ModelPickerActionItem extends ChatInputPickerActionViewItem {
 						}
 					};
 				} else {
-					// Custom model was deleted or hidden, clear selection
+					// Custom model was deleted, hidden, or not ready for chat - clear selection
 					customLanguageModelsService.setSelectedCustomModelId(undefined);
 					this.currentModel = model;
 				}
 			} else {
 				this.currentModel = model;
 			}
-			
+
 			this.updateTooltip();
 			if (this.element) {
 				this.renderLabel(this.element);
 			}
 		}));
-		
+
 		// Also listen for custom model changes to immediately update the display
 		this._register(customLanguageModelsService.onDidChangeCustomModels(() => {
 			// Re-read the current state and update
 			const selectedCustomModelId = customLanguageModelsService.getSelectedCustomModelId();
 			const model = delegate.currentModel.get();
-			
+
 			if (selectedCustomModelId) {
-				const customModel = customLanguageModelsService.getVisibleCustomModels().find(m => m.id === selectedCustomModelId);
-				if (customModel && !customModel.hidden) {
+				const customModel = customLanguageModelsService.getChatSelectableCustomModels().find(m => m.id === selectedCustomModelId);
+				if (customModel && isCustomModelReadyForChat(customModel)) {
 					this.currentModel = {
 						identifier: customModel.id,
 						metadata: {
 							extension: new ExtensionIdentifier('custom'),
-							name: customModel.name,
+							name: getCustomModelListLabel(customModel),
 							id: customModel.id,
 							vendor: customModel.provider,
 							version: '1.0.0',
@@ -314,14 +313,14 @@ export class ModelPickerActionItem extends ChatInputPickerActionViewItem {
 						}
 					};
 				} else {
-					// Model was deleted or hidden, clear selection
+					// Model was deleted or hidden or not ready for chat, clear selection
 					customLanguageModelsService.setSelectedCustomModelId(undefined);
 					this.currentModel = model;
 				}
 			} else {
 				this.currentModel = model;
 			}
-			
+
 			if (this.element) {
 				this.renderLabel(this.element);
 			}
@@ -331,7 +330,7 @@ export class ModelPickerActionItem extends ChatInputPickerActionViewItem {
 	protected override getHoverContents(): IManagedHoverContent | undefined {
 		const label = `${localize('chat.modelPicker.label', "Pick Model")}${super.getHoverContents()}`;
 		const { statusIcon, tooltip } = this.currentModel?.metadata || {};
-		return statusIcon && tooltip ? `${label} • ${tooltip}` : label;
+		return statusIcon && tooltip ? `${label} | ${tooltip}` : label;
 	}
 
 	protected override setAriaLabelAttributes(element: HTMLElement): void {

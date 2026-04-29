@@ -5,12 +5,17 @@
 
 import { createDecorator } from '../../../../platform/instantiation/common/instantiation.js';
 import { IStorageService, StorageScope, StorageTarget } from '../../../../platform/storage/common/storage.js';
-import { AGENT_SYSTEM_PROMPT_GENERAL, AGENT_SYSTEM_PROMPT_TOOLS_AND_INTERNAL, ASK_MODE_SYSTEM_PROMPT, TOOLS_PROMPT_WITHOUT_EDIT } from './agents/agentPrompts.js';
+import { AGENT_SYSTEM_PROMPT_GENERAL, AGENT_SYSTEM_PROMPT_TOOLS_AND_INTERNAL, ASK_MODE_SYSTEM_PROMPT, INITIAL_USER_GENERAL_SYSTEM_PROMPT, TOOLS_PROMPT_WITHOUT_EDIT } from './agents/agentPrompts.js';
 
 export const ILoCoPilotAgentSettingsService = createDecorator<ILoCoPilotAgentSettingsService>('locopilotAgentSettingsService');
 
+/** @deprecated Migrate to useCoding flags; retained for one-time storage migration only. */
+const LEGACY_STORED_FULL_BUILTIN_GENERAL_MARKER = '\uE000LOCOPILOT_FULL_BUILTIN_GENERAL\uE001';
+
 const STORAGE_KEY_ASK_PROMPT = 'locopilot.agentSettings.askModeSystemPrompt';
 const STORAGE_KEY_AGENT_PROMPT = 'locopilot.agentSettings.agentModeSystemPrompt';
+const STORAGE_KEY_ASK_USE_CODING_SYSTEM_PROMPT = 'locopilot.agentSettings.askUseCodingSystemPrompt';
+const STORAGE_KEY_AGENT_USE_CODING_SYSTEM_PROMPT = 'locopilot.agentSettings.agentUseCodingSystemPrompt';
 const STORAGE_KEY_MAX_ITERATIONS = 'locopilot.agentSettings.maxIterationsPerRequest';
 const STORAGE_KEY_AUTO_RUN_SANDBOX = 'locopilot.agentSettings.autoRunCommandsInSandbox';
 
@@ -21,6 +26,8 @@ export interface ILoCoPilotAgentSettingsService {
 
 	getAskModeSystemPrompt(): string;
 	getAgentModeSystemPrompt(): string;
+	getAskUseCodingSystemPrompt(): boolean;
+	getAgentUseCodingSystemPrompt(): boolean;
 	getFullAskModeSystemPrompt(): string;
 	getFullAgentModeSystemPrompt(): string;
 	getMaxIterationsPerRequest(): number;
@@ -28,12 +35,10 @@ export interface ILoCoPilotAgentSettingsService {
 
 	setAskModeSystemPrompt(value: string): void;
 	setAgentModeSystemPrompt(value: string): void;
+	setAskUseCodingSystemPrompt(value: boolean): void;
+	setAgentUseCodingSystemPrompt(value: boolean): void;
 	setMaxIterationsPerRequest(value: number): void;
 	setAutoRunCommandsInSandbox(value: boolean): void;
-
-	restoreAskModeSystemPromptDefault(): void;
-	restoreAgentModeSystemPromptDefault(): void;
-	restoreAllToDefault(): void;
 }
 
 export class LoCoPilotAgentSettingsService implements ILoCoPilotAgentSettingsService {
@@ -41,41 +46,79 @@ export class LoCoPilotAgentSettingsService implements ILoCoPilotAgentSettingsSer
 
 	constructor(
 		@IStorageService private readonly storageService: IStorageService,
-	) { }
+	) {
+		this.migrateLegacyStorageIfNeeded();
+	}
 
-	/** Returns only the general (user-editable) part of the Ask mode system prompt. */
+	/** Migrates obsolete marker-only storage to-toggle + cleared prompt fields. Idempotent per session. */
+	private migrateLegacyStorageIfNeeded(): void {
+		const askRaw = this.storageService.get(STORAGE_KEY_ASK_PROMPT, StorageScope.APPLICATION);
+		if (askRaw === LEGACY_STORED_FULL_BUILTIN_GENERAL_MARKER) {
+			this.storageService.store(STORAGE_KEY_ASK_USE_CODING_SYSTEM_PROMPT, String(true), StorageScope.APPLICATION, StorageTarget.USER);
+			this.storageService.store(STORAGE_KEY_ASK_PROMPT, '', StorageScope.APPLICATION, StorageTarget.USER);
+		}
+		const agentRaw = this.storageService.get(STORAGE_KEY_AGENT_PROMPT, StorageScope.APPLICATION);
+		if (agentRaw === LEGACY_STORED_FULL_BUILTIN_GENERAL_MARKER) {
+			this.storageService.store(STORAGE_KEY_AGENT_USE_CODING_SYSTEM_PROMPT, String(true), StorageScope.APPLICATION, StorageTarget.USER);
+			this.storageService.store(STORAGE_KEY_AGENT_PROMPT, '', StorageScope.APPLICATION, StorageTarget.USER);
+		}
+	}
+
+	getAskUseCodingSystemPrompt(): boolean {
+		return this.storageService.getBoolean(STORAGE_KEY_ASK_USE_CODING_SYSTEM_PROMPT, StorageScope.APPLICATION, false);
+	}
+
+	getAgentUseCodingSystemPrompt(): boolean {
+		return this.storageService.getBoolean(STORAGE_KEY_AGENT_USE_CODING_SYSTEM_PROMPT, StorageScope.APPLICATION, false);
+	}
+
+	setAskUseCodingSystemPrompt(value: boolean): void {
+		this.storageService.store(STORAGE_KEY_ASK_USE_CODING_SYSTEM_PROMPT, String(value), StorageScope.APPLICATION, StorageTarget.USER);
+	}
+
+	setAgentUseCodingSystemPrompt(value: boolean): void {
+		this.storageService.store(STORAGE_KEY_AGENT_USE_CODING_SYSTEM_PROMPT, String(value), StorageScope.APPLICATION, StorageTarget.USER);
+	}
+
+	/** User-editable general fragment when Ask "coding system prompt" is off. */
 	getAskModeSystemPrompt(): string {
 		const stored = this.storageService.get(STORAGE_KEY_ASK_PROMPT, StorageScope.APPLICATION);
 		return stored ?? '';
 	}
 
-	/** Returns only the general (user-editable) part of the Agent mode system prompt. */
+	/** User-editable general fragment when Agent "coding system prompt" is off. */
 	getAgentModeSystemPrompt(): string {
 		const stored = this.storageService.get(STORAGE_KEY_AGENT_PROMPT, StorageScope.APPLICATION);
 		return stored ?? '';
 	}
 
-	/** Returns full system prompt for Ask mode: general + tools (without edit). For use when sending to LLM. */
+	/** Ask mode LLM payload: built-in Ask prompt + tools when toggled on; else optional custom + fallback line + tools. */
 	getFullAskModeSystemPrompt(): string {
-		const prompt = this.getAskModeSystemPrompt();
-		return (prompt || ASK_MODE_SYSTEM_PROMPT) + TOOLS_PROMPT_WITHOUT_EDIT;
+		if (this.getAskUseCodingSystemPrompt()) {
+			return ASK_MODE_SYSTEM_PROMPT + TOOLS_PROMPT_WITHOUT_EDIT;
+		}
+		const user = this.getAskModeSystemPrompt().trim();
+		const general = user.length ? user : INITIAL_USER_GENERAL_SYSTEM_PROMPT;
+		return general + TOOLS_PROMPT_WITHOUT_EDIT;
 	}
 
-	/** Returns full system prompt for Agent mode: general + tools. For use when sending to LLM. */
 	getFullAgentModeSystemPrompt(): string {
-		const prompt = this.getAgentModeSystemPrompt();
-		return (prompt || AGENT_SYSTEM_PROMPT_GENERAL) + AGENT_SYSTEM_PROMPT_TOOLS_AND_INTERNAL;
+		if (this.getAgentUseCodingSystemPrompt()) {
+			return AGENT_SYSTEM_PROMPT_GENERAL + AGENT_SYSTEM_PROMPT_TOOLS_AND_INTERNAL;
+		}
+		const user = this.getAgentModeSystemPrompt().trim();
+		const general = user.length ? user : INITIAL_USER_GENERAL_SYSTEM_PROMPT;
+		return general + AGENT_SYSTEM_PROMPT_TOOLS_AND_INTERNAL;
 	}
 
 	getMaxIterationsPerRequest(): number {
 		const stored = this.storageService.get(STORAGE_KEY_MAX_ITERATIONS, StorageScope.APPLICATION);
 		if (stored === undefined || stored === '') {
-			// Persist default so it's saved like other settings
 			this.storageService.store(STORAGE_KEY_MAX_ITERATIONS, String(DEFAULT_MAX_ITERATIONS), StorageScope.APPLICATION, StorageTarget.USER);
 			return DEFAULT_MAX_ITERATIONS;
 		}
 		const n = parseInt(stored, 10);
-		return isNaN(n) || n < 1 ? DEFAULT_MAX_ITERATIONS : Math.min(100, Math.max(1, n));
+		return isNaN(n) || n < 10 ? DEFAULT_MAX_ITERATIONS : Math.min(500, Math.max(10, n));
 	}
 
 	setAskModeSystemPrompt(value: string): void {
@@ -87,7 +130,7 @@ export class LoCoPilotAgentSettingsService implements ILoCoPilotAgentSettingsSer
 	}
 
 	setMaxIterationsPerRequest(value: number): void {
-		const clamped = Math.min(100, Math.max(1, value));
+		const clamped = Math.min(500, Math.max(10, value));
 		this.storageService.store(STORAGE_KEY_MAX_ITERATIONS, String(clamped), StorageScope.APPLICATION, StorageTarget.USER);
 	}
 
@@ -97,20 +140,5 @@ export class LoCoPilotAgentSettingsService implements ILoCoPilotAgentSettingsSer
 
 	setAutoRunCommandsInSandbox(value: boolean): void {
 		this.storageService.store(STORAGE_KEY_AUTO_RUN_SANDBOX, String(value), StorageScope.APPLICATION, StorageTarget.USER);
-	}
-
-	restoreAskModeSystemPromptDefault(): void {
-		this.storageService.remove(STORAGE_KEY_ASK_PROMPT, StorageScope.APPLICATION);
-	}
-
-	restoreAgentModeSystemPromptDefault(): void {
-		this.storageService.remove(STORAGE_KEY_AGENT_PROMPT, StorageScope.APPLICATION);
-	}
-
-	restoreAllToDefault(): void {
-		this.storageService.remove(STORAGE_KEY_ASK_PROMPT, StorageScope.APPLICATION);
-		this.storageService.remove(STORAGE_KEY_AGENT_PROMPT, StorageScope.APPLICATION);
-		this.storageService.remove(STORAGE_KEY_MAX_ITERATIONS, StorageScope.APPLICATION);
-		this.storageService.remove(STORAGE_KEY_AUTO_RUN_SANDBOX, StorageScope.APPLICATION);
 	}
 }

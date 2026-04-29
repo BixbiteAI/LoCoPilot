@@ -17,7 +17,7 @@ import { IThemeService } from '../../../../../platform/theme/common/themeService
 import { IEditorGroup } from '../../../../services/editor/common/editorGroupsService.js';
 import { CancellationToken } from '../../../../../base/common/cancellation.js';
 import { localize } from '../../../../../nls.js';
-import { ICustomLanguageModelsService, ICustomLanguageModel } from '../../common/customLanguageModelsService.js';
+import { ICustomLanguageModelsService, ICustomLanguageModel, getCustomModelListLabel } from '../../common/customLanguageModelsService.js';
 import { IDialogService } from '../../../../../platform/dialogs/common/dialogs.js';
 import { ICommandService } from '../../../../../platform/commands/common/commands.js';
 import { Codicon } from '../../../../../base/common/codicons.js';
@@ -52,7 +52,7 @@ export class CustomLanguageModelsListEditor extends EditorPane {
 		this.editorDisposables.clear();
 		this.bodyContainer = DOM.append(parent, $('.custom-language-models-list-editor'));
 		this.renderModelsList();
-		
+
 		// Listen for model changes
 		this._register(this.customLanguageModelsService.onDidChangeCustomModels(() => {
 			this.renderModelsList();
@@ -68,7 +68,7 @@ export class CustomLanguageModelsListEditor extends EditorPane {
 		DOM.clearNode(this.bodyContainer);
 
 		const models = this.customLanguageModelsService.getCustomModels();
-		
+
 		if (models.length === 0) {
 			this.renderEmptyState();
 			return;
@@ -88,13 +88,13 @@ export class CustomLanguageModelsListEditor extends EditorPane {
 
 	private renderEmptyState(): void {
 		const emptyContainer = DOM.append(this.bodyContainer!, $('.models-list-empty'));
-		
+
 		const icon = DOM.append(emptyContainer, $('.empty-icon'));
 		icon.appendChild(renderIcon(Codicon.add));
-		
+
 		const message = DOM.append(emptyContainer, $('.empty-message'));
 		message.textContent = localize('customLanguageModels.list.empty', 'No language models added yet');
-		
+
 		const addButton = this._register(new Button(emptyContainer, { ...defaultButtonStyles }));
 		addButton.label = localize('customLanguageModels.list.add', 'Add Model');
 		this._register(addButton.onDidClick(() => {
@@ -114,12 +114,12 @@ export class CustomLanguageModelsListEditor extends EditorPane {
 
 		// Model info
 		const infoContainer = DOM.append(itemContainer, $('.model-info'));
-		
+
 		const nameLabel = DOM.append(infoContainer, $('.model-name'));
-		nameLabel.textContent = model.name;
-		
+		nameLabel.textContent = getCustomModelListLabel(model);
+
 		const detailsLabel = DOM.append(infoContainer, $('.model-details'));
-		detailsLabel.textContent = `${model.type === 'cloud' ? 'Cloud' : 'Local'} • ${model.provider} • ${model.modelName}`;
+		detailsLabel.textContent = `${model.type === 'cloud' ? 'Cloud' : 'Local'} | ${model.provider} | ${model.modelName}`;
 
 		// Actions
 		const actionsContainer = DOM.append(itemContainer, $('.model-actions'));
@@ -137,7 +137,7 @@ export class CustomLanguageModelsListEditor extends EditorPane {
 		this._register(deleteButton.onDidClick(async () => {
 			const confirmed = await this.dialogService.confirm({
 				title: localize('customLanguageModels.delete.confirm.title', 'Delete Model'),
-				message: localize('customLanguageModels.delete.confirm.message', 'Are you sure you want to delete "{0}"?', model.name),
+				message: localize('customLanguageModels.delete.confirm.message', 'Are you sure you want to delete "{0}"?', getCustomModelListLabel(model)),
 				primaryButton: localize('delete', 'Delete'),
 				type: 'warning'
 			});
@@ -162,7 +162,7 @@ export class CustomLanguageModelsListEditor extends EditorPane {
 
 		// Delete the model from the service
 		await this.customLanguageModelsService.removeCustomModel(modelId);
-		
+
 		// The list will be re-rendered by the onDidChangeCustomModels listener
 	}
 

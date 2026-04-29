@@ -3,7 +3,9 @@
  *  Licensed under the MIT License. See License.txt in the project root for license information.
  *--------------------------------------------------------------------------------------------*/
 
-import { CancellationToken } from '../../../../base/common/cancellation.js';
+/* eslint-disable curly, @typescript-eslint/no-explicit-any */
+
+import { CancellationToken, CancellationTokenSource } from '../../../../base/common/cancellation.js';
 import { listenStream } from '../../../../base/common/stream.js';
 import { Disposable } from '../../../../base/common/lifecycle.js';
 import { joinPath } from '../../../../base/common/resources.js';
@@ -23,6 +25,7 @@ import { IWorkbenchContribution } from '../../../common/contributions.js';
 import { streamToBuffer } from '../../../../base/common/buffer.js';
 import { INotificationService } from '../../../../platform/notification/common/notification.js';
 import { toErrorMessage } from '../../../../base/common/errorMessage.js';
+import { CancellationError, isCancellationError } from '../../../../base/common/errors.js';
 
 const HF_API_BASE = 'https://huggingface.co';
 const HF_RESOLVE = `${HF_API_BASE}`;
@@ -40,7 +43,7 @@ interface HFTreeItem {
 }
 
 /** Model format priority list. */
-const FORMAT_PRIORITY = ['gguf', 'transformers', 'safetensors'];
+const FORMAT_PRIORITY = ['gguf', 'mlx', 'transformers', 'safetensors'];
 
 function pickBestGGUFFile(paths: string[], preferredQuant?: string): string | undefined {
 	const gguf = paths.filter(p => p.toLowerCase().endsWith('.gguf'));
@@ -87,6 +90,23 @@ function filterPathsByFormat(paths: string[], format: string): string[] {
 		return paths.filter(p => /\.(bin|safetensors)$/i.test(p) || /config\.(json|json\.model)$/i.test(p));
 	}
 
+	// Apple MLX (mlx-lm): weights + tokenizers (transformers subset + common extra files)
+	if (f === 'mlx') {
+		const tr = filterPathsByFormat(paths, 'transformers');
+		const extra = paths.filter(p => {
+			const l = p.toLowerCase();
+			if (l.endsWith('.gguf') || l.endsWith('.onnx') || l.endsWith('.onnx_data')) {
+				return false;
+			}
+			if (tr.includes(p)) {
+				return false;
+			}
+			return /(vocab|merges|tokenizer|special_tokens|added_tokens|tiktoken|chat_template|processor|preprocessor|spiece)/i.test(p)
+				&& /\.(json|txt|model|jinja2?|yaml|yml|bin|safetensors)$/i.test(p);
+		});
+		return Array.from(new Set([...tr, ...extra]));
+	}
+
 	// Check if the format matches any file exactly or as a substring
 	const exactMatch = paths.filter(p => p.toLowerCase().includes(f));
 	if (exactMatch.length > 0) return exactMatch;
@@ -97,6 +117,9 @@ function filterPathsByFormat(paths: string[], format: string): string[] {
 export class LoCoPilotModelDownloadService extends Disposable implements IWorkbenchContribution {
 	static readonly ID = 'locopilot.modelDownloadService';
 	static readonly MODELS_DIR = 'locopilot-models';
+
+	/** One active download per model; Stop download cancels the token. */
+	private readonly _downloadTokens = new Map<string, CancellationTokenSource>();
 
 	constructor(
 		@ICustomLanguageModelsService private readonly customLanguageModelsService: ICustomLanguageModelsService,
@@ -135,6 +158,14 @@ export class LoCoPilotModelDownloadService extends Disposable implements IWorkbe
 			}
 			async run(accessor: ServicesAccessor, modelId: string): Promise<void> {
 				await self.deleteModelFiles(modelId);
+			}
+		});
+		registerAction2(class extends Action2 {
+			constructor() {
+				super({ id: 'locopilot.cancelModelDownload', title: 'Stop download' });
+			}
+			run(accessor: ServicesAccessor, modelId: string): void {
+				self.cancelModelDownload(modelId);
 			}
 		});
 	}
@@ -227,22 +258,49 @@ export class LoCoPilotModelDownloadService extends Disposable implements IWorkbe
 		return out;
 	}
 
-	async downloadModel(modelId: string, _cancel?: CancellationToken): Promise<void> {
-		const model = this.customLanguageModelsService.getCustomModels().find(m => m.id === modelId);
-		if (!model) {
-			return;
+	async downloadModel(modelId: string): Promise<void> {
+		const prev = this._downloadTokens.get(modelId);
+		if (prev) {
+			prev.cancel();
+			prev.dispose();
+			this._downloadTokens.delete(modelId);
 		}
-		if (model.provider === 'huggingface') {
-			return this._downloadHuggingFaceModel(model, _cancel);
-		} else if (model.provider === 'ollama') {
-			return this._pullOllamaModel(model, _cancel);
+
+		const cts = new CancellationTokenSource();
+		this._downloadTokens.set(modelId, cts);
+		const cancel = cts.token;
+		try {
+			const model = this.customLanguageModelsService.getCustomModels().find(m => m.id === modelId);
+			if (!model) {
+				return;
+			}
+			if (model.provider === 'huggingface') {
+				await this._downloadHuggingFaceModel(model, cancel);
+			} else if (model.provider === 'ollama') {
+				await this._pullOllamaModel(model, cancel);
+			}
+		} finally {
+			this._downloadTokens.delete(modelId);
+			cts.dispose();
 		}
 	}
 
-	private async _pullOllamaModel(model: ICustomLanguageModel, _cancel?: CancellationToken): Promise<void> {
+	cancelModelDownload(modelId: string): void {
+		this._downloadTokens.get(modelId)?.cancel();
+	}
+
+	private async _deleteIncompleteHfFolder(uri: URI): Promise<void> {
+		try {
+			await this.fileService.del(uri, { recursive: true });
+			this._log(`[LoCoPilot Download] Removed partial install under ${uri.fsPath}`);
+		} catch (e) {
+			this._log(`[LoCoPilot Download] Could not remove partial install under ${uri.fsPath}: ${e}`);
+		}
+	}
+
+	private async _pullOllamaModel(model: ICustomLanguageModel, cancel: CancellationToken): Promise<void> {
 		const modelId = model.id;
 		const repoId = model.modelName.trim();
-		const cancel = _cancel ?? CancellationToken.None;
 		const baseUrl = (model.localPath || 'http://localhost:11434').replace(/\/$/, '');
 
 		this._log(`[LoCoPilot Ollama] Starting pull for ${repoId} at ${baseUrl}`);
@@ -252,7 +310,7 @@ export class LoCoPilotModelDownloadService extends Disposable implements IWorkbe
 
 			const url = `${baseUrl}/api/pull`;
 			const body = JSON.stringify({ name: repoId, stream: true });
-			
+
 			const response = await this.requestService.request({
 				type: 'POST',
 				url,
@@ -264,7 +322,17 @@ export class LoCoPilotModelDownloadService extends Disposable implements IWorkbe
 				throw new Error(`Ollama API error ${response.res.statusCode}: ${errorBody || `Make sure Ollama is running at ${baseUrl}.`}`);
 			}
 
-			return new Promise<void>((resolve, reject) => {
+			await new Promise<void>((resolve, reject) => {
+				if (cancel.isCancellationRequested) {
+					reject(new CancellationError());
+					return;
+				}
+
+				const cancelListener = cancel.onCancellationRequested(() => {
+					cancelListener.dispose();
+					reject(new CancellationError());
+				});
+
 				let buffer = '';
 
 				listenStream(response.stream, {
@@ -285,10 +353,19 @@ export class LoCoPilotModelDownloadService extends Disposable implements IWorkbe
 							}
 						}
 					},
-					onError: (error: any) => reject(error),
+					onError: (error: any) => {
+						cancelListener.dispose();
+						reject(error);
+					},
 					onEnd: async () => {
+						cancelListener.dispose();
+						if (cancel.isCancellationRequested) {
+							reject(new CancellationError());
+							return;
+						}
 						await this.customLanguageModelsService.updateCustomModel(modelId, {
-							isDownloading: false
+							isDownloading: false,
+							ollamaPullComplete: true
 							// localPath still holds the Base URL
 						});
 						this._log(`[LoCoPilot Ollama] ${repoId} pulled successfully.`);
@@ -298,7 +375,15 @@ export class LoCoPilotModelDownloadService extends Disposable implements IWorkbe
 			});
 		} catch (e) {
 			this._log(`[LoCoPilot Ollama] Error pulling ${repoId}: ${e}`);
-			await this.customLanguageModelsService.updateCustomModel(modelId, { isDownloading: false });
+			await this.customLanguageModelsService.updateCustomModel(modelId, { isDownloading: false, ollamaPullComplete: false });
+
+			const userCancelled = cancel.isCancellationRequested || isCancellationError(e);
+			if (userCancelled) {
+				this._log(`[LoCoPilot Ollama] Pull cancelled; removing partial layers from Ollama if present.`);
+				await this.deleteModelFiles(model.id);
+				return;
+			}
+
 			const message = toErrorMessage(e);
 			this.notificationService.error(
 				`Failed to pull Ollama model "${repoId}": ${message}. Make sure Ollama is installed and running at ${baseUrl}.`
@@ -307,7 +392,7 @@ export class LoCoPilotModelDownloadService extends Disposable implements IWorkbe
 		}
 	}
 
-	private async _downloadHuggingFaceModel(model: ICustomLanguageModel, _cancel?: CancellationToken): Promise<void> {
+	private async _downloadHuggingFaceModel(model: ICustomLanguageModel, cancel: CancellationToken): Promise<void> {
 		const modelId = model.id;
 		const token = model.token;
 		const repoId = model.modelName.trim();
@@ -316,9 +401,10 @@ export class LoCoPilotModelDownloadService extends Disposable implements IWorkbe
 			return;
 		}
 		const format = (model.format || '').trim();
-		const cancel = _cancel ?? CancellationToken.None;
 
 		this._log(`[LoCoPilot Download] Starting download for ${repoId} (Format: ${format || 'Auto-select'})`);
+		let partialInstallDir: URI | undefined;
+
 		try {
 			await this.customLanguageModelsService.updateCustomModel(modelId, { isDownloading: true, downloadProgress: 0 });
 
@@ -335,6 +421,7 @@ export class LoCoPilotModelDownloadService extends Disposable implements IWorkbe
 				repoId.replace(/\//g, '_')
 			);
 			await this.fileService.createFolder(baseDir);
+			partialInstallDir = baseDir;
 
 			const total = toDownload.length;
 			let mainModelFileUri: URI | undefined;
@@ -406,10 +493,21 @@ export class LoCoPilotModelDownloadService extends Disposable implements IWorkbe
 				downloadProgress: 100,
 				localPath
 			});
+			partialInstallDir = undefined;
 			this._log(`[LoCoPilot Download] ${repoId} downloaded to ${localPath}.`);
 		} catch (e) {
 			this._log(`[LoCoPilot Download] Error downloading ${repoId}: ${e}`);
 			await this.customLanguageModelsService.updateCustomModel(modelId, { isDownloading: false });
+
+			const userCancelled = cancel.isCancellationRequested || isCancellationError(e);
+			if (userCancelled) {
+				this._log(`[LoCoPilot Download] Download cancelled for ${repoId}.`);
+				if (partialInstallDir) {
+					await this._deleteIncompleteHfFolder(partialInstallDir);
+				}
+				return;
+			}
+
 			const message = toErrorMessage(e);
 			this.notificationService.error(
 				`Failed to download model "${repoId}": ${message}. Check the model name (use format org/model-name), token for gated repos, and network.`

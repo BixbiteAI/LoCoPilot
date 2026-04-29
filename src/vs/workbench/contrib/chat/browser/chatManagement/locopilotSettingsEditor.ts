@@ -40,7 +40,7 @@ import { defaultButtonStyles, getInputBoxStyle, getSelectBoxStyles, defaultToggl
 import { settingsSelectBackground, settingsSelectBorder, settingsSelectForeground, settingsSelectListBorder, settingsTextInputBackground, settingsTextInputBorder, settingsTextInputForeground } from '../../../preferences/common/settingsEditorColorRegistry.js';
 import { Toggle } from '../../../../../base/browser/ui/toggle/toggle.js';
 import { SelectBox, ISelectOptionItem, ISelectData } from '../../../../../base/browser/ui/selectBox/selectBox.js';
-import { ICustomLanguageModelsService, ICustomLanguageModel } from '../../common/customLanguageModelsService.js';
+import { ICustomLanguageModelsService, ICustomLanguageModel, getCustomModelListLabel, needsDownloadOrPullRetry } from '../../common/customLanguageModelsService.js';
 import { IDialogService } from '../../../../../platform/dialogs/common/dialogs.js';
 import { ICommandService } from '../../../../../platform/commands/common/commands.js';
 import { ILogService } from '../../../../../platform/log/common/log.js';
@@ -110,6 +110,10 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 	private addFormModelFormatContainer!: HTMLElement;
 	private addFormModelNameInputBox!: InputBox;
 	private addFormModelNameLabel!: HTMLElement;
+	private addFormDisplayNameContainer!: HTMLElement;
+	private addFormDisplayNameInputBox!: InputBox;
+	private addFormLocalhostModelIdContainer!: HTMLElement;
+	private addFormLocalhostModelIdInputBox!: InputBox;
 	private addFormMaxInputTokensInput!: InputBox;
 	private addFormMaxOutputTokensInput!: InputBox;
 	private addFormUseNativeToolsToggle!: Toggle;
@@ -135,9 +139,24 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 	private askPromptFormattedView!: HTMLElement;
 	private agentPromptFormattedRendered: { dispose(): void } | undefined;
 	private askPromptFormattedRendered: { dispose(): void } | undefined;
+	private askCodingSystemPromptToggle!: Toggle;
+	private agentCodingSystemPromptToggle!: Toggle;
+	private agentSettingsSaveBtn!: Button;
+	private agentSettingsCancelBtn!: Button;
+	private agentSettingsBaseline: {
+		maxIterations: number;
+		autoRunSandbox: boolean;
+		llamaPath: string;
+		mlxPath: string;
+		askCoding: boolean;
+		agentCoding: boolean;
+		askPrompt: string;
+		agentPrompt: string;
+	} | undefined;
 	private maxIterationsInput!: InputBox;
 	private autoRunCommandsInSandboxToggle!: Toggle;
 	private llamaCppServerPathInput!: InputBox;
+	private mlxPythonPathInput!: InputBox;
 	private agentSettingsService!: ILoCoPilotAgentSettingsService;
 	private customLanguageModelsService!: ICustomLanguageModelsService;
 	private localModelRunner!: ILoCoPilotLocalModelRunner;
@@ -279,7 +298,12 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 
 		this._register(this.sectionsList.onDidChangeSelection(e => {
 			if (e.elements.length > 0) {
-				this.selectedSection = e.elements[0].id;
+				const previousSection = this.selectedSection;
+				const newSection = e.elements[0].id;
+				this.selectedSection = newSection;
+				if (newSection === LOCOPILOT_SETTINGS_SECTION_ADD_MODEL && previousSection !== LOCOPILOT_SETTINGS_SECTION_ADD_MODEL) {
+					this.resetAddModelFormToDefaults();
+				}
 				this.renderSelectedSection();
 			}
 		}));
@@ -383,6 +407,26 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 			inputBoxStyles: locopilotSettingsInputBoxStyles
 		}));
 
+		// Localhost only: required OpenAI `model` string (e.g. from GET /v1/models)
+		this.addFormLocalhostModelIdContainer = DOM.append(formContainer, $('.form-field'));
+		this.addFormLocalhostModelIdContainer.style.display = 'none';
+		const localhostModelIdLabel = DOM.append(this.addFormLocalhostModelIdContainer, $('label.form-label'));
+		localhostModelIdLabel.textContent = localize('addCustomModel.localhostServerModelId', 'Server model id');
+		const localhostModelIdInputContainer = DOM.append(this.addFormLocalhostModelIdContainer, $('.form-input-container'));
+		this.addFormLocalhostModelIdInputBox = this._register(new InputBox(localhostModelIdInputContainer, this.contextViewService, {
+			placeholder: localize('addCustomModel.localhostServerModelIdPlaceholder', 'e.g. Qwen/Qwen3-4B-MLX-4bit (JSON body "model" field)'),
+			inputBoxStyles: locopilotSettingsInputBoxStyles
+		}));
+
+		this.addFormDisplayNameContainer = DOM.append(formContainer, $('.form-field'));
+		const displayNameLabel = DOM.append(this.addFormDisplayNameContainer, $('label.form-label'));
+		displayNameLabel.textContent = localize('addCustomModel.displayNameOptional', 'Display name (optional)');
+		const displayNameInputContainer = DOM.append(this.addFormDisplayNameContainer, $('.form-input-container'));
+		this.addFormDisplayNameInputBox = this._register(new InputBox(displayNameInputContainer, this.contextViewService, {
+			placeholder: localize('addCustomModel.displayNamePlaceholder', 'Shown in the model list and Auto dropdown; must be unique if set'),
+			inputBoxStyles: locopilotSettingsInputBoxStyles
+		}));
+
 		// Max input tokens (user enters number, default 100,000)
 		const maxInputRow = DOM.append(formContainer, $('.form-field.form-field-tokens'));
 		const maxInputLabel = DOM.append(maxInputRow, $('label.form-label'));
@@ -454,6 +498,22 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 		this.addFormMaxOutputTokensInput.setTooltip(this.maxOutputTokensTooltip(this.addFormMaxOutputTokensInput.value));
 	}
 
+	/** Cloud + first provider, cleared fields, default token limits - use when (re)entering the Add Language Model section. */
+	private resetAddModelFormToDefaults(): void {
+		this.addFormCurrentModelType = 'cloud';
+		this.addFormCurrentProviderIndex = 0;
+		this.addFormModelTypeSelectBox.select(0);
+		this.addFormUpdateProviderOptions();
+		this.addFormModelNameInputBox.value = '';
+		this.addFormDisplayNameInputBox.value = '';
+		this.addFormLocalhostModelIdInputBox.value = '';
+		this.addFormApiKeyInputBox.value = '';
+		this.addFormTokenInputBox.value = '';
+		this.addFormModelFormatInputBox.value = '';
+		this.addFormUseNativeToolsToggle.checked = false;
+		this.addFormUpdateInputFields();
+	}
+
 	private addFormUpdateProviderOptions(): void {
 		const providers = this.addFormCurrentModelType === 'cloud' ? CLOUD_PROVIDERS_ADD : LOCAL_PROVIDERS_ADD;
 		this.addFormProviderSelectBox.setOptions(providers, 0);
@@ -468,6 +528,10 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 		const provider = providers[this.addFormCurrentProviderIndex];
 		const isHuggingFace = this.addFormCurrentModelType === 'local' && provider.text.toLowerCase() === 'huggingface';
 		const isOllama = this.addFormCurrentModelType === 'local' && provider.text.toLowerCase() === 'ollama';
+		const isLocalhost = this.addFormCurrentModelType === 'local' && provider.text.toLowerCase() === 'localhost';
+		if (this.addFormLocalhostModelIdContainer) {
+			this.addFormLocalhostModelIdContainer.style.display = isLocalhost ? '' : 'none';
+		}
 		if (this.addFormCurrentModelType === 'cloud') {
 			if (apiKeyContainer) { apiKeyContainer.style.display = ''; }
 			if (tokenContainer) { tokenContainer.style.display = 'none'; }
@@ -580,9 +644,19 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 
 		const inputResult = this.parseMaxInputK(this.addFormMaxInputTokensInput.value);
 		const outputResult = this.parseMaxOutputTokens(this.addFormMaxOutputTokensInput.value);
-		if (!modelName) {
-			const msg = providerValue === 'localhost' ? localize('addCustomModel.error.urlRequired', 'URL is required') : localize('addCustomModel.error.modelNameRequired', 'Model name is required');
-			await this.dialogService.error(msg);
+		const displayNameOpt = this.addFormDisplayNameInputBox.value.trim();
+		const localhostServerModelId = isLocalhost ? this.addFormLocalhostModelIdInputBox.value.trim() : '';
+		if (isLocalhost) {
+			if (!modelName) {
+				await this.dialogService.error(localize('addCustomModel.error.urlRequired', 'URL is required'));
+				return;
+			}
+			if (!localhostServerModelId) {
+				await this.dialogService.error(localize('addCustomModel.error.localhostServerModelIdRequired', 'Server model id is required (the name your OpenAI-compatible server expects in the request body, e.g. from GET /v1/models).'));
+				return;
+			}
+		} else if (!modelName) {
+			await this.dialogService.error(localize('addCustomModel.error.modelNameRequired', 'Model name is required'));
 			return;
 		}
 		if (this.addFormCurrentModelType === 'cloud' && !apiKey) {
@@ -612,19 +686,23 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 		}
 
 		try {
+			const nameFallback = isLocalhost ? localhostServerModelId : modelName;
 			const addedModel = await this.customLanguageModelsService.addCustomModel({
-				name: providerValue === 'ollama' ? `${modelName} (${ollamaUrl})` : modelName,
+				name: nameFallback,
+				displayName: displayNameOpt || undefined,
 				type: this.addFormCurrentModelType,
 				provider: providerValue,
 				apiKey,
 				token: providerValue === 'ollama' ? undefined : token, // Don't store URL in token secret for Ollama
 				format: format || undefined,
 				modelName: modelName,
+				localhostOpenAiModel: isLocalhost ? localhostServerModelId : undefined,
 				localPath: providerValue === 'ollama' ? ollamaUrl : undefined, // Store Base URL in localPath for Ollama
 				maxInputTokens: inputResult.value,
 				maxOutputTokens: outputResult.value,
 				useNativeTools: this.addFormUseNativeToolsToggle.checked
 			});
+			const listLabel = getCustomModelListLabel(addedModel);
 
 			if (providerValue === 'huggingface' || providerValue === 'ollama') {
 				// Start download process (runs in background; progress updates re-render the list)
@@ -641,22 +719,16 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 					? localize('addCustomModel.ollamaPullStarted', 'Ollama pull started')
 					: localize('addCustomModel.downloadStarted', 'Download started');
 				const infoDetail = providerValue === 'ollama'
-					? localize('addCustomModel.ollamaPullStartedDetail', 'The model "{0}" is being pulled from Ollama. Track progress on the tile below.', modelName)
-					: localize('addCustomModel.downloadStartedDetail', 'The model "{0}" is being downloaded. Track progress on the tile below.', modelName);
+					? localize('addCustomModel.ollamaPullStartedDetail', 'The model "{0}" is being pulled from Ollama. Track progress on the tile below.', listLabel)
+					: localize('addCustomModel.downloadStartedDetail', 'The model "{0}" is being downloaded. Track progress on the tile below.', listLabel);
 				await this.dialogService.info(infoMsg, infoDetail);
 			} else {
 				await this.dialogService.info(
 					localize('addCustomModel.success', 'Model added successfully'),
-					localize('addCustomModel.successDetail', 'The model "{0}" has been added and will appear in the "Auto" dropdown.', modelName)
+					localize('addCustomModel.successDetail', 'The model "{0}" has been added and will appear in the "Auto" dropdown.', listLabel)
 				);
 			}
-			this.addFormModelNameInputBox.value = '';
-			this.addFormApiKeyInputBox.value = '';
-			this.addFormTokenInputBox.value = '';
-			this.addFormModelFormatInputBox.value = '';
-			this.addFormMaxInputTokensInput.value = String(LoCoPilotSettingsEditor.DEFAULT_MAX_INPUT);
-			this.addFormMaxOutputTokensInput.value = String(LoCoPilotSettingsEditor.DEFAULT_MAX_OUTPUT_TOKENS);
-			this.addFormUseNativeToolsToggle.checked = false;
+			this.resetAddModelFormToDefaults();
 		} catch (error) {
 			await this.dialogService.error(localize('addCustomModel.error.addFailed', 'Failed to add model'), toErrorMessage(error));
 		}
@@ -693,10 +765,18 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 		// Row 1: left = model name, right = Run model / Server, Hide, Delete
 		const row1 = DOM.append(itemContainer, $('.model-item-row.model-item-row1'));
 		const nameLabel = DOM.append(row1, $('.model-name'));
-		nameLabel.textContent = model.name;
+		nameLabel.textContent = getCustomModelListLabel(model);
 		const actionsContainer = DOM.append(row1, $('.model-actions'));
 		const runSlot = DOM.append(actionsContainer, $('.model-actions-run-slot'));
-		if (model.provider === 'huggingface' && model.localPath) {
+		const downloadingHFOrOllama = model.isDownloading && (model.provider === 'huggingface' || isOllama);
+		if (needsDownloadOrPullRetry(model)) {
+			const resumeTooltip = localize('customLanguageModels.resumeDownloadTitle', 'Start or resume downloading this model');
+			const resumeButton = this._register(new Button(runSlot, { ...defaultButtonStyles, secondary: true, title: resumeTooltip }));
+			resumeButton.label = localize('customLanguageModels.resumeDownload', 'Download');
+			this._register(resumeButton.onDidClick(() => {
+				this.commandService.executeCommand('locopilot.downloadModel', model.id);
+			}));
+		} else if (model.provider === 'huggingface' && model.localPath && !model.isDownloading) {
 			const isRunning = this.localModelRunner.isServerRunning(model.id);
 			const runServerButton = this._register(new Button(runSlot, { ...defaultButtonStyles, secondary: true }));
 			runServerButton.label = isRunning ? localize('customLanguageModels.stopServer', 'Stop server') : localize('customLanguageModels.runServer', 'Run server');
@@ -712,7 +792,7 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 					this.commandService.executeCommand('locopilot.startLlamaServer', model.id);
 				}
 			}));
-		} else if (isOllama && model.localPath) {
+		} else if (isOllama && model.localPath && !model.isDownloading && !needsDownloadOrPullRetry(model)) {
 			const isRunning = this.localModelRunner.isServerRunning(model.id);
 			const runServerButton = this._register(new Button(runSlot, { ...defaultButtonStyles, secondary: true }));
 			runServerButton.label = isRunning ? localize('customLanguageModels.stopServer', 'Stop server') : localize('customLanguageModels.runOllama', 'Run model');
@@ -724,49 +804,68 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 				}
 			}));
 		}
-		const hideWrap = DOM.append(actionsContainer, $('.model-action-hide'));
-		const hideButton = this._register(new Button(hideWrap, { ...defaultButtonStyles, secondary: true }));
-		hideButton.label = model.hidden ? localize('customLanguageModels.show', 'Show') : localize('customLanguageModels.hide', 'Hide');
-		this._register(hideButton.onDidClick(async () => {
-			await this.customLanguageModelsService.hideCustomModel(model.id, !model.hidden);
-		}));
-		const deleteButton = this._register(new Button(actionsContainer, { ...defaultButtonStyles, secondary: true }));
-		deleteButton.label = localize('customLanguageModels.delete', 'Delete');
-		this._register(deleteButton.onDidClick(async () => {
-			const confirmed = await this.dialogService.confirm({
-				title: localize('customLanguageModels.delete.confirm.title', 'Delete Model'),
-				message: localize('customLanguageModels.delete.confirm.message', 'Are you sure you want to delete "{0}"?', model.name),
-				primaryButton: localize('delete', 'Delete'),
-				type: 'warning'
-			});
-			if (confirmed.confirmed) {
-				itemContainer.classList.add('slide-out');
-				const ANIMATION_MS = 300;
-				await new Promise<void>(resolve => setTimeout(resolve, ANIMATION_MS));
-				try {
-					await this.commandService.executeCommand('locopilot.deleteModelFiles', model.id);
-				} catch {
-					// Ignore; model will still be removed from list
-				}
-				await this.customLanguageModelsService.removeCustomModel(model.id);
+		if (downloadingHFOrOllama) {
+			const stopWrap = DOM.append(actionsContainer, $('.model-action-stop-download'));
+			const tooltip = localize('customLanguageModels.stopDownloadTitle', 'Stop the download or pull and discard partial files');
+			const stopDownloadButton = this._register(new Button(stopWrap, { ...defaultButtonStyles, secondary: true, title: tooltip }));
+			stopDownloadButton.label = localize('customLanguageModels.stopDownload', 'Stop download');
+			this._register(stopDownloadButton.onDidClick(() => {
+				this.commandService.executeCommand('locopilot.cancelModelDownload', model.id);
+			}));
+		} else {
+			if (!needsDownloadOrPullRetry(model)) {
+				const hideWrap = DOM.append(actionsContainer, $('.model-action-hide'));
+				const hideButton = this._register(new Button(hideWrap, { ...defaultButtonStyles, secondary: true }));
+				hideButton.label = model.hidden ? localize('customLanguageModels.show', 'Show') : localize('customLanguageModels.hide', 'Hide');
+				this._register(hideButton.onDidClick(async () => {
+					await this.customLanguageModelsService.hideCustomModel(model.id, !model.hidden);
+				}));
 			}
-		}));
+			const deleteButton = this._register(new Button(actionsContainer, { ...defaultButtonStyles, secondary: true }));
+			deleteButton.label = localize('customLanguageModels.delete', 'Delete');
+			this._register(deleteButton.onDidClick(async () => {
+				const confirmed = await this.dialogService.confirm({
+					title: localize('customLanguageModels.delete.confirm.title', 'Delete Model'),
+					message: localize('customLanguageModels.delete.confirm.message', 'Are you sure you want to delete "{0}"?', getCustomModelListLabel(model)),
+					primaryButton: localize('delete', 'Delete'),
+					type: 'warning'
+				});
+				if (confirmed.confirmed) {
+					itemContainer.classList.add('slide-out');
+					const ANIMATION_MS = 300;
+					await new Promise<void>(resolve => setTimeout(resolve, ANIMATION_MS));
+					try {
+						await this.commandService.executeCommand('locopilot.deleteModelFiles', model.id);
+					} catch {
+						// Ignore; model will still be removed from list
+					}
+					await this.customLanguageModelsService.removeCustomModel(model.id);
+				}
+			}));
+		}
 
-		// Row 2: left = local/cloud • provider • model, right = Tools toggle, Max In, Max Out
+		// Row 2: left = local/cloud | provider | model, right = Tools toggle, Max In, Max Out
 		const row2 = DOM.append(itemContainer, $('.model-item-row.model-item-row2'));
-		let details = `${model.type === 'cloud' ? 'Cloud' : 'Local'} • ${model.provider} • ${model.modelName}`;
+		let details = `${model.type === 'cloud' ? 'Cloud' : 'Local'} | ${model.provider} | ${model.modelName}`;
+		if (model.provider === 'localhost' && model.localhostOpenAiModel) {
+			details += ` | ${localize('customLanguageModels.localhostModelId', 'API model: {0}', model.localhostOpenAiModel)}`;
+		}
 		if (model.type === 'local' && model.useNativeTools) {
-			details += ` • ${localize('customLanguageModels.nativeTools', 'Native Tools')}`;
+			details += ` | ${localize('customLanguageModels.nativeTools', 'Native Tools')}`;
 		}
 		if (model.format) {
-			details += ` • ${model.format}`;
+			details += ` | ${model.format}`;
 		}
 		if (model.isDownloading) {
 			details += isOllama
-				? ` • ${localize('customLanguageModels.pullingInProgress', 'Pulling…')}`
-				: ` • ${localize('customLanguageModels.downloading', 'Downloading')} ${model.downloadProgress ?? 0}%`;
-		} else if ((model.provider === 'huggingface' || isOllama) && model.localPath) {
-			details += ` • ${isOllama ? localize('customLanguageModels.ready', 'Ready') : localize('customLanguageModels.downloaded', 'Downloaded')}`;
+				? ` | ${localize('customLanguageModels.pullingInProgress', 'Pulling...')}`
+				: ` | ${localize('customLanguageModels.downloading', 'Downloading')} ${model.downloadProgress ?? 0}%`;
+		} else if (model.provider === 'huggingface' || isOllama) {
+			if (!needsDownloadOrPullRetry(model)) {
+				details += ` | ${isOllama ? localize('customLanguageModels.ready', 'Ready') : localize('customLanguageModels.downloaded', 'Downloaded')}`;
+			} else {
+				details += ` | ${localize('customLanguageModels.downloadNotFinished', 'Download not finished')}`;
+			}
 		}
 		const detailsLabel = DOM.append(row2, $('.model-details'));
 		detailsLabel.textContent = details;
@@ -838,7 +937,7 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 			const row3 = DOM.append(itemContainer, $('.model-item-row.model-item-row3'));
 			const loadingWrap = DOM.append(row3, $('.model-ollama-pull-loading'));
 			const loadingLabel = DOM.append(loadingWrap, $('.model-ollama-pull-label'));
-			loadingLabel.textContent = localize('customLanguageModels.ollamaPullLoading', 'Pulling model from Ollama…');
+			loadingLabel.textContent = localize('customLanguageModels.ollamaPullLoading', 'Pulling model from Ollama...');
 			const activity = DOM.append(loadingWrap, $('.model-ollama-activity'));
 			activity.setAttribute('aria-hidden', 'true');
 			for (let i = 0; i < 8; i++) {
@@ -850,14 +949,15 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 			const row3 = DOM.append(itemContainer, $('.model-item-row.model-item-row3'));
 			const progressWrap = DOM.append(row3, $('.model-download-progress-wrap'));
 			const progressLabel = DOM.append(progressWrap, $('.model-download-progress-label'));
-			progressLabel.textContent = localize('customLanguageModels.downloadProgressShort', 'Downloading… {0}%', model.downloadProgress ?? 0);
+			progressLabel.textContent = localize('customLanguageModels.downloadProgressShort', 'Downloading... {0}%', model.downloadProgress ?? 0);
 			const progressTrack = DOM.append(progressWrap, $('.model-download-progress-track'));
 			const progressFill = DOM.append(progressTrack, $('.model-download-progress-fill'));
 			const pct = Math.min(100, Math.max(0, model.downloadProgress ?? 0));
 			progressFill.style.setProperty('width', `${pct}%`);
 			progressWrap.setAttribute('aria-label', localize('customLanguageModels.downloadProgress', 'Download progress {0}%', pct));
 		}
-		if ((model.provider === 'huggingface' || isOllama) && model.localPath && !model.isDownloading) {
+		const showInstalledPathRow = !model.isDownloading && model.localPath && (model.provider === 'huggingface' || isOllama) && !needsDownloadOrPullRetry(model);
+		if (showInstalledPathRow) {
 			const row3 = DOM.append(itemContainer, $('.model-item-row.model-item-row3'));
 			const pathLabel = DOM.append(row3, $('.model-saved-path'));
 			pathLabel.textContent = isOllama
@@ -878,6 +978,7 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 			inputBoxStyles: locopilotSettingsInputBoxStyles
 		}));
 		this.maxIterationsInput.value = String(this.agentSettingsService.getMaxIterationsPerRequest());
+		this._register(this.maxIterationsInput.onDidChange(() => this.updateAgentSettingsDirtyIndicators()));
 
 		// Auto approve terminal commands (on/off switch; default off)
 		const autoRunRow = DOM.append(container, $('.agent-setting-row'));
@@ -890,6 +991,7 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 			...defaultToggleStyles
 		}));
 		DOM.append(autoRunWrap, this.autoRunCommandsInSandboxToggle.domNode);
+		this._register(this.autoRunCommandsInSandboxToggle.onChange(() => this.updateAgentSettingsDirtyIndicators()));
 
 		// Llama.cpp server path (for local GGUF models)
 		const llamaPathRow = DOM.append(container, $('.agent-setting-row'));
@@ -901,54 +1003,217 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 			inputBoxStyles: locopilotSettingsInputBoxStyles
 		}));
 		this.llamaCppServerPathInput.value = this.configurationService.getValue<string>(ChatConfiguration.LocopilotLlamaCppServerPath) ?? '';
+		this._register(this.llamaCppServerPathInput.onDidChange(() => this.updateAgentSettingsDirtyIndicators()));
 
-		// System Prompt for Agent - single formatted box: shows rendered markdown, click to edit as text
+		// Python for MLX (mlx-lm) - Apple Silicon only
+		const mlxPythonRow = DOM.append(container, $('.agent-setting-row'));
+		const mlxPythonLabel = DOM.append(mlxPythonRow, $('label.locopilot-setting-label'));
+		mlxPythonLabel.textContent = localize('locopilotSettings.mlxPythonPath', "Python for MLX (mlx-lm)");
+		const mlxPythonWrap = DOM.append(mlxPythonRow, $('.agent-setting-input-wrap.agent-setting-path-wrap'));
+		this.mlxPythonPathInput = this._register(new InputBox(DOM.append(mlxPythonWrap, $('div')), this.contextViewService, {
+			placeholder: localize('locopilotSettings.mlxPythonPathPlaceholder', "Leave empty for python3, or path to a venv Python"),
+			inputBoxStyles: locopilotSettingsInputBoxStyles
+		}));
+		this.mlxPythonPathInput.value = this.configurationService.getValue<string>(ChatConfiguration.LocopilotMlxPythonPath) ?? '';
+		this._register(this.mlxPythonPathInput.onDidChange(() => this.updateAgentSettingsDirtyIndicators()));
+
+		// LoCoPilot prompt - Agent (toggle label only; no separate section heading)
 		const agentSection = DOM.append(container, $('.agent-setting-block'));
-		const agentTitle = DOM.append(agentSection, $('.locopilot-setting-label'));
-		agentTitle.textContent = localize('locopilotSettings.systemPromptAgent', "System Prompt for Agent");
+		const agentCodingRow = DOM.append(agentSection, $('.agent-setting-row'));
+		const agentCodingLabel = DOM.append(agentCodingRow, $('label.locopilot-setting-label'));
+		agentCodingLabel.textContent = localize('locopilotSettings.locopilotPromptAgent', "LoCoPilot's prompt (Agent)");
+		const agentCodingWrap = DOM.append(agentCodingRow, $('.agent-setting-toggle-wrap.agent-setting-switch-wrap'));
+		this.agentCodingSystemPromptToggle = this._register(new Toggle({
+			title: localize('locopilotSettings.locopilotPromptAgentDescription', "When on, Agent mode uses LoCoPilot's built-in coding prompt (tools are appended). When off, you can optionally edit below; leave blank for a short default opener."),
+			isChecked: this.agentSettingsService.getAgentUseCodingSystemPrompt(),
+			...defaultToggleStyles
+		}));
+		DOM.append(agentCodingWrap, this.agentCodingSystemPromptToggle.domNode);
+		this._register(this.agentCodingSystemPromptToggle.onChange(() => {
+			this.updateCodingPromptUIMode('agent');
+			this._renderFormattedPrompt('agent');
+			this.updateAgentSettingsDirtyIndicators();
+		}));
+
 		const agentBox = DOM.append(agentSection, $('.locopilot-prompt-box'));
 		this.agentPromptFormattedView = DOM.append(agentBox, $('.locopilot-prompt-formatted'));
 		this.agentPromptFormattedView.setAttribute('role', 'button');
 		this.agentPromptFormattedView.setAttribute('tabindex', '0');
 		this.agentPromptFormattedView.title = localize('locopilotSettings.clickToEdit', "Click to edit");
 		this.agentPromptTextarea = DOM.append(agentBox, $('textarea.locopilot-prompt-textarea')) as HTMLTextAreaElement;
-		this.agentPromptTextarea.placeholder = localize('locopilotSettings.agentPromptPlaceholder', "General system prompt for Agent mode (tools prompt is added automatically). Use Markdown: **bold**, *italic*, lists...");
+		this.agentPromptTextarea.placeholder = localize('locopilotSettings.agentPromptPlaceholder', "Optional when LoCoPilot's prompt is off. Blank uses a one-line default opener.");
 		this.agentPromptTextarea.value = this.agentSettingsService.getAgentModeSystemPrompt();
 		this.agentPromptTextarea.classList.add('locopilot-prompt-textarea-hidden');
+		this.updateCodingPromptUIMode('agent');
 		this._renderFormattedPrompt('agent');
 		this._register(DOM.addDisposableListener(this.agentPromptFormattedView, 'click', () => this._switchToEditPrompt('agent')));
 		this._register(DOM.addDisposableListener(this.agentPromptFormattedView, 'keydown', (e: KeyboardEvent) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); this._switchToEditPrompt('agent'); } }));
 		this._register(DOM.addDisposableListener(this.agentPromptTextarea, 'blur', () => this._switchToFormattedPrompt('agent')));
+		this._register(DOM.addDisposableListener(this.agentPromptTextarea, 'input', () => this.updateAgentSettingsDirtyIndicators()));
 
-		// System Prompt for Ask - single formatted box
+		// LoCoPilot prompt - Ask (toggle label only; no separate section heading)
 		const askSection = DOM.append(container, $('.agent-setting-block'));
-		const askTitle = DOM.append(askSection, $('.locopilot-setting-label'));
-		askTitle.textContent = localize('locopilotSettings.systemPromptAsk', "System Prompt for Ask");
+		const askCodingRow = DOM.append(askSection, $('.agent-setting-row'));
+		const askCodingLabel = DOM.append(askCodingRow, $('label.locopilot-setting-label'));
+		askCodingLabel.textContent = localize('locopilotSettings.locopilotPromptAsk', "LoCoPilot's prompt (Ask)");
+		const askCodingWrap = DOM.append(askCodingRow, $('.agent-setting-toggle-wrap.agent-setting-switch-wrap'));
+		this.askCodingSystemPromptToggle = this._register(new Toggle({
+			title: localize('locopilotSettings.locopilotPromptAskDescription', "When on, Ask mode uses LoCoPilot's built-in coding prompt for Ask mode (tools are appended). When off, you can optionally edit below; leave blank for a short default opener."),
+			isChecked: this.agentSettingsService.getAskUseCodingSystemPrompt(),
+			...defaultToggleStyles
+		}));
+		DOM.append(askCodingWrap, this.askCodingSystemPromptToggle.domNode);
+		this._register(this.askCodingSystemPromptToggle.onChange(() => {
+			this.updateCodingPromptUIMode('ask');
+			this._renderFormattedPrompt('ask');
+			this.updateAgentSettingsDirtyIndicators();
+		}));
+
 		const askBox = DOM.append(askSection, $('.locopilot-prompt-box'));
 		this.askPromptFormattedView = DOM.append(askBox, $('.locopilot-prompt-formatted'));
 		this.askPromptFormattedView.setAttribute('role', 'button');
 		this.askPromptFormattedView.setAttribute('tabindex', '0');
 		this.askPromptFormattedView.title = localize('locopilotSettings.clickToEdit', "Click to edit");
 		this.askPromptTextarea = DOM.append(askBox, $('textarea.locopilot-prompt-textarea')) as HTMLTextAreaElement;
-		this.askPromptTextarea.placeholder = localize('locopilotSettings.askPromptPlaceholder', "General system prompt for Ask mode (tools prompt is added automatically). Use Markdown: **bold**, *italic*, lists...");
+		this.askPromptTextarea.placeholder = localize('locopilotSettings.askPromptPlaceholder', "Optional when LoCoPilot's prompt is off. Blank uses a one-line default opener.");
 		this.askPromptTextarea.value = this.agentSettingsService.getAskModeSystemPrompt();
 		this.askPromptTextarea.classList.add('locopilot-prompt-textarea-hidden');
+		this.updateCodingPromptUIMode('ask');
 		this._renderFormattedPrompt('ask');
 		this._register(DOM.addDisposableListener(this.askPromptFormattedView, 'click', () => this._switchToEditPrompt('ask')));
 		this._register(DOM.addDisposableListener(this.askPromptFormattedView, 'keydown', (e: KeyboardEvent) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); this._switchToEditPrompt('ask'); } }));
 		this._register(DOM.addDisposableListener(this.askPromptTextarea, 'blur', () => this._switchToFormattedPrompt('ask')));
+		this._register(DOM.addDisposableListener(this.askPromptTextarea, 'input', () => this.updateAgentSettingsDirtyIndicators()));
 
-		// Footer: Cancel (left), Restore to default (middle, primary), Save (right)
 		const footerRow = DOM.append(container, $('.agent-setting-footer'));
-		const cancelBtn = this._register(new Button(footerRow, { ...defaultButtonStyles, secondary: true }));
-		cancelBtn.label = localize('locopilotSettings.cancel', "Cancel");
-		cancelBtn.onDidClick(() => this.cancelAgentSettings());
-		const restoreBtn = this._register(new Button(footerRow, { ...defaultButtonStyles }));
-		restoreBtn.label = localize('locopilotSettings.restoreAllToDefault', "Restore to default");
-		restoreBtn.onDidClick(() => this.restoreAllAgentSettingsToDefault());
-		const saveBtn = this._register(new Button(footerRow, { ...defaultButtonStyles }));
-		saveBtn.label = localize('locopilotSettings.save', "Save");
-		saveBtn.onDidClick(() => { this.saveAgentSettings(); });
+		this.agentSettingsCancelBtn = this._register(new Button(footerRow, { ...defaultButtonStyles, secondary: true }));
+		this.agentSettingsCancelBtn.label = localize('locopilotSettings.cancel', "Cancel");
+		this.agentSettingsCancelBtn.enabled = false;
+		this.agentSettingsCancelBtn.onDidClick(() => this.cancelAgentSettings());
+		this.agentSettingsSaveBtn = this._register(new Button(footerRow, { ...defaultButtonStyles }));
+		this.agentSettingsSaveBtn.label = localize('locopilotSettings.save', "Save");
+		this.agentSettingsSaveBtn.enabled = false;
+		this.agentSettingsSaveBtn.onDidClick(() => { this.saveAgentSettings(); });
+
+		this.captureAgentSettingsBaselineFromPersisted();
+		this.updateAgentSettingsDirtyIndicators();
+	}
+
+	private takeAgentSettingsSnapshotFromPersisted(): {
+		maxIterations: number;
+		autoRunSandbox: boolean;
+		llamaPath: string;
+		mlxPath: string;
+		askCoding: boolean;
+		agentCoding: boolean;
+		askPrompt: string;
+		agentPrompt: string;
+	} {
+		return {
+			maxIterations: this.agentSettingsService.getMaxIterationsPerRequest(),
+			autoRunSandbox: this.agentSettingsService.getAutoRunCommandsInSandbox(),
+			llamaPath: (this.configurationService.getValue<string>(ChatConfiguration.LocopilotLlamaCppServerPath) ?? '').trim(),
+			mlxPath: (this.configurationService.getValue<string>(ChatConfiguration.LocopilotMlxPythonPath) ?? '').trim(),
+			askCoding: this.agentSettingsService.getAskUseCodingSystemPrompt(),
+			agentCoding: this.agentSettingsService.getAgentUseCodingSystemPrompt(),
+			askPrompt: this.agentSettingsService.getAskModeSystemPrompt().trim(),
+			agentPrompt: this.agentSettingsService.getAgentModeSystemPrompt().trim(),
+		};
+	}
+
+	private snapshotAgentPanelFromUI(): {
+		maxIterations: number;
+		autoRunSandbox: boolean;
+		llamaPath: string;
+		mlxPath: string;
+		askCoding: boolean;
+		agentCoding: boolean;
+		askPrompt: string;
+		agentPrompt: string;
+	} {
+		const rawN = parseInt(this.maxIterationsInput.value.trim(), 10);
+		return {
+			maxIterations: isNaN(rawN) ? -1 : rawN,
+			autoRunSandbox: this.autoRunCommandsInSandboxToggle.checked,
+			llamaPath: this.llamaCppServerPathInput.value.trim(),
+			mlxPath: this.mlxPythonPathInput.value.trim(),
+			askCoding: this.askCodingSystemPromptToggle.checked,
+			agentCoding: this.agentCodingSystemPromptToggle.checked,
+			askPrompt: this.askPromptTextarea.value.trim(),
+			agentPrompt: this.agentPromptTextarea.value.trim(),
+		};
+	}
+
+	private captureAgentSettingsBaselineFromPersisted(): void {
+		this.agentSettingsBaseline = this.takeAgentSettingsSnapshotFromPersisted();
+	}
+
+	private isAgentSettingsDirty(): boolean {
+		if (!this.agentSettingsBaseline) {
+			return false;
+		}
+		const cur = this.snapshotAgentPanelFromUI();
+		const b = this.agentSettingsBaseline;
+		return (
+			b.maxIterations !== cur.maxIterations ||
+			b.autoRunSandbox !== cur.autoRunSandbox ||
+			b.llamaPath !== cur.llamaPath ||
+			b.mlxPath !== cur.mlxPath ||
+			b.askCoding !== cur.askCoding ||
+			b.agentCoding !== cur.agentCoding ||
+			b.askPrompt !== cur.askPrompt ||
+			b.agentPrompt !== cur.agentPrompt
+		);
+	}
+
+	private updateAgentSettingsDirtyIndicators(): void {
+		const dirty = this.isAgentSettingsDirty();
+		this.agentSettingsSaveBtn.enabled = dirty;
+		this.agentSettingsCancelBtn.enabled = dirty;
+	}
+
+	private updateCodingPromptUIMode(which: 'agent' | 'ask'): void {
+		const useBuiltin = which === 'agent' ? this.agentCodingSystemPromptToggle.checked : this.askCodingSystemPromptToggle.checked;
+		const textarea = which === 'agent' ? this.agentPromptTextarea : this.askPromptTextarea;
+		const formatted = which === 'agent' ? this.agentPromptFormattedView : this.askPromptFormattedView;
+		const wrap = formatted.parentElement;
+		textarea.disabled = useBuiltin;
+		if (useBuiltin) {
+			formatted.removeAttribute('role');
+			formatted.tabIndex = -1;
+			formatted.removeAttribute('title');
+			wrap?.classList.add('locopilot-prompt-box-disabled');
+		} else {
+			formatted.setAttribute('role', 'button');
+			formatted.tabIndex = 0;
+			formatted.title = localize('locopilotSettings.clickToEdit', "Click to edit");
+			wrap?.classList.remove('locopilot-prompt-box-disabled');
+		}
+	}
+
+	private updateCodingPromptUIModes(): void {
+		this.updateCodingPromptUIMode('agent');
+		this.updateCodingPromptUIMode('ask');
+	}
+
+	private loadAgentPanelFromPersisted(): void {
+		this.maxIterationsInput.value = String(this.agentSettingsService.getMaxIterationsPerRequest());
+		this.autoRunCommandsInSandboxToggle.checked = this.agentSettingsService.getAutoRunCommandsInSandbox();
+		this.llamaCppServerPathInput.value = this.configurationService.getValue<string>(ChatConfiguration.LocopilotLlamaCppServerPath) ?? '';
+		this.mlxPythonPathInput.value = this.configurationService.getValue<string>(ChatConfiguration.LocopilotMlxPythonPath) ?? '';
+		this.askCodingSystemPromptToggle.checked = this.agentSettingsService.getAskUseCodingSystemPrompt();
+		this.agentCodingSystemPromptToggle.checked = this.agentSettingsService.getAgentUseCodingSystemPrompt();
+		this.askPromptTextarea.value = this.agentSettingsService.getAskModeSystemPrompt();
+		this.agentPromptTextarea.value = this.agentSettingsService.getAgentModeSystemPrompt();
+		this.updateCodingPromptUIModes();
+		this._renderFormattedPrompt('agent');
+		this._renderFormattedPrompt('ask');
+		this.agentPromptFormattedView.classList.remove('locopilot-prompt-formatted-hidden');
+		this.askPromptFormattedView.classList.remove('locopilot-prompt-formatted-hidden');
+		this.agentPromptTextarea.classList.add('locopilot-prompt-textarea-hidden');
+		this.askPromptTextarea.classList.add('locopilot-prompt-textarea-hidden');
+		this.captureAgentSettingsBaselineFromPersisted();
+		this.updateAgentSettingsDirtyIndicators();
 	}
 
 	private async saveAgentSettings(): Promise<void> {
@@ -961,14 +1226,17 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 			);
 			return;
 		}
-		const askPrompt = this.askPromptTextarea.value.trim();
-		const agentPrompt = this.agentPromptTextarea.value.trim();
 		try {
 			this.agentSettingsService.setMaxIterationsPerRequest(n);
 			this.agentSettingsService.setAutoRunCommandsInSandbox(this.autoRunCommandsInSandboxToggle.checked);
-			this.agentSettingsService.setAskModeSystemPrompt(askPrompt);
-			this.agentSettingsService.setAgentModeSystemPrompt(agentPrompt);
+			this.agentSettingsService.setAskUseCodingSystemPrompt(this.askCodingSystemPromptToggle.checked);
+			this.agentSettingsService.setAgentUseCodingSystemPrompt(this.agentCodingSystemPromptToggle.checked);
+			this.agentSettingsService.setAskModeSystemPrompt(this.askPromptTextarea.value.trim());
+			this.agentSettingsService.setAgentModeSystemPrompt(this.agentPromptTextarea.value.trim());
 			await this.configurationService.updateValue(ChatConfiguration.LocopilotLlamaCppServerPath, this.llamaCppServerPathInput.value.trim());
+			await this.configurationService.updateValue(ChatConfiguration.LocopilotMlxPythonPath, this.mlxPythonPathInput.value.trim());
+			this.captureAgentSettingsBaselineFromPersisted();
+			this.updateAgentSettingsDirtyIndicators();
 			await this.dialogService.info(
 				localize('locopilotSettings.saveSuccess', "Settings saved"),
 				localize('locopilotSettings.saveSuccessDetail', "Agent settings have been saved successfully.")
@@ -984,6 +1252,7 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 	private _renderFormattedPrompt(which: 'agent' | 'ask'): void {
 		const textarea = which === 'agent' ? this.agentPromptTextarea : this.askPromptTextarea;
 		const container = which === 'agent' ? this.agentPromptFormattedView : this.askPromptFormattedView;
+		const useCodingBuiltin = which === 'agent' ? this.agentCodingSystemPromptToggle.checked : this.askCodingSystemPromptToggle.checked;
 		const setRendered = (r: { dispose(): void } | undefined) => {
 			if (which === 'agent') { this.agentPromptFormattedRendered = r; } else { this.askPromptFormattedRendered = r; }
 		};
@@ -992,11 +1261,24 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 			prev.dispose();
 			setRendered(undefined);
 		}
+		if (useCodingBuiltin) {
+			DOM.reset(container);
+			container.textContent = which === 'agent'
+				? localize(
+					'locopilotSettings.locopilotBuiltinPromptActiveAgent',
+					'LoCoPilot\'s built-in coding prompt is active. Turn off "LoCoPilot\'s prompt (Agent)" to customize.'
+				)
+				: localize(
+					'locopilotSettings.locopilotBuiltinPromptActiveAsk',
+					'LoCoPilot\'s built-in coding prompt is active. Turn off "LoCoPilot\'s prompt (Ask)" to customize.'
+				);
+			container.classList.add('locopilot-prompt-is-default');
+			return;
+		}
 		const trimmed = textarea.value.trim();
 		if (!trimmed) {
 			DOM.reset(container);
-			// Show a placeholder message instead of the full default prompt
-			container.textContent = localize('locopilotSettings.clickToCustomize', "Click to customize system prompt.");
+			container.textContent = localize('locopilotSettings.clickToCustomize', "Click to customize.");
 			container.classList.add('locopilot-prompt-is-default');
 			return;
 		}
@@ -1007,6 +1289,9 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 	}
 
 	private _switchToEditPrompt(which: 'agent' | 'ask'): void {
+		if ((which === 'agent' && this.agentCodingSystemPromptToggle.checked) || (which === 'ask' && this.askCodingSystemPromptToggle.checked)) {
+			return;
+		}
 		const formatted = which === 'agent' ? this.agentPromptFormattedView : this.askPromptFormattedView;
 		const textarea = which === 'agent' ? this.agentPromptTextarea : this.askPromptTextarea;
 		formatted.classList.add('locopilot-prompt-formatted-hidden');
@@ -1023,32 +1308,7 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 	}
 
 	private cancelAgentSettings(): void {
-		this.askPromptTextarea.value = this.agentSettingsService.getAskModeSystemPrompt();
-		this.agentPromptTextarea.value = this.agentSettingsService.getAgentModeSystemPrompt();
-		this.maxIterationsInput.value = String(this.agentSettingsService.getMaxIterationsPerRequest());
-		this.autoRunCommandsInSandboxToggle.checked = this.agentSettingsService.getAutoRunCommandsInSandbox();
-		this.llamaCppServerPathInput.value = this.configurationService.getValue<string>(ChatConfiguration.LocopilotLlamaCppServerPath) ?? '';
-		this._renderFormattedPrompt('agent');
-		this._renderFormattedPrompt('ask');
-		this.agentPromptFormattedView.classList.remove('locopilot-prompt-formatted-hidden');
-		this.askPromptFormattedView.classList.remove('locopilot-prompt-formatted-hidden');
-		this.agentPromptTextarea.classList.add('locopilot-prompt-textarea-hidden');
-		this.askPromptTextarea.classList.add('locopilot-prompt-textarea-hidden');
-	}
-
-	private restoreAllAgentSettingsToDefault(): void {
-		this.agentSettingsService.restoreAllToDefault();
-		this.askPromptTextarea.value = '';
-		this.agentPromptTextarea.value = '';
-		this.maxIterationsInput.value = String(this.agentSettingsService.getMaxIterationsPerRequest());
-		this.autoRunCommandsInSandboxToggle.checked = this.agentSettingsService.getAutoRunCommandsInSandbox();
-		this.llamaCppServerPathInput.value = '';
-		this._renderFormattedPrompt('agent');
-		this._renderFormattedPrompt('ask');
-		this.agentPromptFormattedView.classList.remove('locopilot-prompt-formatted-hidden');
-		this.askPromptFormattedView.classList.remove('locopilot-prompt-formatted-hidden');
-		this.agentPromptTextarea.classList.add('locopilot-prompt-textarea-hidden');
-		this.askPromptTextarea.classList.add('locopilot-prompt-textarea-hidden');
+		this.loadAgentPanelFromPersisted();
 	}
 
 	private renderSelectedSection(): void {
@@ -1066,16 +1326,7 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 				break;
 			case LOCOPILOT_SETTINGS_SECTION_AGENT_SETTINGS:
 				this.agentSettingsPanel.style.display = 'flex';
-				this.askPromptTextarea.value = this.agentSettingsService.getAskModeSystemPrompt();
-				this.agentPromptTextarea.value = this.agentSettingsService.getAgentModeSystemPrompt();
-				this.maxIterationsInput.value = String(this.agentSettingsService.getMaxIterationsPerRequest());
-				this.autoRunCommandsInSandboxToggle.checked = this.agentSettingsService.getAutoRunCommandsInSandbox();
-				this._renderFormattedPrompt('agent');
-				this._renderFormattedPrompt('ask');
-				this.agentPromptFormattedView.classList.remove('locopilot-prompt-formatted-hidden');
-				this.askPromptFormattedView.classList.remove('locopilot-prompt-formatted-hidden');
-				this.agentPromptTextarea.classList.add('locopilot-prompt-textarea-hidden');
-				this.askPromptTextarea.classList.add('locopilot-prompt-textarea-hidden');
+				this.loadAgentPanelFromPersisted();
 				break;
 		}
 
@@ -1092,7 +1343,11 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 		await super.setInput(input, options, context, token);
 		const initialSection = input.initialSection;
 		if (initialSection) {
+			const previousSection = this.selectedSection;
 			this.selectedSection = initialSection;
+			if (initialSection === LOCOPILOT_SETTINGS_SECTION_ADD_MODEL && previousSection !== LOCOPILOT_SETTINGS_SECTION_ADD_MODEL) {
+				this.resetAddModelFormToDefaults();
+			}
 			const idx = this.sections.findIndex(s => s.id === initialSection);
 			if (idx >= 0 && this.sectionsList) {
 				this.sectionsList.setSelection([idx]);

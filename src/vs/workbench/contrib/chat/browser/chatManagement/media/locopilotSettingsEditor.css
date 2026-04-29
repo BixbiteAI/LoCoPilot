@@ -53,7 +53,7 @@
 
 /*
  * Workbench (style.css) draws a full-list focus ring via ::before on .monaco-list:focus
- * when the list has no row keyboard focus — theme color on all sides. Hide it here; row
+ * when the list has no row keyboard focus - theme color on all sides. Hide it here; row
  * selection/focus styling still comes from .monaco-list-row.focused.
  */
 .monaco-workbench .locopilot-settings-editor .sidebar-container .monaco-list:not(.element-focused):not(:active):focus:before {

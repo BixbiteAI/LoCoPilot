@@ -8,12 +8,61 @@ import { Disposable } from '../../../../base/common/lifecycle.js';
 import { createDecorator } from '../../../../platform/instantiation/common/instantiation.js';
 import { IStorageService, StorageScope, StorageTarget } from '../../../../platform/storage/common/storage.js';
 import { ISecretStorageService } from '../../../../platform/secrets/common/secrets.js';
+import { localize } from '../../../../nls.js';
 
 export const ICustomLanguageModelsService = createDecorator<ICustomLanguageModelsService>('customLanguageModelsService');
+
+/**
+ * User-facing label for the model list and the Auto / model picker.
+ * When `displayName` is set it wins (must be unique). Otherwise Ollama uses `modelName` so URLs are not shown
+ * for older entries that stored the base URL in `name`.
+ */
+export function getCustomModelListLabel(model: ICustomLanguageModel): string {
+	const d = model.displayName?.trim();
+	if (d) {
+		return d;
+	}
+	if (model.provider === 'ollama') {
+		return model.modelName;
+	}
+	return model.name;
+}
+
+/** True when the model can be chosen in chat / agent (picker); excludes downloads in progress and incomplete HF/Ollama installs. */
+export function isCustomModelReadyForChat(model: ICustomLanguageModel): boolean {
+	if (model.hidden || model.isDownloading) {
+		return false;
+	}
+	if (model.provider === 'huggingface') {
+		const p = model.localPath?.trim() ?? '';
+		return p.length > 0 && !/^https?:\/\//i.test(p);
+	}
+	if (model.provider === 'ollama') {
+		return model.ollamaPullComplete !== false;
+	}
+	return true;
+}
+
+export function needsDownloadOrPullRetry(model: ICustomLanguageModel): boolean {
+	if (model.isDownloading) {
+		return false;
+	}
+	if (model.provider === 'huggingface') {
+		const p = model.localPath?.trim() ?? '';
+		const hasArtifacts = p.length > 0 && !/^https?:\/\//i.test(p);
+		return !hasArtifacts;
+	}
+	if (model.provider === 'ollama') {
+		return model.ollamaPullComplete === false;
+	}
+	return false;
+}
 
 export interface ICustomLanguageModel {
 	id: string;
 	name: string;
+	/** Optional unique label; when set, shown in the model picker and lists instead of `name` / `modelName`. */
+	displayName?: string;
 	type: 'cloud' | 'local';
 	provider: string;
 	apiKey?: string; // Stored in secret storage
@@ -27,6 +76,8 @@ export interface ICustomLanguageModel {
 	/** Local path where the model is stored */
 	localPath?: string;
 	modelName: string;
+	/** For provider `localhost`: value for JSON `model` (OpenAI id as in GET /v1/models). */
+	localhostOpenAiModel?: string;
 	/** Max input tokens (context window); default 100000 (100K) */
 	maxInputTokens?: number;
 	/** Max output tokens; default 8000 (8K) */
@@ -35,6 +86,11 @@ export interface ICustomLanguageModel {
 	useNativeTools?: boolean;
 	createdAt: number;
 	hidden?: boolean; // Whether the model is hidden/disabled
+	/**
+	 * For `ollama`: false until the first successful pull finishes; set to false when a pull is cancelled.
+	 * Omitted or undefined means true (legacy entries treated as already pulled).
+	 */
+	ollamaPullComplete?: boolean;
 }
 
 export interface ICustomLanguageModelsService {
@@ -42,6 +98,8 @@ export interface ICustomLanguageModelsService {
 	readonly onDidChangeCustomModels: Event<void>;
 	getCustomModels(): ICustomLanguageModel[];
 	getVisibleCustomModels(): ICustomLanguageModel[];
+	/** Custom models that can be used in chat (excludes hidden, in-progress downloads, incomplete HF disk install, cancelled Ollama pull). */
+	getChatSelectableCustomModels(): ICustomLanguageModel[];
 	getSelectedCustomModelId(): string | undefined;
 	setSelectedCustomModelId(id: string | undefined): void;
 	addCustomModel(model: Omit<ICustomLanguageModel, 'id' | 'createdAt'>): Promise<ICustomLanguageModel>;
@@ -84,7 +142,8 @@ export class CustomLanguageModelsService extends Disposable implements ICustomLa
 				hidden: m.hidden ?? false,
 				useNativeTools: m.useNativeTools ?? false,
 				maxInputTokens: m.maxInputTokens ?? 100000,
-				maxOutputTokens: m.maxOutputTokens ?? 8000
+				maxOutputTokens: m.maxOutputTokens ?? 8000,
+				ollamaPullComplete: m.provider === 'ollama' ? (m.ollamaPullComplete ?? true) : m.ollamaPullComplete
 			}));
 			// Load secrets for each model
 			for (const model of this.models) {
@@ -105,6 +164,10 @@ export class CustomLanguageModelsService extends Disposable implements ICustomLa
 			}
 		} catch (e) {
 			this.models = [];
+		}
+		const cleared = this._clearSelectedIfNotChatReady();
+		if (cleared) {
+			this._onDidChangeCustomModels.fire();
 		}
 	}
 
@@ -132,12 +195,35 @@ export class CustomLanguageModelsService extends Disposable implements ICustomLa
 		return `${SECRET_PREFIX}${modelId}:${type}`;
 	}
 
+	private _clearSelectedIfNotChatReady(): boolean {
+		const prev = this.selectedCustomModelId;
+		if (!prev) {
+			return false;
+		}
+		const model = this.models.find(m => m.id === prev);
+		if (model && isCustomModelReadyForChat(model)) {
+			return false;
+		}
+		this.selectedCustomModelId = undefined;
+		this.storageService.store(STORAGE_KEY_SELECTED, '', StorageScope.APPLICATION, StorageTarget.MACHINE);
+		return true;
+	}
+
+	private _displayNameCollides(trimmedDisplayName: string, excludeId?: string): boolean {
+		const key = trimmedDisplayName.toLowerCase();
+		return this.models.some(m => m.id !== excludeId && (m.displayName?.trim().toLowerCase() === key));
+	}
+
 	getCustomModels(): ICustomLanguageModel[] {
 		return [...this.models];
 	}
 
 	getVisibleCustomModels(): ICustomLanguageModel[] {
 		return this.models.filter(m => !m.hidden);
+	}
+
+	getChatSelectableCustomModels(): ICustomLanguageModel[] {
+		return this.models.filter(m => isCustomModelReadyForChat(m));
 	}
 
 	getSelectedCustomModelId(): string | undefined {
@@ -153,11 +239,19 @@ export class CustomLanguageModelsService extends Disposable implements ICustomLa
 	}
 
 	async addCustomModel(modelData: Omit<ICustomLanguageModel, 'id' | 'createdAt'>): Promise<ICustomLanguageModel> {
+		const displayNameTrim = modelData.displayName?.trim();
+		if (displayNameTrim && this._displayNameCollides(displayNameTrim, undefined)) {
+			throw new Error(localize('customLanguageModels.error.displayNameNotUnique', 'A model with this display name already exists.'));
+		}
 		const model: ICustomLanguageModel = {
 			...modelData,
+			displayName: displayNameTrim || undefined,
 			maxInputTokens: modelData.maxInputTokens ?? 100000,
 			maxOutputTokens: modelData.maxOutputTokens ?? 8000,
 			useNativeTools: modelData.useNativeTools ?? false,
+			ollamaPullComplete: modelData.provider === 'ollama'
+				? (modelData.ollamaPullComplete !== undefined ? modelData.ollamaPullComplete : false)
+				: undefined,
 			id: `custom-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`,
 			createdAt: Date.now()
 		};
@@ -180,6 +274,10 @@ export class CustomLanguageModelsService extends Disposable implements ICustomLa
 				await this.secretStorageService.delete(this.getSecretKey(id, 'token'));
 			}
 			this.models.splice(index, 1);
+			if (this.selectedCustomModelId === id) {
+				this.selectedCustomModelId = undefined;
+				this.storageService.store(STORAGE_KEY_SELECTED, '', StorageScope.APPLICATION, StorageTarget.MACHINE);
+			}
 			await this.saveModels();
 			this._onDidChangeCustomModels.fire();
 		}
@@ -188,6 +286,12 @@ export class CustomLanguageModelsService extends Disposable implements ICustomLa
 	async updateCustomModel(id: string, updates: Partial<Omit<ICustomLanguageModel, 'id' | 'createdAt'>>): Promise<void> {
 		const index = this.models.findIndex(m => m.id === id);
 		if (index >= 0) {
+			if (updates.displayName !== undefined) {
+				const next = updates.displayName?.trim() ?? '';
+				if (next && this._displayNameCollides(next, id)) {
+					throw new Error(localize('customLanguageModels.error.displayNameNotUnique', 'A model with this display name already exists.'));
+				}
+			}
 			const model = this.models[index];
 			// Update secrets if provided
 			if (updates.apiKey !== undefined) {
@@ -204,8 +308,13 @@ export class CustomLanguageModelsService extends Disposable implements ICustomLa
 					await this.secretStorageService.delete(this.getSecretKey(id, 'token'));
 				}
 			}
-			this.models[index] = { ...model, ...updates };
+			const merged: ICustomLanguageModel = { ...model, ...updates };
+			if (updates.displayName !== undefined) {
+				merged.displayName = updates.displayName?.trim() || undefined;
+			}
+			this.models[index] = merged;
 			await this.saveModels();
+			this._clearSelectedIfNotChatReady();
 			this._onDidChangeCustomModels.fire();
 		}
 	}

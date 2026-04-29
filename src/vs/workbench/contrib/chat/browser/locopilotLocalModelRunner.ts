@@ -8,12 +8,13 @@ import { URI } from '../../../../base/common/uri.js';
 import { ILogService } from '../../../../platform/log/common/log.js';
 import { IConfigurationService } from '../../../../platform/configuration/common/configuration.js';
 import { IFileService } from '../../../../platform/files/common/files.js';
-import { ICustomLanguageModelsService } from '../common/customLanguageModelsService.js';
+import { ICustomLanguageModelsService, type ICustomLanguageModel } from '../common/customLanguageModelsService.js';
 import { ChatConfiguration } from '../common/constants.js';
 import { ILoCoPilotFileLog } from './locopilotFileLog.js';
 import { registerAction2, Action2 } from '../../../../platform/actions/common/actions.js';
-import { ServicesAccessor } from '../../../../platform/instantiation/common/instantiation.js';
-import { detectLlamaBackend,
+import { createDecorator, IInstantiationService, ServicesAccessor } from '../../../../platform/instantiation/common/instantiation.js';
+import {
+	detectLlamaBackend,
 	getRecommendedBackend,
 	getDefaultLlamaServerPaths,
 	getLlamaCppServerCommand,
@@ -21,14 +22,23 @@ import { detectLlamaBackend,
 	LOCOPILOT_LLAMA_SERVER_PORT,
 	LlamaBackend
 } from './locopilotLlamaCppServer.js';
+import { dirname } from '../../../../base/common/path.js';
+import {
+	getMlxLmServerCommand,
+	getMlxServerBaseUrl,
+	LOCOPILOT_MLX_SERVER_PORT,
+	hfModelLooksLikeMlx,
+	isAppleSiliconMac,
+	shouldUseMlxServerForHfModel,
+} from './locopilotMlxServer.js';
 import { IPathService } from '../../../services/path/common/pathService.js';
 import { ITerminalService, ITerminalInstance, ITerminalGroupService } from '../../terminal/browser/terminal.js';
-import { createDecorator } from '../../../../platform/instantiation/common/instantiation.js';
 import { Event, Emitter } from '../../../../base/common/event.js';
 import { INotificationService, Severity } from '../../../../platform/notification/common/notification.js';
 import { ICommandService } from '../../../../platform/commands/common/commands.js';
 import { IOpenerService } from '../../../../platform/opener/common/opener.js';
 import { LOCOPILOT_SETTINGS_SECTION_AGENT_SETTINGS } from './chatManagement/locopilotSettingsEditorInput.js';
+import { INativeHostService } from '../../../../platform/native/common/native.js';
 
 export const ILoCoPilotLocalModelRunner = createDecorator<ILoCoPilotLocalModelRunner>('locopilotLocalModelRunner');
 
@@ -51,7 +61,7 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 	private readonly _onDidServerStateChange = this._register(new Emitter<string>());
 	readonly onDidServerStateChange = this._onDidServerStateChange.event;
 
-	private runningServers = new Map<string, { port: number, terminal: ITerminalInstance }>();
+	private runningServers = new Map<string, { port: number; terminal: ITerminalInstance; kind: 'llama' | 'mlx' }>();
 
 	constructor(
 		@ICustomLanguageModelsService private readonly customLanguageModelsService: ICustomLanguageModelsService,
@@ -65,6 +75,7 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 		@INotificationService private readonly notificationService: INotificationService,
 		@ICommandService private readonly commandService: ICommandService,
 		@IOpenerService private readonly openerService: IOpenerService,
+		@IInstantiationService private readonly instantiationService: IInstantiationService,
 	) {
 		super();
 		this._registerCommands();
@@ -110,12 +121,14 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 	}
 
 	/**
-	 * Base URL for the local llama server (OpenAI-compatible). Use this when sending chat requests.
+	 * Base URL for the local OpenAI-compatible server (llama.cpp or mlx-lm). Use this when sending chat requests.
 	 */
 	getServerBaseUrl(modelId: string): string | undefined {
 		const running = this.runningServers.get(modelId);
 		if (running) {
-			return getLlamaServerBaseUrl(running.port);
+			return running.kind === 'mlx'
+				? getMlxServerBaseUrl(running.port)
+				: getLlamaServerBaseUrl(running.port);
 		}
 		return undefined;
 	}
@@ -205,16 +218,42 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 		return localPath;
 	}
 
+	/** True if the resolved local path is a single GGUF file (Hugging Face layout). */
+	private async pathResolvesToGguf(localPath: string): Promise<boolean> {
+		const p = await this.resolveModelFilePath(localPath);
+		return p.toLowerCase().endsWith('.gguf');
+	}
+
+	/** Model root for mlx-lm: directory, or parent when localPath is a file. */
+	private async getMlxModelRootPath(localPath: string): Promise<string> {
+		const uri = URI.file(localPath);
+		try {
+			const stat = await this.fileService.stat(uri);
+			if (stat.isDirectory) {
+				return localPath;
+			}
+		} catch {
+			// treat as file path
+		}
+		return dirname(localPath);
+	}
+
 	private async findAvailablePort(startPort: number): Promise<number> {
-		// A simple heuristic for now. In a real scenario, we'd bind to port 0 to get an OS-assigned port,
-		// or test if the port is in use. Since we're in the renderer, we can just pick an unused port from our registry
-		// and assume it's free. We'll increment from LOCOPILOT_LLAMA_SERVER_PORT.
 		let port = startPort;
 		const usedPorts = new Set(Array.from(this.runningServers.values()).map(s => s.port));
 		while (usedPorts.has(port)) {
 			port++;
 		}
-		return port;
+		// On desktop, ask the main process to pick a 127.0.0.1 port that is not already bound (e.g. leftover mlx/llama).
+		return this.instantiationService.invokeFunction((accessor) => {
+			try {
+				const native = accessor.get(INativeHostService);
+				return native.findFreePort(port, 40, 5000, 1).then(free => (free !== 0 ? free : port));
+			} catch {
+				// No native host (e.g. web): keep session-local heuristic only.
+				return Promise.resolve(port);
+			}
+		});
 	}
 
 	/**
@@ -231,6 +270,23 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 		if (!model || !model.localPath) {
 			this._log(`[LoCoPilot Runner] Model ${modelId} not found or has no local path.`);
 			return;
+		}
+
+		if (model.provider === 'huggingface' && isAppleSiliconMac()) {
+			const hasGguf = await this.pathResolvesToGguf(model.localPath);
+			if (shouldUseMlxServerForHfModel(model, hasGguf, true)) {
+				await this._startMlxServerInTerminal(modelId, model as ICustomLanguageModel & { localPath: string });
+				return;
+			}
+		} else if (model.provider === 'huggingface' && !isAppleSiliconMac()) {
+			const hasGguf = await this.pathResolvesToGguf(model.localPath);
+			if (hfModelLooksLikeMlx(model, hasGguf)) {
+				this.notificationService.notify({
+					severity: Severity.Error,
+					message: 'This MLX model can only be run on Apple Silicon (M1 or later) using mlx-lm. Use a GGUF build with llama.cpp on this machine, or use a cloud/localhost provider instead.',
+				});
+				return;
+			}
 		}
 
 		const serverPath = await this.resolveServerPath();
@@ -258,7 +314,7 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 
 		const modelPath = await this.resolveModelFilePath(model.localPath);
 		const backend = getRecommendedBackend();
-		
+
 		const port = await this.findAvailablePort(LOCOPILOT_LLAMA_SERVER_PORT);
 		const { command, args } = getLlamaCppServerCommand(modelPath, backend, serverPath, port);
 		this._log(`[LoCoPilot Runner] Starting llama.cpp server for model ${modelId} on port ${port} with backend: ${backend}`);
@@ -273,12 +329,12 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 			argsCli[mIdx + 1] = escapedPath ?? argsCli[mIdx + 1];
 		}
 		const cmdLine = [command, ...argsCli].join(' ');
-		
+
 		this._log(`[LoCoPilot Runner] Executing: ${cmdLine}`);
 		if (!serverPath) {
-			this._log(`[LoCoPilot Runner] Note: If this fails, install llama.cpp (e.g. clone and build to ~/llama.cpp) or set the path in LoCoPilot Settings → Agent Settings → Llama.cpp server path.`);
+			this._log(`[LoCoPilot Runner] Note: If this fails, install llama.cpp (e.g. clone and build to ~/llama.cpp) or set the path in LoCoPilot Settings > Agent Settings > Llama.cpp server path.`);
 		}
-		
+
 		try {
 			const terminal = await this.terminalService.createTerminal({
 				config: {
@@ -290,7 +346,7 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 			await new Promise<void>(resolve => setTimeout(resolve, 400));
 			await terminal.sendText(cmdLine, true);
 
-			this.runningServers.set(modelId, { port, terminal });
+			this.runningServers.set(modelId, { port, terminal, kind: 'llama' });
 			this._onDidServerStateChange.fire(modelId);
 
 			this._register(terminal.onDisposed(() => {
@@ -304,6 +360,51 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 			this._log(`[LoCoPilot Runner] Terminal started with: ${cmdLine}`);
 		} catch (e) {
 			this._log(`[LoCoPilot Runner] Failed to start terminal: ${e}`);
+			throw e;
+		}
+	}
+
+	/**
+	 * Starts `mlx_lm.server` for downloaded Hugging Face MLX weights (Apple Silicon only).
+	 */
+	private async _startMlxServerInTerminal(modelId: string, model: ICustomLanguageModel & { localPath: string }): Promise<void> {
+		const modelDir = await this.getMlxModelRootPath(model.localPath);
+		const port = await this.findAvailablePort(LOCOPILOT_MLX_SERVER_PORT);
+		const pythonCmd = (this.configurationService.getValue<string>(ChatConfiguration.LocopilotMlxPythonPath) ?? '').trim() || 'python3';
+		const { command, args } = getMlxLmServerCommand(modelDir, port, pythonCmd);
+		const q = (p: string) => (p.includes(' ') || p.includes('"') ? `"${p.replace(/"/g, '\\"')}"` : p);
+		const argsQuoted = args.map(a => (a === modelDir || a.includes(' ') ? q(a) : a));
+		const cmdLine = [command, ...argsQuoted].join(' ');
+
+		this._log(`[LoCoPilot Runner] Starting mlx-lm server for model ${modelId} on port ${port}: ${cmdLine}`);
+
+		try {
+			const terminal = await this.terminalService.createTerminal({
+				config: {
+					name: `MLX - ${model.modelName}`,
+				}
+			});
+			this.terminalService.setActiveInstance(terminal);
+			await this.terminalGroupService.showPanel(true);
+			await new Promise<void>(resolve => setTimeout(resolve, 400));
+			await terminal.sendText(cmdLine, true);
+
+			this.runningServers.set(modelId, { port, terminal, kind: 'mlx' });
+			this._onDidServerStateChange.fire(modelId);
+
+			this._register(terminal.onDisposed(() => {
+				if (this.runningServers.has(modelId)) {
+					this.runningServers.delete(modelId);
+					this._onDidServerStateChange.fire(modelId);
+					this._log(`[LoCoPilot Runner] MLX terminal closed for model ${modelId}`);
+				}
+			}));
+		} catch (e) {
+			this._log(`[LoCoPilot Runner] Failed to start MLX terminal: ${e}`);
+			this.notificationService.notify({
+				severity: Severity.Error,
+				message: `Failed to start MLX server. Install with: ${pythonCmd} -m pip install 'mlx-lm' (Apple Silicon). Set the Python path in settings (locopilot.mlx.pythonPath) if needed.`,
+			});
 			throw e;
 		}
 	}
@@ -339,7 +440,7 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 			await terminal.sendText(cmdLine, true);
 
 			// For Ollama, we don't manage the port, it's always the baseUrl port, but we track the terminal
-			this.runningServers.set(modelId, { port: 11434, terminal });
+			this.runningServers.set(modelId, { port: 11434, terminal, kind: 'llama' });
 			this._onDidServerStateChange.fire(modelId);
 
 			this._register(terminal.onDisposed(() => {

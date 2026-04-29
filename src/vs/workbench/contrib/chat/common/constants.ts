@@ -46,6 +46,8 @@ export enum ChatConfiguration {
 	WebSearchApiKey = 'chat.webSearch.apiKey',
 	/** Path to llama-server binary (llama.cpp). Empty = use PATH. Can be full path to binary or directory containing it. */
 	LocopilotLlamaCppServerPath = 'locopilot.llamaCpp.serverPath',
+	/** Python interpreter to run `python -m mlx_lm.server` for local MLX (Hugging Face) models on Apple Silicon. Empty = `python3` on PATH. */
+	LocopilotMlxPythonPath = 'locopilot.mlx.pythonPath',
 }
 
 /**
