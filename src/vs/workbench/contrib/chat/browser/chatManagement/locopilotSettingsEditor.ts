@@ -118,6 +118,8 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 	private addFormMaxOutputTokensInput!: InputBox;
 	private addFormUseNativeToolsToggle!: Toggle;
 	private addFormUseNativeToolsContainer!: HTMLElement;
+	private addFormMtpToggle!: Toggle;
+	private addFormMtpContainer!: HTMLElement;
 	private addFormAddButton!: Button;
 	private addFormCurrentModelType: 'cloud' | 'local' = 'cloud';
 	private addFormCurrentProviderIndex: number = 0;
@@ -475,6 +477,19 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 		}));
 		DOM.append(useNativeToolsToggleContainer, this.addFormUseNativeToolsToggle.domNode);
 
+		// Multi-Token Prediction toggle (llama.cpp GGUF models only)
+		this.addFormMtpContainer = DOM.append(formContainer, $('.form-field'));
+		this.addFormMtpContainer.style.display = 'none';
+		const mtpLabel = DOM.append(this.addFormMtpContainer, $('label.form-label'));
+		mtpLabel.textContent = localize('addCustomModel.mtp', 'Multi-Token Prediction');
+		const mtpToggleContainer = DOM.append(this.addFormMtpContainer, $('.form-input-container.agent-setting-switch-wrap'));
+		this.addFormMtpToggle = this._register(new Toggle({
+			title: localize('addCustomModel.mtpDescription', 'Speculative decoding via the model\'s own Multi-Token Prediction heads (faster). Only enable for MTP-trained models (e.g. Qwen3.5/3.6, DeepSeek V3/R1, Gemma 4) on a recent llama.cpp build; other models will fail to start. Default: off.'),
+			isChecked: false,
+			...defaultToggleStyles
+		}));
+		DOM.append(mtpToggleContainer, this.addFormMtpToggle.domNode);
+
 		const buttonContainer = DOM.append(formContainer, $('.form-actions'));
 		this.addFormAddButton = this._register(new Button(buttonContainer, { ...defaultButtonStyles }));
 		this.addFormAddButton.label = localize('addCustomModel.add', 'Add Model');
@@ -511,6 +526,7 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 		this.addFormTokenInputBox.value = '';
 		this.addFormModelFormatInputBox.value = '';
 		this.addFormUseNativeToolsToggle.checked = false;
+		this.addFormMtpToggle.checked = false;
 		this.addFormUpdateInputFields();
 	}
 
@@ -537,6 +553,7 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 			if (tokenContainer) { tokenContainer.style.display = 'none'; }
 			if (this.addFormModelFormatContainer) { this.addFormModelFormatContainer.style.display = 'none'; }
 			if (this.addFormUseNativeToolsContainer) { this.addFormUseNativeToolsContainer.style.display = 'none'; }
+			if (this.addFormMtpContainer) { this.addFormMtpContainer.style.display = 'none'; }
 			this.addFormMaxInputTokensInput.value = String(LoCoPilotSettingsEditor.DEFAULT_MAX_INPUT);
 			this.addFormMaxOutputTokensInput.value = String(LoCoPilotSettingsEditor.DEFAULT_MAX_OUTPUT_TOKENS);
 		} else {
@@ -553,6 +570,8 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 			}
 			if (this.addFormModelFormatContainer) { this.addFormModelFormatContainer.style.display = isHuggingFace ? '' : 'none'; }
 			if (this.addFormUseNativeToolsContainer) { this.addFormUseNativeToolsContainer.style.display = ''; }
+			// MTP is a llama.cpp (GGUF) feature, so only relevant to HuggingFace local models.
+			if (this.addFormMtpContainer) { this.addFormMtpContainer.style.display = isHuggingFace ? '' : 'none'; }
 			// Same default token limits for HuggingFace, Ollama and Localhost (and any other local provider)
 			if (isHuggingFace || isOllama || provider.text.toLowerCase() === 'localhost') {
 				this.addFormMaxInputTokensInput.value = String(LoCoPilotSettingsEditor.HF_DEFAULT_MAX_INPUT);
@@ -700,7 +719,8 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 				localPath: providerValue === 'ollama' ? ollamaUrl : undefined, // Store Base URL in localPath for Ollama
 				maxInputTokens: inputResult.value,
 				maxOutputTokens: outputResult.value,
-				useNativeTools: this.addFormUseNativeToolsToggle.checked
+				useNativeTools: this.addFormUseNativeToolsToggle.checked,
+				mtp: this.addFormMtpToggle.checked
 			});
 			const listLabel = getCustomModelListLabel(addedModel);
 
@@ -885,6 +905,24 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 			DOM.append(toolsWrap, toolsToggle.domNode);
 			this._register(toolsToggle.onChange(async () => {
 				await this.customLanguageModelsService.updateCustomModel(model.id, { useNativeTools: toolsToggle.checked });
+			}));
+		}
+		// Multi-Token Prediction toggle: llama.cpp GGUF feature, so HuggingFace local models only.
+		if (model.provider === 'huggingface') {
+			const mtpDesc = localize('customLanguageModels.mtpDescription', 'Run with Multi-Token Prediction (faster). Only for MTP-trained models on a recent llama.cpp build; other models will fail to start.');
+			const mtpContainer = DOM.append(secondarySettingsContainer, $('.model-action-tools-container'));
+			mtpContainer.title = mtpDesc;
+			const mtpIcon = DOM.append(mtpContainer, $('span.model-action-tools-icon'));
+			mtpIcon.appendChild(renderIcon(Codicon.rocket));
+			const mtpWrap = DOM.append(mtpContainer, $('.model-action-tools.agent-setting-switch-wrap'));
+			const mtpToggle = this._register(new Toggle({
+				title: mtpDesc,
+				isChecked: !!model.mtp,
+				...defaultToggleStyles
+			}));
+			DOM.append(mtpWrap, mtpToggle.domNode);
+			this._register(mtpToggle.onChange(async () => {
+				await this.customLanguageModelsService.updateCustomModel(model.id, { mtp: mtpToggle.checked });
 			}));
 		}
 		const maxInputContainer = DOM.append(secondarySettingsContainer, $('.model-max-input-container'));

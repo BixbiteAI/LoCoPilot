@@ -84,6 +84,11 @@ export interface ICustomLanguageModel {
 	maxOutputTokens?: number;
 	/** Whether to use native tool calling (true) or system prompt injection (false) for local models */
 	useNativeTools?: boolean;
+	/**
+	 * For local GGUF models run via llama.cpp: enable Multi-Token Prediction speculative decoding
+	 * (`--spec-type mtp`). Only valid for models trained with MTP heads; default off.
+	 */
+	mtp?: boolean;
 	createdAt: number;
 	hidden?: boolean; // Whether the model is hidden/disabled
 	/**
@@ -141,6 +146,7 @@ export class CustomLanguageModelsService extends Disposable implements ICustomLa
 				...m,
 				hidden: m.hidden ?? false,
 				useNativeTools: m.useNativeTools ?? false,
+				mtp: m.mtp ?? false,
 				maxInputTokens: m.maxInputTokens ?? 100000,
 				maxOutputTokens: m.maxOutputTokens ?? 8000,
 				ollamaPullComplete: m.provider === 'ollama' ? (m.ollamaPullComplete ?? true) : m.ollamaPullComplete
@@ -249,6 +255,7 @@ export class CustomLanguageModelsService extends Disposable implements ICustomLa
 			maxInputTokens: modelData.maxInputTokens ?? 100000,
 			maxOutputTokens: modelData.maxOutputTokens ?? 8000,
 			useNativeTools: modelData.useNativeTools ?? false,
+			mtp: modelData.mtp ?? false,
 			ollamaPullComplete: modelData.provider === 'ollama'
 				? (modelData.ollamaPullComplete !== undefined ? modelData.ollamaPullComplete : false)
 				: undefined,

@@ -19,8 +19,12 @@ import {
 	getDefaultLlamaServerPaths,
 	getLlamaCppServerCommand,
 	getLlamaServerBaseUrl,
+	getLlamaServerHealthUrl,
 	LOCOPILOT_LLAMA_SERVER_PORT,
-	LlamaBackend
+	LlamaBackend,
+	type LlamaServerTuning,
+	type FlashAttentionMode,
+	type KvCacheType
 } from './locopilotLlamaCppServer.js';
 import { dirname } from '../../../../base/common/path.js';
 import {
@@ -39,6 +43,9 @@ import { ICommandService } from '../../../../platform/commands/common/commands.j
 import { IOpenerService } from '../../../../platform/opener/common/opener.js';
 import { LOCOPILOT_SETTINGS_SECTION_AGENT_SETTINGS } from './chatManagement/locopilotSettingsEditorInput.js';
 import { INativeHostService } from '../../../../platform/native/common/native.js';
+import { IRequestService } from '../../../../platform/request/common/request.js';
+import { CancellationToken } from '../../../../base/common/cancellation.js';
+import { timeout } from '../../../../base/common/async.js';
 
 export const ILoCoPilotLocalModelRunner = createDecorator<ILoCoPilotLocalModelRunner>('locopilotLocalModelRunner');
 
@@ -76,6 +83,7 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 		@ICommandService private readonly commandService: ICommandService,
 		@IOpenerService private readonly openerService: IOpenerService,
 		@IInstantiationService private readonly instantiationService: IInstantiationService,
+		@IRequestService private readonly requestService: IRequestService,
 	) {
 		super();
 		this._registerCommands();
@@ -159,8 +167,78 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 		}
 		const backend = getRecommendedBackend();
 		const serverPath = this.configurationService.getValue<string>(ChatConfiguration.LocopilotLlamaCppServerPath);
-		const { command, args } = getLlamaCppServerCommand(model.localPath, backend, serverPath);
+		const { command, args } = getLlamaCppServerCommand(model.localPath, backend, serverPath, LOCOPILOT_LLAMA_SERVER_PORT, this._getLlamaTuning(model));
 		return { command, args, backend };
+	}
+
+	/**
+	 * Reads llama.cpp performance settings. All values default to safe, self-falling-back behavior:
+	 * flash attention 'auto', KV cache 'f16', MTP/mlock off.
+	 * MTP is per-model first (the model's own toggle), then the global setting as a fallback default.
+	 */
+	private _getLlamaTuning(model?: ICustomLanguageModel): LlamaServerTuning {
+		const cfg = this.configurationService;
+		const perModelMtp = model?.mtp;
+		const globalMtp = cfg.getValue<boolean>(ChatConfiguration.LocopilotLlamaCppMtp);
+		return {
+			contextSize: cfg.getValue<number>(ChatConfiguration.LocopilotLlamaCppContextSize),
+			flashAttention: cfg.getValue<FlashAttentionMode>(ChatConfiguration.LocopilotLlamaCppFlashAttention),
+			kvCacheType: cfg.getValue<KvCacheType>(ChatConfiguration.LocopilotLlamaCppKvCacheType),
+			multiTokenPrediction: perModelMtp !== undefined ? perModelMtp : globalMtp,
+			mtpArgs: cfg.getValue<string>(ChatConfiguration.LocopilotLlamaCppMtpArgs),
+			cacheReuse: cfg.getValue<number>(ChatConfiguration.LocopilotLlamaCppCacheReuse),
+			threads: cfg.getValue<number>(ChatConfiguration.LocopilotLlamaCppThreads),
+			batchSize: cfg.getValue<number>(ChatConfiguration.LocopilotLlamaCppBatchSize),
+			ubatchSize: cfg.getValue<number>(ChatConfiguration.LocopilotLlamaCppUbatchSize),
+			mlock: cfg.getValue<boolean>(ChatConfiguration.LocopilotLlamaCppMlock),
+			extraArgs: cfg.getValue<string>(ChatConfiguration.LocopilotLlamaCppExtraArgs),
+		};
+	}
+
+	/**
+	 * Best-effort warm-up: poll the server's /health until it is ready, then fire a tiny 1-token
+	 * request so GPU kernels are compiled and the cache is primed before the user's first message.
+	 * Fire-and-forget; all failures are swallowed (the server may simply still be loading).
+	 */
+	private async _warmUpLlamaServer(port: number, modelName: string): Promise<void> {
+		const healthUrl = getLlamaServerHealthUrl(port);
+		const token = CancellationToken.None;
+		// Poll readiness for up to ~2 minutes (large models can take a while to load).
+		let ready = false;
+		for (let attempt = 0; attempt < 120; attempt++) {
+			try {
+				const res = await this.requestService.request({ type: 'GET', url: healthUrl }, token);
+				const status = res.res.statusCode ?? 0;
+				if (status === 200) {
+					ready = true;
+					break;
+				}
+			} catch {
+				// not up yet
+			}
+			await timeout(1000);
+		}
+		if (!ready) {
+			this._log(`[LoCoPilot Runner] Warm-up skipped: server on port ${port} did not become ready in time.`);
+			return;
+		}
+		try {
+			const body = JSON.stringify({
+				model: modelName,
+				messages: [{ role: 'user', content: 'ping' }],
+				max_tokens: 1,
+				stream: false,
+			});
+			await this.requestService.request({
+				type: 'POST',
+				url: `${getLlamaServerBaseUrl(port)}/chat/completions`,
+				headers: { 'Content-Type': 'application/json' },
+				data: body,
+			}, token);
+			this._log(`[LoCoPilot Runner] Warm-up request completed for server on port ${port}.`);
+		} catch (e) {
+			this._log(`[LoCoPilot Runner] Warm-up request failed (ignored): ${e}`);
+		}
 	}
 
 	/**
@@ -316,19 +394,13 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 		const backend = getRecommendedBackend();
 
 		const port = await this.findAvailablePort(LOCOPILOT_LLAMA_SERVER_PORT);
-		const { command, args } = getLlamaCppServerCommand(modelPath, backend, serverPath, port);
+		const { command, args } = getLlamaCppServerCommand(modelPath, backend, serverPath, port, this._getLlamaTuning(model));
 		this._log(`[LoCoPilot Runner] Starting llama.cpp server for model ${modelId} on port ${port} with backend: ${backend}`);
-		// Build command line for the user's shell (path with spaces/quotes escaped)
-		const modelPathArg = args[args.indexOf('-m') + 1];
-		const escapedPath = modelPathArg && (modelPathArg.includes(' ') || modelPathArg.includes('"'))
-			? `"${modelPathArg.replace(/"/g, '\\"')}"`
-			: modelPathArg;
-		const argsCli = [...args];
-		const mIdx = argsCli.indexOf('-m');
-		if (mIdx >= 0 && argsCli[mIdx + 1] !== undefined) {
-			argsCli[mIdx + 1] = escapedPath ?? argsCli[mIdx + 1];
-		}
-		const cmdLine = [command, ...argsCli].join(' ');
+		// Build command line for the user's shell. Quote ANY arg containing spaces/quotes (e.g. model
+		// paths under "Application Support", and --model-draft for MTP), not just the -m path.
+		const shellQuote = (a: string) => (a.includes(' ') || a.includes('"')) ? `"${a.replace(/"/g, '\\"')}"` : a;
+		const argsCli = args.map(shellQuote);
+		const cmdLine = [shellQuote(command), ...argsCli].join(' ');
 
 		this._log(`[LoCoPilot Runner] Executing: ${cmdLine}`);
 		if (!serverPath) {
@@ -348,6 +420,11 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 
 			this.runningServers.set(modelId, { port, terminal, kind: 'llama' });
 			this._onDidServerStateChange.fire(modelId);
+
+			// Warm up in the background so the first real message has no kernel-JIT / cache lag.
+			if (this.configurationService.getValue<boolean>(ChatConfiguration.LocopilotLlamaCppWarmup) !== false) {
+				this._warmUpLlamaServer(port, model.modelName);
+			}
 
 			this._register(terminal.onDisposed(() => {
 				if (this.runningServers.has(modelId)) {
@@ -426,7 +503,10 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 		const baseUrl = (model.localPath || 'http://localhost:11434').replace(/\/$/, '');
 		// If baseUrl is not default, we might need to set OLLAMA_HOST
 		const hostEnv = baseUrl !== 'http://localhost:11434' ? `OLLAMA_HOST=${baseUrl} ` : '';
-		const cmdLine = `${hostEnv}ollama run ${model.modelName}`;
+		// Keep the model resident so subsequent chat requests skip the cold-start reload. Empty = Ollama default.
+		const keepAlive = (this.configurationService.getValue<string>(ChatConfiguration.LocopilotOllamaKeepAlive) ?? '').trim();
+		const keepAliveArg = keepAlive ? ` --keepalive ${keepAlive}` : '';
+		const cmdLine = `${hostEnv}ollama run${keepAliveArg} ${model.modelName}`;
 		this._log(`[LoCoPilot Runner] Running Ollama model: ${cmdLine}`);
 		try {
 			const terminal = await this.terminalService.createTerminal({

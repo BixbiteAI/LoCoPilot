@@ -618,6 +618,88 @@ configurationRegistry.registerConfiguration({
 			description: nls.localize('locopilot.mlx.pythonPath.description', "Python interpreter used to run `python -m mlx_lm.server` for local Hugging Face MLX models on Apple Silicon. Leave empty to use `python3` from your PATH, or set a venv (e.g. /path/to/.venv/bin/python3)."),
 			default: '',
 		},
+		[ChatConfiguration.LocopilotLlamaCppContextSize]: {
+			type: 'number',
+			minimum: 512,
+			markdownDescription: nls.localize('locopilot.llamaCpp.contextSize.description', "Context window (`-c`) for the local llama.cpp server. A smaller window means a smaller KV cache, faster prompt processing, and less memory. Increase it only if you need longer prompts."),
+			default: 16384,
+		},
+		[ChatConfiguration.LocopilotLlamaCppFlashAttention]: {
+			type: 'string',
+			enum: ['auto', 'on', 'off'],
+			enumDescriptions: [
+				nls.localize('locopilot.llamaCpp.fa.auto', "Enable Flash Attention where supported and automatically fall back to standard attention otherwise (recommended)."),
+				nls.localize('locopilot.llamaCpp.fa.on', "Force Flash Attention on. Fails to start on backends that do not support it."),
+				nls.localize('locopilot.llamaCpp.fa.off', "Disable Flash Attention."),
+			],
+			markdownDescription: nls.localize('locopilot.llamaCpp.flashAttention.description', "Flash Attention mode (`-fa`) for the local llama.cpp server. `auto` is the safe default: llama.cpp uses Flash Attention when the model and hardware support it and falls back to standard attention otherwise."),
+			default: 'auto',
+		},
+		[ChatConfiguration.LocopilotLlamaCppKvCacheType]: {
+			type: 'string',
+			enum: ['f16', 'q8_0', 'q4_0'],
+			enumDescriptions: [
+				nls.localize('locopilot.llamaCpp.kv.f16', "Full-precision KV cache (default, always safe)."),
+				nls.localize('locopilot.llamaCpp.kv.q8_0', "8-bit KV cache: ~half the memory, slightly faster. Requires Flash Attention (auto-enabled)."),
+				nls.localize('locopilot.llamaCpp.kv.q4_0', "4-bit KV cache: smallest memory, fastest. May slightly reduce quality. Requires Flash Attention (auto-enabled)."),
+			],
+			markdownDescription: nls.localize('locopilot.llamaCpp.kvCacheType.description', "KV cache quantization (`--cache-type-k/v`) for the local llama.cpp server. Quantizing shrinks the cache so more context fits on the GPU. When set to `q8_0`/`q4_0`, Flash Attention is auto-enabled (required), so this never fails to start."),
+			default: 'f16',
+		},
+		[ChatConfiguration.LocopilotLlamaCppMtp]: {
+			type: 'boolean',
+			markdownDescription: nls.localize('locopilot.llamaCpp.mtp.description', "Enable Multi-Token Prediction / NextN speculative decoding for the local llama.cpp server. When on, the model file is also passed as `--model-draft` and the flags in `#locopilot.llamaCpp.mtpArgs#` are appended. **Only enable this for models trained with MTP/NextN heads** (e.g. Qwen3.5/3.6, DeepSeek V3/R1, Gemma 4) on a **recent llama.cpp build (~b9180+)**. Older builds reject the flags and fail to start. Can also be toggled per model in LoCoPilot Settings."),
+			default: false,
+		},
+		[ChatConfiguration.LocopilotLlamaCppMtpArgs]: {
+			type: 'string',
+			markdownDescription: nls.localize('locopilot.llamaCpp.mtpArgs.description', "Flags appended after `--model-draft <model>` when Multi-Token Prediction is enabled. The exact value is build-specific. Run `llama-server -h` to see your build's supported `--spec-type` values (e.g. `draft-mtp`, `draft-eagle3`, `ngram-cache`). Adjust this if your build differs; clear it to pass only `--model-draft`."),
+			default: '--spec-type draft-mtp',
+		},
+		[ChatConfiguration.LocopilotLlamaCppCacheReuse]: {
+			type: 'number',
+			minimum: 0,
+			markdownDescription: nls.localize('locopilot.llamaCpp.cacheReuse.description', "Minimum chunk size to reuse from the KV cache via shifting (`--cache-reuse`) on the local llama.cpp server. Lets repeated prompt prefixes (like the system prompt resent on every agent turn) skip reprocessing, which noticeably speeds up multi-turn/tool conversations. Set to `0` to disable."),
+			default: 256,
+		},
+		[ChatConfiguration.LocopilotLlamaCppThreads]: {
+			type: 'number',
+			minimum: 0,
+			markdownDescription: nls.localize('locopilot.llamaCpp.threads.description', "CPU threads (`--threads`) for the local llama.cpp server. `0` lets llama.cpp auto-detect. Set to your physical (performance) core count if auto-detection is suboptimal on a hybrid CPU."),
+			default: 0,
+		},
+		[ChatConfiguration.LocopilotLlamaCppBatchSize]: {
+			type: 'number',
+			minimum: 0,
+			markdownDescription: nls.localize('locopilot.llamaCpp.batchSize.description', "Logical batch size (`--batch-size`) for prompt processing on the local llama.cpp server. `0` uses the build default (2048). Larger values can speed up prefill of long prompts at the cost of memory."),
+			default: 0,
+		},
+		[ChatConfiguration.LocopilotLlamaCppUbatchSize]: {
+			type: 'number',
+			minimum: 0,
+			markdownDescription: nls.localize('locopilot.llamaCpp.ubatchSize.description', "Physical batch size (`--ubatch-size`) for the local llama.cpp server. `0` uses the build default (512). Larger values can speed up prefill at the cost of memory."),
+			default: 0,
+		},
+		[ChatConfiguration.LocopilotLlamaCppWarmup]: {
+			type: 'boolean',
+			markdownDescription: nls.localize('locopilot.llamaCpp.warmup.description', "After the local llama.cpp server starts, send a tiny background request to pre-compile GPU kernels and warm the cache, so your first real message responds without the initial lag. Best-effort; failures are ignored."),
+			default: true,
+		},
+		[ChatConfiguration.LocopilotLlamaCppMlock]: {
+			type: 'boolean',
+			markdownDescription: nls.localize('locopilot.llamaCpp.mlock.description', "Lock model weights into RAM (`--mlock`) so they are never paged out. Can speed up inference but may fail to start without sufficient memory or locked-memory privileges, so it is off by default."),
+			default: false,
+		},
+		[ChatConfiguration.LocopilotLlamaCppExtraArgs]: {
+			type: 'string',
+			markdownDescription: nls.localize('locopilot.llamaCpp.extraArgs.description', "Extra command-line arguments appended verbatim to the local `llama-server` command (advanced). Example: `--threads 8 --batch-size 2048`. Invalid flags for your build may prevent the server from starting."),
+			default: '',
+		},
+		[ChatConfiguration.LocopilotOllamaKeepAlive]: {
+			type: 'string',
+			markdownDescription: nls.localize('locopilot.ollama.keepAlive.description', "How long Ollama keeps a model loaded in memory after use (`ollama run --keepalive`), e.g. `30m`, `1h`, or `-1` to keep it loaded indefinitely. Keeping the model resident avoids the cold-start reload between requests. Leave empty to use Ollama's default."),
+			default: '30m',
+		},
 		[ChatConfiguration.EditModeHidden]: {
 			type: 'boolean',
 			description: nls.localize('chat.editMode.hidden', "When enabled, hides the Edit mode from the chat mode picker."),

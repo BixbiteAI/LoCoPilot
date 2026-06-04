@@ -48,6 +48,32 @@ export enum ChatConfiguration {
 	LocopilotLlamaCppServerPath = 'locopilot.llamaCpp.serverPath',
 	/** Python interpreter to run `python -m mlx_lm.server` for local MLX (Hugging Face) models on Apple Silicon. Empty = `python3` on PATH. */
 	LocopilotMlxPythonPath = 'locopilot.mlx.pythonPath',
+	/** Context window (`-c`) for llama-server. Smaller = smaller KV cache, faster prefill, less memory. */
+	LocopilotLlamaCppContextSize = 'locopilot.llamaCpp.contextSize',
+	/** Flash Attention mode for llama-server (`-fa`): 'auto' (default, self-falls-back), 'on', or 'off'. */
+	LocopilotLlamaCppFlashAttention = 'locopilot.llamaCpp.flashAttention',
+	/** KV cache quantization for llama-server (`--cache-type-k/v`): 'f16' (default/safe), 'q8_0', or 'q4_0'. */
+	LocopilotLlamaCppKvCacheType = 'locopilot.llamaCpp.kvCacheType',
+	/** Multi-Token Prediction / NextN speculative decoding. Opt-in: only MTP-trained models on recent builds. */
+	LocopilotLlamaCppMtp = 'locopilot.llamaCpp.multiTokenPrediction',
+	/** Build-specific flags appended after `--model-draft` when MTP is on (e.g. `--spec-type nextn`). */
+	LocopilotLlamaCppMtpArgs = 'locopilot.llamaCpp.mtpArgs',
+	/** Min chunk size to reuse from the KV cache via shifting (`--cache-reuse`). 0 disables. */
+	LocopilotLlamaCppCacheReuse = 'locopilot.llamaCpp.cacheReuse',
+	/** CPU threads for generation (`--threads`). 0 = auto-detect. */
+	LocopilotLlamaCppThreads = 'locopilot.llamaCpp.threads',
+	/** Logical batch size (`--batch-size`). 0 = build default. */
+	LocopilotLlamaCppBatchSize = 'locopilot.llamaCpp.batchSize',
+	/** Physical batch size (`--ubatch-size`). 0 = build default. */
+	LocopilotLlamaCppUbatchSize = 'locopilot.llamaCpp.ubatchSize',
+	/** Fire a tiny warm-up request after the server starts so the first real message has no JIT lag. */
+	LocopilotLlamaCppWarmup = 'locopilot.llamaCpp.warmup',
+	/** Lock model weights in RAM (`--mlock`) to avoid paging. Opt-in: can fail without privileges/RAM. */
+	LocopilotLlamaCppMlock = 'locopilot.llamaCpp.mlock',
+	/** Extra raw args appended to the llama-server command line (power users). */
+	LocopilotLlamaCppExtraArgs = 'locopilot.llamaCpp.extraArgs',
+	/** How long Ollama keeps a model loaded in memory (`ollama run --keepalive`). Reduces cold starts. */
+	LocopilotOllamaKeepAlive = 'locopilot.ollama.keepAlive',
 }
 
 /**

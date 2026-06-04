@@ -605,7 +605,7 @@ export class LoCoPilotLanguageModelProvider extends Disposable implements ILangu
 		}
 		const url = `${baseUrl}/chat/completions`;
 		const mappedMessages = messages.flatMap(m => this._mapMessageToOpenAI(m));
-		const maxOutputTokens = model.maxOutputTokens ?? 1000;
+		const maxOutputTokens = model.maxOutputTokens ?? 8000;
 		const body: any = {
 			model: model.modelName,
 			messages: mappedMessages,
@@ -845,7 +845,7 @@ export class LoCoPilotLanguageModelProvider extends Disposable implements ILangu
 	private async _callOllamaModel(model: ICustomLanguageModel, messages: IChatMessage[], options: { [name: string]: unknown }, stream: AsyncIterableSource<IChatResponsePart | IChatResponsePart[]>, token: CancellationToken): Promise<any> {
 		const baseUrl = (model.localPath || 'http://localhost:11434').replace(/\/$/, '');
 		const mappedMessages = messages.flatMap(m => this._mapMessageToOpenAI(m));
-		const maxOutputTokens = model.maxOutputTokens ?? 1000;
+		const maxOutputTokens = model.maxOutputTokens ?? 8000;
 
 		const excludedTools = [
 			'setup_tools_createNewWorkspace',
@@ -1070,7 +1070,7 @@ export class LoCoPilotLanguageModelProvider extends Disposable implements ILangu
 		}
 		this._log(`[LoCoPilot Provider] Calling localhost model at: ${url}`);
 		const mappedMessages = messages.flatMap(m => this._mapMessageToOpenAI(m));
-		const maxOutputTokens = model.maxOutputTokens ?? 1000;
+		const maxOutputTokens = model.maxOutputTokens ?? 8000;
 		let openAiModel = (model.localhostOpenAiModel ?? '').trim();
 		if (!openAiModel) {
 			const n = (model.name ?? '').trim();
