@@ -3,7 +3,7 @@
  *  Licensed under the MIT License. See License.txt in the project root for license information.
  *--------------------------------------------------------------------------------------------*/
 
-import { streamToBuffer } from '../../../base/common/buffer.js';
+import { streamToBuffer, VSBuffer } from '../../../base/common/buffer.js';
 import { CancellationToken } from '../../../base/common/cancellation.js';
 import { getErrorMessage } from '../../../base/common/errors.js';
 import { Event } from '../../../base/common/event.js';
@@ -35,10 +35,23 @@ export interface IRequestToFileResult {
 	res: { headers: IHeaders; statusCode?: number };
 }
 
+export interface IRequestStreamResult {
+	headers: IHeaders;
+	statusCode?: number;
+}
+
 export interface IRequestService {
 	readonly _serviceBrand: undefined;
 
 	request(options: IRequestOptions, token: CancellationToken): Promise<IRequestContext>;
+
+	/**
+	 * Performs a request and streams the response body to `onChunk` as data arrives, instead of
+	 * buffering the entire body first. Resolves with status/headers once the stream ends.
+	 * Implemented by the renderer's IPC-backed request service (runs the request in the main
+	 * process, avoiding renderer CORS/mixed-content limits); may be undefined elsewhere.
+	 */
+	requestStream?(options: IRequestOptions, onChunk: (chunk: VSBuffer) => void, token: CancellationToken): Promise<IRequestStreamResult>;
 
 	/**
 	 * Request a URL and stream the response body directly to a file (no in-memory buffering).

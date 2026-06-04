@@ -7,9 +7,11 @@ import { bufferToStream, streamToBuffer, VSBuffer } from '../../../base/common/b
 import { CancellationToken } from '../../../base/common/cancellation.js';
 import { Emitter, Event } from '../../../base/common/event.js';
 import { DisposableStore } from '../../../base/common/lifecycle.js';
+import { listenStream } from '../../../base/common/stream.js';
+import { generateUuid } from '../../../base/common/uuid.js';
 import { IChannel, IServerChannel } from '../../../base/parts/ipc/common/ipc.js';
 import { IHeaders, IRequestContext, IRequestOptions } from '../../../base/parts/request/common/request.js';
-import { AuthInfo, Credentials, IRequestService, IRequestToFileResult } from './request.js';
+import { AuthInfo, Credentials, IRequestService, IRequestStreamResult, IRequestToFileResult } from './request.js';
 
 type RequestResponse = [
 	{
@@ -25,11 +27,13 @@ export interface IRequestToFileProgressEvent {
 }
 
 const DOWNLOAD_PROGRESS_EVENT = 'onDownloadProgress';
+const REQUEST_STREAM_DATA_EVENT = 'onRequestStreamData';
 
 export class RequestChannel implements IServerChannel {
 
 	private readonly _progressEmitters = new Map<string, Emitter<IRequestToFileProgressEvent>>();
 	private readonly _progressDisposables = new Map<string, DisposableStore>();
+	private readonly _streamEmitters = new Map<string, Emitter<VSBuffer>>();
 
 	constructor(private readonly service: IRequestService) { }
 
@@ -46,6 +50,15 @@ export class RequestChannel implements IServerChannel {
 			}
 			return emitter.event;
 		}
+		if (event === REQUEST_STREAM_DATA_EVENT && typeof arg === 'string') {
+			const requestId = arg;
+			let emitter = this._streamEmitters.get(requestId);
+			if (!emitter) {
+				emitter = new Emitter<VSBuffer>();
+				this._streamEmitters.set(requestId, emitter);
+			}
+			return emitter.event;
+		}
 		throw new Error('Invalid listen');
 	}
 
@@ -56,6 +69,26 @@ export class RequestChannel implements IServerChannel {
 					const buffer = await streamToBuffer(stream);
 					return <RequestResponse>[{ statusCode: res.statusCode, headers: res.headers }, buffer];
 				});
+			case 'requestStream': {
+				// Streams the response body to the renderer chunk-by-chunk (via the data event) as it
+				// arrives, instead of buffering the whole body. Enables true token-by-token streaming
+				// for local/cloud LLM SSE responses without renderer CORS/mixed-content restrictions.
+				const options = args[0];
+				const requestId = args[1] as string;
+				const emitter = this._streamEmitters.get(requestId);
+				return this.service.request(options, token)
+					.then(({ res, stream }) => new Promise<IRequestStreamResult>((resolve, reject) => {
+						listenStream(stream, {
+							onData: chunk => emitter?.fire(chunk),
+							onError: err => reject(err),
+							onEnd: () => resolve({ statusCode: res.statusCode, headers: res.headers })
+						}, token);
+					}))
+					.finally(() => {
+						this._streamEmitters.get(requestId)?.dispose();
+						this._streamEmitters.delete(requestId);
+					});
+			}
 			case 'requestToFile': {
 				const options = args[0];
 				const destinationFilePath = args[1];
@@ -92,6 +125,18 @@ export class RequestChannelClient implements IRequestService {
 	async request(options: IRequestOptions, token: CancellationToken): Promise<IRequestContext> {
 		const [res, buffer] = await this.channel.call<RequestResponse>('request', [options], token);
 		return { res, stream: bufferToStream(buffer) };
+	}
+
+	async requestStream(options: IRequestOptions, onChunk: (chunk: VSBuffer) => void, token: CancellationToken): Promise<IRequestStreamResult> {
+		const requestId = generateUuid();
+		// Subscribe to the data event before issuing the call so no chunk is missed (messages
+		// are delivered in order over the same channel: the listen registers the emitter first).
+		const subscription = this.channel.listen<VSBuffer>(REQUEST_STREAM_DATA_EVENT, requestId)(chunk => onChunk(chunk));
+		try {
+			return await this.channel.call<IRequestStreamResult>('requestStream', [options, requestId], token);
+		} finally {
+			subscription.dispose();
+		}
 	}
 
 	async requestToFile(options: IRequestOptions, destinationFilePath: string, token: CancellationToken, progressRequestId?: string): Promise<IRequestToFileResult> {

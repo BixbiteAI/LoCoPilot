@@ -6,11 +6,11 @@
 import { IConfigurationService } from '../../../../platform/configuration/common/configuration.js';
 import { IMainProcessService } from '../../../../platform/ipc/common/mainProcessService.js';
 import { InstantiationType, registerSingleton } from '../../../../platform/instantiation/common/extensions.js';
-import { AbstractRequestService, AuthInfo, Credentials, IRequestService } from '../../../../platform/request/common/request.js';
+import { AbstractRequestService, AuthInfo, Credentials, IRequestService, IRequestStreamResult, IRequestToFileResult } from '../../../../platform/request/common/request.js';
 import { RequestChannelClient } from '../../../../platform/request/common/requestIpc.js';
 import { INativeHostService } from '../../../../platform/native/common/native.js';
 import { IRequestContext, IRequestOptions } from '../../../../base/parts/request/common/request.js';
-import { IRequestToFileResult } from '../../../../platform/request/common/request.js';
+import { VSBuffer } from '../../../../base/common/buffer.js';
 import { CancellationToken } from '../../../../base/common/cancellation.js';
 import { ILoggerService } from '../../../../platform/log/common/log.js';
 import { localize } from '../../../../nls.js';
@@ -42,6 +42,16 @@ export class NativeRequestService extends AbstractRequestService implements IReq
 		const requestChannel = this.mainProcessService.getChannel('request');
 		const requestChannelClient = new RequestChannelClient(requestChannel);
 		return this.logAndRequest(options, () => requestChannelClient.request(options, token));
+	}
+
+	async requestStream(options: IRequestOptions, onChunk: (chunk: VSBuffer) => void, token: CancellationToken): Promise<IRequestStreamResult> {
+		if (!options.proxyAuthorization) {
+			options.proxyAuthorization = this.configurationService.inspect<string>('http.proxyAuthorization').userLocalValue;
+		}
+		// Stream via the main process request channel (no renderer CORS/mixed-content restrictions).
+		const requestChannel = this.mainProcessService.getChannel('request');
+		const requestChannelClient = new RequestChannelClient(requestChannel);
+		return requestChannelClient.requestStream(options, onChunk, token);
 	}
 
 	async requestToFile(options: IRequestOptions, destinationFilePath: string, token: CancellationToken, progressRequestId?: string): Promise<IRequestToFileResult> {

@@ -622,11 +622,22 @@ export class Response extends AbstractResponse implements IDisposable {
 		this._updateRepr(true);
 	}
 
-	/** Last index of a response part with the given kind (for merging interleaved streaming chunks). */
+	/**
+	 * Last index of a response part with the given kind, for merging interleaved streaming chunks
+	 * (e.g. reasoning_content then content then reasoning again within a single turn).
+	 *
+	 * The backward scan stops at a tool invocation boundary: parts produced in different agent
+	 * iterations (separated by a tool call) must not be merged, otherwise thinking/answer text from
+	 * a later iteration would be appended to an earlier block and rendered out of order.
+	 */
 	private _lastPartIndexOfKind(kind: 'markdownContent' | 'thinking'): number {
 		for (let i = this._responseParts.length - 1; i >= 0; i--) {
-			if (this._responseParts[i].kind === kind) {
+			const part = this._responseParts[i];
+			if (part.kind === kind) {
 				return i;
+			}
+			if (part.kind === 'toolInvocation' || part.kind === 'toolInvocationSerialized') {
+				return -1;
 			}
 		}
 		return -1;

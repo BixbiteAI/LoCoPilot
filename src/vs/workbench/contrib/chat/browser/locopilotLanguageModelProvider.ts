@@ -3,7 +3,7 @@
  *  Licensed under the MIT License. See License.txt in the project root for license information.
  *--------------------------------------------------------------------------------------------*/
 
-/* eslint-disable @typescript-eslint/no-explicit-any, curly, prefer-const */
+/* eslint-disable @typescript-eslint/no-explicit-any, curly */
 /* eslint-disable local/code-no-in-operator */
 
 import { AsyncIterableSource } from '../../../../base/common/async.js';
@@ -23,6 +23,19 @@ import { IWorkbenchContribution } from '../../../common/contributions.js';
 import { LOCOPILOT_SETTINGS_SECTION_LIST_MODELS } from './chatManagement/locopilotSettingsEditorInput.js';
 
 import { ILoCoPilotLocalModelRunner } from './locopilotLocalModelRunner.js';
+
+/** Shape of a single SSE chunk from an OpenAI-compatible `/chat/completions` stream. */
+interface IOpenAiStreamChunk {
+	choices?: Array<{
+		delta?: {
+			content?: string;
+			reasoning_content?: string;
+			reasoning?: string;
+			thinking?: string;
+			tool_calls?: Array<{ index?: number; id?: string; function?: { name?: string; arguments?: string | object } }>;
+		};
+	}>;
+}
 
 export class LoCoPilotLanguageModelProvider extends Disposable implements ILanguageModelChatProvider, IWorkbenchContribution {
 	private readonly _onDidChange = this._register(new Emitter<void>());
@@ -593,6 +606,58 @@ export class LoCoPilotLanguageModelProvider extends Disposable implements ILangu
 		});
 	}
 
+	/**
+	 * Streams an SSE POST and invokes onJson for each parsed `data:` line as chunks arrive.
+	 *
+	 * Uses the request service's streaming API (requestStream), which runs the HTTP request in the
+	 * main process and pushes the response body to the renderer chunk-by-chunk over IPC. This gives
+	 * true token-by-token streaming while avoiding the renderer CORS / mixed-content restrictions
+	 * that block a direct `fetch` to a plaintext `http://localhost` server. Falls back to the
+	 * buffered request() path if streaming is unavailable.
+	 *
+	 * Returns the HTTP status code; throws on network-level errors.
+	 */
+	private async _fetchSSEStream(
+		url: string,
+		headers: Record<string, string>,
+		bodyJson: string,
+		token: CancellationToken,
+		onJson: (json: unknown) => void
+	): Promise<number> {
+		let buffer = '';
+		const consume = (text: string): void => {
+			buffer += text;
+			const lines = buffer.split('\n');
+			buffer = lines.pop() ?? '';
+			for (const line of lines) {
+				const t = line.trim();
+				if (!t.startsWith('data: ')) { continue; }
+				const d = t.slice(6);
+				if (d === '[DONE]') { continue; }
+				try { onJson(JSON.parse(d)); } catch { /* skip malformed */ }
+			}
+		};
+
+		const reqOptions = { type: 'POST', url, headers, data: bodyJson } as const;
+
+		// Preferred: stream the body chunk-by-chunk via the main process.
+		if (typeof this.requestService.requestStream === 'function') {
+			const result = await this.requestService.requestStream(reqOptions, chunk => consume(chunk.toString()), token);
+			return result.statusCode ?? 0;
+		}
+
+		// Fallback: buffered request (whole body delivered at once).
+		const response = await this.requestService.request(reqOptions, token);
+		await new Promise<void>((resolve, reject) => {
+			listenStream(response.stream, {
+				onData: chunk => consume(chunk.toString()),
+				onError: err => reject(err),
+				onEnd: () => resolve()
+			}, token);
+		});
+		return response.res.statusCode ?? 0;
+	}
+
 	private async _callLocalModel(model: ICustomLanguageModel, messages: IChatMessage[], options: { [name: string]: unknown }, stream: AsyncIterableSource<IChatResponsePart | IChatResponsePart[]>, token: CancellationToken): Promise<any> {
 		this._log(`[LoCoPilot Provider] Calling local model: ${model.modelName}`);
 		if (!model.localPath) {
@@ -679,151 +744,59 @@ export class LoCoPilotLanguageModelProvider extends Disposable implements ILangu
 
 		const headers: Record<string, string> = { 'Content-Type': 'application/json', 'Accept': 'text/event-stream' };
 		try {
-			let response = await this.requestService.request({
-				type: 'POST',
-				url,
-				headers,
-				data: JSON.stringify(body)
-			}, token);
+			const accumulatedToolCalls: Map<number, { id?: string; name?: string; args: string }> = new Map();
 
-			// Fallback: If 400 error and tools were provided, try again without tools
-			if (response.res.statusCode === 400 && body.tools) {
+			const processChunk = (json: unknown): void => {
+				const choice = (json as IOpenAiStreamChunk).choices?.[0];
+				const localReasoning = this._reasoningTextFromOpenAiDelta(choice?.delta);
+				if (localReasoning) {
+					this._log(`[LoCoPilot Provider] Reasoning delta: ${localReasoning.substring(0, 200)}${localReasoning.length > 200 ? '...' : ''}`);
+					stream.emitOne({ type: 'thinking', value: localReasoning });
+				}
+				if (choice?.delta?.content) {
+					stream.emitOne({ type: 'text', value: choice.delta.content });
+				}
+				if (choice?.delta?.tool_calls) {
+					for (const tc of choice.delta.tool_calls) {
+						const idx = tc.index ?? 0;
+						let acc = accumulatedToolCalls.get(idx);
+						if (!acc) { acc = { args: '' }; accumulatedToolCalls.set(idx, acc); }
+						if (tc.id) { acc.id = tc.id; }
+						if (tc.function?.name) { acc.name = tc.function.name; }
+						if (tc.function?.arguments !== undefined) { acc.args += tc.function.arguments; }
+					}
+				}
+			};
+
+			let status = await this._fetchSSEStream(url, headers, JSON.stringify(body), token, processChunk);
+
+			// Fallback: If 400 error and tools were provided, retry without tools
+			if (status === 400 && body.tools) {
 				this._log(`[LoCoPilot Provider] Local model request failed with 400, retrying without tools as fallback...`);
+				accumulatedToolCalls.clear();
 				const fallbackBody = { ...body };
 				delete fallbackBody.tools;
-				response = await this.requestService.request({
-					type: 'POST',
-					url,
-					headers,
-					data: JSON.stringify(fallbackBody)
-				}, token);
+				status = await this._fetchSSEStream(url, headers, JSON.stringify(fallbackBody), token, processChunk);
 			}
 
-			if (response.res.statusCode !== 200) {
-				const msg = response.res.statusCode === 404 || response.res.statusCode === 502 || response.res.statusCode === 503
+			if (status !== 200) {
+				const msg = status === 404 || status === 502 || status === 503
 					? this._getLocalLlamaServerNotRunningMessage(model.modelName)
-					: `Local model "${model.modelName}" request failed (${response.res.statusCode}).`;
+					: `Local model "${model.modelName}" request failed (${status}).`;
 				throw new Error(msg);
 			}
-			let buffer = '';
-			return new Promise<void>((resolve, reject) => {
-				// OpenAI streams tool_calls in deltas: id, function.name, and function.arguments arrive in separate chunks. Accumulate by index and emit on stream end.
-				const accumulatedToolCalls: Map<number, { id?: string; name?: string; args: string }> = new Map();
 
-				listenStream(response.stream, {
-					onData: chunk => {
-						buffer += chunk.toString();
-						const lines = buffer.split('\n');
-						buffer = lines.pop() || '';
-						for (const line of lines) {
-							const trimmed = line.trim();
-							if (trimmed.startsWith('data: ')) {
-								const data = trimmed.slice(6);
-								if (data === '[DONE]') continue;
-								try {
-									const json = JSON.parse(data);
-									const choice = json.choices?.[0];
-									const localReasoning = this._reasoningTextFromOpenAiDelta(choice?.delta);
-									if (localReasoning) {
-										this._log(`[LoCoPilot Provider] Reasoning delta: ${localReasoning.substring(0, 200)}${localReasoning.length > 200 ? '...' : ''}`);
-									}
-									if (choice?.delta?.content) {
-										const content = choice.delta.content;
-										// accumulatedContent += content;
-										// 
-										// // Check for manual tool call in accumulated content
-										// if (accumulatedContent.includes('"tool_calls"')) {
-										// 	try {
-										// 		// Try to find a complete JSON block in the accumulated content
-										// 		const match = accumulatedContent.match(/\{[\s\S]*"tool_calls"[\s\S]*\}/);
-										// 		if (match) {
-										// 			const potentialJson = JSON.parse(match[0]);
-										// 			if (potentialJson.tool_calls) {
-										// 				for (const tc of potentialJson.tool_calls) {
-										// 					const idx = tc.index ?? 0;
-										// 					let acc = accumulatedToolCalls.get(idx);
-										// 					if (!acc) {
-										// 						acc = { args: '' };
-										// 						accumulatedToolCalls.set(idx, acc);
-										// 					}
-										// 					if (tc.id) acc.id = tc.id;
-										// 					if (tc.function?.name) acc.name = tc.function.name;
-										// 					if (tc.function?.arguments) {
-										// 						acc.args = typeof tc.function.arguments === 'string' 
-										// 							? tc.function.arguments 
-										// 							: JSON.stringify(tc.function.arguments);
-										// 					}
-										// 				}
-										// 				// If we successfully parsed a tool call, remove it from accumulatedContent so it's not emitted as text
-										// 				accumulatedContent = accumulatedContent.replace(match[0], '');
-										// 				continue;
-										// 			}
-										// 		}
-										// 	} catch {
-										// 		// JSON might be incomplete, wait for more chunks
-										// 	}
-										// }
-										// 
-										// // Only emit content if it doesn't look like the start of a tool call
-										// if (!accumulatedContent.trim().startsWith('{') || accumulatedContent.length > 1000) {
-										// 	stream.emitOne({ type: 'text', value: accumulatedContent });
-										// 	accumulatedContent = '';
-										// }
-										stream.emitOne({ type: 'text', value: content });
-									}
-									if (localReasoning) {
-										stream.emitOne({ type: 'thinking', value: localReasoning });
-									}
-									// Accumulate tool call deltas by index (id, function.name, function.arguments stream separately)
-									if (choice?.delta?.tool_calls) {
-										for (const tc of choice.delta.tool_calls) {
-											const idx = tc.index ?? 0;
-											let acc = accumulatedToolCalls.get(idx);
-											if (!acc) {
-												acc = { args: '' };
-												accumulatedToolCalls.set(idx, acc);
-											}
-											if (tc.id) acc.id = tc.id;
-											if (tc.function?.name) acc.name = tc.function.name;
-											if (tc.function?.arguments !== undefined) acc.args += tc.function.arguments;
-										}
-									}
-								} catch {
-									// ignore parse errors
-								}
-							}
-						}
-					},
-					onError: error => reject(error),
-					onEnd: () => {
-						// Emit complete accumulated tool calls once stream ends
-						const indices = Array.from(accumulatedToolCalls.keys()).sort((a, b) => a - b);
-						for (const idx of indices) {
-							const acc = accumulatedToolCalls.get(idx)!;
-							if (acc.id && acc.name) {
-								try {
-									const parameters = acc.args ? JSON.parse(acc.args) : {};
-									stream.emitOne({
-										type: 'tool_use',
-										name: acc.name,
-										toolCallId: acc.id,
-										parameters
-									});
-								} catch (_e) {
-									// If arguments are incomplete/invalid JSON, still emit so agent can handle
-									stream.emitOne({
-										type: 'tool_use',
-										name: acc.name,
-										toolCallId: acc.id,
-										parameters: {}
-									});
-								}
-							}
-						}
-						resolve();
+			// Emit accumulated tool calls
+			for (const idx of Array.from(accumulatedToolCalls.keys()).sort((a, b) => a - b)) {
+				const acc = accumulatedToolCalls.get(idx)!;
+				if (acc.id && acc.name) {
+					try {
+						stream.emitOne({ type: 'tool_use', name: acc.name, toolCallId: acc.id, parameters: acc.args ? JSON.parse(acc.args) : {} });
+					} catch {
+						stream.emitOne({ type: 'tool_use', name: acc.name, toolCallId: acc.id, parameters: {} });
 					}
-				}, token);
-			});
+				}
+			}
 		} catch (e: unknown) {
 			const errMsg = e && typeof (e as Error).message === 'string' ? (e as Error).message : String(e);
 			if (this._isCanceledError(errMsg)) {
@@ -910,142 +883,55 @@ export class LoCoPilotLanguageModelProvider extends Disposable implements ILangu
 
 		const headers: Record<string, string> = { 'Content-Type': 'application/json', 'Accept': 'text/event-stream' };
 		try {
-			let response = await this.requestService.request({
-				type: 'POST',
-				url,
-				headers,
-				data: JSON.stringify(body)
-			}, token);
-
-			if (response.res.statusCode !== 200) {
-				const errorBody = await streamToBuffer(response.stream).then(b => b.toString());
-				throw new Error(this._getApiErrorMessage('Ollama', response.res.statusCode ?? 0) + (errorBody ? `: ${errorBody}` : ''));
-			}
-
-			let buffer = '';
-			let accumulatedContent = '';
+			const accumulatedToolCalls: Map<number, { id?: string; name?: string; args: string }> = new Map();
 			let hasEmittedAnything = false;
 
-			return new Promise<void>((resolve, reject) => {
-				const accumulatedToolCalls: Map<number, { id?: string; name?: string; args: string }> = new Map();
-
-				listenStream(response.stream, {
-					onData: chunk => {
-						buffer += chunk.toString();
-						const lines = buffer.split('\n');
-						buffer = lines.pop() || '';
-						for (const line of lines) {
-							const trimmed = line.trim();
-							if (trimmed.startsWith('data: ')) {
-								const data = trimmed.slice(6);
-								if (data === '[DONE]') continue;
-								try {
-									const json = JSON.parse(data);
-									const choice = json.choices?.[0] as {
-										delta?: {
-											content?: string;
-											reasoning_content?: string;
-											reasoning?: string;
-											thinking?: string;
-											tool_calls?: Array<{ index?: number; id?: string; function?: { name?: string; arguments?: string | object } }>;
-										};
-									};
-									const delta = choice?.delta;
-									if (delta?.content) {
-										stream.emitOne({ type: 'text', value: delta.content });
-										hasEmittedAnything = true;
-									}
-									const reasoningDelta = this._reasoningTextFromOpenAiDelta(delta);
-									if (reasoningDelta) {
-										stream.emitOne({ type: 'thinking', value: reasoningDelta });
-									}
-									if (delta?.tool_calls) {
-										for (const tc of delta.tool_calls) {
-											const idx = tc.index ?? 0;
-											let acc = accumulatedToolCalls.get(idx);
-											if (!acc) {
-												acc = { args: '' };
-												accumulatedToolCalls.set(idx, acc);
-											}
-											if (tc.id) acc.id = tc.id;
-											if (tc.function?.name) acc.name = tc.function.name;
-											if (tc.function?.arguments !== undefined) {
-												const a = tc.function.arguments;
-												acc.args += typeof a === 'string' ? a : JSON.stringify(a);
-											}
-										}
-									}
-								} catch {
-								}
-							}
+			const status = await this._fetchSSEStream(url, headers, JSON.stringify(body), token, json => {
+				const choice = (json as IOpenAiStreamChunk).choices?.[0];
+				const delta = choice?.delta;
+				if (delta?.content) {
+					stream.emitOne({ type: 'text', value: delta.content });
+					hasEmittedAnything = true;
+				}
+				const reasoningDelta = this._reasoningTextFromOpenAiDelta(delta);
+				if (reasoningDelta) {
+					stream.emitOne({ type: 'thinking', value: reasoningDelta });
+				}
+				if (delta?.tool_calls) {
+					for (const tc of delta.tool_calls) {
+						const idx = tc.index ?? 0;
+						let acc = accumulatedToolCalls.get(idx);
+						if (!acc) { acc = { args: '' }; accumulatedToolCalls.set(idx, acc); }
+						if (tc.id) { acc.id = tc.id; }
+						if (tc.function?.name) { acc.name = tc.function.name; }
+						if (tc.function?.arguments !== undefined) {
+							const a = tc.function.arguments;
+							acc.args += typeof a === 'string' ? a : JSON.stringify(a);
 						}
-					},
-					onError: error => reject(error),
-					onEnd: () => {
-						if (accumulatedContent.includes('"tool_calls"')) {
-							try {
-								const match = accumulatedContent.match(/\{[\s\S]*"tool_calls"[\s\S]*\}/);
-								if (match) {
-									const potentialJson = JSON.parse(match[0]);
-									if (potentialJson.tool_calls) {
-										for (const tc of potentialJson.tool_calls) {
-											const idx = tc.index ?? 0;
-											let acc = accumulatedToolCalls.get(idx);
-											if (!acc) {
-												acc = { args: '' };
-												accumulatedToolCalls.set(idx, acc);
-											}
-											if (tc.id) acc.id = tc.id;
-											if (tc.function?.name) acc.name = tc.function.name;
-											if (tc.function?.arguments) {
-												acc.args = typeof tc.function.arguments === 'string'
-													? tc.function.arguments
-													: JSON.stringify(tc.function.arguments);
-											}
-										}
-										accumulatedContent = accumulatedContent.replace(match[0], '');
-									}
-								}
-							} catch { /* empty */ }
-						}
-
-						if (accumulatedContent.trim()) {
-							stream.emitOne({ type: 'text', value: accumulatedContent });
-							hasEmittedAnything = true;
-						}
-
-						if (!hasEmittedAnything && accumulatedToolCalls.size === 0 && !options.tools) {
-							stream.emitOne({ type: 'text', value: 'The model did not return a response. Please try again or try with another model.' });
-						} else if (!hasEmittedAnything && accumulatedToolCalls.size === 0 && options.tools) {
-							this._log(`[LoCoPilot Provider] Ollama model returned empty response for tool-calling request. This might trigger a nudge.`);
-						}
-
-						const indices = Array.from(accumulatedToolCalls.keys()).sort((a, b) => a - b);
-						for (const idx of indices) {
-							const acc = accumulatedToolCalls.get(idx)!;
-							if (acc.id && acc.name) {
-								try {
-									const parameters = acc.args ? JSON.parse(acc.args) : {};
-									stream.emitOne({
-										type: 'tool_use',
-										name: acc.name,
-										toolCallId: acc.id,
-										parameters
-									});
-								} catch (_e) {
-									stream.emitOne({
-										type: 'tool_use',
-										name: acc.name,
-										toolCallId: acc.id,
-										parameters: {}
-									});
-								}
-							}
-						}
-						resolve();
 					}
-				}, token);
+				}
 			});
+
+			if (status !== 200) {
+				throw new Error(this._getApiErrorMessage('Ollama', status));
+			}
+
+			if (!hasEmittedAnything && accumulatedToolCalls.size === 0 && !options.tools) {
+				stream.emitOne({ type: 'text', value: 'The model did not return a response. Please try again or try with another model.' });
+			} else if (!hasEmittedAnything && accumulatedToolCalls.size === 0 && options.tools) {
+				this._log(`[LoCoPilot Provider] Ollama model returned empty response for tool-calling request. This might trigger a nudge.`);
+			}
+
+			for (const idx of Array.from(accumulatedToolCalls.keys()).sort((a, b) => a - b)) {
+				const acc = accumulatedToolCalls.get(idx)!;
+				if (acc.id && acc.name) {
+					try {
+						stream.emitOne({ type: 'tool_use', name: acc.name, toolCallId: acc.id, parameters: acc.args ? JSON.parse(acc.args) : {} });
+					} catch (_e) {
+						stream.emitOne({ type: 'tool_use', name: acc.name, toolCallId: acc.id, parameters: {} });
+					}
+				}
+			}
 		} catch (e: unknown) {
 			const errMsg = e && typeof (e as Error).message === 'string' ? (e as Error).message : String(e);
 			if (this._isCanceledError(errMsg)) {
@@ -1147,151 +1033,59 @@ export class LoCoPilotLanguageModelProvider extends Disposable implements ILangu
 
 		const headers: Record<string, string> = { 'Content-Type': 'application/json', 'Accept': 'text/event-stream' };
 		try {
-			let response = await this.requestService.request({
-				type: 'POST',
-				url,
-				headers,
-				data: JSON.stringify(body)
-			}, token);
+			const accumulatedToolCalls: Map<number, { id?: string; name?: string; args: string }> = new Map();
 
-			// Fallback: If 400 error and tools were provided, try again without tools
-			if (response.res.statusCode === 400 && body.tools) {
+			const processChunk = (json: unknown): void => {
+				const choice = (json as IOpenAiStreamChunk).choices?.[0];
+				const localReasoning = this._reasoningTextFromOpenAiDelta(choice?.delta);
+				if (localReasoning) {
+					this._log(`[LoCoPilot Provider] Reasoning delta: ${localReasoning.substring(0, 200)}${localReasoning.length > 200 ? '...' : ''}`);
+					stream.emitOne({ type: 'thinking', value: localReasoning });
+				}
+				if (choice?.delta?.content) {
+					stream.emitOne({ type: 'text', value: choice.delta.content });
+				}
+				if (choice?.delta?.tool_calls) {
+					for (const tc of choice.delta.tool_calls) {
+						const idx = tc.index ?? 0;
+						let acc = accumulatedToolCalls.get(idx);
+						if (!acc) { acc = { args: '' }; accumulatedToolCalls.set(idx, acc); }
+						if (tc.id) { acc.id = tc.id; }
+						if (tc.function?.name) { acc.name = tc.function.name; }
+						if (tc.function?.arguments !== undefined) { acc.args += tc.function.arguments; }
+					}
+				}
+			};
+
+			let status = await this._fetchSSEStream(url, headers, JSON.stringify(body), token, processChunk);
+
+			// Fallback: If 400 error and tools were provided, retry without tools
+			if (status === 400 && body.tools) {
 				this._log(`[LoCoPilot Provider] Localhost model request failed with 400, retrying without tools as fallback...`);
+				accumulatedToolCalls.clear();
 				const fallbackBody = { ...body };
 				delete fallbackBody.tools;
-				response = await this.requestService.request({
-					type: 'POST',
-					url,
-					headers,
-					data: JSON.stringify(fallbackBody)
-				}, token);
+				status = await this._fetchSSEStream(url, headers, JSON.stringify(fallbackBody), token, processChunk);
 			}
 
-			if (response.res.statusCode !== 200) {
-				const msg = response.res.statusCode === 404 || response.res.statusCode === 502 || response.res.statusCode === 503
+			if (status !== 200) {
+				const msg = status === 404 || status === 502 || status === 503
 					? `Localhost server not responding at ${url}. Check that the server is running and the URL is correct.`
-					: `Localhost model "${model.name}" request failed (${response.res.statusCode}).`;
+					: `Localhost model "${model.name}" request failed (${status}).`;
 				throw new Error(msg);
 			}
-			let buffer = '';
-			return new Promise<void>((resolve, reject) => {
-				// OpenAI streams tool_calls in deltas: id, function.name, and function.arguments arrive in separate chunks. Accumulate by index and emit on stream end.
-				const accumulatedToolCalls: Map<number, { id?: string; name?: string; args: string }> = new Map();
 
-				listenStream(response.stream, {
-					onData: chunk => {
-						buffer += chunk.toString();
-						const lines = buffer.split('\n');
-						buffer = lines.pop() || '';
-						for (const line of lines) {
-							const trimmed = line.trim();
-							if (trimmed.startsWith('data: ')) {
-								const data = trimmed.slice(6);
-								if (data === '[DONE]') continue;
-								try {
-									const json = JSON.parse(data);
-									const choice = json.choices?.[0];
-									const localReasoning = this._reasoningTextFromOpenAiDelta(choice?.delta);
-									if (localReasoning) {
-										this._log(`[LoCoPilot Provider] Reasoning delta: ${localReasoning.substring(0, 200)}${localReasoning.length > 200 ? '...' : ''}`);
-									}
-									if (choice?.delta?.content) {
-										const content = choice.delta.content;
-										// accumulatedContent += content;
-										// 
-										// // Check for manual tool call in accumulated content
-										// if (accumulatedContent.includes('"tool_calls"')) {
-										// 	try {
-										// 		// Try to find a complete JSON block in the accumulated content
-										// 		const match = accumulatedContent.match(/\{[\s\S]*"tool_calls"[\s\S]*\}/);
-										// 		if (match) {
-										// 			const potentialJson = JSON.parse(match[0]);
-										// 			if (potentialJson.tool_calls) {
-										// 				for (const tc of potentialJson.tool_calls) {
-										// 					const idx = tc.index ?? 0;
-										// 					let acc = accumulatedToolCalls.get(idx);
-										// 					if (!acc) {
-										// 						acc = { args: '' };
-										// 						accumulatedToolCalls.set(idx, acc);
-										// 					}
-										// 					if (tc.id) acc.id = tc.id;
-										// 					if (tc.function?.name) acc.name = tc.function.name;
-										// 					if (tc.function?.arguments) {
-										// 						acc.args = typeof tc.function.arguments === 'string' 
-										// 							? tc.function.arguments 
-										// 							: JSON.stringify(tc.function.arguments);
-										// 					}
-										// 				}
-										// 				// If we successfully parsed a tool call, remove it from accumulatedContent so it's not emitted as text
-										// 				accumulatedContent = accumulatedContent.replace(match[0], '');
-										// 				continue;
-										// 			}
-										// 		}
-										// 	} catch {
-										// 		// JSON might be incomplete, wait for more chunks
-										// 	}
-										// }
-										// 
-										// // Only emit content if it doesn't look like the start of a tool call
-										// if (!accumulatedContent.trim().startsWith('{') || accumulatedContent.length > 1000) {
-										// 	stream.emitOne({ type: 'text', value: accumulatedContent });
-										// 	accumulatedContent = '';
-										// }
-										stream.emitOne({ type: 'text', value: content });
-									}
-									if (localReasoning) {
-										stream.emitOne({ type: 'thinking', value: localReasoning });
-									}
-									// Accumulate tool call deltas by index (id, function.name, function.arguments stream separately)
-									if (choice?.delta?.tool_calls) {
-										for (const tc of choice.delta.tool_calls) {
-											const idx = tc.index ?? 0;
-											let acc = accumulatedToolCalls.get(idx);
-											if (!acc) {
-												acc = { args: '' };
-												accumulatedToolCalls.set(idx, acc);
-											}
-											if (tc.id) acc.id = tc.id;
-											if (tc.function?.name) acc.name = tc.function.name;
-											if (tc.function?.arguments !== undefined) acc.args += tc.function.arguments;
-										}
-									}
-								} catch {
-									// ignore parse errors
-								}
-							}
-						}
-					},
-					onError: error => reject(error),
-					onEnd: () => {
-						// Emit complete accumulated tool calls once stream ends
-						const indices = Array.from(accumulatedToolCalls.keys()).sort((a, b) => a - b);
-						for (const idx of indices) {
-							const acc = accumulatedToolCalls.get(idx)!;
-							if (acc.id && acc.name) {
-								try {
-									const parameters = acc.args ? JSON.parse(acc.args) : {};
-									stream.emitOne({
-										type: 'tool_use',
-										name: acc.name,
-										toolCallId: acc.id,
-										parameters
-									});
-								} catch (_e) {
-									// If arguments are incomplete/invalid JSON, still emit so agent can handle
-									stream.emitOne({
-										type: 'tool_use',
-										name: acc.name,
-										toolCallId: acc.id,
-										parameters: {}
-									});
-								}
-							}
-						}
-						resolve();
+			// Emit accumulated tool calls
+			for (const idx of Array.from(accumulatedToolCalls.keys()).sort((a, b) => a - b)) {
+				const acc = accumulatedToolCalls.get(idx)!;
+				if (acc.id && acc.name) {
+					try {
+						stream.emitOne({ type: 'tool_use', name: acc.name, toolCallId: acc.id, parameters: acc.args ? JSON.parse(acc.args) : {} });
+					} catch {
+						stream.emitOne({ type: 'tool_use', name: acc.name, toolCallId: acc.id, parameters: {} });
 					}
-				}, token);
-			});
+				}
+			}
 		} catch (e: unknown) {
 			const errMsg = e && typeof (e as Error).message === 'string' ? (e as Error).message : String(e);
 			if (this._isCanceledError(errMsg)) {

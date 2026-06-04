@@ -3,6 +3,8 @@
  *  Licensed under the MIT License. See License.txt in the project root for license information.
  *--------------------------------------------------------------------------------------------*/
 
+/* eslint-disable @typescript-eslint/no-explicit-any */
+
 import { CancellationToken } from '../../../../../base/common/cancellation.js';
 import { MarkdownString } from '../../../../../base/common/htmlContent.js';
 import { ILogService } from '../../../../../platform/log/common/log.js';
@@ -11,9 +13,8 @@ import { ILoCoPilotFileLog } from '../locopilotFileLog.js';
 import { nullExtensionDescription } from '../../../../services/extensions/common/extensions.js';
 import { IChatAgentRequest, IChatAgentResult } from '../../common/participants/chatAgents.js';
 import { IChatProgress } from '../../common/chatService/chatService.js';
-import { ChatImageMimeType, ChatMessageRole, IChatMessage, IChatMessageImagePart, IChatResponseToolUsePart, ILanguageModelsService } from '../../common/languageModels.js';
+import { ChatImageMimeType, ChatMessageRole, IChatMessage, IChatMessageImagePart, IChatResponseToolUsePart, ILanguageModelsService, LanguageModelPartAudience } from '../../common/languageModels.js';
 import { ILanguageModelToolsService, IToolData, toolMatchesModel } from '../../common/tools/languageModelToolsService.js';
-import { LanguageModelPartAudience } from '../../common/languageModels.js';
 import { TASK_COMPLETE_SIGNAL } from './agentPrompts.js';
 
 /** Re-export for consumers that need the completion signal. */
@@ -70,7 +71,7 @@ export class UnifiedAgent {
 		// Get model metadata and available tools
 		const modelMetadata = this.languageModelsService.lookupLanguageModel(modelId);
 		const allTools = await this.getAvailableTools(modelMetadata, request);
-		
+
 		this._log(`[LoCoPilot] Available tools: ${allTools.length}`);
 		if (allTools.length > 0) {
 			this._log(`[LoCoPilot] Tools: ${allTools.map(t => t.id).join(', ')}`);
@@ -102,9 +103,6 @@ export class UnifiedAgent {
 			let fullText = '';
 			let fullThinking = '';
 			const toolCalls: IChatResponseToolUsePart[] = [];
-			let lastProgressUpdate = Date.now();
-			let lastThinkingUpdate = Date.now();
-			const PROGRESS_UPDATE_INTERVAL = 100; // ms - throttle UI updates
 			// Chat model merges markdownContent/thinking by appending; emit only deltas to avoid duplication
 			let lastEmittedDisplayLength = 0;
 			let lastEmittedThinkingLength = 0;
@@ -120,30 +118,22 @@ export class UnifiedAgent {
 						fullText += p.value;
 						const displaySoFar = fullText.replace(/\s*\[TASK_COMPLETE\]\s*/g, '').trim();
 						const delta = displaySoFar.slice(lastEmittedDisplayLength);
-						// Emit first chunk immediately so the response is created and UI shows content
-						const now = Date.now();
-						const throttleElapsed = now - lastProgressUpdate > PROGRESS_UPDATE_INTERVAL;
-						if (delta && (throttleElapsed || lastEmittedDisplayLength === 0)) {
+						if (delta) {
 							progress([{
 								kind: 'markdownContent',
 								content: new MarkdownString(delta)
 							}]);
 							lastEmittedDisplayLength = displaySoFar.length;
 							hasEverEmitted = true;
-							if (throttleElapsed) {
-								lastProgressUpdate = now;
-							}
 						}
 					} else if (p.type === 'thinking' && p.value) {
 						const chunk = Array.isArray(p.value) ? p.value.join('') : p.value;
 						fullThinking += chunk;
-						// Emit only thinking delta so merge-by-append doesn't duplicate
-						const now = Date.now();
+						// Emit each thinking delta immediately for token-by-token streaming
 						const thinkingDelta = fullThinking.slice(lastEmittedThinkingLength);
-						if (thinkingDelta && (now - lastThinkingUpdate > PROGRESS_UPDATE_INTERVAL || lastEmittedThinkingLength === 0)) {
+						if (thinkingDelta) {
 							progress([{ kind: 'thinking', value: thinkingDelta }]);
 							lastEmittedThinkingLength = fullThinking.length;
-							lastThinkingUpdate = now;
 						}
 						this._log(`[LoCoPilot] Thinking: ${fullThinking.substring(0, 200)}...`);
 					} else if (p.type === 'tool_use') {
@@ -255,7 +245,7 @@ export class UnifiedAgent {
 
 			// Execute tools and add results to conversation
 			this._log(`[LoCoPilot] Executing ${toolCalls.length} tool call(s)...`);
-			
+
 			const toolResults: any[] = [];
 			const imagePartsForVision: IChatMessageImagePart[] = [];
 			for (const toolCall of toolCalls) {
@@ -292,7 +282,7 @@ export class UnifiedAgent {
 							} else if (item.kind === 'data' && item.value?.mimeType?.startsWith('image/')) {
 								resultContent.push({
 									type: 'text',
-									value: 'Image file — see the image in the next user message for vision.'
+									value: 'Image file - see the image in the next user message for vision.'
 								});
 								// Collect image for a user message so the model can use vision (tool messages are text-only)
 								imagePartsForVision.push({
@@ -325,7 +315,7 @@ export class UnifiedAgent {
 				} catch (error: any) {
 					this.logService.error(`[LoCoPilot] Tool ${toolCall.name} failed: ${error}`);
 					this.locopilotFileLog.log(`[LoCoPilot] Tool ${toolCall.name} failed: ${error}`);
-					
+
 					toolResults.push({
 						type: 'tool_result',
 						toolCallId: toolCall.toolCallId,
@@ -353,7 +343,7 @@ export class UnifiedAgent {
 				conversationMessages.push({
 					role: ChatMessageRole.User,
 					content: [
-						{ type: 'text', value: 'Image(s) from readFile — view below for vision:' },
+						{ type: 'text', value: 'Image(s) from readFile - view below for vision:' },
 						...imagePartsForVision
 					]
 				});
@@ -366,7 +356,7 @@ export class UnifiedAgent {
 			const reason = iterationCount >= this.MAX_ITERATIONS ? 'Reached maximum iterations' : 'No response from model';
 			this.logService.warn(`[LoCoPilot] Agent stopped: ${reason}`);
 			this.locopilotFileLog.log(`[LoCoPilot] Agent stopped: ${reason}`);
-			
+
 			if (consecutiveNoCompleteCount >= 2 && !hasEverEmitted) {
 				progress([{
 					kind: 'markdownContent',
@@ -390,7 +380,7 @@ export class UnifiedAgent {
 	private async getAvailableTools(modelMetadata: any, request: IChatAgentRequest): Promise<IToolData[]> {
 		const allTools = Array.from(this.toolsService.getTools(undefined));
 		const userSelectedTools = request.userSelectedTools || {};
-		
+
 		// Filter tools
 		const availableTools = allTools.filter(tool => {
 			// Check if tool matches the model
