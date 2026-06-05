@@ -15,15 +15,10 @@ import { IChatAgentRequest, IChatAgentResult } from '../../common/participants/c
 import { IChatProgress } from '../../common/chatService/chatService.js';
 import { ChatImageMimeType, ChatMessageRole, IChatMessage, IChatMessageImagePart, IChatResponseToolUsePart, ILanguageModelsService, LanguageModelPartAudience } from '../../common/languageModels.js';
 import { ILanguageModelToolsService, IToolData, toolMatchesModel } from '../../common/tools/languageModelToolsService.js';
-import { TASK_COMPLETE_SIGNAL } from './agentPrompts.js';
-
-/** Re-export for consumers that need the completion signal. */
-export { TASK_COMPLETE_SIGNAL };
-
 /**
  * Unified agent that runs the language model with the given messages and streams progress.
  * This implements a full agentic loop with tool calling support.
- * Iterates until the LLM includes TASK_COMPLETE_SIGNAL in its response or max iterations.
+ * Iterates until the LLM makes no more tool calls (natural completion) or max iterations.
  */
 /** Max times the same tool+args can be called before we force-stop to avoid loops. */
 const REPEATED_TOOL_CALL_THRESHOLD = 5;
@@ -62,7 +57,6 @@ export class UnifiedAgent {
 		this._log(`[LoCoPilot] UnifiedAgent.run starting - modelId=${modelId}, initialMessages=${messages.length}`);
 
 		let iterationCount = 0;
-		let consecutiveNoCompleteCount = 0;
 		let hasEverEmitted = false;
 		const conversationMessages = [...messages];
 		// Track recent tool invocations (toolKey) to detect repeated same tool+args loops
@@ -116,7 +110,7 @@ export class UnifiedAgent {
 				for (const p of parts) {
 					if (p.type === 'text') {
 						fullText += p.value;
-						const displaySoFar = fullText.replace(/\s*\[TASK_COMPLETE\]\s*/g, '').trim();
+						const displaySoFar = fullText;
 						const delta = displaySoFar.slice(lastEmittedDisplayLength);
 						if (delta) {
 							progress([{
@@ -150,10 +144,7 @@ export class UnifiedAgent {
 				progress([{ kind: 'thinking', value: finalThinkingDelta }]);
 			}
 
-			// Strip completion signal from displayed text (escape [ ] for regex)
-			const displayText = fullText.includes(TASK_COMPLETE_SIGNAL)
-				? fullText.replace(/\s*\[TASK_COMPLETE\]\s*/g, '').trim()
-				: fullText;
+			const displayText = fullText;
 
 			// Emit final delta so UI has full text (chat model appends each progress chunk)
 			const finalDelta = displayText.slice(lastEmittedDisplayLength);
@@ -194,31 +185,11 @@ export class UnifiedAgent {
 				});
 			}
 
-			// No tool calls: check for completion signal
+			// No tool calls: the model has given its final response, stop the loop
 			if (toolCalls.length === 0) {
-				if (fullText.includes(TASK_COMPLETE_SIGNAL)) {
-					this._log(`[LoCoPilot] Agent completed: received ${TASK_COMPLETE_SIGNAL}`);
-					break;
-				}
-				consecutiveNoCompleteCount++;
-				// After 2 text-only responses without [TASK_COMPLETE], stop to avoid infinite loop and garbled UI
-				if (consecutiveNoCompleteCount >= 2) {
-					this._log(`[LoCoPilot] Stopping: ${consecutiveNoCompleteCount} responses without ${TASK_COMPLETE_SIGNAL} (max nudge limit)`);
-					break;
-				}
-				// Nudge once: ask LLM to use tools or signal complete
-				this._log(`[LoCoPilot] No tool calls and no ${TASK_COMPLETE_SIGNAL}; sending nudge (${consecutiveNoCompleteCount}/2)`);
-				conversationMessages.push({
-					role: ChatMessageRole.User,
-					content: [{
-						type: 'text',
-						value: `Use the available tools to complete the task, or if you have given your final answer, end your next message with ${TASK_COMPLETE_SIGNAL}.`
-					}]
-				});
-				continue;
+				this._log(`[LoCoPilot] Agent completed: no tool calls in response`);
+				break;
 			}
-
-			consecutiveNoCompleteCount = 0;
 
 			// Build keys for this round's tool calls to check for repetition
 			const thisRoundKeys: string[] = [];
@@ -352,17 +323,16 @@ export class UnifiedAgent {
 			this._log(`[LoCoPilot] Completed iteration ${iterationCount}, continuing loop...`);
 		}
 
-		if (iterationCount >= this.MAX_ITERATIONS || consecutiveNoCompleteCount >= 2) {
-			const reason = iterationCount >= this.MAX_ITERATIONS ? 'Reached maximum iterations' : 'No response from model';
-			this.logService.warn(`[LoCoPilot] Agent stopped: ${reason}`);
-			this.locopilotFileLog.log(`[LoCoPilot] Agent stopped: ${reason}`);
+		if (iterationCount >= this.MAX_ITERATIONS) {
+			this.logService.warn(`[LoCoPilot] Agent stopped: Reached maximum iterations`);
+			this.locopilotFileLog.log(`[LoCoPilot] Agent stopped: Reached maximum iterations`);
 
-			if (consecutiveNoCompleteCount >= 2 && !hasEverEmitted) {
+			if (!hasEverEmitted) {
 				progress([{
 					kind: 'markdownContent',
 					content: new MarkdownString('The model did not return a response. Please try again or try with another model.')
 				}]);
-			} else if (iterationCount >= this.MAX_ITERATIONS) {
+			} else {
 				progress([{
 					kind: 'markdownContent',
 					content: new MarkdownString('\n\n*Note: Reached maximum number of iterations. The task may be incomplete.*')
