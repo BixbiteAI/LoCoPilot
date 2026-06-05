@@ -700,6 +700,11 @@ configurationRegistry.registerConfiguration({
 			markdownDescription: nls.localize('locopilot.ollama.keepAlive.description', "How long Ollama keeps a model loaded in memory after use (`ollama run --keepalive`), e.g. `30m`, `1h`, or `-1` to keep it loaded indefinitely. Keeping the model resident avoids the cold-start reload between requests. Leave empty to use Ollama's default."),
 			default: '30m',
 		},
+		[ChatConfiguration.LocopilotShowToolDetails]: {
+			type: 'boolean',
+			default: false,
+			description: nls.localize('locopilot.chat.showToolDetails.description', "When enabled, tool call parameters and results are shown in the chat panel. When disabled, only the tool name is shown."),
+		},
 		[ChatConfiguration.EditModeHidden]: {
 			type: 'boolean',
 			description: nls.localize('chat.editMode.hidden', "When enabled, hides the Edit mode from the chat mode picker."),
@@ -1016,12 +1021,13 @@ configurationRegistry.registerConfiguration({
 		},
 		[ChatConfiguration.ThinkingStyle]: {
 			type: 'string',
-			default: 'fixedScrolling',
-			enum: ['collapsed', 'collapsedPreview', 'fixedScrolling'],
+			default: 'autoCollapse',
+			enum: ['collapsed', 'collapsedPreview', 'fixedScrolling', 'autoCollapse'],
 			enumDescriptions: [
 				nls.localize('chat.agent.thinkingMode.collapsed', "Thinking parts will be collapsed by default."),
 				nls.localize('chat.agent.thinkingMode.collapsedPreview', "Thinking parts will be expanded first, then collapse once we reach a part that is not thinking."),
 				nls.localize('chat.agent.thinkingMode.fixedScrolling', "Show thinking in a fixed-height streaming panel that auto-scrolls; click header to expand to full height."),
+				nls.localize('chat.agent.thinkingMode.autoCollapse', "Thinking is expanded while the model is working, then automatically collapses when done. Click to re-expand."),
 			],
 			description: nls.localize('chat.agent.thinkingStyle', "Controls how thinking is rendered."),
 			tags: ['experimental'],

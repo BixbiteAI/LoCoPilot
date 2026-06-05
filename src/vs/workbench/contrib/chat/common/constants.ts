@@ -74,6 +74,8 @@ export enum ChatConfiguration {
 	LocopilotLlamaCppExtraArgs = 'locopilot.llamaCpp.extraArgs',
 	/** How long Ollama keeps a model loaded in memory (`ollama run --keepalive`). Reduces cold starts. */
 	LocopilotOllamaKeepAlive = 'locopilot.ollama.keepAlive',
+	/** Whether to show tool call parameters and results in the chat UI. */
+	LocopilotShowToolDetails = 'locopilot.chat.showToolDetails',
 }
 
 /**
@@ -105,6 +107,7 @@ export enum ThinkingDisplayMode {
 	Collapsed = 'collapsed',
 	CollapsedPreview = 'collapsedPreview',
 	FixedScrolling = 'fixedScrolling',
+	AutoCollapse = 'autoCollapse',
 }
 
 export enum CollapsedToolsDisplayMode {

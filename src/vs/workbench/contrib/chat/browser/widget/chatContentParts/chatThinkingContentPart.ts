@@ -123,6 +123,7 @@ export class ChatThinkingContentPart extends ChatCollapsibleContentPart implemen
 	private markdownResult: IRenderedMarkdown | undefined;
 	private wrapper!: HTMLElement;
 	private fixedScrollingMode: boolean = false;
+	private autoCollapseMode: boolean = false;
 	private autoScrollEnabled: boolean = true;
 	private scrollableElement: DomScrollableElement | undefined;
 	private lastExtractedTitle: string | undefined;
@@ -157,6 +158,7 @@ export class ChatThinkingContentPart extends ChatCollapsibleContentPart implemen
 		const configuredMode = this.configurationService.getValue<ThinkingDisplayMode>('chat.agent.thinkingStyle') ?? ThinkingDisplayMode.FixedScrolling;
 
 		this.fixedScrollingMode = configuredMode === ThinkingDisplayMode.FixedScrolling;
+		this.autoCollapseMode = configuredMode === ThinkingDisplayMode.AutoCollapse;
 
 		this.currentTitle = extractedTitle;
 		if (extractedTitle !== this.defaultTitle) {
@@ -174,6 +176,9 @@ export class ChatThinkingContentPart extends ChatCollapsibleContentPart implemen
 			// Use streamingCompleted to support look-ahead completion: when we know
 			// this thinking part is done (based on subsequent non-pinnable parts)
 			// even though the overall response is not complete
+			this.setExpanded(!this.streamingCompleted && !this.element.isComplete);
+		} else if (configuredMode === ThinkingDisplayMode.AutoCollapse) {
+			// Expand while the model is thinking; auto-collapse once done
 			this.setExpanded(!this.streamingCompleted && !this.element.isComplete);
 		} else if (configuredMode === ThinkingDisplayMode.FixedScrolling) {
 			this.setExpanded(true);
@@ -516,6 +521,11 @@ export class ChatThinkingContentPart extends ChatCollapsibleContentPart implemen
 			this._collapseButton.icon = Codicon.check;
 		}
 
+		// Auto-collapse when streaming finishes in autoCollapse mode
+		if (this.autoCollapseMode) {
+			this.setExpanded(false);
+		}
+
 		// Update scroll dimensions now that streaming is complete
 		// This removes unnecessary scrollbar when content fits
 		this.updateScrollDimensionsForCompletion();
@@ -747,6 +757,11 @@ export class ChatThinkingContentPart extends ChatCollapsibleContentPart implemen
 		if (this._collapseButton) {
 			this._collapseButton.icon = Codicon.check;
 			this._collapseButton.label = finalLabel;
+		}
+
+		// Auto-collapse when streaming finishes in autoCollapse mode
+		if (this.autoCollapseMode) {
+			this.setExpanded(false);
 		}
 
 		this.updateDropdownClickability();
