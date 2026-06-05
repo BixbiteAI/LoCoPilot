@@ -12,20 +12,17 @@ import { IMarkdownRenderer } from '../../../../../../../platform/markdown/browse
 import { IChatToolInvocation, IChatToolInvocationSerialized, ToolConfirmKind } from '../../../../common/chatService/chatService.js';
 import { IChatRendererContent } from '../../../../common/model/chatViewModel.js';
 import { CodeBlockModelCollection } from '../../../../common/widget/codeBlockModelCollection.js';
-import { isToolResultInputOutputDetails, isToolResultOutputDetails, ToolInvocationPresentation } from '../../../../common/tools/languageModelToolsService.js';
+import { ToolInvocationPresentation } from '../../../../common/tools/languageModelToolsService.js';
 import { ChatTreeItem, IChatCodeBlockInfo } from '../../../chat.js';
 import { EditorPool } from '../chatContentCodePools.js';
 import { IChatContentPart, IChatContentPartRenderContext } from '../chatContentParts.js';
 import { CollapsibleListPool } from '../chatReferencesContentPart.js';
 import { ExtensionsInstallConfirmationWidgetSubPart } from './chatExtensionsInstallToolSubPart.js';
-import { ChatInputOutputMarkdownProgressPart } from './chatInputOutputMarkdownProgressPart.js';
 import { ChatMcpAppSubPart, IMcpAppRenderData } from './chatMcpAppSubPart.js';
-import { ChatResultListSubPart } from './chatResultListSubPart.js';
 import { ChatTerminalToolConfirmationSubPart } from './chatTerminalToolConfirmationSubPart.js';
 import { ChatTerminalToolProgressPart } from './chatTerminalToolProgressPart.js';
 import { ToolConfirmationSubPart } from './chatToolConfirmationSubPart.js';
 import { BaseChatToolInvocationSubPart } from './chatToolInvocationSubPart.js';
-import { ChatToolOutputSubPart } from './chatToolOutputPart.js';
 import { ChatToolPostExecuteConfirmationPart } from './chatToolPostExecuteConfirmationPart.js';
 import { ChatToolProgressSubPart } from './chatToolProgressPart.js';
 import { ChatToolStreamingSubPart } from './chatToolStreamingSubPart.js';
@@ -166,43 +163,7 @@ export class ChatToolInvocationPart extends Disposable implements IChatContentPa
 			return this.instantiationService.createInstance(ChatTerminalToolProgressPart, this.toolInvocation, this.toolInvocation.toolSpecificData, this.context, this.renderer, this.editorPool, this.currentWidthDelegate, this.codeBlockStartIndex, this.codeBlockModelCollection);
 		}
 
-		const resultDetails = IChatToolInvocation.resultDetails(this.toolInvocation);
-		if (Array.isArray(resultDetails) && resultDetails.length) {
-			return this.instantiationService.createInstance(ChatResultListSubPart, this.toolInvocation, this.context, this.toolInvocation.pastTenseMessage ?? this.toolInvocation.invocationMessage, resultDetails, this.listPool);
-		}
-
-		if (isToolResultOutputDetails(resultDetails)) {
-			return this.instantiationService.createInstance(ChatToolOutputSubPart, this.toolInvocation, this.context, this._onDidRemount.event);
-		}
-
-		if (isToolResultInputOutputDetails(resultDetails)) {
-			return this.instantiationService.createInstance(
-				ChatInputOutputMarkdownProgressPart,
-				this.toolInvocation,
-				this.context,
-				this.codeBlockStartIndex,
-				this.toolInvocation.pastTenseMessage ?? this.toolInvocation.invocationMessage,
-				this.toolInvocation.originMessage,
-				resultDetails.input,
-				resultDetails.output,
-				!!resultDetails.isError,
-			);
-		}
-
-		if (this.toolInvocation.kind === 'toolInvocation' && this.toolInvocation.toolSpecificData?.kind === 'input' && !IChatToolInvocation.isComplete(this.toolInvocation)) {
-			return this.instantiationService.createInstance(
-				ChatInputOutputMarkdownProgressPart,
-				this.toolInvocation,
-				this.context,
-				this.codeBlockStartIndex,
-				this.toolInvocation.invocationMessage,
-				this.toolInvocation.originMessage,
-				typeof this.toolInvocation.toolSpecificData.rawInput === 'string' ? this.toolInvocation.toolSpecificData.rawInput : JSON.stringify(this.toolInvocation.toolSpecificData.rawInput, null, 2),
-				undefined,
-				false,
-			);
-		}
-
+		// Always use the simple progress part (tool name only) - params and results are hidden
 		return this.instantiationService.createInstance(ChatToolProgressSubPart, this.toolInvocation, this.context, this.renderer, this.announcedToolProgressKeys);
 	}
 
