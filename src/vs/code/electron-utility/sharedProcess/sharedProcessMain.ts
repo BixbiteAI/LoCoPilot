@@ -20,6 +20,8 @@ import { LogsDataCleaner } from './contrib/logsDataCleaner.js';
 import { UnusedWorkspaceStorageDataCleaner } from './contrib/storageDataCleaner.js';
 import { IChecksumService } from '../../../platform/checksum/common/checksumService.js';
 import { ChecksumService } from '../../../platform/checksum/node/checksumService.js';
+import { IEmbeddingComputeService } from '../../../platform/embeddings/common/embeddingCompute.js';
+import { EmbeddingComputeService } from '../../../platform/embeddings/node/embeddingComputeService.js';
 import { IConfigurationService } from '../../../platform/configuration/common/configuration.js';
 import { ConfigurationService } from '../../../platform/configuration/common/configurationService.js';
 import { IDiagnosticsService } from '../../../platform/diagnostics/common/diagnostics.js';
@@ -292,6 +294,9 @@ class SharedProcessMain extends Disposable implements IClientConnectionFilter {
 		// Checksum
 		services.set(IChecksumService, new SyncDescriptor(ChecksumService, undefined, false /* proxied to other processes */));
 
+		// LoCoPilot bundled embeddings (semantic code search)
+		services.set(IEmbeddingComputeService, new SyncDescriptor(EmbeddingComputeService, undefined, false /* proxied to other processes */));
+
 		// V8 Inspect profiler
 		services.set(IV8InspectProfilingService, new SyncDescriptor(V8InspectProfilingService, undefined, false /* proxied to other processes */));
 
@@ -426,6 +431,10 @@ class SharedProcessMain extends Disposable implements IClientConnectionFilter {
 		// Checksum
 		const checksumChannel = ProxyChannel.fromService(accessor.get(IChecksumService), this._store);
 		this.server.registerChannel('checksum', checksumChannel);
+
+		// LoCoPilot bundled embeddings
+		const embeddingChannel = ProxyChannel.fromService(accessor.get(IEmbeddingComputeService), this._store);
+		this.server.registerChannel('locopilotEmbeddings', embeddingChannel);
 
 		// Profiling
 		const profilingChannel = ProxyChannel.fromService(accessor.get(IV8InspectProfilingService), this._store);

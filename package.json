@@ -112,6 +112,7 @@
     "native-is-elevated": "0.9.0",
     "native-keymap": "^3.3.5",
     "node-pty": "^1.2.0-beta.8",
+    "onnxruntime-node": "1.20.1",
     "open": "^10.1.2",
     "tas-client": "0.3.1",
     "undici": "^7.18.2",

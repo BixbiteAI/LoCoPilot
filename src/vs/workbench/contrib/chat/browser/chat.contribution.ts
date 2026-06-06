@@ -67,6 +67,8 @@ import { LoCoPilotModelDownloadService } from './locopilotModelDownloadService.j
 import { ILoCoPilotLocalModelRunner, LoCoPilotLocalModelRunner } from './locopilotLocalModelRunner.js';
 import { LanguageModelToolsExtensionPointHandler } from '../common/tools/languageModelToolsContribution.js';
 import { BuiltinToolsContribution } from '../common/tools/builtinTools/tools.js';
+import './retrieval/retrievalService.js'; // registers ILoCoPilotRetrievalService singleton
+import { LoCoPilotRetrievalContribution } from './retrieval/retrievalContribution.js';
 import { IVoiceChatService, VoiceChatService } from '../common/voiceChatService.js';
 import { registerChatAccessibilityActions } from './actions/chatAccessibilityActions.js';
 import { AgentChatAccessibilityHelp, EditsChatAccessibilityHelp, PanelChatAccessibilityHelp, QuickChatAccessibilityHelp } from './actions/chatAccessibilityHelp.js';
@@ -704,6 +706,33 @@ configurationRegistry.registerConfiguration({
 			type: 'boolean',
 			default: false,
 			description: nls.localize('locopilot.chat.showToolDetails.description', "When enabled, tool call parameters and results are shown in the chat panel. When disabled, only the tool name is shown."),
+		},
+		'locopilot.retrieval.enabled': {
+			type: 'boolean',
+			default: true,
+			description: nls.localize('locopilot.retrieval.enabled.description', "Enable local semantic code search (the semanticSearch tool). Builds a private embedding index of your workspace in the background, stored only on your machine under .locopilot/. Requires a local embedding backend (Ollama with `ollama pull nomic-embed-text`, or a configured embedding endpoint)."),
+		},
+		'locopilot.retrieval.embeddingModel': {
+			type: 'string',
+			default: 'nomic-embed-text',
+			description: nls.localize('locopilot.retrieval.embeddingModel.description', "Embedding model used for semantic code search. Default is nomic-embed-text (Apache-2.0, runs locally via Ollama). Changing this rebuilds the index."),
+		},
+		'locopilot.retrieval.ollamaUrl': {
+			type: 'string',
+			default: 'http://localhost:11434',
+			description: nls.localize('locopilot.retrieval.ollamaUrl.description', "Base URL of the Ollama server used for embeddings (semantic code search)."),
+		},
+		'locopilot.retrieval.embeddingUrl': {
+			type: 'string',
+			default: '',
+			description: nls.localize('locopilot.retrieval.embeddingUrl.description', "Optional: an OpenAI-compatible /v1/embeddings endpoint to use instead of Ollama (e.g. a llama.cpp embedding server, LM Studio, or a cloud provider). Leave empty to auto-detect Ollama."),
+		},
+		'locopilot.retrieval.embeddingApiKey': {
+			type: 'string',
+			default: '',
+			scope: ConfigurationScope.APPLICATION,
+			tags: ['usesOnlineServices'],
+			description: nls.localize('locopilot.retrieval.embeddingApiKey.description', "Optional API key sent as a Bearer token to the configured embedding endpoint (only needed for cloud embedding providers; leave empty for local backends)."),
 		},
 		[ChatConfiguration.EditModeHidden]: {
 			type: 'boolean',
@@ -1469,6 +1498,7 @@ registerWorkbenchContribution2(ChatSetupContribution.ID, ChatSetupContribution, 
 registerWorkbenchContribution2(ChatTeardownContribution.ID, ChatTeardownContribution, WorkbenchPhase.AfterRestored);
 registerWorkbenchContribution2(ChatStatusBarEntry.ID, ChatStatusBarEntry, WorkbenchPhase.BlockRestore);
 registerWorkbenchContribution2(BuiltinToolsContribution.ID, BuiltinToolsContribution, WorkbenchPhase.Eventually);
+registerWorkbenchContribution2(LoCoPilotRetrievalContribution.ID, LoCoPilotRetrievalContribution, WorkbenchPhase.Eventually);
 registerWorkbenchContribution2(ChatAgentSettingContribution.ID, ChatAgentSettingContribution, WorkbenchPhase.AfterRestored);
 registerWorkbenchContribution2(ChatAgentActionsContribution.ID, ChatAgentActionsContribution, WorkbenchPhase.Eventually);
 registerWorkbenchContribution2(ToolReferenceNamesContribution.ID, ToolReferenceNamesContribution, WorkbenchPhase.AfterRestored);

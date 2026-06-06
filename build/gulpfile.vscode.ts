@@ -285,6 +285,7 @@ function packageTask(platform: string, arch: string, sourceFolderName: string, d
 		const telemetry = gulp.src('.build/telemetry/**', { base: '.build/telemetry', dot: true });
 
 		const profiles = gulp.src('resources/profiles/**', { base: '.', dot: true });
+		const embeddingModel = gulp.src('resources/embeddings/**', { base: '.', dot: true });
 
 		const jsFilter = util.filter(data => !data.isDirectory() && /\.js$/.test(data.path));
 		const root = path.resolve(path.join(import.meta.dirname, '..'));
@@ -321,6 +322,7 @@ function packageTask(platform: string, arch: string, sourceFolderName: string, d
 			api,
 			telemetry,
 			profiles,
+			embeddingModel,
 			sources,
 			deps
 		);
