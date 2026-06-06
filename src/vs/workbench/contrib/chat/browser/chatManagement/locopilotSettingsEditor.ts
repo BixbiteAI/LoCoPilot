@@ -68,14 +68,15 @@ const locopilotSettingsSelectBoxStyles = getSelectBoxStyles({
 
 const CLOUD_PROVIDERS_ADD: ISelectOptionItem[] = [
 	{ text: 'Anthropic', description: '' },
-	{ text: 'OpenAI', description: '' },
 	{ text: 'Google', description: '' },
+	{ text: 'Hugging Face', description: '' },
+	{ text: 'OpenAI', description: '' },
 ];
 
 const LOCAL_PROVIDERS_ADD: ISelectOptionItem[] = [
 	{ text: 'HuggingFace', description: '' },
-	{ text: 'Ollama', description: '' },
 	{ text: 'Localhost', description: '' },
+	{ text: 'Ollama', description: '' },
 ];
 
 export const locopilotSettingsSashBorder = registerColor('locopilotSettings.sashBorder', PANEL_BORDER, localize('locopilotSettingsSashBorder', "The color of the LoCoPilot Settings editor splitview sash border."));
@@ -120,6 +121,8 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 	private addFormUseNativeToolsContainer!: HTMLElement;
 	private addFormMtpToggle!: Toggle;
 	private addFormMtpContainer!: HTMLElement;
+	private addFormHfFastestToggle!: Toggle;
+	private addFormHfFastestContainer!: HTMLElement;
 	private addFormAddButton!: Button;
 	private addFormCurrentModelType: 'cloud' | 'local' = 'cloud';
 	private addFormCurrentProviderIndex: number = 0;
@@ -490,6 +493,19 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 		}));
 		DOM.append(mtpToggleContainer, this.addFormMtpToggle.domNode);
 
+		// HF cloud routing toggle (shown only for Hugging Face cloud): on = cheapest, off = fastest
+		this.addFormHfFastestContainer = DOM.append(formContainer, $('.form-field'));
+		this.addFormHfFastestContainer.style.display = 'none';
+		const hfFastestLabel = DOM.append(this.addFormHfFastestContainer, $('label.form-label'));
+		hfFastestLabel.textContent = localize('addCustomModel.hfCheapest', 'Cheapest');
+		const hfFastestToggleContainer = DOM.append(this.addFormHfFastestContainer, $('.form-input-container.agent-setting-switch-wrap'));
+		this.addFormHfFastestToggle = this._register(new Toggle({
+			title: localize('addCustomModel.hfCheapestDescription', 'On = route to the cheapest available provider; Off = route to the fastest available provider. HF controls the actual routing.'),
+			isChecked: true,
+			...defaultToggleStyles
+		}));
+		DOM.append(hfFastestToggleContainer, this.addFormHfFastestToggle.domNode);
+
 		const buttonContainer = DOM.append(formContainer, $('.form-actions'));
 		this.addFormAddButton = this._register(new Button(buttonContainer, { ...defaultButtonStyles }));
 		this.addFormAddButton.label = localize('addCustomModel.add', 'Add Model');
@@ -545,6 +561,7 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 		const isHuggingFace = this.addFormCurrentModelType === 'local' && provider.text.toLowerCase() === 'huggingface';
 		const isOllama = this.addFormCurrentModelType === 'local' && provider.text.toLowerCase() === 'ollama';
 		const isLocalhost = this.addFormCurrentModelType === 'local' && provider.text.toLowerCase() === 'localhost';
+		const isHfCloud = this.addFormCurrentModelType === 'cloud' && provider.text === 'Hugging Face';
 		if (this.addFormLocalhostModelIdContainer) {
 			this.addFormLocalhostModelIdContainer.style.display = isLocalhost ? '' : 'none';
 		}
@@ -552,11 +569,18 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 			if (apiKeyContainer) { apiKeyContainer.style.display = ''; }
 			if (tokenContainer) { tokenContainer.style.display = 'none'; }
 			if (this.addFormModelFormatContainer) { this.addFormModelFormatContainer.style.display = 'none'; }
-			if (this.addFormUseNativeToolsContainer) { this.addFormUseNativeToolsContainer.style.display = 'none'; }
+			// Tools toggle: hidden for normal cloud (always on), shown for HF cloud so the user can
+			// disable function-calling for models that don't support it.
+			if (this.addFormUseNativeToolsContainer) { this.addFormUseNativeToolsContainer.style.display = isHfCloud ? '' : 'none'; }
 			if (this.addFormMtpContainer) { this.addFormMtpContainer.style.display = 'none'; }
+			if (this.addFormHfFastestContainer) { this.addFormHfFastestContainer.style.display = isHfCloud ? '' : 'none'; }
+			// Reset toggles to defaults each time HF cloud is selected (cheapest on, tools off)
+			if (isHfCloud && this.addFormHfFastestToggle) { this.addFormHfFastestToggle.checked = true; }
+			if (isHfCloud && this.addFormUseNativeToolsToggle) { this.addFormUseNativeToolsToggle.checked = false; }
 			this.addFormMaxInputTokensInput.value = String(LoCoPilotSettingsEditor.DEFAULT_MAX_INPUT);
 			this.addFormMaxOutputTokensInput.value = String(LoCoPilotSettingsEditor.DEFAULT_MAX_OUTPUT_TOKENS);
 		} else {
+			if (this.addFormHfFastestContainer) { this.addFormHfFastestContainer.style.display = 'none'; }
 			if (apiKeyContainer) { apiKeyContainer.style.display = 'none'; }
 			// For Ollama, we reuse the token field for the Base URL
 			if (tokenContainer) {
@@ -593,7 +617,11 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 		const isLocalhost = this.addFormCurrentModelType === 'local' && provider.text.toLowerCase() === 'localhost';
 		const isHuggingFace = this.addFormCurrentModelType === 'local' && provider.text.toLowerCase() === 'huggingface';
 		const isOllama = this.addFormCurrentModelType === 'local' && provider.text.toLowerCase() === 'ollama';
-		if (isLocalhost) {
+		const isHfCloud = this.addFormCurrentModelType === 'cloud' && provider.text === 'Hugging Face';
+		if (isHfCloud) {
+			this.addFormModelNameLabel.textContent = localize('addCustomModel.modelName', 'Model Name');
+			this.addFormModelNameInputBox.setPlaceHolder(localize('addCustomModel.modelNamePlaceholderHfCloud', 'e.g., meta-llama/Llama-3.3-70B-Instruct'));
+		} else if (isLocalhost) {
 			this.addFormModelNameLabel.textContent = localize('addCustomModel.localhostUrl', 'Localhost URL');
 			this.addFormModelNameInputBox.setPlaceHolder(localize('addCustomModel.localhostUrlPlaceholder', 'e.g., http://localhost:1234/v1/chat/completions'));
 		} else if (isOllama) {
@@ -651,7 +679,9 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 	private async handleAddModel(): Promise<void> {
 		const providers = this.addFormCurrentModelType === 'cloud' ? CLOUD_PROVIDERS_ADD : LOCAL_PROVIDERS_ADD;
 		const provider = providers[this.addFormCurrentProviderIndex];
-		const providerValue = provider.text.toLowerCase().replace(/\s+/g, '');
+		const isHfCloud = this.addFormCurrentModelType === 'cloud' && provider.text === 'Hugging Face';
+		// Use distinct id for cloud HF so it doesn't collide with local 'huggingface' (GGUF/MLX)
+		const providerValue = isHfCloud ? 'huggingface-cloud' : provider.text.toLowerCase().replace(/\s+/g, '');
 		const isLocalhost = providerValue === 'localhost';
 		const modelName = this.addFormModelNameInputBox.value.trim();
 		const apiKey = this.addFormCurrentModelType === 'cloud' ? this.addFormApiKeyInputBox.value.trim() : undefined;
@@ -720,7 +750,8 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 				maxInputTokens: inputResult.value,
 				maxOutputTokens: outputResult.value,
 				useNativeTools: this.addFormUseNativeToolsToggle.checked,
-				mtp: this.addFormMtpToggle.checked
+				mtp: this.addFormMtpToggle.checked,
+				hfFastest: isHfCloud ? !this.addFormHfFastestToggle.checked : undefined,
 			});
 			const listLabel = getCustomModelListLabel(addedModel);
 
@@ -890,8 +921,10 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 		const detailsLabel = DOM.append(row2, $('.model-details'));
 		detailsLabel.textContent = details;
 
-		const secondarySettingsContainer = DOM.append(row2, $('.model-secondary-settings'));
-		if (model.type === 'local') {
+		// Settings row: toggles + token inputs on their own line (right-aligned), so row 2 text stays fully visible
+		const settingsRow = DOM.append(itemContainer, $('.model-item-row.model-item-row-settings'));
+		const secondarySettingsContainer = DOM.append(settingsRow, $('.model-secondary-settings'));
+		if (model.type === 'local' || model.provider === 'huggingface-cloud') {
 			const toolsContainer = DOM.append(secondarySettingsContainer, $('.model-action-tools-container'));
 			toolsContainer.title = localize('customLanguageModels.toolsDescription', 'Enable native tool calling for this model');
 			const toolsIcon = DOM.append(toolsContainer, $('span.model-action-tools-icon'));
@@ -923,6 +956,24 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 			DOM.append(mtpWrap, mtpToggle.domNode);
 			this._register(mtpToggle.onChange(async () => {
 				await this.customLanguageModelsService.updateCustomModel(model.id, { mtp: mtpToggle.checked });
+			}));
+		}
+		// HF cloud routing toggle: on = cheapest, off = fastest. Shown only for HF cloud models.
+		if (model.provider === 'huggingface-cloud') {
+			const hfDesc = localize('customLanguageModels.hfCheapestDescription', 'On = route to the cheapest provider; Off = route to the fastest provider. HF controls the actual routing.');
+			const hfContainer = DOM.append(secondarySettingsContainer, $('.model-action-tools-container'));
+			hfContainer.title = hfDesc;
+			const hfIcon = DOM.append(hfContainer, $('span.model-action-tools-icon'));
+			hfIcon.textContent = '$'; // cost indicator: on = cheapest, off = higher cost (fastest)
+			const hfWrap = DOM.append(hfContainer, $('.model-action-tools.agent-setting-switch-wrap'));
+			const hfToggle = this._register(new Toggle({
+				title: hfDesc,
+				isChecked: !model.hfFastest, // checked = cheapest
+				...defaultToggleStyles
+			}));
+			DOM.append(hfWrap, hfToggle.domNode);
+			this._register(hfToggle.onChange(async () => {
+				await this.customLanguageModelsService.updateCustomModel(model.id, { hfFastest: !hfToggle.checked });
 			}));
 		}
 		const maxInputContainer = DOM.append(secondarySettingsContainer, $('.model-max-input-container'));

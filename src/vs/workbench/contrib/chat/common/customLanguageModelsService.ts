@@ -78,6 +78,11 @@ export interface ICustomLanguageModel {
 	modelName: string;
 	/** For provider `localhost`: value for JSON `model` (OpenAI id as in GET /v1/models). */
 	localhostOpenAiModel?: string;
+	/**
+	 * For provider `huggingface-cloud` (HF Inference Providers router): routing policy suffix.
+	 * false/undefined => `:cheapest` (lowest price); true => `:fastest`.
+	 */
+	hfFastest?: boolean;
 	/** Max input tokens (context window); default 100000 (100K) */
 	maxInputTokens?: number;
 	/** Max output tokens; default 8000 (8K) */

@@ -46,6 +46,7 @@ const CLOUD_PROVIDERS: ISelectOptionItem[] = [
 	{ text: 'Anthropic', description: '' },
 	{ text: 'OpenAI', description: '' },
 	{ text: 'Google', description: '' },
+	{ text: 'Hugging Face', description: '' },
 ];
 
 const LOCAL_PROVIDERS: ISelectOptionItem[] = [
@@ -71,6 +72,8 @@ export class AddCustomModelEditor extends EditorPane {
 	private displayNameInputBox!: InputBox;
 	private localhostModelIdContainer!: HTMLElement;
 	private localhostModelIdInputBox!: InputBox;
+	private hfRoutingContainer!: HTMLElement;
+	private hfFastestCheckbox!: HTMLInputElement;
 	private addButton!: Button;
 
 	private currentModelType: 'cloud' | 'local' = 'cloud';
@@ -136,7 +139,7 @@ export class AddCustomModelEditor extends EditorPane {
 		this.providerSelectBox.render(providerSelectContainer);
 		this._register(this.providerSelectBox.onDidSelect((e: ISelectData) => {
 			this.currentProviderIndex = e.index;
-			this.updateModelNameLabel();
+			this.updateInputFields();
 		}));
 
 		// API Key (for cloud)
@@ -182,6 +185,18 @@ export class AddCustomModelEditor extends EditorPane {
 			inputBoxStyles: settingsStyleInputBox
 		}));
 
+		// Routing policy toggle (Hugging Face cloud only): off = cheapest, on = fastest
+		this.hfRoutingContainer = DOM.append(formContainer, $('.form-field'));
+		this.hfRoutingContainer.style.display = 'none';
+		const hfRoutingLabel = DOM.append(this.hfRoutingContainer, $('label.form-label'));
+		hfRoutingLabel.textContent = localize('addCustomModel.hfRouting', 'Routing');
+		const hfRoutingWrap = DOM.append(this.hfRoutingContainer, $('.form-input-container'));
+		const hfRoutingInline = DOM.append(hfRoutingWrap, $('label.hf-routing-toggle'));
+		this.hfFastestCheckbox = DOM.append(hfRoutingInline, $('input')) as HTMLInputElement;
+		this.hfFastestCheckbox.type = 'checkbox';
+		const hfRoutingText = DOM.append(hfRoutingInline, $('span'));
+		hfRoutingText.textContent = localize('addCustomModel.hfRoutingHint', 'Prefer fastest provider (off = cheapest)');
+
 		this.displayNameContainer = DOM.append(formContainer, $('.form-field'));
 		const dnLabel = DOM.append(this.displayNameContainer, $('label.form-label'));
 		dnLabel.textContent = localize('addCustomModel.displayNameOptional', 'Display name (optional)');
@@ -215,6 +230,11 @@ export class AddCustomModelEditor extends EditorPane {
 		const providers = this.currentModelType === 'cloud' ? CLOUD_PROVIDERS : LOCAL_PROVIDERS;
 		const provider = providers[this.currentProviderIndex];
 		const isLocalhost = this.currentModelType === 'local' && provider.text.toLowerCase() === 'localhost';
+		const isHfCloud = this.currentModelType === 'cloud' && provider.text === 'Hugging Face';
+
+		if (this.hfRoutingContainer) {
+			this.hfRoutingContainer.style.display = isHfCloud ? '' : 'none';
+		}
 
 		if (this.currentModelType === 'cloud') {
 			if (apiKeyContainer) {
@@ -261,7 +281,10 @@ export class AddCustomModelEditor extends EditorPane {
 	private async handleAddModel(): Promise<void> {
 		const providers = this.currentModelType === 'cloud' ? CLOUD_PROVIDERS : LOCAL_PROVIDERS;
 		const provider = providers[this.currentProviderIndex];
-		const providerValue = provider.text.toLowerCase().replace(/\s+/g, '');
+		const isHfCloud = this.currentModelType === 'cloud' && provider.text === 'Hugging Face';
+		// Cloud "Hugging Face" => HF Inference Providers router. Use a distinct id so it does
+		// not collide with the local `huggingface` (GGUF/MLX) provider.
+		const providerValue = isHfCloud ? 'huggingface-cloud' : provider.text.toLowerCase().replace(/\s+/g, '');
 		const isLocalhost = providerValue === 'localhost';
 		const modelName = this.modelNameInputBox.value.trim();
 		const localhostServerModelId = isLocalhost ? this.localhostModelIdInputBox.value.trim() : '';
@@ -301,6 +324,7 @@ export class AddCustomModelEditor extends EditorPane {
 				token,
 				modelName: modelName,
 				localhostOpenAiModel: isLocalhost ? localhostServerModelId : undefined,
+				hfFastest: isHfCloud ? this.hfFastestCheckbox.checked : undefined,
 			});
 
 			await this.dialogService.info(
@@ -314,6 +338,7 @@ export class AddCustomModelEditor extends EditorPane {
 			this.localhostModelIdInputBox.value = '';
 			this.apiKeyInputBox.value = '';
 			this.tokenInputBox.value = '';
+			this.hfFastestCheckbox.checked = false;
 		} catch (error) {
 			await this.dialogService.error(
 				localize('addCustomModel.error.addFailed', 'Failed to add model'),

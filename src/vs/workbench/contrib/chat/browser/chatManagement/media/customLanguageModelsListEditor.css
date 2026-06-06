@@ -1,3 +1,8 @@
+/*---------------------------------------------------------------------------------------------
+ *  Copyright (c) Microsoft Corporation. All rights reserved.
+ *  Licensed under the MIT License. See License.txt in the project root for license information.
+ *--------------------------------------------------------------------------------------------*/
+
 .custom-language-models-list-editor {
 	display: flex;
 	flex-direction: column;
@@ -45,6 +50,14 @@
 	align-items: center;
 	justify-content: space-between;
 	gap: 12px;
+	min-width: 0;
+}
+
+/* Settings row: toggles + token inputs, right-aligned on their own line */
+.model-item-row.model-item-row-settings {
+	display: flex;
+	align-items: center;
+	justify-content: flex-end;
 	min-width: 0;
 }
 

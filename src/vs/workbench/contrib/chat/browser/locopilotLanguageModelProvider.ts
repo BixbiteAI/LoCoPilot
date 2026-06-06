@@ -225,6 +225,17 @@ export class LoCoPilotLanguageModelProvider extends Disposable implements ILangu
 				return await this._callAnthropic(model, messages, options, stream, token);
 			} else if (model.provider === 'google') {
 				return await this._callGoogle(model, messages, options, stream, token);
+			} else if (model.provider === 'huggingface-cloud') {
+				// HF Inference Providers router is OpenAI-wire-compatible; reuse the OpenAI path
+				// with the router endpoint and a routing-policy suffix on the model id.
+				return await this._callOpenAI(model, messages, options, stream, token, {
+					url: 'https://router.huggingface.co/v1/chat/completions',
+					modelName: `${model.modelName}:${model.hfFastest ? 'fastest' : 'cheapest'}`,
+					providerLabel: 'HuggingFace',
+					// Only send tools/function-calling when the user enabled it for this model.
+					// Many HF-served models reject tools with "function calling not support".
+					disableTools: !model.useNativeTools
+				});
 			} else if (model.provider === 'huggingface') {
 				return await this._callLocalModel(model, messages, options, stream, token);
 			} else if (model.provider === 'ollama') {
@@ -249,8 +260,10 @@ export class LoCoPilotLanguageModelProvider extends Disposable implements ILangu
 		}
 	}
 
-	private async _callOpenAI(model: ICustomLanguageModel, messages: IChatMessage[], options: { [name: string]: unknown }, stream: AsyncIterableSource<IChatResponsePart | IChatResponsePart[]>, token: CancellationToken): Promise<any> {
-		const url = 'https://api.openai.com/v1/chat/completions';
+	private async _callOpenAI(model: ICustomLanguageModel, messages: IChatMessage[], options: { [name: string]: unknown }, stream: AsyncIterableSource<IChatResponsePart | IChatResponsePart[]>, token: CancellationToken, opts?: { url?: string; modelName?: string; providerLabel?: string; disableTools?: boolean }): Promise<any> {
+		const url = opts?.url ?? 'https://api.openai.com/v1/chat/completions';
+		const requestModelName = opts?.modelName ?? model.modelName;
+		const providerLabel = opts?.providerLabel ?? 'OpenAI';
 		const headers: Record<string, string> = {
 			'Authorization': `Bearer ${model.apiKey}`,
 			'Content-Type': 'application/json',
@@ -267,15 +280,15 @@ export class LoCoPilotLanguageModelProvider extends Disposable implements ILangu
 
 		const maxOutputTokens = model.maxOutputTokens ?? 8000;
 		const body: any = {
-			model: model.modelName,
+			model: requestModelName,
 			messages: mappedMessages,
 			stream: true,
 			temperature: 0.3,
 			max_tokens: maxOutputTokens
 		};
 
-		// Add tools if provided
-		if (options.tools && Array.isArray(options.tools) && options.tools.length > 0) {
+		// Add tools if provided (unless caller disabled them, e.g. HF model without function-calling support)
+		if (!opts?.disableTools && options.tools && Array.isArray(options.tools) && options.tools.length > 0) {
 			body.tools = options.tools;
 			body.tool_choice = 'auto';
 			this._log(`[LoCoPilot Provider] OpenAI request: ${options.tools.length} tools`);
@@ -291,7 +304,15 @@ export class LoCoPilotLanguageModelProvider extends Disposable implements ILangu
 		}, token);
 
 		if (response.res.statusCode !== 200) {
-			throw new Error(this._getApiErrorMessage('OpenAI', response.res.statusCode ?? 0));
+			// Surface the provider's actual error body (HF router returns useful JSON like
+			// {"error":"..."} explaining bad model id, unsupported tools, missing provider, etc.)
+			let detail = '';
+			try {
+				const buf = await streamToBuffer(response.stream);
+				detail = buf.toString().trim();
+			} catch { /* ignore */ }
+			const base = this._getApiErrorMessage(providerLabel, response.res.statusCode ?? 0);
+			throw new Error(detail ? `${base}\n\n${providerLabel} response: ${detail.slice(0, 500)}` : base);
 		}
 
 		return new Promise<void>((resolve, reject) => {
