@@ -12,6 +12,10 @@ import { ILanguageModelToolsConfirmationService } from '../../common/tools/langu
 import { ILanguageModelToolsService } from '../../common/tools/languageModelToolsService.js';
 import { InternalFetchWebPageToolId } from '../../common/tools/builtinTools/tools.js';
 import { FetchWebPageTool, FetchWebPageToolData, IFetchWebPageToolParams } from './fetchPageTool.js';
+// Git tools are built but intentionally NOT exposed to the agent (the model already has
+// run_in_terminal, which covers git status/diff). Uncomment the import + registration below to
+// enable dedicated git tools later. The shared-process git IPC service stays wired regardless.
+// import { createGitDiffToolData, createGitStatusToolData, GitDiffTool, GitStatusTool } from './gitTool.js';
 
 export class NativeBuiltinToolsContribution extends Disposable implements IWorkbenchContribution {
 
@@ -26,6 +30,13 @@ export class NativeBuiltinToolsContribution extends Disposable implements IWorkb
 
 		const editTool = instantiationService.createInstance(FetchWebPageTool);
 		this._register(toolsService.registerTool(FetchWebPageToolData, editTool));
+
+		// Git tools (run git in the shared process, capture output) - built but NOT registered.
+		// The agent uses run_in_terminal for git instead. Re-enable here if a dedicated tool is wanted:
+		// const gitStatusTool = instantiationService.createInstance(GitStatusTool);
+		// this._register(toolsService.registerTool(createGitStatusToolData(), gitStatusTool));
+		// const gitDiffTool = instantiationService.createInstance(GitDiffTool);
+		// this._register(toolsService.registerTool(createGitDiffToolData(), gitDiffTool));
 
 		this._register(confirmationService.registerConfirmationContribution(
 			InternalFetchWebPageToolId,

@@ -22,6 +22,8 @@ import { IChecksumService } from '../../../platform/checksum/common/checksumServ
 import { ChecksumService } from '../../../platform/checksum/node/checksumService.js';
 import { IEmbeddingComputeService } from '../../../platform/embeddings/common/embeddingCompute.js';
 import { EmbeddingComputeService } from '../../../platform/embeddings/node/embeddingComputeService.js';
+import { ILoCoPilotGitService } from '../../../platform/locopilotGit/common/locopilotGit.js';
+import { LoCoPilotGitService } from '../../../platform/locopilotGit/node/locopilotGitService.js';
 import { IConfigurationService } from '../../../platform/configuration/common/configuration.js';
 import { ConfigurationService } from '../../../platform/configuration/common/configurationService.js';
 import { IDiagnosticsService } from '../../../platform/diagnostics/common/diagnostics.js';
@@ -297,6 +299,9 @@ class SharedProcessMain extends Disposable implements IClientConnectionFilter {
 		// LoCoPilot bundled embeddings (semantic code search)
 		services.set(IEmbeddingComputeService, new SyncDescriptor(EmbeddingComputeService, undefined, false /* proxied to other processes */));
 
+		// LoCoPilot git execution (status/diff for the chat agent)
+		services.set(ILoCoPilotGitService, new SyncDescriptor(LoCoPilotGitService, undefined, false /* proxied to other processes */));
+
 		// V8 Inspect profiler
 		services.set(IV8InspectProfilingService, new SyncDescriptor(V8InspectProfilingService, undefined, false /* proxied to other processes */));
 
@@ -435,6 +440,10 @@ class SharedProcessMain extends Disposable implements IClientConnectionFilter {
 		// LoCoPilot bundled embeddings
 		const embeddingChannel = ProxyChannel.fromService(accessor.get(IEmbeddingComputeService), this._store);
 		this.server.registerChannel('locopilotEmbeddings', embeddingChannel);
+
+		// LoCoPilot git
+		const gitChannel = ProxyChannel.fromService(accessor.get(ILoCoPilotGitService), this._store);
+		this.server.registerChannel('locopilotGit', gitChannel);
 
 		// Profiling
 		const profilingChannel = ProxyChannel.fromService(accessor.get(IV8InspectProfilingService), this._store);

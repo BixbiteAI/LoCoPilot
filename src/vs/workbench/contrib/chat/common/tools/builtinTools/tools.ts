@@ -16,6 +16,7 @@ import { createListDirectoryToolData, ListDirectoryTool } from './listDirectoryT
 import { createReadLintsToolData, ReadLintsTool } from './readLintsTool.js';
 import { createGrepToolData, GrepTool } from './grepTool.js';
 import { createFindFilesToolData, FindFilesTool } from './findFilesTool.js';
+import { createOutlineToolData, OutlineTool } from './outlineTool.js';
 // Enable createFile for more tools if desired (LLM does not see it when commented out)
 // import { createCreateFileToolData, CreateFileTool } from './createFileTool.js';
 // import { createStringReplaceToolData, StringReplaceTool } from './stringReplaceTool.js';
@@ -49,11 +50,15 @@ export class BuiltinToolsContribution extends Disposable implements IWorkbenchCo
 		const findFilesTool = instantiationService.createInstance(FindFilesTool);
 		this._register(toolsService.registerTool(createFindFilesToolData(), findFilesTool));
 
+		// Outline tool: compact symbol map of a file (read-only, no node dependency)
+		const outlineTool = instantiationService.createInstance(OutlineTool);
+		this._register(toolsService.registerTool(createOutlineToolData(), outlineTool));
+
 		// Register web search tool (requires chat.webSearch.apiKey in settings)
 		const webSearchTool = instantiationService.createInstance(WebSearchTool);
 		this._register(toolsService.registerTool(createWebSearchToolData(), webSearchTool));
 
-		// Register write/edit tools — modifyFile handles create + full replace + partial replace
+		// Register write/edit tools - modifyFile handles create + full replace + partial replace
 		// createFile: commented out so LLM uses modifyFile(path, "", contents) to create files
 		// const createFileTool = instantiationService.createInstance(CreateFileTool);
 		// this._register(toolsService.registerTool(createCreateFileToolData(), createFileTool));

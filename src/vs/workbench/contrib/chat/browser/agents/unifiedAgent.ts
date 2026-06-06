@@ -28,6 +28,25 @@ const REPEATED_TOOL_CALL_WINDOW = 6;
 
 const DEFAULT_MAX_ITERATIONS = 25;
 
+/**
+ * Tool ids that are safe to run concurrently within a single agent turn: read-only inspection
+ * tools plus runSubagent (used for read-only parallel research). Edit/mutating tools are
+ * deliberately excluded so they run sequentially and never race on the same files.
+ */
+const PARALLELIZABLE_TOOL_IDS = new Set<string>([
+	'semanticSearch',
+	'readFile',
+	'listDirectory',
+	'grep',
+	'findFiles',
+	'readLints',
+	'outline',
+	'gitStatus',
+	'gitDiff',
+	'webSearch',
+	'runSubagent',
+]);
+
 export class UnifiedAgent {
 	private readonly MAX_ITERATIONS: number;
 
@@ -214,91 +233,38 @@ export class UnifiedAgent {
 				break;
 			}
 
-			// Execute tools and add results to conversation
+			// Execute tools and add results to conversation.
+			// Read-only tools (and research subagents) have no side effects on each other, so we
+			// run them concurrently for speed. Anything that can mutate the workspace (edits, etc.)
+			// runs sequentially after the reads to avoid races. Results are reassembled in the
+			// original tool-call order so each tool_result lines up with its tool_use id.
 			this._log(`[LoCoPilot] Executing ${toolCalls.length} tool call(s)...`);
+
+			const results: Array<{ toolResult: any; images: IChatMessageImagePart[] }> = new Array(toolCalls.length);
+			const parallelIndexes: number[] = [];
+			const sequentialIndexes: number[] = [];
+			toolCalls.forEach((tc, i) => {
+				(PARALLELIZABLE_TOOL_IDS.has(tc.name) ? parallelIndexes : sequentialIndexes).push(i);
+			});
+
+			if (parallelIndexes.length > 1) {
+				this._log(`[LoCoPilot] Running ${parallelIndexes.length} read-only tool call(s) in parallel`);
+			}
+
+			// Run all read-only calls concurrently...
+			await Promise.all(parallelIndexes.map(async i => {
+				results[i] = await this.executeToolCall(toolCalls[i], request, token);
+			}));
+			// ...then the (potentially mutating) calls one at a time, preserving order.
+			for (const i of sequentialIndexes) {
+				results[i] = await this.executeToolCall(toolCalls[i], request, token);
+			}
 
 			const toolResults: any[] = [];
 			const imagePartsForVision: IChatMessageImagePart[] = [];
-			for (const toolCall of toolCalls) {
-				try {
-					this._log(`[LoCoPilot] Executing tool: ${toolCall.name}`);
-
-					// Tool display uses existing formats only: invokeTool appends toolInvocation via appendProgress when context is set; chat renders via ChatToolInvocationPart (no custom progress text here).
-					const result = await this.toolsService.invokeTool(
-						{
-							callId: toolCall.toolCallId,
-							toolId: toolCall.name,
-							parameters: toolCall.parameters,
-							context: request.sessionResource ? {
-								sessionId: request.sessionResource.toString(),
-								sessionResource: request.sessionResource
-							} : undefined,
-							chatRequestId: request.requestId
-						},
-						async () => 0, // token counter
-						token
-					);
-
-					this._log(`[LoCoPilot] Tool ${toolCall.name} executed successfully`);
-
-					// Format tool result: text parts go to tool message; image data parts go to a separate user message so the LLM can use vision
-					const resultContent: any[] = [];
-					if (result.content) {
-						for (const item of result.content) {
-							if (item.kind === 'text') {
-								resultContent.push({
-									type: 'text',
-									value: item.value
-								});
-							} else if (item.kind === 'data' && item.value?.mimeType?.startsWith('image/')) {
-								resultContent.push({
-									type: 'text',
-									value: 'Image file - see the image in the next user message for vision.'
-								});
-								// Collect image for a user message so the model can use vision (tool messages are text-only)
-								imagePartsForVision.push({
-									type: 'image_url',
-									value: {
-										mimeType: item.value.mimeType as ChatImageMimeType,
-										data: item.value.data
-									}
-								});
-							}
-						}
-					}
-
-					if (resultContent.length === 0) {
-						resultContent.push({
-							type: 'text',
-							value: 'Tool executed successfully (no output)'
-						});
-					}
-
-					toolResults.push({
-						type: 'tool_result',
-						toolCallId: toolCall.toolCallId,
-						value: resultContent,
-						isError: false
-					});
-
-					// Tool result is shown in chat via toolInvocation state (languageModelToolsService updates invocation with result)
-
-				} catch (error: any) {
-					this.logService.error(`[LoCoPilot] Tool ${toolCall.name} failed: ${error}`);
-					this.locopilotFileLog.log(`[LoCoPilot] Tool ${toolCall.name} failed: ${error}`);
-
-					toolResults.push({
-						type: 'tool_result',
-						toolCallId: toolCall.toolCallId,
-						value: [{
-							type: 'text',
-							value: `Error executing tool: ${error.message || error}`
-						}],
-						isError: true
-					});
-
-					// Error is reflected in toolInvocation state in chat UI
-				}
+			for (const r of results) {
+				toolResults.push(r.toolResult);
+				imagePartsForVision.push(...r.images);
 			}
 
 			// Add tool results to conversation
@@ -342,6 +308,99 @@ export class UnifiedAgent {
 
 		this._log(`[LoCoPilot] UnifiedAgent.run completed after ${iterationCount} iterations`);
 		return {};
+	}
+
+	/**
+	 * Execute a single tool call and format its result for the conversation.
+	 * Returns the tool_result message plus any image parts to surface to the model for vision.
+	 * Never throws - tool errors are returned as an error tool_result so the loop can recover.
+	 */
+	private async executeToolCall(
+		toolCall: IChatResponseToolUsePart,
+		request: IChatAgentRequest,
+		token: CancellationToken
+	): Promise<{ toolResult: any; images: IChatMessageImagePart[] }> {
+		const images: IChatMessageImagePart[] = [];
+		try {
+			this._log(`[LoCoPilot] Executing tool: ${toolCall.name}`);
+
+			// Tool display uses existing formats only: invokeTool appends toolInvocation via appendProgress when context is set; chat renders via ChatToolInvocationPart (no custom progress text here).
+			const result = await this.toolsService.invokeTool(
+				{
+					callId: toolCall.toolCallId,
+					toolId: toolCall.name,
+					parameters: toolCall.parameters,
+					context: request.sessionResource ? {
+						sessionId: request.sessionResource.toString(),
+						sessionResource: request.sessionResource
+					} : undefined,
+					chatRequestId: request.requestId
+				},
+				async () => 0, // token counter
+				token
+			);
+
+			this._log(`[LoCoPilot] Tool ${toolCall.name} executed successfully`);
+
+			// Format tool result: text parts go to tool message; image data parts go to a separate user message so the LLM can use vision
+			const resultContent: any[] = [];
+			if (result.content) {
+				for (const item of result.content) {
+					if (item.kind === 'text') {
+						resultContent.push({
+							type: 'text',
+							value: item.value
+						});
+					} else if (item.kind === 'data' && item.value?.mimeType?.startsWith('image/')) {
+						resultContent.push({
+							type: 'text',
+							value: 'Image file - see the image in the next user message for vision.'
+						});
+						// Collect image for a user message so the model can use vision (tool messages are text-only)
+						images.push({
+							type: 'image_url',
+							value: {
+								mimeType: item.value.mimeType as ChatImageMimeType,
+								data: item.value.data
+							}
+						});
+					}
+				}
+			}
+
+			if (resultContent.length === 0) {
+				resultContent.push({
+					type: 'text',
+					value: 'Tool executed successfully (no output)'
+				});
+			}
+
+			return {
+				toolResult: {
+					type: 'tool_result',
+					toolCallId: toolCall.toolCallId,
+					value: resultContent,
+					isError: false
+				},
+				images
+			};
+		} catch (error: any) {
+			this.logService.error(`[LoCoPilot] Tool ${toolCall.name} failed: ${error}`);
+			this.locopilotFileLog.log(`[LoCoPilot] Tool ${toolCall.name} failed: ${error}`);
+
+			return {
+				toolResult: {
+					type: 'tool_result',
+					toolCallId: toolCall.toolCallId,
+					value: [{
+						type: 'text',
+						value: `Error executing tool: ${error.message || error}`
+					}],
+					isError: true
+				},
+				images
+			};
+		}
 	}
 
 	/**

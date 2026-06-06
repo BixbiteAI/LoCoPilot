@@ -42,7 +42,7 @@ import { createToolSimpleTextResult } from './toolHelpers.js';
 
 const BaseModelDescription = `Launch a new agent to handle complex, multi-step tasks autonomously. This tool is good at researching complex questions, searching for code, and executing multi-step tasks. When you are searching for a keyword or file and are not confident that you will find the right match in the first few tries, use this agent to perform the search for you.
 
-- Agents do not run async or in the background, you will wait for the agent\'s result.
+- You will wait for the agent's result before your turn ends. However, if you emit SEVERAL runSubagent calls in a SINGLE turn, they execute concurrently - use this to research independent areas of a large codebase in parallel (each returns its own summary). Use parallel subagents for read-only exploration; do not have multiple agents edit the same files at once.
 - When the agent is done, it will return a single message back to you. The result returned by the agent is not visible to the user. To show the user the result, you should send a text message back to the user with a concise summary of the result.
 - Each agent invocation is stateless. You will not be able to send additional messages to the agent, nor will the agent be able to communicate with you outside of its final report. Therefore, your prompt should contain a highly detailed task description for the agent to perform autonomously and you should specify exactly what information the agent should return back to you in its final and only message to you.
 - The agent's outputs should generally be trusted
