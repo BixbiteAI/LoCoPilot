@@ -280,7 +280,7 @@ export class ChatInputPart extends Disposable implements IHistoryNavigationWidge
 	private readonly _widgetController = this._register(new MutableDisposable<ChatInputPartWidgetController>());
 
 	private _timerBar: HTMLElement | undefined;
-	private _timerIntervalId: ReturnType<typeof setInterval> | undefined;
+	private _timerIntervalId: number | undefined;
 	private _timerStartTime: number | undefined;
 
 	readonly height = observableValue<number>(this, 0);

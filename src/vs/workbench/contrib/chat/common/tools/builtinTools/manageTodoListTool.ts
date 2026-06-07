@@ -30,19 +30,28 @@ export function createManageTodoListToolData(): IToolData {
 	const inputSchema: IJSONSchema & { properties: IJSONSchemaMap } = {
 		type: 'object',
 		properties: {
+			operation: {
+				type: 'string',
+				enum: ['write', 'read'],
+				description: 'write: Create or update the full todo list (default) | read: Return the current todo list without modifying it. When reading, todoList is not required.'
+			},
 			todoList: {
 				type: 'array',
-				description: 'Complete array of all todo items. Must include ALL items - both existing and new.',
+				description: 'Complete array of all todo items. Must include ALL items - both existing and new. Required for the write operation.',
 				items: {
 					type: 'object',
 					properties: {
 						id: {
 							type: 'number',
-							description: 'Unique identifier for the todo. Use sequential numbers starting from 1.'
+							description: 'Unique identifier for the todo. Use sequential numbers starting from 1. Must be unique within the list.'
 						},
 						title: {
 							type: 'string',
 							description: 'Concise action-oriented todo label (3-7 words). Displayed in UI.'
+						},
+						description: {
+							type: 'string',
+							description: 'Optional one-line detail capturing the intent or acceptance criteria for the todo. Helps preserve context across long sessions.'
 						},
 						status: {
 							type: 'string',
@@ -54,7 +63,7 @@ export function createManageTodoListToolData(): IToolData {
 				}
 			}
 		},
-		required: ['todoList']
+		required: []
 	};
 
 	return {
@@ -65,7 +74,7 @@ export function createManageTodoListToolData(): IToolData {
 		icon: ThemeIcon.fromId(Codicon.checklist.id),
 		displayName: localize('tool.manageTodoList.displayName', 'Manage and track todo items for task planning'),
 		userDescription: localize('tool.manageTodoList.userDescription', 'Manage and track todo items for task planning'),
-		modelDescription: 'Manage a structured todo list to track progress and plan tasks throughout your coding session. Use this tool VERY frequently to ensure task visibility and proper planning.\n\nWhen to use this tool:\n- Complex multi-step work requiring planning and tracking\n- When user provides multiple tasks or requests (numbered/comma-separated)\n- After receiving new instructions that require multiple steps\n- BEFORE starting work on any todo (mark as in-progress)\n- IMMEDIATELY after completing each todo (mark completed individually)\n- When breaking down larger tasks into smaller actionable steps\n- To give users visibility into your progress and planning\n\nWhen NOT to use:\n- Single, trivial tasks that can be completed in one step\n- Purely conversational/informational requests\n- When just reading files or performing simple searches\n\nCRITICAL workflow:\n1. Plan tasks by writing todo list with specific, actionable items\n2. Mark ONE todo as in-progress before starting work\n3. Complete the work for that specific todo\n4. Mark that todo as completed IMMEDIATELY\n5. Move to next todo and repeat\n\nTodo states:\n- not-started: Todo not yet begun\n- in-progress: Currently working (limit ONE at a time)\n- completed: Finished successfully\n\nIMPORTANT: Mark todos completed as soon as they are done. Do not batch completions.',
+		modelDescription: 'Manage a structured todo list to track progress and plan tasks throughout your coding session. Use this tool VERY frequently to ensure task visibility and proper planning.\n\nWhen to use this tool:\n- Complex multi-step work requiring planning and tracking\n- When user provides multiple tasks or requests (numbered/comma-separated)\n- After receiving new instructions that require multiple steps\n- BEFORE starting work on any todo (mark as in-progress)\n- IMMEDIATELY after completing each todo (mark completed individually)\n- When breaking down larger tasks into smaller actionable steps\n- To give users visibility into your progress and planning\n\nWhen NOT to use:\n- Single, trivial tasks that can be completed in one step\n- Purely conversational/informational requests\n- When just reading files or performing simple searches\n\nCRITICAL workflow:\n1. Plan tasks by writing todo list with specific, actionable items\n2. Mark ONE todo as in-progress before starting work\n3. Complete the work for that specific todo\n4. Mark that todo as completed IMMEDIATELY\n5. Move to next todo and repeat\n\nTodo states:\n- not-started: Todo not yet begun\n- in-progress: Currently working (limit ONE at a time)\n- completed: Finished successfully\n\nOperations:\n- write (default): Provide the COMPLETE todoList. Each item needs a unique id, a title, a status, and an optional one-line description capturing intent/acceptance criteria. Keep exactly ONE item in-progress.\n- read: Omit todoList to retrieve the current list (useful to re-orient after a long stretch of work).\n\nIMPORTANT: Mark todos completed as soon as they are done. Do not batch completions. Keep ids unique and exactly one todo in-progress.',
 		source: ToolDataSource.Internal,
 		inputSchema: inputSchema,
 		alwaysDisplayInputOutput: true
@@ -80,6 +89,7 @@ interface IManageTodoListToolInputParams {
 		id: number;
 		title: string;
 		status: 'not-started' | 'in-progress' | 'completed';
+		description?: string;
 	}>;
 	// used for todo read only
 	chatSessionResource?: string;
@@ -157,7 +167,8 @@ export class ManageTodoListTool extends Disposable implements IToolImpl {
 		const todoList = items.map(todo => ({
 			id: todo.id.toString(),
 			title: todo.title,
-			status: todo.status
+			status: todo.status,
+			description: todo.description
 		}));
 
 		return {
@@ -264,8 +275,24 @@ export class ManageTodoListTool extends Disposable implements IToolImpl {
 		const todoList: IChatTodo[] = args.todoList.map((parsedTodo) => ({
 			id: parsedTodo.id,
 			title: parsedTodo.title,
-			status: parsedTodo.status
+			status: parsedTodo.status,
+			description: parsedTodo.description
 		}));
+
+		// Reject duplicate ids early - duplicates corrupt the id-based diff/compare logic.
+		const seenIds = new Set<number>();
+		for (const todo of todoList) {
+			if (seenIds.has(todo.id)) {
+				return {
+					content: [{
+						kind: 'text',
+						value: `Error: Duplicate todo id ${todo.id}. Next: Assign each todo a unique id (sequential numbers starting from 1) and retry.`
+					}],
+					toolResultError: 'Duplicate todo id'
+				};
+			}
+			seenIds.add(todo.id);
+		}
 
 		const existingTodos = this.chatTodoListService.getTodos(chatSessionResource);
 		const changes = this.calculateTodoChanges(existingTodos, todoList);
@@ -280,6 +307,10 @@ export class ManageTodoListTool extends Disposable implements IToolImpl {
 		}
 		else if (todoList.length > 10) {
 			warnings.push('Warning: Large todo list (>10 items). Consider keeping the list focused and actionable.');
+		}
+
+		if (statusCounts.inProgressCount > 1) {
+			warnings.push('Warning: More than one todo is in-progress. Keep exactly ONE todo in-progress at a time and complete it before starting the next.');
 		}
 
 		if (changes > 3) {
@@ -335,27 +366,38 @@ export class ManageTodoListTool extends Disposable implements IToolImpl {
 			}
 
 			const lines = [`- ${checkbox} ${todo.title}`];
+			if (todo.description) {
+				lines.push(`  - ${todo.description}`);
+			}
 
 			return lines.join('\n');
 		}).join('\n');
 	}
 
 	private calculateTodoChanges(oldList: IChatTodo[], newList: IChatTodo[]): number {
-		// Assume arrays are equivalent in order; compare index-by-index
+		// Compare by id so reordering the list does not register as spurious changes.
+		const oldMap = new Map(oldList.map(todo => [todo.id, todo]));
+		const newMap = new Map(newList.map(todo => [todo.id, todo]));
+
+		let added = 0;
 		let modified = 0;
-		const minLen = Math.min(oldList.length, newList.length);
-		for (let i = 0; i < minLen; i++) {
-			const o = oldList[i];
-			const n = newList[i];
-			if (o.title !== n.title || o.status !== n.status) {
+		for (const n of newList) {
+			const o = oldMap.get(n.id);
+			if (!o) {
+				added++;
+			} else if (o.title !== n.title || o.status !== n.status || o.description !== n.description) {
 				modified++;
 			}
 		}
 
-		const added = Math.max(0, newList.length - oldList.length);
-		const removed = Math.max(0, oldList.length - newList.length);
-		const totalChanges = added + removed + modified;
-		return totalChanges;
+		let removed = 0;
+		for (const o of oldList) {
+			if (!newMap.has(o.id)) {
+				removed++;
+			}
+		}
+
+		return added + modified + removed;
 	}
 }
 

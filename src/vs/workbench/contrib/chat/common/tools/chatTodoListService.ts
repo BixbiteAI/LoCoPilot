@@ -15,6 +15,7 @@ export interface IChatTodo {
 	id: number;
 	title: string;
 	status: 'not-started' | 'in-progress' | 'completed';
+	description?: string;
 }
 
 export interface IChatTodoListStorage {
@@ -34,6 +35,11 @@ export interface IChatTodoListService {
 export class ChatTodoListStorage implements IChatTodoListStorage {
 	private memento: Memento<Record<string, IChatTodo[]>>;
 
+	// Cap the number of sessions whose todo lists are retained to avoid unbounded
+	// growth of workspace storage. When exceeded, the oldest (insertion-order) keys
+	// are evicted. The most-recently written session is always preserved.
+	private static readonly MAX_RETAINED_SESSIONS = 50;
+
 	constructor(@IStorageService storageService: IStorageService) {
 		this.memento = new Memento('chat-todo-list', storageService);
 	}
@@ -45,7 +51,20 @@ export class ChatTodoListStorage implements IChatTodoListStorage {
 
 	private setSessionData(sessionResource: URI, todoList: IChatTodo[]): void {
 		const storage = this.memento.getMemento(StorageScope.WORKSPACE, StorageTarget.MACHINE);
-		storage[this.toKey(sessionResource)] = todoList;
+		const key = this.toKey(sessionResource);
+		// Re-insert at the end so this key becomes the most recently used.
+		delete storage[key];
+		storage[key] = todoList;
+
+		// Evict oldest entries beyond the retention cap.
+		const keys = Object.keys(storage);
+		if (keys.length > ChatTodoListStorage.MAX_RETAINED_SESSIONS) {
+			const overflow = keys.length - ChatTodoListStorage.MAX_RETAINED_SESSIONS;
+			for (let i = 0; i < overflow; i++) {
+				delete storage[keys[i]];
+			}
+		}
+
 		this.memento.saveMemento();
 	}
 

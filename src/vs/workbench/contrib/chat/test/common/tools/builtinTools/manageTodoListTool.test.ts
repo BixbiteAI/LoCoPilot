@@ -33,11 +33,16 @@ suite('ManageTodoListTool Schema', () => {
 		assert.strictEqual(toolData.inputSchema?.type, 'object', 'Schema should be an object type');
 	});
 
-	test('createManageTodoListToolData schema has required todoList field', () => {
+	test('createManageTodoListToolData schema exposes todoList and operation properties', () => {
 		const toolData = createManageTodoListToolData();
 
-		assert.ok(toolData.inputSchema?.required?.includes('todoList'), 'todoList should be required');
+		// todoList is optional at the top level so the read operation can omit it.
+		assert.ok(!toolData.inputSchema?.required?.includes('todoList'), 'todoList should not be required (read omits it)');
 		assert.ok(toolData.inputSchema?.properties?.todoList, 'todoList property should exist');
+
+		const operationProperty = toolData.inputSchema?.properties?.operation as IJSONSchema | undefined;
+		assert.ok(operationProperty, 'operation property should exist');
+		assert.deepStrictEqual(operationProperty.enum, ['write', 'read'], 'operation should have correct enum values');
 	});
 
 	test('createManageTodoListToolData todoList items have correct required fields', () => {
@@ -47,6 +52,7 @@ suite('ManageTodoListTool Schema', () => {
 		assert.ok('id' in properties, 'Schema should have id property');
 		assert.ok('title' in properties, 'Schema should have title property');
 		assert.ok('status' in properties, 'Schema should have status property');
+		assert.ok('description' in properties, 'Schema should have description property');
 		assert.deepStrictEqual(required, ['id', 'title', 'status'], 'Required fields should be id, title, status');
 	});
 

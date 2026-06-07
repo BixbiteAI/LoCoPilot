@@ -822,6 +822,7 @@ export interface IChatTodoListContent {
 		id: string;
 		title: string;
 		status: 'not-started' | 'in-progress' | 'completed';
+		description?: string;
 	}>;
 }
 
