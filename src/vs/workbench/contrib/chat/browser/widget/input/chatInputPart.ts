@@ -25,7 +25,7 @@ import { Lazy } from '../../../../../../base/common/lazy.js';
 import { Disposable, DisposableStore, IDisposable, MutableDisposable, toDisposable } from '../../../../../../base/common/lifecycle.js';
 import { ResourceSet } from '../../../../../../base/common/map.js';
 import { MarshalledId } from '../../../../../../base/common/marshallingIds.js';
-import { Schemas } from '../../../../../../base/common/network.js';
+import { FileAccess, Schemas } from '../../../../../../base/common/network.js';
 import { mixin } from '../../../../../../base/common/objects.js';
 import { autorun, derived, derivedOpts, IObservable, ISettableObservable, observableFromEvent, observableValue } from '../../../../../../base/common/observable.js';
 import { isMacintosh } from '../../../../../../base/common/platform.js';
@@ -278,6 +278,10 @@ export class ChatInputPart extends Disposable implements IHistoryNavigationWidge
 	private chatInputTodoListWidgetContainer!: HTMLElement;
 	private chatInputWidgetsContainer!: HTMLElement;
 	private readonly _widgetController = this._register(new MutableDisposable<ChatInputPartWidgetController>());
+
+	private _timerBar: HTMLElement | undefined;
+	private _timerIntervalId: ReturnType<typeof setInterval> | undefined;
+	private _timerStartTime: number | undefined;
 
 	readonly height = observableValue<number>(this, 0);
 
@@ -1731,6 +1735,10 @@ export class ChatInputPart extends Disposable implements IHistoryNavigationWidge
 		this.container.append(this.chatInputOverlay);
 		this.container.classList.toggle('compact', this.options.renderStyle === 'compact');
 
+		this._timerBar = dom.$('.chat-request-timer-bar');
+		this._timerBar.style.display = 'none';
+		this.container.insertBefore(this._timerBar, this.container.firstChild);
+
 		// Create a scoped context key service for option group visibility expressions
 		// This isolates chatSessionOption.* context keys to this specific chat input instance
 		this._scopedContextKeyService = this._register(this.contextKeyService.createScoped(this.container));
@@ -2098,6 +2106,110 @@ export class ChatInputPart extends Disposable implements IHistoryNavigationWidge
 			this.height.set(newHeight, undefined);
 		}));
 		this._register(inputResizeObserver.observe(this.container));
+	}
+
+	public setRequestInProgress(inProgress: boolean, getStats?: () => { lastWordCount: number; impliedWordLoadRate: number; thinkingWordCount?: number } | undefined): void {
+		if (!this._timerBar) {
+			return;
+		}
+		if (inProgress) {
+			if (this._timerIntervalId === undefined) {
+				this._timerStartTime = Date.now();
+
+				// Build the logo loader element (created once, reused each tick)
+				const logoLoader = this._buildLogoLoader(14);
+				this._timerBar.appendChild(logoLoader);
+
+				// Stat spans - created once, updated each tick to avoid DOM thrash
+				const timeEl = dom.$('span.timer-time');
+				const sep1 = dom.$('span.timer-sep');
+				sep1.textContent = '·';
+				const tokEl = dom.$('span.timer-tokens');
+				const sep2 = dom.$('span.timer-sep');
+				sep2.textContent = '·';
+				const rateEl = dom.$('span.timer-rate');
+
+				this._timerBar.appendChild(timeEl);
+				this._timerBar.appendChild(sep1);
+				this._timerBar.appendChild(tokEl);
+				this._timerBar.appendChild(sep2);
+				this._timerBar.appendChild(rateEl);
+
+				const update = () => {
+					if (!this._timerBar) { return; }
+					const elapsedMs = Date.now() - this._timerStartTime!;
+					const elapsed = Math.floor(elapsedMs / 1000);
+					const stats = getStats?.();
+					const outputTokens = stats?.lastWordCount ?? 0;
+					const thinkingTokens = stats?.thinkingWordCount ?? 0;
+					const totalTokens = outputTokens + thinkingTokens;
+					// Compute rate from total tokens (output + thinking) over elapsed time
+					const elapsedSec = elapsedMs / 1000;
+					const rate = totalTokens > 0 && elapsedSec > 1 ? Math.round(totalTokens / elapsedSec) : 0;
+
+					timeEl.textContent = `${elapsed}s`;
+
+					const hasTok = totalTokens > 0;
+					sep1.style.display = hasTok ? '' : 'none';
+					tokEl.style.display = hasTok ? '' : 'none';
+					if (hasTok) {
+						tokEl.textContent = `${totalTokens} tokens`;
+						tokEl.title = thinkingTokens > 0
+							? `${outputTokens} output + ${thinkingTokens} thinking`
+							: '';
+					}
+
+					const hasRate = rate > 0;
+					sep2.style.display = hasRate ? '' : 'none';
+					rateEl.style.display = hasRate ? '' : 'none';
+					if (hasRate) {
+						rateEl.textContent = `${rate} tokens/sec`;
+					}
+				};
+
+				sep1.style.display = 'none';
+				tokEl.style.display = 'none';
+				sep2.style.display = 'none';
+				rateEl.style.display = 'none';
+
+				update();
+				this._timerBar.style.display = '';
+				const win = dom.getWindow(this._timerBar);
+				this._timerIntervalId = win.setInterval(update, 250);
+			}
+		} else {
+			if (this._timerIntervalId !== undefined) {
+				dom.getWindow(this._timerBar).clearInterval(this._timerIntervalId);
+				this._timerIntervalId = undefined;
+				this._timerStartTime = undefined;
+			}
+			this._timerBar.style.display = 'none';
+			dom.clearNode(this._timerBar);
+		}
+	}
+
+	private _buildLogoLoader(size: number): HTMLElement {
+		const wrap = dom.$('.locopilot-logo-loader');
+		wrap.style.width = `${size}px`;
+		wrap.style.height = `${size}px`;
+
+		const logoUri = FileAccess.asFileUri('vs/workbench/contrib/chat/browser/widget/input/media/locopilot-logo.png');
+		const src = FileAccess.uriToBrowserUri(logoUri).toString(true);
+
+		// Faint ghost copy of the logo - always visible (the "track")
+		const track = dom.$<HTMLImageElement>('img.logo-track');
+		track.src = src;
+		track.alt = '';
+		wrap.appendChild(track);
+
+		// Full-opacity copy that fills in clockwise via an animated conic mask -
+		// makes the logo itself look like it's loading.
+		const fill = dom.$<HTMLImageElement>('img.logo-fill');
+		fill.src = src;
+		fill.alt = '';
+		wrap.appendChild(fill);
+
+		return wrap;
 	}
 
 	public toggleChatInputOverlay(editing: boolean): void {

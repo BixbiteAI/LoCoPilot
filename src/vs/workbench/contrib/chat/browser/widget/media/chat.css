@@ -1088,6 +1088,90 @@ have to be updated for changes to the rules above, or to support more deeply nes
 	background-color: var(--vscode-toolbar-hoverBackground);
 }
 
+/* Request timer bar (above input) */
+.interactive-session .interactive-input-part > .chat-request-timer-bar {
+	display: flex;
+	align-items: center;
+	gap: 6px;
+	padding: 4px 12px;
+	color: var(--vscode-disabledForeground, var(--vscode-descriptionForeground));
+}
+
+.interactive-session .interactive-input-part > .chat-request-timer-bar .timer-time {
+	font-size: 11px;
+	font-variant-numeric: tabular-nums;
+}
+
+.interactive-session .interactive-input-part > .chat-request-timer-bar .timer-sep {
+	font-size: 10px;
+	opacity: 0.45;
+	user-select: none;
+}
+
+.interactive-session .interactive-input-part > .chat-request-timer-bar .timer-tokens {
+	font-size: 11px;
+	font-variant-numeric: tabular-nums;
+}
+
+.interactive-session .interactive-input-part > .chat-request-timer-bar .timer-rate {
+	font-size: 11px;
+	opacity: 0.75;
+	font-variant-numeric: tabular-nums;
+}
+
+/* Logo loader - the logo pulses with a fade-in/out cycle to indicate loading */
+.locopilot-logo-loader {
+	position: relative;
+	display: inline-flex;
+	align-items: center;
+	justify-content: center;
+	flex-shrink: 0;
+}
+
+.locopilot-logo-loader > img {
+	position: absolute;
+	inset: 0;
+	width: 100%;
+	height: 100%;
+	object-fit: contain;
+}
+
+.locopilot-logo-loader > .logo-track {
+	opacity: 0.25;
+}
+
+/* Pulsing fill layer: fades from transparent to full opacity and back */
+.locopilot-logo-loader > .logo-fill {
+	animation: loco-pulse 1500ms ease-in-out infinite;
+}
+
+@keyframes loco-pulse {
+	0%   { opacity: 0.2; }
+	50%  { opacity: 1; }
+	100% { opacity: 0.2; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+	.locopilot-logo-loader > .logo-fill {
+		animation: none;
+		opacity: 0.9;
+	}
+	.locopilot-logo-loader > .logo-track {
+		opacity: 0;
+	}
+}
+
+@media (prefers-reduced-motion: reduce) {
+	.locopilot-logo-loader > .logo-fill {
+		animation: none;
+		-webkit-mask-image: none;
+		mask-image: none;
+	}
+	.locopilot-logo-loader > .logo-track {
+		opacity: 0;
+	}
+}
+
 .interactive-session .interactive-input-part > .chat-input-widgets-container {
 	margin-bottom: -4px;
 	width: 100%;

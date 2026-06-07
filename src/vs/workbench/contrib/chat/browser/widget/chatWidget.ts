@@ -1780,7 +1780,23 @@ export class ChatWidget extends Disposable implements IChatWidget {
 				return;
 			}
 
-			this.requestInProgress.set(this.viewModel.model.requestInProgress.get());
+			const inProgress = this.viewModel.model.requestInProgress.get();
+			this.requestInProgress.set(inProgress);
+			const vm = this.viewModel;
+			this.inputPart.setRequestInProgress(inProgress, () => {
+				const last = vm.getItems().findLast(item => isResponseVM(item)) as { response?: { value: ReadonlyArray<{ kind: string; value?: string | string[] }> }; contentUpdateTimings?: { lastWordCount: number; impliedWordLoadRate: number } } | undefined;
+				const timings = last?.contentUpdateTimings;
+				let thinkingWordCount = 0;
+				if (last?.response?.value) {
+					for (const part of last.response.value) {
+						if (part.kind === 'thinking' && part.value) {
+							const text = Array.isArray(part.value) ? part.value.join('') : part.value;
+							thinkingWordCount += text.split(/\s+/).filter(w => w.length > 0).length;
+						}
+					}
+				}
+				return timings ? { ...timings, thinkingWordCount } : undefined;
+			});
 
 			// Update the editor's placeholder text when it changes in the view model
 			if (events?.some(e => e?.kind === 'changePlaceholder')) {
