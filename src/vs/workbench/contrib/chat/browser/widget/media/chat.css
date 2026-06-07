@@ -333,10 +333,10 @@
 }
 
 /* Use theme focus border (like input box) for focused chat list rows (AI/user messages) instead of default blue */
+/* Remove the focus border (teal/blue) on AI/user messages when clicked */
 .interactive-list > .monaco-list .monaco-list-row.focused,
 .interactive-list > .monaco-list:focus .monaco-list-row.focused {
-	outline: 1px solid var(--vscode-focusBorder) !important;
-	outline-offset: -1px;
+	outline: none !important;
 }
 
 .hc-black .interactive-request,
