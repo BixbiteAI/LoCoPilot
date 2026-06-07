@@ -15,6 +15,7 @@ import { IChatAgentRequest, IChatAgentResult } from '../../common/participants/c
 import { IChatProgress } from '../../common/chatService/chatService.js';
 import { ChatImageMimeType, ChatMessageRole, IChatMessage, IChatMessageImagePart, IChatResponseToolUsePart, ILanguageModelsService, LanguageModelPartAudience } from '../../common/languageModels.js';
 import { ILanguageModelToolsService, IToolData, toolMatchesModel } from '../../common/tools/languageModelToolsService.js';
+import { ContextManager } from './contextManager.js';
 /**
  * Unified agent that runs the language model with the given messages and streams progress.
  * This implements a full agentic loop with tool calling support.
@@ -49,6 +50,7 @@ const PARALLELIZABLE_TOOL_IDS = new Set<string>([
 
 export class UnifiedAgent {
 	private readonly MAX_ITERATIONS: number;
+	private readonly contextManager: ContextManager;
 
 	constructor(
 		private readonly languageModelsService: ILanguageModelsService,
@@ -59,6 +61,10 @@ export class UnifiedAgent {
 		maxIterations: number = DEFAULT_MAX_ITERATIONS
 	) {
 		this.MAX_ITERATIONS = Math.min(100, Math.max(1, maxIterations));
+		this.contextManager = new ContextManager(
+			this.languageModelsService,
+			(msg, ...args) => this._log(msg, ...args)
+		);
 	}
 
 	private _log(msg: string, ...args: unknown[]): void {
@@ -77,7 +83,7 @@ export class UnifiedAgent {
 
 		let iterationCount = 0;
 		let hasEverEmitted = false;
-		const conversationMessages = [...messages];
+		let conversationMessages = [...messages];
 		// Track recent tool invocations (toolKey) to detect repeated same tool+args loops
 		const recentToolKeys: string[] = [];
 
@@ -95,6 +101,23 @@ export class UnifiedAgent {
 			iterationCount++;
 			this._log(`[LoCoPilot] === Iteration ${iterationCount} ===`);
 			this._log(`[LoCoPilot] Current conversation has ${conversationMessages.length} messages`);
+
+			// Tiered context compaction: keep the growing conversation inside the model's usable
+			// input budget. Cheap stubbing first, then summarize the middle, then drop oldest.
+			try {
+				const compaction = await this.contextManager.compactIfNeeded(
+					modelId,
+					modelMetadata,
+					conversationMessages,
+					token
+				);
+				if (compaction.compacted) {
+					conversationMessages = compaction.messages;
+					this._log(`[LoCoPilot] Context compacted [${compaction.tiers.join(', ')}]: ${compaction.tokensBefore} -> ${compaction.tokensAfter} tokens, ${conversationMessages.length} messages`);
+				}
+			} catch (e) {
+				this._log(`[LoCoPilot] Context compaction failed (continuing uncompacted): ${e}`);
+			}
 
 			// Send request to LLM with tools
 			const tools = this.formatToolsForLLM(allTools);

@@ -1006,12 +1006,16 @@ export class LoCoPilotBuiltInAgent extends Disposable implements IChatAgentImple
 		this.locopilotFileLog.log(msg, ...args);
 	}
 
-	/** Threshold: trigger summarization when conversation tokens >= this fraction of max input tokens. */
-	private static readonly AUTO_SUMMARIZE_THRESHOLD = 0.9;
-	/** Fraction of history entries to keep as recent (not summarized). */
-	private static readonly RECENT_HISTORY_FRACTION = 0.1;
-	/** Target summary length as fraction of max input tokens. */
-	private static readonly SUMMARY_LENGTH_FRACTION = 0.1;
+	/**
+	 * Trigger summarization when conversation tokens >= this fraction of max input tokens.
+	 * High watermark - kept below 1.0 so a large turn doesn't overshoot before we compact.
+	 * (The in-loop ContextManager handles per-iteration growth; this is the cross-turn safety net.)
+	 */
+	private static readonly AUTO_SUMMARIZE_THRESHOLD = 0.75;
+	/** Fraction of history entries to keep verbatim as the recent window (not summarized). */
+	private static readonly RECENT_HISTORY_FRACTION = 0.25;
+	/** Target summary length as fraction of max input tokens (the compressed old history block). */
+	private static readonly SUMMARY_LENGTH_FRACTION = 0.15;
 
 	/**
 	 * Compute total token count for an array of chat messages (for context window check).
