@@ -3,6 +3,18 @@
  *  Licensed under the MIT License. See License.txt in the project root for license information.
  *--------------------------------------------------------------------------------------------*/
 
+/* Remove the teal/focus border box drawn around the entire file tree when focused */
+.monaco-workbench .part.sidebar .monaco-list:not(.element-focused):not(:active):focus:before {
+	outline: none !important;
+}
+
+/* Make text white on focused (teal bg) rows that are not also selected, matching active selection foreground */
+.monaco-workbench .part.sidebar .monaco-list:focus .monaco-list-row.focused:not(.selected),
+.monaco-workbench .part.sidebar .monaco-list:focus .monaco-list-row.focused:not(.selected) .monaco-icon-label,
+.monaco-workbench .part.sidebar .monaco-list:focus .monaco-list-row.focused:not(.selected) .label-name {
+	color: var(--vscode-list-activeSelectionForeground) !important;
+}
+
 .monaco-workbench.nosidebar > .part.sidebar {
 	display: none !important;
 	visibility: hidden !important;
