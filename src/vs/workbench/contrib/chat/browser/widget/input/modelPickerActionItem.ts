@@ -157,7 +157,7 @@ function getModelPickerActionBarActionProvider(commandService: ICommandService, 
 			if (!isNewOrAnonymousUser && chatEntitlementService.entitlement !== ChatEntitlement.Free) {
 				additionalActions.push({
 					id: 'addLanguageModels',
-					label: localize('chat.addLanguageModels', "Add Language Models"),
+					label: localize('chat.addLanguageModels', "Add Model"),
 					enabled: true,
 					tooltip: localize('chat.addLanguageModels.tooltip', "Add custom language models (Cloud or Local)"),
 					class: undefined,
@@ -176,9 +176,9 @@ function getModelPickerActionBarActionProvider(commandService: ICommandService, 
 			if (isNewOrAnonymousUser || chatEntitlementService.entitlement === ChatEntitlement.Free) {
 				additionalActions.push({
 					id: 'moreModels',
-					label: isNewOrAnonymousUser ? localize('chat.moreModels', "Add Language Models") : localize('chat.morePremiumModels', "Add Premium Models"),
+					label: isNewOrAnonymousUser ? localize('chat.moreModels', "Add Model") : localize('chat.morePremiumModels', "Add Premium Models"),
 					enabled: true,
-					tooltip: isNewOrAnonymousUser ? localize('chat.moreModels.tooltip', "Add Language Models") : localize('chat.morePremiumModels.tooltip', "Add Premium Models"),
+					tooltip: isNewOrAnonymousUser ? localize('chat.moreModels.tooltip', "Add Model") : localize('chat.morePremiumModels.tooltip', "Add Premium Models"),
 					class: undefined,
 					run: () => {
 						if (isNewOrAnonymousUser) {

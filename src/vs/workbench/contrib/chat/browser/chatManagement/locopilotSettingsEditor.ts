@@ -159,6 +159,11 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 	private selectedSection: string = LOCOPILOT_SETTINGS_SECTION_ADD_MODEL;
 	private sections: SectionItem[] = [];
 
+	private currentLogsModelId: string | undefined;
+	private logsOverlayEl: HTMLElement | undefined;
+	private logsTitleEl: HTMLElement | undefined;
+	private logsBodyEl: HTMLElement | undefined;
+
 	constructor(
 		group: IEditorGroup,
 		@ITelemetryService telemetryService: ITelemetryService,
@@ -179,8 +184,16 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 		this.customLanguageModelsService = customLanguageModelsService;
 		this.localModelRunner = localModelRunner;
 
-		this._register(this.localModelRunner.onDidServerStateChange(() => {
+		this._register(this.localModelRunner.onDidServerStateChange((modelId) => {
 			this.renderListModels();
+			if (!this.localModelRunner.isServerRunning(modelId) && this.currentLogsModelId === modelId) {
+				this._hideLogsOverlay();
+			}
+		}));
+		this._register(this.localModelRunner.onDidLogUpdate((modelId) => {
+			if (this.currentLogsModelId === modelId && this.logsBodyEl) {
+				this._appendLogsLine(this.localModelRunner.getServerLogs(modelId));
+			}
 		}));
 	}
 
@@ -251,8 +264,8 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 
 	private renderSidebar(parent: HTMLElement): void {
 		this.sections = [
-			{ id: LOCOPILOT_SETTINGS_SECTION_ADD_MODEL, label: localize('locopilotSettings.addLanguageModel', "Add Language Model") },
-			{ id: LOCOPILOT_SETTINGS_SECTION_LIST_MODELS, label: localize('locopilotSettings.languageModels', "Language Models") },
+			{ id: LOCOPILOT_SETTINGS_SECTION_ADD_MODEL, label: localize('locopilotSettings.addModel', "Add Model") },
+			{ id: LOCOPILOT_SETTINGS_SECTION_LIST_MODELS, label: localize('locopilotSettings.myModels', "My Models") },
 			{ id: LOCOPILOT_SETTINGS_SECTION_AGENT_SETTINGS, label: localize('locopilotSettings.agentSettings', "Agent Settings") },
 		];
 
@@ -314,6 +327,17 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 		this.listModelsContainer = DOM.append(this.listModelsPanel, $('.custom-language-models-list-editor'));
 		this._register(this.customLanguageModelsService.onDidChangeCustomModels(() => this.renderListModels()));
 
+		// Logs overlay - sits at the bottom of the list panel, hidden until a "Logs" button is clicked
+		this.logsOverlayEl = DOM.append(this.listModelsPanel, $('.model-logs-overlay'));
+		this.logsOverlayEl.style.display = 'none';
+		const logsHeader = DOM.append(this.logsOverlayEl, $('.model-logs-header'));
+		this.logsTitleEl = DOM.append(logsHeader, $('.model-logs-title'));
+		const logsCloseBtn = DOM.append(logsHeader, $('.model-logs-close'));
+		logsCloseBtn.textContent = 'x';
+		logsCloseBtn.title = localize('customLanguageModels.logs.close', 'Close logs');
+		this._register(DOM.addDisposableListener(logsCloseBtn, 'click', () => this._hideLogsOverlay()));
+		this.logsBodyEl = DOM.append(this.logsOverlayEl, $('.model-logs-body'));
+
 		// Agent Settings - system prompts + max iteration
 		this.agentSettingsPanel = DOM.append(bodyContainer, $('.locopilot-settings-panel.agent-settings-panel'));
 		this.renderAgentSettings(this.agentSettingsPanel);
@@ -326,7 +350,7 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 		const formContainer = DOM.append(wrapper, $('.add-custom-model-form'));
 
 		const title = DOM.append(formContainer, $('h2.form-title'));
-		title.textContent = localize('addCustomModel.title', 'Add Language Model');
+		title.textContent = localize('addCustomModel.title', 'Add Model');
 
 		const modelTypeContainer = DOM.append(formContainer, $('.form-field'));
 		const modelTypeLabel = DOM.append(modelTypeContainer, $('label.form-label'));
@@ -733,7 +757,7 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 			return;
 		}
 		const title = DOM.append(this.listModelsContainer, $('h2.models-list-title'));
-		title.textContent = localize('customLanguageModels.list.title', 'Language Models');
+		title.textContent = localize('customLanguageModels.list.title', 'My Models');
 		const listContainer = DOM.append(this.listModelsContainer, $('.models-list-container'));
 		models.forEach((model: ICustomLanguageModel) => this.renderListModelItem(model, listContainer));
 	}
@@ -770,6 +794,11 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 					this.commandService.executeCommand('locopilot.startLlamaServer', model.id);
 				}
 			}));
+			if (isRunning) {
+				const logsButton = this._register(new Button(actionsContainer, { ...defaultButtonStyles, secondary: true, title: localize('customLanguageModels.logs.viewTooltip', 'View server logs') }));
+				logsButton.label = localize('customLanguageModels.logs', 'Logs');
+				this._register(logsButton.onDidClick(() => this._showLogsOverlay(model.id, getCustomModelListLabel(model))));
+			}
 		} else if (isOllama && model.localPath && !model.isDownloading && !needsDownloadOrPullRetry(model)) {
 			const isRunning = this.localModelRunner.isServerRunning(model.id);
 			const runServerButton = this._register(new Button(runSlot, { ...defaultButtonStyles, secondary: true }));
@@ -781,6 +810,11 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 					this.commandService.executeCommand('locopilot.runOllamaModel', model.id);
 				}
 			}));
+			if (isRunning) {
+				const logsButton = this._register(new Button(actionsContainer, { ...defaultButtonStyles, secondary: true, title: localize('customLanguageModels.logs.viewTooltip', 'View server logs') }));
+				logsButton.label = localize('customLanguageModels.logs', 'Logs');
+				this._register(logsButton.onDidClick(() => this._showLogsOverlay(model.id, getCustomModelListLabel(model))));
+			}
 		}
 		if (downloadingHFOrOllama) {
 			const stopWrap = DOM.append(actionsContainer, $('.model-action-stop-download'));
@@ -848,7 +882,33 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 		const detailsLabel = DOM.append(row2, $('.model-details'));
 		detailsLabel.textContent = details;
 
-		// Settings row: toggles + token inputs on their own line (right-aligned), so row 2 text stays fully visible
+		// Context window input sits on the right of row 2, inline with the details text
+		const contextWindowContainer = DOM.append(row2, $('.model-max-input-container'));
+		const contextWindowIcon = DOM.append(contextWindowContainer, $('span.model-max-input-icon'));
+		contextWindowIcon.appendChild(renderIcon(Codicon.window));
+		const isLocalModel = model.type === 'local';
+		const contextWindowDefault = isLocalModel ? LoCoPilotSettingsEditor.LOCAL_DEFAULT_CONTEXT_WINDOW : LoCoPilotSettingsEditor.DEFAULT_CONTEXT_WINDOW;
+		const contextWindowInput = this._register(new InputBox(contextWindowContainer, this.contextViewService, {
+			placeholder: String(contextWindowDefault),
+			tooltip: '',
+			inputBoxStyles: locopilotSettingsInputBoxStyles
+		}));
+		contextWindowInput.element.style.minWidth = `${LoCoPilotSettingsEditor.TOKEN_LIMIT_INPUT_WIDTH_PX}px`;
+		contextWindowInput.element.style.width = `${LoCoPilotSettingsEditor.TOKEN_LIMIT_INPUT_WIDTH_PX}px`;
+		contextWindowInput.value = String(model.contextWindow ?? model.maxInputTokens ?? contextWindowDefault);
+		const syncContextWindowTooltip = () => {
+			contextWindowInput.setTooltip(this.contextWindowTooltip(contextWindowInput.value));
+		};
+		syncContextWindowTooltip();
+		this._register(contextWindowInput.onDidChange(async () => {
+			syncContextWindowTooltip();
+			const result = this.parseContextWindow(contextWindowInput.value);
+			if (result.valid) {
+				await this.customLanguageModelsService.updateCustomModel(model.id, { contextWindow: result.value });
+			}
+		}));
+
+		// Settings row: toggles only (right-aligned)
 		const settingsRow = DOM.append(itemContainer, $('.model-item-row.model-item-row-settings'));
 		const secondarySettingsContainer = DOM.append(settingsRow, $('.model-secondary-settings'));
 		if (model.type === 'local' || model.provider === 'huggingface-cloud') {
@@ -891,7 +951,7 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 			const hfContainer = DOM.append(secondarySettingsContainer, $('.model-action-tools-container'));
 			hfContainer.title = hfDesc;
 			const hfIcon = DOM.append(hfContainer, $('span.model-action-tools-icon'));
-			hfIcon.textContent = '$'; // cost indicator: on = cheapest, off = higher cost (fastest)
+			hfIcon.appendChild(renderIcon(Codicon.tag));
 			const hfWrap = DOM.append(hfContainer, $('.model-action-tools.agent-setting-switch-wrap'));
 			const hfToggle = this._register(new Toggle({
 				title: hfDesc,
@@ -903,30 +963,6 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 				await this.customLanguageModelsService.updateCustomModel(model.id, { hfFastest: !hfToggle.checked });
 			}));
 		}
-		const contextWindowContainer = DOM.append(secondarySettingsContainer, $('.model-max-input-container'));
-		const contextWindowIcon = DOM.append(contextWindowContainer, $('span.model-max-input-icon'));
-		contextWindowIcon.appendChild(renderIcon(Codicon.window));
-		const isLocalModel = model.type === 'local';
-		const contextWindowDefault = isLocalModel ? LoCoPilotSettingsEditor.LOCAL_DEFAULT_CONTEXT_WINDOW : LoCoPilotSettingsEditor.DEFAULT_CONTEXT_WINDOW;
-		const contextWindowInput = this._register(new InputBox(contextWindowContainer, this.contextViewService, {
-			placeholder: String(contextWindowDefault),
-			tooltip: '',
-			inputBoxStyles: locopilotSettingsInputBoxStyles
-		}));
-		contextWindowInput.element.style.minWidth = `${LoCoPilotSettingsEditor.TOKEN_LIMIT_INPUT_WIDTH_PX}px`;
-		contextWindowInput.element.style.width = `${LoCoPilotSettingsEditor.TOKEN_LIMIT_INPUT_WIDTH_PX}px`;
-		contextWindowInput.value = String(model.contextWindow ?? model.maxInputTokens ?? contextWindowDefault);
-		const syncContextWindowTooltip = () => {
-			contextWindowInput.setTooltip(this.contextWindowTooltip(contextWindowInput.value));
-		};
-		syncContextWindowTooltip();
-		this._register(contextWindowInput.onDidChange(async () => {
-			syncContextWindowTooltip();
-			const result = this.parseContextWindow(contextWindowInput.value);
-			if (result.valid) {
-				await this.customLanguageModelsService.updateCustomModel(model.id, { contextWindow: result.value });
-			}
-		}));
 
 		// Row 3: local path or download progress (Ollama: indeterminate spinner; Hugging Face: % bar)
 		if (model.isDownloading && isOllama) {
@@ -963,7 +999,56 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 		}
 	}
 
+	private _showLogsOverlay(modelId: string, modelLabel: string): void {
+		this.currentLogsModelId = modelId;
+		if (!this.logsOverlayEl || !this.logsBodyEl) { return; }
+		if (this.logsTitleEl) {
+			this.logsTitleEl.textContent = localize('customLanguageModels.logs.title', 'Logs: {0}', modelLabel);
+		}
+		DOM.clearNode(this.logsBodyEl);
+		const lines = this.localModelRunner.getServerLogs(modelId);
+		for (const line of lines) {
+			this._appendLogLine(line);
+		}
+		this.logsOverlayEl.style.display = '';
+		this.logsBodyEl.scrollTop = this.logsBodyEl.scrollHeight;
+	}
+
+	private _hideLogsOverlay(): void {
+		this.currentLogsModelId = undefined;
+		if (this.logsOverlayEl) {
+			this.logsOverlayEl.style.display = 'none';
+		}
+		if (this.logsBodyEl) {
+			DOM.clearNode(this.logsBodyEl);
+		}
+	}
+
+	private _appendLogsLine(allLines: string[]): void {
+		if (!this.logsBodyEl) { return; }
+		// Only append lines that aren't already rendered (track count via child count)
+		const rendered = this.logsBodyEl.childElementCount;
+		const newLines = allLines.slice(rendered);
+		for (const line of newLines) {
+			this._appendLogLine(line);
+		}
+		// Auto-scroll only if already near the bottom
+		const { scrollTop, scrollHeight, clientHeight } = this.logsBodyEl;
+		if (scrollHeight - scrollTop - clientHeight < 60) {
+			this.logsBodyEl.scrollTop = scrollHeight;
+		}
+	}
+
+	private _appendLogLine(line: string): void {
+		if (!this.logsBodyEl) { return; }
+		const lineEl = DOM.append(this.logsBodyEl, $('div.model-log-line'));
+		lineEl.textContent = line;
+	}
+
 	private renderAgentSettings(container: HTMLElement): void {
+		const title = DOM.append(container, $('h2.agent-settings-title'));
+		title.textContent = localize('locopilotSettings.agentSettingsTitle', 'Agent Settings');
+
 		// Max iterations per request
 		const maxIterSection = DOM.append(container, $('.agent-setting-row'));
 		const maxIterLabel = DOM.append(maxIterSection, $('label.locopilot-setting-label'));

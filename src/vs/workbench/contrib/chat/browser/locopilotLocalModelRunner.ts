@@ -38,7 +38,7 @@ import {
 	shouldUseMlxServerForHfModel,
 } from './locopilotMlxServer.js';
 import { IPathService } from '../../../services/path/common/pathService.js';
-import { ITerminalService, ITerminalInstance, ITerminalGroupService } from '../../terminal/browser/terminal.js';
+import { ITerminalService, ITerminalInstance } from '../../terminal/browser/terminal.js';
 import { Event, Emitter } from '../../../../base/common/event.js';
 import { INotificationService, Severity } from '../../../../platform/notification/common/notification.js';
 import { ICommandService } from '../../../../platform/commands/common/commands.js';
@@ -54,9 +54,11 @@ export const ILoCoPilotLocalModelRunner = createDecorator<ILoCoPilotLocalModelRu
 export interface ILoCoPilotLocalModelRunner {
 	readonly _serviceBrand: undefined;
 	readonly onDidServerStateChange: Event<string>;
+	readonly onDidLogUpdate: Event<string>;
 	getBackend(): LlamaBackend;
 	getBackendPriority(): LlamaBackend[];
 	getServerBaseUrl(modelId: string): string | undefined;
+	getServerLogs(modelId: string): string[];
 	startServerInTerminal(modelId: string): Promise<void>;
 	stopServer(modelId: string): void;
 	runOllamaModelInTerminal(modelId: string): Promise<void>;
@@ -70,7 +72,12 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 	private readonly _onDidServerStateChange = this._register(new Emitter<string>());
 	readonly onDidServerStateChange = this._onDidServerStateChange.event;
 
-	private runningServers = new Map<string, { port: number; terminal: ITerminalInstance; kind: 'llama' | 'mlx' }>();
+	private readonly _onDidLogUpdate = this._register(new Emitter<string>());
+	readonly onDidLogUpdate = this._onDidLogUpdate.event;
+
+	private static readonly MAX_LOG_LINES = 2000;
+
+	private runningServers = new Map<string, { port: number; terminal: ITerminalInstance; kind: 'llama' | 'mlx'; logs: string[] }>();
 
 	constructor(
 		@ICustomLanguageModelsService private readonly customLanguageModelsService: ICustomLanguageModelsService,
@@ -80,7 +87,6 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 		@ILogService private readonly logService: ILogService,
 		@ILoCoPilotFileLog private readonly locopilotFileLog: ILoCoPilotFileLog,
 		@ITerminalService private readonly terminalService: ITerminalService,
-		@ITerminalGroupService private readonly terminalGroupService: ITerminalGroupService,
 		@INotificationService private readonly notificationService: INotificationService,
 		@ICommandService private readonly commandService: ICommandService,
 		@IOpenerService private readonly openerService: IOpenerService,
@@ -146,6 +152,10 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 
 	isServerRunning(modelId: string): boolean {
 		return this.runningServers.has(modelId);
+	}
+
+	getServerLogs(modelId: string): string[] {
+		return this.runningServers.get(modelId)?.logs ?? [];
 	}
 
 	stopServer(modelId: string): void {
@@ -465,13 +475,20 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 					name: `Llama Server - ${model.modelName}`,
 				}
 			});
-			this.terminalService.setActiveInstance(terminal);
-			await this.terminalGroupService.showPanel(true);
 			await new Promise<void>(resolve => setTimeout(resolve, 400));
 			await terminal.sendText(cmdLine, true);
 
-			this.runningServers.set(modelId, { port, terminal, kind: 'llama' });
+			const logs: string[] = [];
+			this.runningServers.set(modelId, { port, terminal, kind: 'llama', logs });
 			this._onDidServerStateChange.fire(modelId);
+
+			this._register(terminal.onLineData(line => {
+				logs.push(line);
+				if (logs.length > LoCoPilotLocalModelRunner.MAX_LOG_LINES) {
+					logs.splice(0, logs.length - LoCoPilotLocalModelRunner.MAX_LOG_LINES);
+				}
+				this._onDidLogUpdate.fire(modelId);
+			}));
 
 			// Warm up in the background so the first real message has no kernel-JIT / cache lag.
 			if (this.configurationService.getValue<boolean>(ChatConfiguration.LocopilotLlamaCppWarmup) !== false) {
@@ -513,13 +530,20 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 					name: `MLX - ${model.modelName}`,
 				}
 			});
-			this.terminalService.setActiveInstance(terminal);
-			await this.terminalGroupService.showPanel(true);
 			await new Promise<void>(resolve => setTimeout(resolve, 400));
 			await terminal.sendText(cmdLine, true);
 
-			this.runningServers.set(modelId, { port, terminal, kind: 'mlx' });
+			const logs: string[] = [];
+			this.runningServers.set(modelId, { port, terminal, kind: 'mlx', logs });
 			this._onDidServerStateChange.fire(modelId);
+
+			this._register(terminal.onLineData(line => {
+				logs.push(line);
+				if (logs.length > LoCoPilotLocalModelRunner.MAX_LOG_LINES) {
+					logs.splice(0, logs.length - LoCoPilotLocalModelRunner.MAX_LOG_LINES);
+				}
+				this._onDidLogUpdate.fire(modelId);
+			}));
 
 			this._register(terminal.onDisposed(() => {
 				if (this.runningServers.has(modelId)) {
@@ -569,14 +593,21 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 					name: `Ollama - ${model.modelName}`,
 				}
 			});
-			this.terminalService.setActiveInstance(terminal);
-			await this.terminalGroupService.showPanel(true);
 			await new Promise<void>(resolve => setTimeout(resolve, 400));
 			await terminal.sendText(cmdLine, true);
 
+			const logs: string[] = [];
 			// For Ollama, we don't manage the port, it's always the baseUrl port, but we track the terminal
-			this.runningServers.set(modelId, { port: 11434, terminal, kind: 'llama' });
+			this.runningServers.set(modelId, { port: 11434, terminal, kind: 'llama', logs });
 			this._onDidServerStateChange.fire(modelId);
+
+			this._register(terminal.onLineData(line => {
+				logs.push(line);
+				if (logs.length > LoCoPilotLocalModelRunner.MAX_LOG_LINES) {
+					logs.splice(0, logs.length - LoCoPilotLocalModelRunner.MAX_LOG_LINES);
+				}
+				this._onDidLogUpdate.fire(modelId);
+			}));
 
 			this._register(terminal.onDisposed(() => {
 				if (this.runningServers.has(modelId)) {
