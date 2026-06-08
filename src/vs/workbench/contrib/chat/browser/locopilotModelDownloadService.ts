@@ -19,6 +19,7 @@ import { IFileService } from '../../../../platform/files/common/files.js';
 import { IEnvironmentService } from '../../../../platform/environment/common/environment.js';
 import { ICustomLanguageModelsService, ICustomLanguageModel } from '../common/customLanguageModelsService.js';
 import { ILoCoPilotFileLog } from './locopilotFileLog.js';
+import { ILoCoPilotOllamaService } from './locopilotOllamaService.js';
 import { registerAction2, Action2 } from '../../../../platform/actions/common/actions.js';
 import { ServicesAccessor } from '../../../../platform/instantiation/common/instantiation.js';
 import { IWorkbenchContribution } from '../../../common/contributions.js';
@@ -129,6 +130,7 @@ export class LoCoPilotModelDownloadService extends Disposable implements IWorkbe
 		@ILogService private readonly logService: ILogService,
 		@ILoCoPilotFileLog private readonly locopilotFileLog: ILoCoPilotFileLog,
 		@INotificationService private readonly notificationService: INotificationService,
+		@ILoCoPilotOllamaService private readonly ollamaService: ILoCoPilotOllamaService,
 	) {
 		super();
 		this._registerCommands();
@@ -302,6 +304,17 @@ export class LoCoPilotModelDownloadService extends Disposable implements IWorkbe
 		const modelId = model.id;
 		const repoId = model.modelName.trim();
 		const baseUrl = (model.localPath || 'http://localhost:11434').replace(/\/$/, '');
+
+		// Make sure Ollama is installed and running before we pull. If it is missing, the service offers a
+		// consent-gated install (it never installs silently) and we stop here so the user can act.
+		const readiness = await this.ollamaService.ensureReady(baseUrl);
+		if (readiness !== 'ready') {
+			if (readiness === 'starting') {
+				this.notificationService.info(`Ollama is starting up. Once it is running, click "Download" again to pull "${repoId}".`);
+			}
+			this._log(`[LoCoPilot Ollama] Not ready to pull ${repoId} (state: ${readiness}).`);
+			return;
+		}
 
 		this._log(`[LoCoPilot Ollama] Starting pull for ${repoId} at ${baseUrl}`);
 		try {

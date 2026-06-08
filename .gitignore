@@ -29,3 +29,9 @@ test-output.json
 # Bundled embedding model weights (fetched via scripts/fetch-embedding-model.mjs before building)
 resources/embeddings/*/model.onnx
 resources/embeddings/*/vocab.txt
+
+# Bundled llama.cpp binaries (fetched via scripts/fetch-llama-binaries.mjs before building)
+resources/bin/
+
+# Bundled MLX Python runtime (built via scripts/fetch-mlx-runtime.mjs before building; macOS arm64)
+resources/mlx/

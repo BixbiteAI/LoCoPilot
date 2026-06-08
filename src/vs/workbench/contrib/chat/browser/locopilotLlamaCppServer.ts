@@ -16,6 +16,32 @@ const LLAMA_SERVER_BIN_WIN = 'llama-server.exe';
 /** Subpath under user home for conventional llama.cpp build (build/bin or build/bin/llama-server). */
 const LLAMA_CPP_REL_BIN = ['llama.cpp', 'build', 'bin'];
 
+/**
+ * Returns the node-style `<platform>-<arch>` key for the bundled binary directory
+ * (e.g. 'darwin-arm64', 'win32-x64', 'linux-x64'). Matches resources/bin/<key>/ produced by
+ * scripts/fetch-llama-binaries.mjs and selected per-build in build/gulpfile.vscode.ts.
+ */
+function getBundledPlatformArch(): string {
+	const plat = isWindows ? 'win32' : (isMacintosh ? 'darwin' : 'linux');
+	const nodeProcess = (globalThis as { vscode?: { process?: { arch?: string } }; process?: { arch?: string } }).vscode?.process
+		?? (typeof (globalThis as { process?: { arch?: string } }).process !== 'undefined' ? (globalThis as { process: { arch?: string } }).process : undefined);
+	const arch = nodeProcess?.arch ?? 'x64';
+	return `${plat}-${arch}`;
+}
+
+/**
+ * Full path to the llama-server binary bundled inside the installed app, or undefined when there is
+ * no app root (e.g. web). Existence is not checked here - the caller stats it before use.
+ * appRootFsPath: IEnvironmentService.appRoot.
+ */
+export function getBundledLlamaServerPath(appRootFsPath: string | undefined): string | undefined {
+	if (!appRootFsPath) {
+		return undefined;
+	}
+	const binName = isWindows ? LLAMA_SERVER_BIN_WIN : LLAMA_SERVER_BIN;
+	return pathJoin(appRootFsPath, 'resources', 'bin', getBundledPlatformArch(), binName);
+}
+
 /** Priority order for backends: first available is used. */
 const BACKEND_PRIORITY: LlamaBackend[] = ['cuda', 'metal', 'vulkan', 'cpu'];
 

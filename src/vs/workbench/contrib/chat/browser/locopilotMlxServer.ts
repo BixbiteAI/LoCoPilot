@@ -4,9 +4,29 @@
  *--------------------------------------------------------------------------------------------*/
 
 import { isMacintosh, isWindows } from '../../../../base/common/platform.js';
+import { join as pathJoin } from '../../../../base/common/path.js';
 
 /** Start from a different default than llama.cpp to reduce accidental port overlap. */
 export const LOCOPILOT_MLX_SERVER_PORT = 38462;
+
+/**
+ * Relative location of the bundled, self-contained Python runtime (python-build-standalone with
+ * mlx-lm pre-installed) inside the installed app. Only shipped in the macOS arm64 package - MLX is
+ * Apple Silicon only. Produced by scripts/fetch-mlx-runtime.mjs and packaged in build/gulpfile.vscode.ts.
+ */
+const BUNDLED_MLX_REL = ['resources', 'mlx', 'darwin-arm64', 'python', 'bin', 'python3'];
+
+/**
+ * Full path to the bundled MLX Python interpreter, or undefined when there is no app root (web) or
+ * this is not an Apple Silicon Mac. Existence is not checked here - the caller stats it before use.
+ * appRootFsPath: IEnvironmentService.appRoot (INativeEnvironmentService).
+ */
+export function getBundledMlxPython(appRootFsPath: string | undefined): string | undefined {
+	if (!appRootFsPath || !isAppleSiliconMac()) {
+		return undefined;
+	}
+	return pathJoin(appRootFsPath, ...BUNDLED_MLX_REL);
+}
 
 /**
  * Apple Silicon Mac only. MLX inference is not supported on Intel Mac or other OSes.

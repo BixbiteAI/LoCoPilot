@@ -17,6 +17,7 @@ import {
 	detectLlamaBackend,
 	getRecommendedBackend,
 	getDefaultLlamaServerPaths,
+	getBundledLlamaServerPath,
 	getLlamaCppServerCommand,
 	getLlamaServerBaseUrl,
 	getLlamaServerHealthUrl,
@@ -28,6 +29,7 @@ import {
 } from './locopilotLlamaCppServer.js';
 import { dirname } from '../../../../base/common/path.js';
 import {
+	getBundledMlxPython,
 	getMlxLmServerCommand,
 	getMlxServerBaseUrl,
 	LOCOPILOT_MLX_SERVER_PORT,
@@ -41,8 +43,8 @@ import { Event, Emitter } from '../../../../base/common/event.js';
 import { INotificationService, Severity } from '../../../../platform/notification/common/notification.js';
 import { ICommandService } from '../../../../platform/commands/common/commands.js';
 import { IOpenerService } from '../../../../platform/opener/common/opener.js';
-import { LOCOPILOT_SETTINGS_SECTION_AGENT_SETTINGS } from './chatManagement/locopilotSettingsEditorInput.js';
 import { INativeHostService } from '../../../../platform/native/common/native.js';
+import { IEnvironmentService, INativeEnvironmentService } from '../../../../platform/environment/common/environment.js';
 import { IRequestService } from '../../../../platform/request/common/request.js';
 import { CancellationToken } from '../../../../base/common/cancellation.js';
 import { timeout } from '../../../../base/common/async.js';
@@ -84,6 +86,7 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 		@IOpenerService private readonly openerService: IOpenerService,
 		@IInstantiationService private readonly instantiationService: IInstantiationService,
 		@IRequestService private readonly requestService: IRequestService,
+		@IEnvironmentService private readonly environmentService: IEnvironmentService,
 	) {
 		super();
 		this._registerCommands();
@@ -242,12 +245,37 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 	}
 
 	/**
-	 * Resolves the path to use for llama-server: configured path, or first conventional path that exists (~/llama.cpp/build/bin), or undefined (use PATH).
+	 * Install root of the app (where resources/ lives). Only present on desktop; undefined on web.
+	 * appRoot is declared on INativeEnvironmentService, so read it through that subtype.
+	 */
+	private get _appRoot(): string | undefined {
+		return (this.environmentService as Partial<INativeEnvironmentService>).appRoot;
+	}
+
+	/**
+	 * Resolves the path to use for llama-server. Priority:
+	 *   1. User override (locopilot.llamaCpp.serverPath) - for remote/custom builds. Advanced; unset by default.
+	 *   2. Bundled binary shipped inside the app (resources/bin/<platform>-<arch>/llama-server) - the
+	 *      zero-setup default that ships with every package via scripts/fetch-llama-binaries.mjs.
+	 *   3. Conventional install locations (~/llama.cpp/build/bin, Homebrew, etc.).
+	 *   4. undefined → fall back to llama-server on PATH.
 	 */
 	private async resolveServerPath(): Promise<string | undefined> {
 		const configured = this.configurationService.getValue<string>(ChatConfiguration.LocopilotLlamaCppServerPath)?.trim();
 		if (configured) {
 			return configured;
+		}
+		// Prefer the binary we ship inside the installer - no user setup required.
+		const bundled = getBundledLlamaServerPath(this._appRoot);
+		if (bundled) {
+			try {
+				const stat = await this.fileService.stat(URI.file(bundled));
+				if (stat.isFile) {
+					return bundled;
+				}
+			} catch {
+				// Not bundled for this build (e.g. binary not fetched, or unsupported arch) - fall through.
+			}
 		}
 		const userHome = await this.pathService.userHome();
 		const homeFs = userHome.fsPath;
@@ -263,6 +291,32 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 			}
 		}
 		return undefined;
+	}
+
+	/**
+	 * Resolves the Python interpreter for mlx_lm.server. Priority:
+	 *   1. User override (locopilot.mlx.pythonPath) - advanced; unset by default.
+	 *   2. Bundled self-contained Python with mlx-lm pre-installed, shipped in the macOS arm64 package
+	 *      (resources/mlx/darwin-arm64/python/bin/python3) - the zero-setup default.
+	 *   3. `python3` on PATH (legacy fallback; requires the user to have installed mlx-lm themselves).
+	 */
+	private async resolveMlxPython(): Promise<string> {
+		const configured = (this.configurationService.getValue<string>(ChatConfiguration.LocopilotMlxPythonPath) ?? '').trim();
+		if (configured) {
+			return configured;
+		}
+		const bundled = getBundledMlxPython(this._appRoot);
+		if (bundled) {
+			try {
+				const stat = await this.fileService.stat(URI.file(bundled));
+				if (stat.isFile) {
+					return bundled;
+				}
+			} catch {
+				// Not bundled in this build - fall through to PATH.
+			}
+		}
+		return 'python3';
 	}
 
 	/** Resolves localPath to a .gguf file path (if it's a directory, finds first .gguf). */
@@ -371,18 +425,18 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 		if (!serverPath) {
 			this.notificationService.prompt(
 				Severity.Error,
-				'llama.cpp server was not found. Please clone and build it from https://github.com/ggerganov/llama.cpp, then set the path in Agent Settings (e.g., ~/llama.cpp/build/bin/llama-server).',
+				'The bundled llama.cpp engine could not be found for this build. This is unexpected - try reinstalling LoCoPilot. If you maintain your own llama.cpp build, you can point at it with the "locopilot.llamaCpp.serverPath" setting.',
 				[
 					{
-						label: 'Open Agent Settings',
+						label: 'Open Settings',
 						run: () => {
-							this.commandService.executeCommand('workbench.action.chat.openLoCoPilotSettings', { section: LOCOPILOT_SETTINGS_SECTION_AGENT_SETTINGS });
+							this.commandService.executeCommand('workbench.action.openSettings', ChatConfiguration.LocopilotLlamaCppServerPath);
 						}
 					},
 					{
 						label: 'Get llama.cpp',
 						run: () => {
-							this.openerService.open('https://github.com/ggerganov/llama.cpp');
+							this.openerService.open('https://github.com/ggml-org/llama.cpp');
 						}
 					}
 				]
@@ -403,9 +457,7 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 		const cmdLine = [shellQuote(command), ...argsCli].join(' ');
 
 		this._log(`[LoCoPilot Runner] Executing: ${cmdLine}`);
-		if (!serverPath) {
-			this._log(`[LoCoPilot Runner] Note: If this fails, install llama.cpp (e.g. clone and build to ~/llama.cpp) or set the path in LoCoPilot Settings > Agent Settings > Llama.cpp server path.`);
-		}
+		this._log(`[LoCoPilot Runner] Using llama-server: ${serverPath} (bundled = ${serverPath === getBundledLlamaServerPath(this._appRoot)}).`);
 
 		try {
 			const terminal = await this.terminalService.createTerminal({
@@ -447,7 +499,7 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 	private async _startMlxServerInTerminal(modelId: string, model: ICustomLanguageModel & { localPath: string }): Promise<void> {
 		const modelDir = await this.getMlxModelRootPath(model.localPath);
 		const port = await this.findAvailablePort(LOCOPILOT_MLX_SERVER_PORT);
-		const pythonCmd = (this.configurationService.getValue<string>(ChatConfiguration.LocopilotMlxPythonPath) ?? '').trim() || 'python3';
+		const pythonCmd = await this.resolveMlxPython();
 		const { command, args } = getMlxLmServerCommand(modelDir, port, pythonCmd);
 		const q = (p: string) => (p.includes(' ') || p.includes('"') ? `"${p.replace(/"/g, '\\"')}"` : p);
 		const argsQuoted = args.map(a => (a === modelDir || a.includes(' ') ? q(a) : a));
@@ -478,9 +530,12 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 			}));
 		} catch (e) {
 			this._log(`[LoCoPilot Runner] Failed to start MLX terminal: ${e}`);
+			const usingBundled = pythonCmd === getBundledMlxPython(this._appRoot);
 			this.notificationService.notify({
 				severity: Severity.Error,
-				message: `Failed to start MLX server. Install with: ${pythonCmd} -m pip install 'mlx-lm' (Apple Silicon). Set the Python path in settings (locopilot.mlx.pythonPath) if needed.`,
+				message: usingBundled
+					? `Failed to start the bundled MLX runtime. This is unexpected - try reinstalling LoCoPilot. To use your own Python instead, set "locopilot.mlx.pythonPath".`
+					: `Failed to start MLX server with "${pythonCmd}". Install mlx-lm (${pythonCmd} -m pip install 'mlx-lm', Apple Silicon only), or set "locopilot.mlx.pythonPath".`,
 			});
 			throw e;
 		}

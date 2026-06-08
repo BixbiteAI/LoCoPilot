@@ -7,7 +7,6 @@ import './media/locopilotSettingsEditor.css';
 import './media/addCustomModelEditor.css';
 import './media/customLanguageModelsListEditor.css';
 import * as DOM from '../../../../../base/browser/dom.js';
-import { IConfigurationService } from '../../../../../platform/configuration/common/configuration.js';
 import { IInstantiationService } from '../../../../../platform/instantiation/common/instantiation.js';
 import { IStorageService } from '../../../../../platform/storage/common/storage.js';
 import { ITelemetryService } from '../../../../../platform/telemetry/common/telemetry.js';
@@ -32,7 +31,6 @@ import { Event } from '../../../../../base/common/event.js';
 import { Dimension } from '../../../../../base/browser/dom.js';
 import { registerColor } from '../../../../../platform/theme/common/colorRegistry.js';
 import { PANEL_BORDER } from '../../../../common/theme.js';
-import { ChatConfiguration } from '../../common/constants.js';
 import { ILoCoPilotAgentSettingsService, DEFAULT_MAX_ITERATIONS } from '../locopilotAgentSettingsService.js';
 import { InputBox } from '../../../../../base/browser/ui/inputbox/inputBox.js';
 import { IContextViewService } from '../../../../../platform/contextview/browser/contextView.js';
@@ -146,8 +144,6 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 	private agentSettingsBaseline: {
 		maxIterations: number;
 		autoRunSandbox: boolean;
-		llamaPath: string;
-		mlxPath: string;
 		askCoding: boolean;
 		agentCoding: boolean;
 		askPrompt: string;
@@ -155,8 +151,6 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 	} | undefined;
 	private maxIterationsInput!: InputBox;
 	private autoRunCommandsInSandboxToggle!: Toggle;
-	private llamaCppServerPathInput!: InputBox;
-	private mlxPythonPathInput!: InputBox;
 	private agentSettingsService!: ILoCoPilotAgentSettingsService;
 	private customLanguageModelsService!: ICustomLanguageModelsService;
 	private localModelRunner!: ILoCoPilotLocalModelRunner;
@@ -170,7 +164,6 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 		@ITelemetryService telemetryService: ITelemetryService,
 		@IThemeService themeService: IThemeService,
 		@IStorageService storageService: IStorageService,
-		@IConfigurationService private readonly configurationService: IConfigurationService,
 		@IInstantiationService private readonly instantiationService: IInstantiationService,
 		@ILoCoPilotAgentSettingsService agentSettingsService: ILoCoPilotAgentSettingsService,
 		@IContextViewService private readonly contextViewService: IContextViewService,
@@ -768,15 +761,12 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 			const isRunning = this.localModelRunner.isServerRunning(model.id);
 			const runServerButton = this._register(new Button(runSlot, { ...defaultButtonStyles, secondary: true }));
 			runServerButton.label = isRunning ? localize('customLanguageModels.stopServer', 'Stop server') : localize('customLanguageModels.runServer', 'Run server');
-			this._register(runServerButton.onDidClick(async () => {
+			this._register(runServerButton.onDidClick(() => {
 				if (isRunning) {
 					this.localModelRunner.stopServer(model.id);
 				} else {
-					const currentPath = this.llamaCppServerPathInput.value.trim();
-					const savedPath = this.configurationService.getValue<string>(ChatConfiguration.LocopilotLlamaCppServerPath);
-					if (currentPath !== (savedPath ?? '').trim()) {
-						await this.configurationService.updateValue(ChatConfiguration.LocopilotLlamaCppServerPath, currentPath);
-					}
+					// llama-server ships bundled in the app (resources/bin/<platform>-<arch>), so there is
+					// no path to configure - just start it.
 					this.commandService.executeCommand('locopilot.startLlamaServer', model.id);
 				}
 			}));
@@ -999,29 +989,11 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 		DOM.append(autoRunWrap, this.autoRunCommandsInSandboxToggle.domNode);
 		this._register(this.autoRunCommandsInSandboxToggle.onChange(() => this.updateAgentSettingsDirtyIndicators()));
 
-		// Llama.cpp server path (for local GGUF models)
-		const llamaPathRow = DOM.append(container, $('.agent-setting-row'));
-		const llamaPathLabel = DOM.append(llamaPathRow, $('label.locopilot-setting-label'));
-		llamaPathLabel.textContent = localize('locopilotSettings.llamaCppServerPath', "Llama.cpp server path");
-		const llamaPathWrap = DOM.append(llamaPathRow, $('.agent-setting-input-wrap.agent-setting-path-wrap'));
-		this.llamaCppServerPathInput = this._register(new InputBox(DOM.append(llamaPathWrap, $('div')), this.contextViewService, {
-			placeholder: localize('locopilotSettings.llamaCppServerPathPlaceholder', "e.g. /path/to/llama-server or C:\\llama.cpp\\build\\bin"),
-			inputBoxStyles: locopilotSettingsInputBoxStyles
-		}));
-		this.llamaCppServerPathInput.value = this.configurationService.getValue<string>(ChatConfiguration.LocopilotLlamaCppServerPath) ?? '';
-		this._register(this.llamaCppServerPathInput.onDidChange(() => this.updateAgentSettingsDirtyIndicators()));
-
-		// Python for MLX (mlx-lm) - Apple Silicon only
-		const mlxPythonRow = DOM.append(container, $('.agent-setting-row'));
-		const mlxPythonLabel = DOM.append(mlxPythonRow, $('label.locopilot-setting-label'));
-		mlxPythonLabel.textContent = localize('locopilotSettings.mlxPythonPath', "Python for MLX (mlx-lm)");
-		const mlxPythonWrap = DOM.append(mlxPythonRow, $('.agent-setting-input-wrap.agent-setting-path-wrap'));
-		this.mlxPythonPathInput = this._register(new InputBox(DOM.append(mlxPythonWrap, $('div')), this.contextViewService, {
-			placeholder: localize('locopilotSettings.mlxPythonPathPlaceholder', "Leave empty for python3, or path to a venv Python"),
-			inputBoxStyles: locopilotSettingsInputBoxStyles
-		}));
-		this.mlxPythonPathInput.value = this.configurationService.getValue<string>(ChatConfiguration.LocopilotMlxPythonPath) ?? '';
-		this._register(this.mlxPythonPathInput.onDidChange(() => this.updateAgentSettingsDirtyIndicators()));
+		// Note: both local engines ship bundled inside the app, so there are no paths to configure:
+		//  - llama.cpp (GGUF)        -> resources/bin/<platform>-<arch>
+		//  - MLX runtime (mac arm64) -> resources/mlx/darwin-arm64 (self-contained Python + mlx-lm)
+		// Power users can still override via the hidden settings locopilot.llamaCpp.serverPath and
+		// locopilot.mlx.pythonPath (e.g. to point at a custom build or their own Python).
 
 		// LoCoPilot prompt - Agent (toggle label only; no separate section heading)
 		const agentSection = DOM.append(container, $('.agent-setting-block'));
@@ -1108,8 +1080,6 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 	private takeAgentSettingsSnapshotFromPersisted(): {
 		maxIterations: number;
 		autoRunSandbox: boolean;
-		llamaPath: string;
-		mlxPath: string;
 		askCoding: boolean;
 		agentCoding: boolean;
 		askPrompt: string;
@@ -1118,8 +1088,6 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 		return {
 			maxIterations: this.agentSettingsService.getMaxIterationsPerRequest(),
 			autoRunSandbox: this.agentSettingsService.getAutoRunCommandsInSandbox(),
-			llamaPath: (this.configurationService.getValue<string>(ChatConfiguration.LocopilotLlamaCppServerPath) ?? '').trim(),
-			mlxPath: (this.configurationService.getValue<string>(ChatConfiguration.LocopilotMlxPythonPath) ?? '').trim(),
 			askCoding: this.agentSettingsService.getAskUseCodingSystemPrompt(),
 			agentCoding: this.agentSettingsService.getAgentUseCodingSystemPrompt(),
 			askPrompt: this.agentSettingsService.getAskModeSystemPrompt().trim(),
@@ -1130,8 +1098,6 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 	private snapshotAgentPanelFromUI(): {
 		maxIterations: number;
 		autoRunSandbox: boolean;
-		llamaPath: string;
-		mlxPath: string;
 		askCoding: boolean;
 		agentCoding: boolean;
 		askPrompt: string;
@@ -1141,8 +1107,6 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 		return {
 			maxIterations: isNaN(rawN) ? -1 : rawN,
 			autoRunSandbox: this.autoRunCommandsInSandboxToggle.checked,
-			llamaPath: this.llamaCppServerPathInput.value.trim(),
-			mlxPath: this.mlxPythonPathInput.value.trim(),
 			askCoding: this.askCodingSystemPromptToggle.checked,
 			agentCoding: this.agentCodingSystemPromptToggle.checked,
 			askPrompt: this.askPromptTextarea.value.trim(),
@@ -1163,8 +1127,6 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 		return (
 			b.maxIterations !== cur.maxIterations ||
 			b.autoRunSandbox !== cur.autoRunSandbox ||
-			b.llamaPath !== cur.llamaPath ||
-			b.mlxPath !== cur.mlxPath ||
 			b.askCoding !== cur.askCoding ||
 			b.agentCoding !== cur.agentCoding ||
 			b.askPrompt !== cur.askPrompt ||
@@ -1205,8 +1167,6 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 	private loadAgentPanelFromPersisted(): void {
 		this.maxIterationsInput.value = String(this.agentSettingsService.getMaxIterationsPerRequest());
 		this.autoRunCommandsInSandboxToggle.checked = this.agentSettingsService.getAutoRunCommandsInSandbox();
-		this.llamaCppServerPathInput.value = this.configurationService.getValue<string>(ChatConfiguration.LocopilotLlamaCppServerPath) ?? '';
-		this.mlxPythonPathInput.value = this.configurationService.getValue<string>(ChatConfiguration.LocopilotMlxPythonPath) ?? '';
 		this.askCodingSystemPromptToggle.checked = this.agentSettingsService.getAskUseCodingSystemPrompt();
 		this.agentCodingSystemPromptToggle.checked = this.agentSettingsService.getAgentUseCodingSystemPrompt();
 		this.askPromptTextarea.value = this.agentSettingsService.getAskModeSystemPrompt();
@@ -1239,8 +1199,6 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 			this.agentSettingsService.setAgentUseCodingSystemPrompt(this.agentCodingSystemPromptToggle.checked);
 			this.agentSettingsService.setAskModeSystemPrompt(this.askPromptTextarea.value.trim());
 			this.agentSettingsService.setAgentModeSystemPrompt(this.agentPromptTextarea.value.trim());
-			await this.configurationService.updateValue(ChatConfiguration.LocopilotLlamaCppServerPath, this.llamaCppServerPathInput.value.trim());
-			await this.configurationService.updateValue(ChatConfiguration.LocopilotMlxPythonPath, this.mlxPythonPathInput.value.trim());
 			this.captureAgentSettingsBaselineFromPersisted();
 			this.updateAgentSettingsDirtyIndicators();
 			await this.dialogService.info(

@@ -44,9 +44,9 @@ export enum ChatConfiguration {
 	AgentsControlClickBehavior = 'chat.agentsControl.clickBehavior',
 	ExplainChangesEnabled = 'chat.editing.explainChanges.enabled',
 	WebSearchApiKey = 'chat.webSearch.apiKey',
-	/** Path to llama-server binary (llama.cpp). Empty = use PATH. Can be full path to binary or directory containing it. */
+	/** Advanced override for the llama-server binary. Empty (default) = use the bundled engine shipped in the app (resources/bin/<platform>-<arch>), then conventional install paths, then PATH. Set to a custom build path only if needed. */
 	LocopilotLlamaCppServerPath = 'locopilot.llamaCpp.serverPath',
-	/** Python interpreter to run `python -m mlx_lm.server` for local MLX (Hugging Face) models on Apple Silicon. Empty = `python3` on PATH. */
+	/** Advanced override for the Python interpreter running `python -m mlx_lm.server` (Apple Silicon MLX). Empty (default) = use the bundled self-contained Python with mlx-lm (resources/mlx/darwin-arm64), then `python3` on PATH. */
 	LocopilotMlxPythonPath = 'locopilot.mlx.pythonPath',
 	/** Context window (`-c`) for llama-server. Smaller = smaller KV cache, faster prefill, less memory. */
 	LocopilotLlamaCppContextSize = 'locopilot.llamaCpp.contextSize',

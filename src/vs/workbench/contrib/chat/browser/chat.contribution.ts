@@ -65,6 +65,7 @@ import { ILoCoPilotAgentSettingsService, LoCoPilotAgentSettingsService } from '.
 import { LoCoPilotLanguageModelProvider } from './locopilotLanguageModelProvider.js';
 import { LoCoPilotModelDownloadService } from './locopilotModelDownloadService.js';
 import { ILoCoPilotLocalModelRunner, LoCoPilotLocalModelRunner } from './locopilotLocalModelRunner.js';
+import { ILoCoPilotOllamaService, LoCoPilotOllamaService } from './locopilotOllamaService.js';
 import { LanguageModelToolsExtensionPointHandler } from '../common/tools/languageModelToolsContribution.js';
 import { BuiltinToolsContribution } from '../common/tools/builtinTools/tools.js';
 import './retrieval/retrievalService.js'; // registers ILoCoPilotRetrievalService singleton
@@ -612,12 +613,12 @@ configurationRegistry.registerConfiguration({
 		},
 		[ChatConfiguration.LocopilotLlamaCppServerPath]: {
 			type: 'string',
-			description: nls.localize('locopilot.llamaCpp.serverPath.description', "Path to the llama-server binary (from llama.cpp). Leave empty to use the binary from your PATH. You can set the full path to the binary (e.g. /path/to/llama-server or C:\\llama.cpp\\build\\bin\\llama-server.exe) or the directory that contains it. Required when running local GGUF models if llama-server is not on PATH."),
+			description: nls.localize('locopilot.llamaCpp.serverPath.description', "Advanced override for the llama-server binary. LoCoPilot ships a bundled llama.cpp engine, so this is normally left empty. Set it only to point at your own build (full path to the binary, e.g. /path/to/llama-server or C:\\llama.cpp\\build\\bin\\llama-server.exe, or the directory that contains it)."),
 			default: '',
 		},
 		[ChatConfiguration.LocopilotMlxPythonPath]: {
 			type: 'string',
-			description: nls.localize('locopilot.mlx.pythonPath.description', "Python interpreter used to run `python -m mlx_lm.server` for local Hugging Face MLX models on Apple Silicon. Leave empty to use `python3` from your PATH, or set a venv (e.g. /path/to/.venv/bin/python3)."),
+			description: nls.localize('locopilot.mlx.pythonPath.description', "Advanced override for the Python interpreter used to run `python -m mlx_lm.server` (local Hugging Face MLX models, Apple Silicon). LoCoPilot ships a bundled self-contained Python with mlx-lm pre-installed, so this is normally left empty. Set it only to use your own interpreter (e.g. /path/to/.venv/bin/python3)."),
 			default: '',
 		},
 		[ChatConfiguration.LocopilotLlamaCppContextSize]: {
@@ -1572,5 +1573,6 @@ registerSingleton(IChatLayoutService, ChatLayoutService, InstantiationType.Delay
 registerSingleton(ILoCoPilotFileLog, LoCoPilotFileLog, InstantiationType.Delayed);
 registerSingleton(ILoCoPilotAgentSettingsService, LoCoPilotAgentSettingsService, InstantiationType.Delayed);
 registerSingleton(ILoCoPilotLocalModelRunner, LoCoPilotLocalModelRunner, InstantiationType.Delayed);
+registerSingleton(ILoCoPilotOllamaService, LoCoPilotOllamaService, InstantiationType.Delayed);
 
 ChatWidget.CONTRIBS.push(ChatDynamicVariableModel);
