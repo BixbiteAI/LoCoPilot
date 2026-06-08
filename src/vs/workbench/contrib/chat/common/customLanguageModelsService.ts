@@ -58,6 +58,38 @@ export function needsDownloadOrPullRetry(model: ICustomLanguageModel): boolean {
 	return false;
 }
 
+/** Default context window for newly added cloud models (modern safe floor: GPT-4o, Llama 3.1, Mistral). */
+export const DEFAULT_CONTEXT_WINDOW_CLOUD = 128000;
+/** Default context window for newly added local models. Newer local models (Llama 3.x, Qwen) handle this;
+ *  the user must still ensure their llama.cpp/Ollama server is launched with a matching context. */
+export const DEFAULT_CONTEXT_WINDOW_LOCAL = 32000;
+/** Upper bound for a model's output reservation: the real reply cap most chat models honor. */
+const OUTPUT_CAP_CLOUD = 16000;
+const OUTPUT_CAP_LOCAL = 4000;
+/** Floor so even tiny windows still leave a usable reply length. */
+const OUTPUT_FLOOR = 256;
+
+/** Allowed range for the user-entered context window. */
+export const MIN_CONTEXT_WINDOW = 1024;
+export const MAX_CONTEXT_WINDOW = 2000000;
+
+export function defaultContextWindow(isLocal: boolean): number {
+	return isLocal ? DEFAULT_CONTEXT_WINDOW_LOCAL : DEFAULT_CONTEXT_WINDOW_CLOUD;
+}
+
+/**
+ * Derive the token budgets from a single context window.
+ * - maxOutputTokens: reply cap = min(provider cap, 25% of the window), never below {@link OUTPUT_FLOOR}.
+ *   Output is an (almost) constant absolute cap in practice, not a fixed % of the window, hence the min().
+ * - maxInputTokens: reported as the FULL window; the context manager reserves output from it itself
+ *   (see contextManager.computeUsableBudget), so do NOT pre-subtract output here or it double-counts.
+ */
+export function deriveTokenLimits(contextWindow: number, isLocal: boolean): { maxInputTokens: number; maxOutputTokens: number } {
+	const cap = isLocal ? OUTPUT_CAP_LOCAL : OUTPUT_CAP_CLOUD;
+	const maxOutputTokens = Math.max(OUTPUT_FLOOR, Math.min(cap, Math.floor(contextWindow * 0.25)));
+	return { maxInputTokens: contextWindow, maxOutputTokens };
+}
+
 export interface ICustomLanguageModel {
 	id: string;
 	name: string;
@@ -83,9 +115,11 @@ export interface ICustomLanguageModel {
 	 * false/undefined => `:cheapest` (lowest price); true => `:fastest`.
 	 */
 	hfFastest?: boolean;
-	/** Max input tokens (context window); default 100000 (100K) */
+	/** Total context window in tokens (user-set). Input/output budgets are derived from this; see {@link deriveTokenLimits}. */
+	contextWindow?: number;
+	/** @deprecated Legacy field, migrated into {@link contextWindow}. Kept only so old stored entries still parse. */
 	maxInputTokens?: number;
-	/** Max output tokens; default 8000 (8K) */
+	/** @deprecated Legacy field; output is now derived from {@link contextWindow}. */
 	maxOutputTokens?: number;
 	/** Whether to use native tool calling (true) or system prompt injection (false) for local models */
 	useNativeTools?: boolean;
@@ -152,8 +186,7 @@ export class CustomLanguageModelsService extends Disposable implements ICustomLa
 				hidden: m.hidden ?? false,
 				useNativeTools: m.useNativeTools ?? false,
 				mtp: m.mtp ?? false,
-				maxInputTokens: m.maxInputTokens ?? 100000,
-				maxOutputTokens: m.maxOutputTokens ?? 8000,
+				contextWindow: m.contextWindow ?? m.maxInputTokens ?? defaultContextWindow(m.type === 'local'),
 				ollamaPullComplete: m.provider === 'ollama' ? (m.ollamaPullComplete ?? true) : m.ollamaPullComplete
 			}));
 			// Load secrets for each model
@@ -257,8 +290,7 @@ export class CustomLanguageModelsService extends Disposable implements ICustomLa
 		const model: ICustomLanguageModel = {
 			...modelData,
 			displayName: displayNameTrim || undefined,
-			maxInputTokens: modelData.maxInputTokens ?? 100000,
-			maxOutputTokens: modelData.maxOutputTokens ?? 8000,
+			contextWindow: modelData.contextWindow ?? defaultContextWindow(modelData.type === 'local'),
 			useNativeTools: modelData.useNativeTools ?? false,
 			mtp: modelData.mtp ?? false,
 			ollamaPullComplete: modelData.provider === 'ollama'

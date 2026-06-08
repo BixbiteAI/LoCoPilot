@@ -17,7 +17,7 @@ import { ExtensionIdentifier } from '../../../../platform/extensions/common/exte
 import { ILogService } from '../../../../platform/log/common/log.js';
 import { IRequestService } from '../../../../platform/request/common/request.js';
 import { ILoCoPilotFileLog } from './locopilotFileLog.js';
-import { ICustomLanguageModelsService, ICustomLanguageModel, getCustomModelListLabel } from '../common/customLanguageModelsService.js';
+import { ICustomLanguageModelsService, ICustomLanguageModel, getCustomModelListLabel, deriveTokenLimits, defaultContextWindow } from '../common/customLanguageModelsService.js';
 import { IChatMessage, ILanguageModelChatInfoOptions, ILanguageModelChatMetadataAndIdentifier, ILanguageModelChatProvider, ILanguageModelChatResponse, ILanguageModelsService, IChatResponsePart, ChatMessageRole } from '../common/languageModels.js';
 import { IWorkbenchContribution } from '../../../common/contributions.js';
 import { LOCOPILOT_SETTINGS_SECTION_LIST_MODELS } from './chatManagement/locopilotSettingsEditorInput.js';
@@ -163,11 +163,10 @@ export class LoCoPilotLanguageModelProvider extends Disposable implements ILangu
 		const customModels = this.customLanguageModelsService.getChatSelectableCustomModels();
 		this._log(`[LoCoPilot Provider] provideLanguageModelChatInfo called, found ${customModels.length} custom models`);
 		const result = customModels.map(m => {
-			// Local llama.cpp models typically have a default context of 4096 unless configured otherwise.
-			// The logs show the server is started with -c 4096.
+			// Input/output budgets are derived from the single user-set context window.
 			const isLocal = m.provider === 'huggingface' || m.provider === 'localhost' || m.provider === 'ollama';
-			const defaultMaxInput = isLocal ? 32000 : 100000;
-			const defaultMaxOutput = isLocal ? 1000 : 8000;
+			const contextWindow = m.contextWindow ?? defaultContextWindow(isLocal);
+			const { maxInputTokens, maxOutputTokens } = deriveTokenLimits(contextWindow, isLocal);
 
 			return {
 				identifier: m.id,
@@ -178,8 +177,8 @@ export class LoCoPilotLanguageModelProvider extends Disposable implements ILangu
 					vendor: 'locopilot',
 					version: '1.0.0',
 					family: m.modelName,
-					maxInputTokens: m.maxInputTokens ?? defaultMaxInput,
-					maxOutputTokens: m.maxOutputTokens ?? defaultMaxOutput,
+					maxInputTokens,
+					maxOutputTokens,
 					isDefaultForLocation: {},
 					isUserSelectable: true,
 					modelPickerCategory: { label: 'Custom Models', order: 100 },
@@ -278,7 +277,8 @@ export class LoCoPilotLanguageModelProvider extends Disposable implements ILangu
 			this._log(`[LoCoPilot Provider]   Message ${i + 1} (${msg.role}): ${contentStr}...`);
 		}
 
-		const maxOutputTokens = model.maxOutputTokens ?? 8000;
+		const isLocalModel = model.provider === 'huggingface' || model.provider === 'localhost' || model.provider === 'ollama';
+		const { maxOutputTokens } = deriveTokenLimits(model.contextWindow ?? defaultContextWindow(isLocalModel), isLocalModel);
 		const body: any = {
 			model: requestModelName,
 			messages: mappedMessages,
@@ -403,7 +403,8 @@ export class LoCoPilotLanguageModelProvider extends Disposable implements ILangu
 		};
 
 		const systemMessage = messages.find(m => m.role === ChatMessageRole.System);
-		const maxOutputTokens = model.maxOutputTokens ?? 8000;
+		const isLocalModel = model.provider === 'huggingface' || model.provider === 'localhost' || model.provider === 'ollama';
+		const { maxOutputTokens } = deriveTokenLimits(model.contextWindow ?? defaultContextWindow(isLocalModel), isLocalModel);
 		const body: any = {
 			model: model.modelName,
 			messages: messages.filter(m => m.role !== ChatMessageRole.System).map(m => this._mapMessageToAnthropic(m)),
@@ -525,7 +526,8 @@ export class LoCoPilotLanguageModelProvider extends Disposable implements ILangu
 				contents.push(mapped);
 			}
 		}
-		const maxOutputTokens = model.maxOutputTokens ?? 8000;
+		const isLocalModel = model.provider === 'huggingface' || model.provider === 'localhost' || model.provider === 'ollama';
+		const { maxOutputTokens } = deriveTokenLimits(model.contextWindow ?? defaultContextWindow(isLocalModel), isLocalModel);
 		const body: any = {
 			contents,
 			generationConfig: {
@@ -691,7 +693,8 @@ export class LoCoPilotLanguageModelProvider extends Disposable implements ILangu
 		}
 		const url = `${baseUrl}/chat/completions`;
 		const mappedMessages = messages.flatMap(m => this._mapMessageToOpenAI(m));
-		const maxOutputTokens = model.maxOutputTokens ?? 8000;
+		const isLocalModel = model.provider === 'huggingface' || model.provider === 'localhost' || model.provider === 'ollama';
+		const { maxOutputTokens } = deriveTokenLimits(model.contextWindow ?? defaultContextWindow(isLocalModel), isLocalModel);
 		const body: any = {
 			model: model.modelName,
 			messages: mappedMessages,
@@ -839,7 +842,8 @@ export class LoCoPilotLanguageModelProvider extends Disposable implements ILangu
 	private async _callOllamaModel(model: ICustomLanguageModel, messages: IChatMessage[], options: { [name: string]: unknown }, stream: AsyncIterableSource<IChatResponsePart | IChatResponsePart[]>, token: CancellationToken): Promise<any> {
 		const baseUrl = (model.localPath || 'http://localhost:11434').replace(/\/$/, '');
 		const mappedMessages = messages.flatMap(m => this._mapMessageToOpenAI(m));
-		const maxOutputTokens = model.maxOutputTokens ?? 8000;
+		const isLocalModel = model.provider === 'huggingface' || model.provider === 'localhost' || model.provider === 'ollama';
+		const { maxOutputTokens } = deriveTokenLimits(model.contextWindow ?? defaultContextWindow(isLocalModel), isLocalModel);
 
 		const excludedTools = [
 			'setup_tools_createNewWorkspace',
@@ -977,7 +981,8 @@ export class LoCoPilotLanguageModelProvider extends Disposable implements ILangu
 		}
 		this._log(`[LoCoPilot Provider] Calling localhost model at: ${url}`);
 		const mappedMessages = messages.flatMap(m => this._mapMessageToOpenAI(m));
-		const maxOutputTokens = model.maxOutputTokens ?? 8000;
+		const isLocalModel = model.provider === 'huggingface' || model.provider === 'localhost' || model.provider === 'ollama';
+		const { maxOutputTokens } = deriveTokenLimits(model.contextWindow ?? defaultContextWindow(isLocalModel), isLocalModel);
 		let openAiModel = (model.localhostOpenAiModel ?? '').trim();
 		if (!openAiModel) {
 			const n = (model.name ?? '').trim();
