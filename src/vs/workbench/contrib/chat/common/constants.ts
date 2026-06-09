@@ -74,6 +74,10 @@ export enum ChatConfiguration {
 	LocopilotLlamaCppExtraArgs = 'locopilot.llamaCpp.extraArgs',
 	/** How long Ollama keeps a model loaded in memory (`ollama run --keepalive`). Reduces cold starts. */
 	LocopilotOllamaKeepAlive = 'locopilot.ollama.keepAlive',
+	/** Auto-start a local GGUF/MLX server when a message is sent to a model whose server is not running. */
+	LocopilotLocalAutoStartServer = 'locopilot.local.autoStartServer',
+	/** Keep only one local model loaded: stop the previously active local server when switching models. */
+	LocopilotLocalSingleActiveModel = 'locopilot.local.singleActiveModel',
 	/** Whether to show tool call parameters and results in the chat UI. */
 	LocopilotShowToolDetails = 'locopilot.chat.showToolDetails',
 }

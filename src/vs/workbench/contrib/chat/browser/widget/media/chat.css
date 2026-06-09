@@ -2191,6 +2191,10 @@ have to be updated for changes to the rules above, or to support more deeply nes
 	margin-bottom: 8px;
 }
 
+.chat-tool-invocation-part:has(> .chat-tool-empty) {
+	display: none;
+}
+
 .interactive-response-progress-tree,
 .interactive-session .chat-summary-list,
 .interactive-session .chat-used-context-list {

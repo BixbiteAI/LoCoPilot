@@ -161,7 +161,7 @@ export interface IChatRendererDelegate {
 
 const mostRecentResponseClassName = 'chat-most-recent-response';
 
-/** Allows LoCoPilot chat errors to use [label](command:...) links to open settings (see locopilotLanguageModelProvider). */
+/** Allows LoCoPilot chat errors to use a [label](command:...) link to open settings (see locopilotLanguageModelProvider). */
 const chatErrorDetailsMarkdownOpts = { isTrusted: { enabledCommands: ['workbench.action.chat.openLoCoPilotSettings'] } };
 
 export class ChatListItemRenderer extends Disposable implements ITreeRenderer<ChatTreeItem, FuzzyScore, IChatListItemTemplate> {

@@ -703,6 +703,16 @@ configurationRegistry.registerConfiguration({
 			markdownDescription: nls.localize('locopilot.ollama.keepAlive.description', "How long Ollama keeps a model loaded in memory after use (`ollama run --keepalive`), e.g. `30m`, `1h`, or `-1` to keep it loaded indefinitely. Keeping the model resident avoids the cold-start reload between requests. Leave empty to use Ollama's default."),
 			default: '30m',
 		},
+		[ChatConfiguration.LocopilotLocalAutoStartServer]: {
+			type: 'boolean',
+			markdownDescription: nls.localize('locopilot.local.autoStartServer.description', "Automatically start the local server (llama.cpp for GGUF, mlx-lm for MLX) when you send a message to a downloaded local model whose server is not running, so you can just pick the model and chat. When off, you start servers manually from My Models."),
+			default: true,
+		},
+		[ChatConfiguration.LocopilotLocalSingleActiveModel]: {
+			type: 'boolean',
+			markdownDescription: nls.localize('locopilot.local.singleActiveModel.description', "Keep only one local model loaded at a time. When you auto-start a local model, the previously running local server is stopped first to free up CPU and memory. Turn off to keep multiple local servers running at once."),
+			default: true,
+		},
 		[ChatConfiguration.LocopilotShowToolDetails]: {
 			type: 'boolean',
 			default: false,

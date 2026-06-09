@@ -62,7 +62,20 @@ export interface ILoCoPilotLocalModelRunner {
 	getServerBaseUrl(modelId: string): string | undefined;
 	getServerLogs(modelId: string): string[];
 	startServerInTerminal(modelId: string): Promise<void>;
+	/**
+	 * Ensures a local server for the model is running and ready to answer chat requests.
+	 * If not running, starts it (stopping the previously active local server first when
+	 * `singleActiveModel` is on) and waits until the OpenAI-compatible endpoint responds.
+	 * Returns the server base URL when ready, or undefined if it could not be started.
+	 */
+	ensureServerForModel(modelId: string, token?: CancellationToken): Promise<string | undefined>;
 	stopServer(modelId: string): void;
+	/**
+	 * Stops every running llama.cpp/MLX server we manage, except an optional one to keep.
+	 * Used to free CPU/RAM when switching to a different local engine (e.g. an Ollama model),
+	 * since those servers are not otherwise touched by that engine's request path.
+	 */
+	stopManagedServers(exceptModelId?: string): void;
 	runOllamaModelInTerminal(modelId: string): Promise<void>;
 	isServerRunning(modelId: string): boolean;
 	/** True while the server process is being launched (between button click and first state change). */
@@ -178,6 +191,14 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 			this.runningServers.delete(modelId);
 			this._onDidServerStateChange.fire(modelId);
 			this._log(`[LoCoPilot Runner] Stopped server for model ${modelId}`);
+		}
+	}
+
+	stopManagedServers(exceptModelId?: string): void {
+		for (const modelId of Array.from(this.runningServers.keys())) {
+			if (modelId !== exceptModelId) {
+				this.stopServer(modelId);
+			}
 		}
 	}
 
@@ -542,6 +563,62 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 			this._endStarting(modelId, `Failed to start llama-server terminal: ${e}`);
 			throw e;
 		}
+	}
+
+	/**
+	 * Auto-start-on-use entry point. Reuses startServerInTerminal (which picks llama.cpp or mlx-lm),
+	 * but first frees memory by stopping the previously active local server when singleActiveModel is on,
+	 * then waits until the server's OpenAI endpoint actually responds so the caller can send immediately.
+	 */
+	async ensureServerForModel(modelId: string, token: CancellationToken = CancellationToken.None): Promise<string | undefined> {
+		// Already running - reuse as-is.
+		const existing = this.getServerBaseUrl(modelId);
+		if (existing) {
+			return existing;
+		}
+
+		// Single active model: stop any other running local servers so we don't pile models into RAM/CPU.
+		const singleActive = this.configurationService.getValue<boolean>(ChatConfiguration.LocopilotLocalSingleActiveModel) !== false;
+		if (singleActive) {
+			this.stopManagedServers(modelId);
+		}
+
+		// Launch (no-op if another caller already kicked it off; startServerInTerminal guards on runningServers).
+		await this.startServerInTerminal(modelId);
+
+		const baseUrl = this.getServerBaseUrl(modelId);
+		if (!baseUrl) {
+			// startServerInTerminal already surfaced the reason (missing binary, unsupported MLX, etc.).
+			return undefined;
+		}
+
+		const ready = await this._waitForServerReady(baseUrl, token);
+		return ready ? baseUrl : undefined;
+	}
+
+	/**
+	 * Polls the OpenAI-compatible `/models` endpoint (served by both llama.cpp and mlx-lm) until it
+	 * responds 200 or the timeout/cancellation hits. Engine-agnostic readiness check.
+	 */
+	private async _waitForServerReady(baseUrl: string, token: CancellationToken): Promise<boolean> {
+		const url = `${baseUrl}/models`;
+		// Large models can take a while to load; poll for up to ~2 minutes.
+		for (let attempt = 0; attempt < 120; attempt++) {
+			if (token.isCancellationRequested) {
+				return false;
+			}
+			try {
+				const res = await this.requestService.request({ type: 'GET', url }, token);
+				if ((res.res.statusCode ?? 0) === 200) {
+					return true;
+				}
+			} catch {
+				// not up yet
+			}
+			await timeout(1000);
+		}
+		this._log(`[LoCoPilot Runner] Server at ${baseUrl} did not become ready in time.`);
+		return false;
 	}
 
 	/**

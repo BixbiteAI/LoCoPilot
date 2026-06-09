@@ -792,13 +792,9 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 				model.id, getCustomModelListLabel(model), runSlot, actionsContainer,
 				() => this.commandService.executeCommand('locopilot.startLlamaServer', model.id)
 			);
-		} else if (isOllama && model.localPath && !model.isDownloading && !needsDownloadOrPullRetry(model)) {
-			this._renderServerControls(
-				model.id, getCustomModelListLabel(model), runSlot, actionsContainer,
-				() => this.commandService.executeCommand('locopilot.runOllamaModel', model.id),
-				localize('customLanguageModels.runOllama', 'Run model')
-			);
 		}
+		// Ollama models need no Run/Stop/Logs controls: the Ollama daemon auto-loads the model
+		// on demand when a chat request arrives, so there is no per-model server to manage.
 		if (downloadingHFOrOllama) {
 			const stopWrap = DOM.append(actionsContainer, $('.model-action-stop-download'));
 			const tooltip = localize('customLanguageModels.stopDownloadTitle', 'Stop the download or pull and discard partial files');
@@ -992,8 +988,7 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 		modelLabel: string,
 		runSlot: HTMLElement,
 		actionsContainer: HTMLElement,
-		startCommand: () => void,
-		runLabel?: string
+		startCommand: () => void
 	): void {
 		const isRunning = this.localModelRunner.isServerRunning(modelId);
 		const isStarting = this.localModelRunner.isServerStarting(modelId);
@@ -1021,24 +1016,17 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 				this.serverStartErrors.delete(modelId);
 				startCommand();
 			}));
-		} else {
-			// Normal: Run / Stop button
+		} else if (isRunning) {
+			// Running: Stop + Logs. There is no manual Run button - local models auto-start on first
+			// use (see ensureServerForModel), so the list only needs to stop a running server or show its logs.
 			const btn = this._register(new Button(runSlot, { ...defaultButtonStyles, secondary: true }));
-			if (isRunning) {
-				btn.label = localize('customLanguageModels.stopServer', 'Stop server');
-				this._register(btn.onDidClick(() => this.localModelRunner.stopServer(modelId)));
-				// Logs button appears next to Stop
-				const logsButton = this._register(new Button(actionsContainer, { ...defaultButtonStyles, secondary: true, title: localize('customLanguageModels.logs.viewTooltip', 'View server logs') }));
-				logsButton.label = localize('customLanguageModels.logs', 'Logs');
-				this._register(logsButton.onDidClick(() => this._showLogsOverlay(modelId, modelLabel)));
-			} else {
-				btn.label = runLabel ?? localize('customLanguageModels.runServer', 'Run server');
-				this._register(btn.onDidClick(() => {
-					this.serverStartErrors.delete(modelId); // clear any previous error on fresh start
-					startCommand();
-				}));
-			}
+			btn.label = localize('customLanguageModels.stopServer', 'Stop server');
+			this._register(btn.onDidClick(() => this.localModelRunner.stopServer(modelId)));
+			const logsButton = this._register(new Button(actionsContainer, { ...defaultButtonStyles, secondary: true, title: localize('customLanguageModels.logs.viewTooltip', 'View server logs') }));
+			logsButton.label = localize('customLanguageModels.logs', 'Logs');
+			this._register(logsButton.onDidClick(() => this._showLogsOverlay(modelId, modelLabel)));
 		}
+		// else: not running and no error - nothing to show; the server starts automatically on first message.
 	}
 
 	private _showLogsOverlay(modelId: string, modelLabel: string): void {

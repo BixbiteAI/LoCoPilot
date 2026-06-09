@@ -16,6 +16,8 @@ import { listenStream } from '../../../../base/common/stream.js';
 import { ExtensionIdentifier } from '../../../../platform/extensions/common/extensions.js';
 import { ILogService } from '../../../../platform/log/common/log.js';
 import { IRequestService } from '../../../../platform/request/common/request.js';
+import { IConfigurationService } from '../../../../platform/configuration/common/configuration.js';
+import { ChatConfiguration } from '../common/constants.js';
 import { ILoCoPilotFileLog } from './locopilotFileLog.js';
 import { ICustomLanguageModelsService, ICustomLanguageModel, getCustomModelListLabel, deriveTokenLimits, defaultContextWindow } from '../common/customLanguageModelsService.js';
 import { IChatMessage, ILanguageModelChatInfoOptions, ILanguageModelChatMetadataAndIdentifier, ILanguageModelChatProvider, ILanguageModelChatResponse, ILanguageModelsService, IChatResponsePart, ChatMessageRole } from '../common/languageModels.js';
@@ -48,6 +50,7 @@ export class LoCoPilotLanguageModelProvider extends Disposable implements ILangu
 		@ILogService private readonly logService: ILogService,
 		@ILoCoPilotFileLog private readonly locopilotFileLog: ILoCoPilotFileLog,
 		@ILoCoPilotLocalModelRunner private readonly localModelRunner: ILoCoPilotLocalModelRunner,
+		@IConfigurationService private readonly configurationService: IConfigurationService,
 	) {
 		super();
 		this._log('[LoCoPilot] Initializing Language Model Provider');
@@ -138,14 +141,19 @@ export class LoCoPilotLanguageModelProvider extends Disposable implements ILangu
 		}
 	}
 
-	/** Chat error panel renders this as Markdown; includes a command link (see chatListRenderer trusted command for this id). */
-	private _getLocalLlamaServerNotRunningMessage(modelName: string): string {
-		const openLanguageModels = createMarkdownCommandLink({
+	/**
+	 * Chat error panel renders this as Markdown. By the time this shows, auto-start has either been
+	 * turned off or already tried and failed, so we don't offer another "Run" click here - instead we
+	 * point at My Models, where the user can see the server logs and start/stop it manually.
+	 */
+	private _getLocalLlamaServerNotRunningMessage(modelName: string, displayName?: string): string {
+		const label = displayName?.trim() || modelName;
+		const openModels = createMarkdownCommandLink({
 			title: 'Open My Models',
 			id: 'workbench.action.chat.openLoCoPilotSettings',
 			arguments: [{ section: LOCOPILOT_SETTINGS_SECTION_LIST_MODELS }],
 		});
-		return `Local model server is not running. ${openLanguageModels} - find **${modelName}** and click **Run server** to start the local server (llama.cpp for GGUF, or mlx-lm for MLX on Apple Silicon).`;
+		return `**${label}** could not be started. ${openModels} to view its logs or start it manually.`;
 	}
 
 	/**
@@ -687,9 +695,15 @@ export class LoCoPilotLanguageModelProvider extends Disposable implements ILangu
 			this._log(`[LoCoPilot Provider] Model ${model.modelName} is not downloaded yet.`);
 			throw new Error(`The model "${model.modelName}" is not downloaded yet. Add it in LoCoPilot Settings with provider HuggingFace and wait for the download to complete.`);
 		}
-		const baseUrl = this.localModelRunner.getServerBaseUrl(model.id);
+		let baseUrl = this.localModelRunner.getServerBaseUrl(model.id);
+		if (!baseUrl && this.configurationService.getValue<boolean>(ChatConfiguration.LocopilotLocalAutoStartServer) !== false) {
+			// Auto-start-on-use (Ollama-like): launch this model's server, stop the previously active one,
+			// and wait until it is ready, so the user can just pick the model and send without a manual step.
+			this._log(`[LoCoPilot Provider] Auto-starting local server for ${model.modelName}.`);
+			baseUrl = await this.localModelRunner.ensureServerForModel(model.id, token);
+		}
 		if (!baseUrl) {
-			throw new Error(this._getLocalLlamaServerNotRunningMessage(model.modelName));
+			throw new Error(this._getLocalLlamaServerNotRunningMessage(model.modelName, model.displayName));
 		}
 		const url = `${baseUrl}/chat/completions`;
 		const mappedMessages = messages.flatMap(m => this._mapMessageToOpenAI(m));
@@ -805,7 +819,7 @@ export class LoCoPilotLanguageModelProvider extends Disposable implements ILangu
 
 			if (status !== 200) {
 				const msg = status === 404 || status === 502 || status === 503
-					? this._getLocalLlamaServerNotRunningMessage(model.modelName)
+					? this._getLocalLlamaServerNotRunningMessage(model.modelName, model.displayName)
 					: `Local model "${model.modelName}" request failed (${status}).`;
 				throw new Error(msg);
 			}
@@ -828,7 +842,7 @@ export class LoCoPilotLanguageModelProvider extends Disposable implements ILangu
 			}
 			const isConnectionRefused = /ECONNREFUSED|ERR_CONNECTION_REFUSED|net::ERR_CONNECTION_REFUSED|fetch failed|Failed to fetch/i.test(errMsg);
 			const msg = isConnectionRefused
-				? this._getLocalLlamaServerNotRunningMessage(model.modelName)
+				? this._getLocalLlamaServerNotRunningMessage(model.modelName, model.displayName)
 				: `Local model "${model.modelName}" error: ${errMsg}`;
 			throw new Error(msg);
 		}
@@ -840,6 +854,11 @@ export class LoCoPilotLanguageModelProvider extends Disposable implements ILangu
 	 * Reasoning streams as `delta.reasoning_content`, `delta.reasoning`, or `delta.thinking` depending on the server.
 	 */
 	private async _callOllamaModel(model: ICustomLanguageModel, messages: IChatMessage[], options: { [name: string]: unknown }, stream: AsyncIterableSource<IChatResponsePart | IChatResponsePart[]>, token: CancellationToken): Promise<any> {
+		// Switching to Ollama: free any running llama.cpp/MLX server so two local engines don't compete
+		// for RAM/CPU. Ollama then manages its own model memory via its daemon (keepAlive setting).
+		if (this.configurationService.getValue<boolean>(ChatConfiguration.LocopilotLocalSingleActiveModel) !== false) {
+			this.localModelRunner.stopManagedServers();
+		}
 		const baseUrl = (model.localPath || 'http://localhost:11434').replace(/\/$/, '');
 		const mappedMessages = messages.flatMap(m => this._mapMessageToOpenAI(m));
 		const isLocalModel = model.provider === 'huggingface' || model.provider === 'localhost' || model.provider === 'ollama';
