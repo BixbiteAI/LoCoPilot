@@ -346,37 +346,112 @@
 	bottom: 12px;
 	margin: 16px 20px 24px;
 	border: 1px solid var(--vscode-panel-border);
-	border-radius: 4px;
+	border-radius: 6px;
 	background-color: var(--vscode-terminal-background, var(--vscode-editor-background));
 	display: flex;
 	flex-direction: column;
-	max-height: 260px;
+	max-height: 340px;
 	overflow: hidden;
+	box-shadow: 0 4px 16px rgba(0, 0, 0, 0.25);
 }
 
 .model-logs-header {
 	display: flex;
 	align-items: center;
 	justify-content: space-between;
-	padding: 6px 12px;
-	background-color: var(--vscode-panel-background, var(--vscode-sideBar-background));
+	padding: 7px 10px 7px 12px;
+	background-color: var(--vscode-titleBar-activeBackground, var(--vscode-panel-background, var(--vscode-sideBar-background)));
 	border-bottom: 1px solid var(--vscode-panel-border);
 	flex-shrink: 0;
+	gap: 8px;
+}
+
+.model-logs-header-left {
+	display: flex;
+	align-items: center;
+	gap: 8px;
+	min-width: 0;
+	flex: 1;
+}
+
+.model-logs-status-dot {
+	width: 8px;
+	height: 8px;
+	border-radius: 50%;
+	background-color: #3fb950;
+	flex-shrink: 0;
+	box-shadow: 0 0 4px #3fb95099;
+	animation: model-logs-pulse 2s ease-in-out infinite;
+}
+
+@keyframes model-logs-pulse {
+	0%, 100% { opacity: 1; }
+	50% { opacity: 0.55; }
 }
 
 .model-logs-title {
-	font-size: 12px;
+	font-size: 11px;
 	font-weight: 600;
 	color: var(--vscode-foreground);
+	letter-spacing: 0.02em;
+	white-space: nowrap;
+	overflow: hidden;
+	text-overflow: ellipsis;
+}
+
+.model-logs-badge {
+	font-size: 10px;
+	font-weight: 500;
+	color: var(--vscode-badge-foreground);
+	background-color: var(--vscode-badge-background);
+	border-radius: 10px;
+	padding: 1px 6px;
+	flex-shrink: 0;
+	font-family: var(--monaco-monospace-font, monospace);
+}
+
+.model-logs-header-actions {
+	display: flex;
+	align-items: center;
+	gap: 2px;
+	flex-shrink: 0;
+}
+
+.model-logs-action-btn {
+	cursor: pointer;
+	font-size: 11px;
+	color: var(--vscode-descriptionForeground);
+	padding: 3px 6px;
+	border-radius: 3px;
+	line-height: 1;
+	border: none;
+	background: none;
+	display: flex;
+	align-items: center;
+	gap: 3px;
+	font-family: inherit;
+	white-space: nowrap;
+}
+
+.model-logs-action-btn:hover {
+	color: var(--vscode-foreground);
+	background-color: var(--vscode-toolbar-hoverBackground);
+}
+
+.model-logs-action-btn:active {
+	background-color: var(--vscode-toolbar-activeBackground);
 }
 
 .model-logs-close {
 	cursor: pointer;
-	font-size: 12px;
+	font-size: 14px;
 	color: var(--vscode-descriptionForeground);
-	padding: 2px 4px;
-	border-radius: 2px;
+	padding: 3px 5px;
+	border-radius: 3px;
 	line-height: 1;
+	border: none;
+	background: none;
+	font-family: inherit;
 }
 
 .model-logs-close:hover {
@@ -386,17 +461,99 @@
 
 .model-logs-body {
 	overflow-y: auto;
-	padding: 8px 12px;
+	padding: 8px 0;
 	flex: 1;
 	font-family: var(--monaco-monospace-font, monospace);
-	font-size: 11px;
-	line-height: 1.5;
+	font-size: 11.5px;
+	line-height: 1.6;
 	color: var(--vscode-terminal-foreground, var(--vscode-foreground));
+	counter-reset: log-line;
+}
+
+.model-logs-body::-webkit-scrollbar {
+	width: 6px;
+}
+
+.model-logs-body::-webkit-scrollbar-track {
+	background: transparent;
+}
+
+.model-logs-body::-webkit-scrollbar-thumb {
+	background-color: var(--vscode-scrollbarSlider-background);
+	border-radius: 3px;
+}
+
+.model-logs-body::-webkit-scrollbar-thumb:hover {
+	background-color: var(--vscode-scrollbarSlider-hoverBackground);
 }
 
 .model-log-line {
 	white-space: pre-wrap;
 	word-break: break-all;
+	padding: 0 12px 0 46px;
+	position: relative;
+	counter-increment: log-line;
+}
+
+.model-log-line::before {
+	content: counter(log-line);
+	position: absolute;
+	left: 0;
+	width: 38px;
+	text-align: right;
+	color: var(--vscode-editorLineNumber-foreground, var(--vscode-descriptionForeground));
+	font-size: 10px;
+	opacity: 0.45;
+	user-select: none;
+	padding-right: 8px;
+	line-height: inherit;
+}
+
+.model-log-line:hover {
+	background-color: var(--vscode-list-hoverBackground);
+}
+
+.model-log-line.log-level-error {
+	color: var(--vscode-errorForeground, #f48771);
+}
+
+.model-log-line.log-level-warn {
+	color: var(--vscode-editorWarning-foreground, #cca700);
+}
+
+.model-log-line.log-level-info {
+	color: var(--vscode-terminal-ansiCyan, var(--vscode-terminal-foreground));
+}
+
+.model-log-line.log-level-debug {
+	color: var(--vscode-descriptionForeground);
+	opacity: 0.75;
+}
+
+.model-logs-empty {
+	padding: 24px 12px;
+	text-align: center;
+	color: var(--vscode-descriptionForeground);
+	font-size: 12px;
+	font-style: italic;
+	opacity: 0.7;
+}
+
+.model-logs-footer {
+	display: flex;
+	align-items: center;
+	justify-content: space-between;
+	padding: 4px 12px;
+	border-top: 1px solid var(--vscode-panel-border);
+	flex-shrink: 0;
+	background-color: var(--vscode-titleBar-activeBackground, var(--vscode-panel-background, var(--vscode-sideBar-background)));
+}
+
+.model-logs-footer-info {
+	font-size: 10px;
+	color: var(--vscode-descriptionForeground);
+	font-family: var(--monaco-monospace-font, monospace);
+	opacity: 0.7;
 }
 
 /* Server starting state - spinner + label shown in the run button slot */

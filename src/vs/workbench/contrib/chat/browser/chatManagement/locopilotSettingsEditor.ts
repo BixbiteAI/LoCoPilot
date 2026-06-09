@@ -164,7 +164,9 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 	private currentLogsModelId: string | undefined;
 	private logsOverlayEl: HTMLElement | undefined;
 	private logsTitleEl: HTMLElement | undefined;
+	private logsBadgeEl: HTMLElement | undefined;
 	private logsBodyEl: HTMLElement | undefined;
+	private logsFooterInfoEl: HTMLElement | undefined;
 
 	constructor(
 		group: IEditorGroup,
@@ -337,12 +339,30 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 		this.logsOverlayEl = DOM.append(this.listModelsPanel, $('.model-logs-overlay'));
 		this.logsOverlayEl.style.display = 'none';
 		const logsHeader = DOM.append(this.logsOverlayEl, $('.model-logs-header'));
-		this.logsTitleEl = DOM.append(logsHeader, $('.model-logs-title'));
-		const logsCloseBtn = DOM.append(logsHeader, $('.model-logs-close'));
+		const logsHeaderLeft = DOM.append(logsHeader, $('.model-logs-header-left'));
+		DOM.append(logsHeaderLeft, $('.model-logs-status-dot'));
+		this.logsTitleEl = DOM.append(logsHeaderLeft, $('.model-logs-title'));
+		this.logsBadgeEl = DOM.append(logsHeaderLeft, $('.model-logs-badge'));
+		this.logsBadgeEl.style.display = 'none';
+		const logsHeaderActions = DOM.append(logsHeader, $('.model-logs-header-actions'));
+		const logsCopyBtn = DOM.append(logsHeaderActions, $('button.model-logs-action-btn'));
+		logsCopyBtn.textContent = localize('customLanguageModels.logs.copy', 'Copy');
+		logsCopyBtn.title = localize('customLanguageModels.logs.copyTooltip', 'Copy all logs to clipboard');
+		this._register(DOM.addDisposableListener(logsCopyBtn, 'click', () => this._copyLogs()));
+		const logsClearBtn = DOM.append(logsHeaderActions, $('button.model-logs-action-btn'));
+		logsClearBtn.textContent = localize('customLanguageModels.logs.clear', 'Clear');
+		logsClearBtn.title = localize('customLanguageModels.logs.clearTooltip', 'Clear log view');
+		this._register(DOM.addDisposableListener(logsClearBtn, 'click', () => {
+			if (this.logsBodyEl) { DOM.clearNode(this.logsBodyEl); this._updateLogsBadge(); }
+		}));
+		const logsCloseBtn = DOM.append(logsHeaderActions, $('button.model-logs-close'));
 		logsCloseBtn.textContent = 'x';
 		logsCloseBtn.title = localize('customLanguageModels.logs.close', 'Close logs');
 		this._register(DOM.addDisposableListener(logsCloseBtn, 'click', () => this._hideLogsOverlay()));
 		this.logsBodyEl = DOM.append(this.logsOverlayEl, $('.model-logs-body'));
+		const logsFooter = DOM.append(this.logsOverlayEl, $('.model-logs-footer'));
+		this.logsFooterInfoEl = DOM.append(logsFooter, $('.model-logs-footer-info'));
+		this.logsFooterInfoEl.textContent = localize('customLanguageModels.logs.footerEmpty', 'No log entries');
 
 		// Agent Settings - system prompts + max iteration
 		this.agentSettingsPanel = DOM.append(bodyContainer, $('.locopilot-settings-panel.agent-settings-panel'));
@@ -742,6 +762,8 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 
 	private renderListModels(): void {
 		if (!this.listModelsContainer) { return; }
+		// Preserve scroll position so re-renders don't jump the list
+		const savedScroll = this.contentsContainer?.scrollTop ?? 0;
 		DOM.clearNode(this.listModelsContainer);
 		const models = this.customLanguageModelsService.getCustomModels();
 		if (models.length === 0) {
@@ -761,6 +783,7 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 		title.textContent = localize('customLanguageModels.list.title', 'My Models');
 		const listContainer = DOM.append(this.listModelsContainer, $('.models-list-container'));
 		models.forEach((model: ICustomLanguageModel) => this.renderListModelItem(model, listContainer));
+		if (this.contentsContainer) { this.contentsContainer.scrollTop = savedScroll; }
 	}
 
 	private renderListModelItem(model: ICustomLanguageModel, listContainer: HTMLElement): void {
@@ -1047,6 +1070,12 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 		if (this.logsBodyEl) {
 			DOM.clearNode(this.logsBodyEl);
 		}
+		if (this.logsBadgeEl) {
+			this.logsBadgeEl.style.display = 'none';
+		}
+		if (this.logsFooterInfoEl) {
+			this.logsFooterInfoEl.textContent = localize('customLanguageModels.logs.footerEmpty', 'No log entries');
+		}
 	}
 
 	private _appendLogsLine(allLines: string[]): void {
@@ -1068,6 +1097,36 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 		if (!this.logsBodyEl) { return; }
 		const lineEl = DOM.append(this.logsBodyEl, $('div.model-log-line'));
 		lineEl.textContent = line;
+		const lower = line.toLowerCase();
+		if (/\b(error|fatal|exception|failed|failure)\b/.test(lower)) {
+			lineEl.classList.add('log-level-error');
+		} else if (/\b(warn|warning)\b/.test(lower)) {
+			lineEl.classList.add('log-level-warn');
+		} else if (/\b(info|starting|started|loaded|listening|ready)\b/.test(lower)) {
+			lineEl.classList.add('log-level-info');
+		} else if (/\b(debug|trace|verbose)\b/.test(lower)) {
+			lineEl.classList.add('log-level-debug');
+		}
+		this._updateLogsBadge();
+	}
+
+	private _updateLogsBadge(): void {
+		if (!this.logsBodyEl || !this.logsBadgeEl || !this.logsFooterInfoEl) { return; }
+		const count = this.logsBodyEl.childElementCount;
+		if (count > 0) {
+			this.logsBadgeEl.textContent = String(count);
+			this.logsBadgeEl.style.display = '';
+			this.logsFooterInfoEl.textContent = localize('customLanguageModels.logs.footerCount', '{0} lines', count);
+		} else {
+			this.logsBadgeEl.style.display = 'none';
+			this.logsFooterInfoEl.textContent = localize('customLanguageModels.logs.footerEmpty', 'No log entries');
+		}
+	}
+
+	private _copyLogs(): void {
+		if (!this.logsBodyEl) { return; }
+		const lines = Array.from(this.logsBodyEl.children).map(el => (el as HTMLElement).textContent ?? '');
+		navigator.clipboard?.writeText(lines.join('\n'));
 	}
 
 	private renderAgentSettings(container: HTMLElement): void {

@@ -434,7 +434,8 @@ export class ChatSetupContribution extends Disposable implements IWorkbenchContr
 
 		registerAction2(ChatSetupTriggerAction);
 		registerAction2(ChatSetupTriggerForceSignInDialogAction);
-		registerAction2(ChatSetupFromAccountsAction);
+		// LOCOPILOT: "Sign in to use AI features..." entry in the accounts (profile) context menu - hidden intentionally. Do NOT delete, uncomment to restore.
+		// registerAction2(ChatSetupFromAccountsAction);
 		registerAction2(ChatSetupTriggerAnonymousWithoutDialogAction);
 		registerAction2(ChatSetupTriggerSupportAnonymousAction);
 		registerAction2(UpgradePlanAction);
