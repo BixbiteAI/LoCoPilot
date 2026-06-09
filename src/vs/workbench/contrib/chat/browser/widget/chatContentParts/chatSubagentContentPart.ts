@@ -7,7 +7,6 @@ import * as dom from '../../../../../../base/browser/dom.js';
 import { $, AnimationFrameScheduler, DisposableResizeObserver } from '../../../../../../base/browser/dom.js';
 import { Codicon } from '../../../../../../base/common/codicons.js';
 import { IDisposable } from '../../../../../../base/common/lifecycle.js';
-import { ThemeIcon } from '../../../../../../base/common/themables.js';
 import { rcut } from '../../../../../../base/common/strings.js';
 import { localize } from '../../../../../../nls.js';
 import { IHoverService } from '../../../../../../platform/hover/browser/hover.js';
@@ -153,15 +152,16 @@ export class ChatSubagentContentPart extends ChatCollapsibleContentPart implemen
 		// Note: wrapper is created lazily in initContent(), so we can't set its style here
 
 		if (this._collapseButton && !this.element.isComplete) {
-			this._collapseButton.icon = ThemeIcon.modify(Codicon.loading, 'spin');
+			this._setLoadingIcon();
 		}
 
 		this._register(autorun(r => {
 			this.expanded.read(r);
 			if (this._collapseButton) {
 				if (!this.element.isComplete && this.isActive) {
-					this._collapseButton.icon = ThemeIcon.modify(Codicon.loading, 'spin');
+					this._setLoadingIcon();
 				} else {
+					this._clearLoadingIcon();
 					this._collapseButton.icon = Codicon.check;
 				}
 			}

@@ -194,7 +194,7 @@ export class ChatThinkingContentPart extends ChatCollapsibleContentPart implemen
 			node.classList.add('chat-thinking-fixed-mode');
 			this.currentTitle = this.defaultTitle;
 			if (this._collapseButton && !this.element.isComplete) {
-				this._collapseButton.icon = ThemeIcon.modify(Codicon.loading, 'spin');
+				this._setLoadingIcon();
 			}
 		}
 
@@ -203,8 +203,9 @@ export class ChatThinkingContentPart extends ChatCollapsibleContentPart implemen
 			this.expanded.read(r);
 			if (this._collapseButton && this.wrapper) {
 				if (this.wrapper.classList.contains('chat-thinking-streaming') && !this.element.isComplete) {
-					this._collapseButton.icon = ThemeIcon.modify(Codicon.loading, 'spin');
+					this._setLoadingIcon();
 				} else {
+					this._clearLoadingIcon();
 					this._collapseButton.icon = Codicon.check;
 				}
 			}
@@ -223,7 +224,7 @@ export class ChatThinkingContentPart extends ChatCollapsibleContentPart implemen
 		}));
 
 		if (this._collapseButton && !this.streamingCompleted && !this.element.isComplete) {
-			this._collapseButton.icon = ThemeIcon.modify(Codicon.loading, 'spin');
+			this._setLoadingIcon();
 		}
 
 		const label = this.lastExtractedTitle ?? '';
@@ -370,6 +371,11 @@ export class ChatThinkingContentPart extends ChatCollapsibleContentPart implemen
 				this.markdownResult.dispose();
 				this.markdownResult = undefined;
 			}
+			// Lazily create textContainer if initContent() ran before any thinking content arrived
+			if (!this.textContainer && this.wrapper) {
+				this.textContainer = $('.chat-thinking-item.markdown-content');
+				this.wrapper.appendChild(this.textContainer);
+			}
 			if (this.textContainer) {
 				clearNode(this.textContainer);
 				this.textContainer.appendChild(createThinkingIcon(Codicon.circleFilled));
@@ -403,6 +409,11 @@ export class ChatThinkingContentPart extends ChatCollapsibleContentPart implemen
 		}, target));
 		this.markdownResult = rendered;
 		if (!target) {
+			// Lazily create textContainer if initContent() ran before any thinking content arrived
+			if (!this.textContainer && this.wrapper) {
+				this.textContainer = $('.chat-thinking-item.markdown-content');
+				this.wrapper.appendChild(this.textContainer);
+			}
 			if (this.textContainer) {
 				clearNode(this.textContainer);
 				this.textContainer.appendChild(createThinkingIcon(Codicon.circleFilled));

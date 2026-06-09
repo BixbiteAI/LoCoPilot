@@ -73,6 +73,17 @@ const OUTPUT_FLOOR = 256;
 export const MIN_CONTEXT_WINDOW = 1024;
 export const MAX_CONTEXT_WINDOW = 2000000;
 
+/**
+ * Number of consecutive tool-shaped request failures before native tool calling is auto-disabled
+ * for a model. Set above 1 so a single transient error (one bad turn, a 500, a truncated reply)
+ * does not permanently demote a tool-capable model; see {@link ICustomLanguageModel.toolFailureStreak}.
+ */
+export const TOOL_FAILURE_DISABLE_THRESHOLD = 2;
+
+/** Fields that can be auto-derived from HuggingFace/Ollama metadata and that the user may override. */
+export type DerivableModelField = 'contextWindow' | 'format' | 'useNativeTools' | 'mtp';
+const DERIVABLE_FIELDS: readonly DerivableModelField[] = ['contextWindow', 'format', 'useNativeTools', 'mtp'];
+
 export function defaultContextWindow(isLocal: boolean): number {
 	return isLocal ? DEFAULT_CONTEXT_WINDOW_LOCAL : DEFAULT_CONTEXT_WINDOW_CLOUD;
 }
@@ -135,6 +146,21 @@ export interface ICustomLanguageModel {
 	 * Omitted or undefined means true (legacy entries treated as already pulled).
 	 */
 	ollamaPullComplete?: boolean;
+	/**
+	 * Per-field markers set to true when the user explicitly edits a derivable field. Auto-enrichment
+	 * ({@link ICustomLanguageModelsService.applyDerivedMetadata}) never overwrites a field marked here,
+	 * so a manual edit always wins over HuggingFace/Ollama metadata. See {@link DerivableModelField}.
+	 */
+	userOverrides?: Partial<Record<DerivableModelField, boolean>>;
+	/** True once HF/Ollama metadata enrichment has run for this model (so derived values are no longer the bare defaults). */
+	metadataEnriched?: boolean;
+	/**
+	 * True when the runtime auto-disabled native tool calling after repeated tool-shaped failures
+	 * (distinct from the user turning tools off). Surfaced in the UI and cleared if the user re-enables tools.
+	 */
+	toolsAutoDisabled?: boolean;
+	/** Consecutive tool-shaped request failures; reset on a successful tool-using request. Persisted so the next session skips a doomed first attempt. */
+	toolFailureStreak?: number;
 }
 
 export interface ICustomLanguageModelsService {
@@ -150,6 +176,17 @@ export interface ICustomLanguageModelsService {
 	removeCustomModel(id: string): Promise<void>;
 	updateCustomModel(id: string, updates: Partial<Omit<ICustomLanguageModel, 'id' | 'createdAt'>>): Promise<void>;
 	hideCustomModel(id: string, hidden: boolean): Promise<void>;
+	/**
+	 * Apply metadata derived from HuggingFace/Ollama. Only writes fields the user has NOT overridden
+	 * (and never re-enables tools that the runtime auto-disabled). Marks the model as enriched.
+	 */
+	applyDerivedMetadata(id: string, derived: Partial<Pick<ICustomLanguageModel, 'contextWindow' | 'format' | 'useNativeTools'>>): Promise<void>;
+	/** Record one tool-shaped request failure; returns the new consecutive-failure streak. */
+	recordToolFailure(id: string): Promise<number>;
+	/** Reset the tool-failure streak after a successful tool-using request. */
+	resetToolFailureStreak(id: string): Promise<void>;
+	/** Auto-disable native tool calling after repeated failures (sets toolsAutoDisabled + useNativeTools=false, without marking a user override). */
+	autoDisableTools(id: string): Promise<void>;
 }
 
 const STORAGE_KEY = 'customLanguageModels';
@@ -187,7 +224,11 @@ export class CustomLanguageModelsService extends Disposable implements ICustomLa
 				useNativeTools: m.useNativeTools ?? false,
 				mtp: m.mtp ?? false,
 				contextWindow: m.contextWindow ?? m.maxInputTokens ?? defaultContextWindow(m.type === 'local'),
-				ollamaPullComplete: m.provider === 'ollama' ? (m.ollamaPullComplete ?? true) : m.ollamaPullComplete
+				ollamaPullComplete: m.provider === 'ollama' ? (m.ollamaPullComplete ?? true) : m.ollamaPullComplete,
+				userOverrides: m.userOverrides ?? {},
+				metadataEnriched: m.metadataEnriched ?? false,
+				toolsAutoDisabled: m.toolsAutoDisabled ?? false,
+				toolFailureStreak: m.toolFailureStreak ?? 0
 			}));
 			// Load secrets for each model
 			for (const model of this.models) {
@@ -291,8 +332,15 @@ export class CustomLanguageModelsService extends Disposable implements ICustomLa
 			...modelData,
 			displayName: displayNameTrim || undefined,
 			contextWindow: modelData.contextWindow ?? defaultContextWindow(modelData.type === 'local'),
-			useNativeTools: modelData.useNativeTools ?? false,
+			// Optimistic default: most current instruct models support tool calling. Enrichment refines
+			// this from a confirmed source (Ollama capabilities), and the runtime auto-disables it for
+			// models that repeatedly fail tool calls (see autoDisableTools / TOOL_FAILURE_DISABLE_THRESHOLD).
+			useNativeTools: modelData.useNativeTools ?? true,
 			mtp: modelData.mtp ?? false,
+			userOverrides: modelData.userOverrides ?? {},
+			metadataEnriched: modelData.metadataEnriched ?? false,
+			toolsAutoDisabled: false,
+			toolFailureStreak: 0,
 			ollamaPullComplete: modelData.provider === 'ollama'
 				? (modelData.ollamaPullComplete !== undefined ? modelData.ollamaPullComplete : false)
 				: undefined,
@@ -356,11 +404,80 @@ export class CustomLanguageModelsService extends Disposable implements ICustomLa
 			if (updates.displayName !== undefined) {
 				merged.displayName = updates.displayName?.trim() || undefined;
 			}
+			// This is the user-facing edit path: any derivable field present here is an explicit user
+			// choice, so mark it as overridden. applyDerivedMetadata then leaves these fields alone.
+			const overrides: Partial<Record<DerivableModelField, boolean>> = { ...(model.userOverrides ?? {}) };
+			for (const field of DERIVABLE_FIELDS) {
+				if (Object.prototype.hasOwnProperty.call(updates, field)) {
+					overrides[field] = true;
+				}
+			}
+			merged.userOverrides = overrides;
+			// If the user explicitly re-enabled tools, clear a prior runtime auto-disable and the failure
+			// streak so the model gets a fresh chance. Turning tools off by hand is likewise not an auto-disable.
+			if (Object.prototype.hasOwnProperty.call(updates, 'useNativeTools')) {
+				merged.toolsAutoDisabled = false;
+				merged.toolFailureStreak = 0;
+			}
 			this.models[index] = merged;
 			await this.saveModels();
 			this._clearSelectedIfNotChatReady();
 			this._onDidChangeCustomModels.fire();
 		}
+	}
+
+	async applyDerivedMetadata(id: string, derived: Partial<Pick<ICustomLanguageModel, 'contextWindow' | 'format' | 'useNativeTools'>>): Promise<void> {
+		const index = this.models.findIndex(m => m.id === id);
+		if (index < 0) {
+			return;
+		}
+		const model = this.models[index];
+		const ov = model.userOverrides ?? {};
+		const updates: Partial<ICustomLanguageModel> = {};
+		if (derived.contextWindow !== undefined && !ov.contextWindow) {
+			updates.contextWindow = derived.contextWindow;
+		}
+		if (derived.format !== undefined && !ov.format) {
+			updates.format = derived.format;
+		}
+		// Never re-enable tools the user turned off or the runtime auto-disabled; only a confirmed source
+		// (e.g. Ollama capabilities) flows in here, so it may safely turn tools OFF for unsupported models.
+		if (derived.useNativeTools !== undefined && !ov.useNativeTools && !model.toolsAutoDisabled) {
+			updates.useNativeTools = derived.useNativeTools;
+		}
+		this.models[index] = { ...model, ...updates, metadataEnriched: true };
+		await this.saveModels();
+		this._onDidChangeCustomModels.fire();
+	}
+
+	async recordToolFailure(id: string): Promise<number> {
+		const index = this.models.findIndex(m => m.id === id);
+		if (index < 0) {
+			return 0;
+		}
+		const streak = (this.models[index].toolFailureStreak ?? 0) + 1;
+		this.models[index] = { ...this.models[index], toolFailureStreak: streak };
+		await this.saveModels();
+		return streak;
+	}
+
+	async resetToolFailureStreak(id: string): Promise<void> {
+		const index = this.models.findIndex(m => m.id === id);
+		if (index < 0 || (this.models[index].toolFailureStreak ?? 0) === 0) {
+			return;
+		}
+		this.models[index] = { ...this.models[index], toolFailureStreak: 0 };
+		await this.saveModels();
+	}
+
+	async autoDisableTools(id: string): Promise<void> {
+		const index = this.models.findIndex(m => m.id === id);
+		if (index < 0) {
+			return;
+		}
+		this.models[index] = { ...this.models[index], useNativeTools: false, toolsAutoDisabled: true, toolFailureStreak: 0 };
+		await this.saveModels();
+		this._onDidChangeCustomModels.fire();
 	}
 
 	async hideCustomModel(id: string, hidden: boolean): Promise<void> {

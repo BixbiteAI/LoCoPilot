@@ -19,7 +19,8 @@ import { IRequestService } from '../../../../platform/request/common/request.js'
 import { IConfigurationService } from '../../../../platform/configuration/common/configuration.js';
 import { ChatConfiguration } from '../common/constants.js';
 import { ILoCoPilotFileLog } from './locopilotFileLog.js';
-import { ICustomLanguageModelsService, ICustomLanguageModel, getCustomModelListLabel, deriveTokenLimits, defaultContextWindow } from '../common/customLanguageModelsService.js';
+import { INotificationService } from '../../../../platform/notification/common/notification.js';
+import { ICustomLanguageModelsService, ICustomLanguageModel, getCustomModelListLabel, deriveTokenLimits, defaultContextWindow, TOOL_FAILURE_DISABLE_THRESHOLD } from '../common/customLanguageModelsService.js';
 import { IChatMessage, ILanguageModelChatInfoOptions, ILanguageModelChatMetadataAndIdentifier, ILanguageModelChatProvider, ILanguageModelChatResponse, ILanguageModelsService, IChatResponsePart, ChatMessageRole } from '../common/languageModels.js';
 import { IWorkbenchContribution } from '../../../common/contributions.js';
 import { LOCOPILOT_SETTINGS_SECTION_LIST_MODELS } from './chatManagement/locopilotSettingsEditorInput.js';
@@ -51,6 +52,7 @@ export class LoCoPilotLanguageModelProvider extends Disposable implements ILangu
 		@ILoCoPilotFileLog private readonly locopilotFileLog: ILoCoPilotFileLog,
 		@ILoCoPilotLocalModelRunner private readonly localModelRunner: ILoCoPilotLocalModelRunner,
 		@IConfigurationService private readonly configurationService: IConfigurationService,
+		@INotificationService private readonly notificationService: INotificationService,
 	) {
 		super();
 		this._log('[LoCoPilot] Initializing Language Model Provider');
@@ -223,38 +225,82 @@ export class LoCoPilotLanguageModelProvider extends Disposable implements ILangu
 		};
 	}
 
+	/**
+	 * Heuristic: does this error look like the provider/model rejecting tool calling specifically
+	 * (as opposed to a generic network/auth/rate error)? Used to decide whether to count a tool-shaped
+	 * failure toward auto-disabling native tools. Kept conservative to avoid demoting capable models.
+	 */
+	private _isToolUnsupportedError(errMsg: string): boolean {
+		const m = errMsg.toLowerCase();
+		if (!/tool|function[\s_-]?call|function calling/.test(m)) {
+			return false;
+		}
+		return /not\s*support|unsupported|isn'?t support|does\s*not\s*support|no endpoints?|cannot|not\s*available|not\s*allowed|invalid|400/.test(m);
+	}
+
+	/** Dispatch a request to the right per-provider implementation. Shared by the first attempt and the tools-disabled retry. */
+	private async _dispatchProvider(model: ICustomLanguageModel, messages: IChatMessage[], options: { [name: string]: unknown }, stream: AsyncIterableSource<IChatResponsePart | IChatResponsePart[]>, token: CancellationToken): Promise<any> {
+		if (model.provider === 'openai') {
+			return await this._callOpenAI(model, messages, options, stream, token);
+		} else if (model.provider === 'anthropic') {
+			return await this._callAnthropic(model, messages, options, stream, token);
+		} else if (model.provider === 'google') {
+			return await this._callGoogle(model, messages, options, stream, token);
+		} else if (model.provider === 'huggingface-cloud') {
+			return await this._callOpenAI(model, messages, options, stream, token, {
+				url: 'https://router.huggingface.co/v1/chat/completions',
+				modelName: `${model.modelName}:${model.hfFastest ? 'fastest' : 'cheapest'}`,
+				providerLabel: 'HuggingFace',
+				disableTools: !model.useNativeTools
+			});
+		} else if (model.provider === 'huggingface') {
+			return await this._callLocalModel(model, messages, options, stream, token);
+		} else if (model.provider === 'ollama') {
+			return await this._callOllamaModel(model, messages, options, stream, token);
+		} else if (model.provider === 'localhost') {
+			return await this._callLocalhostModel(model, messages, options, stream, token);
+		} else {
+			throw new Error(`Unsupported provider: ${model.provider}`);
+		}
+	}
+
 	private async _doSendChatRequest(model: ICustomLanguageModel, messages: IChatMessage[], options: { [name: string]: unknown }, stream: AsyncIterableSource<IChatResponsePart | IChatResponsePart[]>, token: CancellationToken): Promise<any> {
 		let rejected = false;
+		// Tools are effectively requested when the caller passed some AND the model has native tools on.
+		const toolsRequested = Array.isArray(options.tools) && options.tools.length > 0 && model.useNativeTools !== false;
 		try {
-			if (model.provider === 'openai') {
-				return await this._callOpenAI(model, messages, options, stream, token);
-			} else if (model.provider === 'anthropic') {
-				return await this._callAnthropic(model, messages, options, stream, token);
-			} else if (model.provider === 'google') {
-				return await this._callGoogle(model, messages, options, stream, token);
-			} else if (model.provider === 'huggingface-cloud') {
-				// HF Inference Providers router is OpenAI-wire-compatible; reuse the OpenAI path
-				// with the router endpoint and a routing-policy suffix on the model id.
-				return await this._callOpenAI(model, messages, options, stream, token, {
-					url: 'https://router.huggingface.co/v1/chat/completions',
-					modelName: `${model.modelName}:${model.hfFastest ? 'fastest' : 'cheapest'}`,
-					providerLabel: 'HuggingFace',
-					// Only send tools/function-calling when the user enabled it for this model.
-					// Many HF-served models reject tools with "function calling not support".
-					disableTools: !model.useNativeTools
-				});
-			} else if (model.provider === 'huggingface') {
-				return await this._callLocalModel(model, messages, options, stream, token);
-			} else if (model.provider === 'ollama') {
-				return await this._callOllamaModel(model, messages, options, stream, token);
-			} else if (model.provider === 'localhost') {
-				return await this._callLocalhostModel(model, messages, options, stream, token);
-			} else {
-				throw new Error(`Unsupported provider: ${model.provider}`);
+			const result = await this._dispatchProvider(model, messages, options, stream, token);
+			// A clean tool-using turn clears any accumulated failure streak.
+			if (toolsRequested) {
+				void this.customLanguageModelsService.resetToolFailureStreak(model.id);
 			}
+			return result;
 		} catch (e) {
-			rejected = true;
 			const errMsg = e && typeof (e as Error).message === 'string' ? (e as Error).message : String(e);
+			// Tool-shaped failure handling: count it, auto-disable past the threshold, and retry this same
+			// request once WITHOUT tools so the user is not blocked. Tool-rejection errors are raised before
+			// any content streams (e.g. an HTTP 400 at request setup), so retrying into the same stream is safe.
+			if (!this._isCanceledError(errMsg) && toolsRequested && this._isToolUnsupportedError(errMsg)) {
+				try {
+					const streak = await this.customLanguageModelsService.recordToolFailure(model.id);
+					this._log(`[LoCoPilot Provider] Tool-call failure #${streak} for ${getCustomModelListLabel(model)}: ${errMsg}`);
+					if (streak >= TOOL_FAILURE_DISABLE_THRESHOLD && !model.toolsAutoDisabled) {
+						await this.customLanguageModelsService.autoDisableTools(model.id);
+						this.notificationService.info(`Disabled native tool calling for "${getCustomModelListLabel(model)}" after repeated failures. You can re-enable it in the model's settings.`);
+					}
+					const retryOptions = { ...options, tools: undefined };
+					return await this._dispatchProvider({ ...model, useNativeTools: false }, messages, retryOptions, stream, token);
+				} catch (retryErr) {
+					rejected = true;
+					const retryMsg = retryErr && typeof (retryErr as Error).message === 'string' ? (retryErr as Error).message : String(retryErr);
+					const toThrowRetry = this._isCanceledError(retryMsg) ? new Error(this._getCanceledMessage()) : retryErr;
+					this.logService.error(`LoCoPilot provider error (after tools-disabled retry): ${retryErr}`);
+					this.locopilotFileLog.log(`LoCoPilot provider error (after tools-disabled retry): ${retryErr}`);
+					stream.reject(toThrowRetry);
+					throw toThrowRetry;
+				}
+			}
+			rejected = true;
 			const toThrow = this._isCanceledError(errMsg) ? new Error(this._getCanceledMessage()) : e;
 			this.logService.error(`LoCoPilot provider error: ${e}`);
 			this.locopilotFileLog.log(`LoCoPilot provider error: ${e}`);

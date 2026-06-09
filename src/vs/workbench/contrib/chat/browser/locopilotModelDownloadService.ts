@@ -17,7 +17,7 @@ import type { IRequestToFileProgressEvent } from '../../../../platform/request/c
 import { ILogService } from '../../../../platform/log/common/log.js';
 import { IFileService } from '../../../../platform/files/common/files.js';
 import { IEnvironmentService } from '../../../../platform/environment/common/environment.js';
-import { ICustomLanguageModelsService, ICustomLanguageModel } from '../common/customLanguageModelsService.js';
+import { ICustomLanguageModelsService, ICustomLanguageModel, MIN_CONTEXT_WINDOW, MAX_CONTEXT_WINDOW } from '../common/customLanguageModelsService.js';
 import { ILoCoPilotFileLog } from './locopilotFileLog.js';
 import { ILoCoPilotOllamaService } from './locopilotOllamaService.js';
 import { registerAction2, Action2 } from '../../../../platform/actions/common/actions.js';
@@ -113,6 +113,40 @@ function filterPathsByFormat(paths: string[], format: string): string[] {
 	if (exactMatch.length > 0) return exactMatch;
 
 	return [];
+}
+
+/** Best-effort family detection from the repo id + the files we actually downloaded; used to fill `format` post-download. */
+function detectFormatFamily(repoId: string, paths: string[]): string | undefined {
+	const lower = paths.map(p => p.toLowerCase());
+	if (lower.some(p => p.endsWith('.gguf'))) {
+		return 'gguf';
+	}
+	// MLX repos are safetensors under the hood, so distinguish them by the conventional repo naming / tag.
+	if (/(^|[-_/])mlx([-_]|$)/i.test(repoId)) {
+		return 'mlx';
+	}
+	if (lower.some(p => p.endsWith('.safetensors') || p.endsWith('.bin'))) {
+		return 'transformers';
+	}
+	return undefined;
+}
+
+/** Pull a context window out of an HF config.json-style object, trying the common architecture keys. */
+function contextWindowFromConfig(cfg: any): number | undefined {
+	const candidates = [cfg?.max_position_embeddings, cfg?.n_positions, cfg?.max_sequence_length, cfg?.n_ctx, cfg?.seq_length];
+	for (const c of candidates) {
+		const n = typeof c === 'number' ? c : Number(c);
+		if (Number.isInteger(n) && n >= MIN_CONTEXT_WINDOW && n <= MAX_CONTEXT_WINDOW) {
+			return n;
+		}
+	}
+	return undefined;
+}
+
+/** Validate a raw context-window number into the accepted range, or undefined if unusable. */
+function sanitizeContextWindow(value: unknown): number | undefined {
+	const n = typeof value === 'number' ? value : Number(value);
+	return Number.isInteger(n) && n >= MIN_CONTEXT_WINDOW && n <= MAX_CONTEXT_WINDOW ? n : undefined;
 }
 
 export class LoCoPilotModelDownloadService extends Disposable implements IWorkbenchContribution {
@@ -382,6 +416,8 @@ export class LoCoPilotModelDownloadService extends Disposable implements IWorkbe
 							// localPath still holds the Base URL
 						});
 						this._log(`[LoCoPilot Ollama] ${repoId} pulled successfully.`);
+						// Enrich context window + tool support from Ollama (best-effort, never blocks completion).
+						await this._enrichOllamaMetadata(model, baseUrl, cancel);
 						resolve();
 					}
 				}, cancel);
@@ -508,6 +544,9 @@ export class LoCoPilotModelDownloadService extends Disposable implements IWorkbe
 			});
 			partialInstallDir = undefined;
 			this._log(`[LoCoPilot Download] ${repoId} downloaded to ${localPath}.`);
+
+			// Enrich format/context window from HF now that the files are on disk (best-effort, never blocks completion).
+			await this._enrichHuggingFaceMetadata(model, toDownload, cancel);
 		} catch (e) {
 			this._log(`[LoCoPilot Download] Error downloading ${repoId}: ${e}`);
 			await this.customLanguageModelsService.updateCustomModel(modelId, { isDownloading: false });
@@ -526,6 +565,97 @@ export class LoCoPilotModelDownloadService extends Disposable implements IWorkbe
 				`Failed to download model "${repoId}": ${message}. Check the model name (use format org/model-name), token for gated repos, and network.`
 			);
 			throw e;
+		}
+	}
+
+	/** GET a URL and parse the body as JSON, or undefined on any non-200 / parse error. Best-effort; never throws. */
+	private async _getJson(url: string, headers: Record<string, string>, cancel: CancellationToken): Promise<any | undefined> {
+		try {
+			const res = await this.requestService.request({ type: 'GET', url, headers: { Accept: 'application/json', ...headers } }, cancel);
+			if (res.res.statusCode !== 200) {
+				return undefined;
+			}
+			const raw = await streamToBuffer(res.stream).then(b => b.toString());
+			return JSON.parse(raw);
+		} catch {
+			return undefined;
+		}
+	}
+
+	/**
+	 * Derive `format` and `contextWindow` from HuggingFace and write them via applyDerivedMetadata
+	 * (which skips any field the user has overridden). Best-effort: failures are logged and ignored,
+	 * leaving the model on its defaults.
+	 */
+	private async _enrichHuggingFaceMetadata(model: ICustomLanguageModel, downloadedPaths: string[], cancel: CancellationToken): Promise<void> {
+		try {
+			const repoId = model.modelName.trim();
+			const repoPath = repoId.split('/').map(encodeURIComponent).join('/');
+			const headers: Record<string, string> = {};
+			if (model.token) {
+				headers['Authorization'] = `Bearer ${model.token}`;
+			}
+
+			const format = detectFormatFamily(repoId, downloadedPaths);
+
+			// 1) Model info: for GGUF repos this carries `gguf.context_length` directly.
+			let contextWindow: number | undefined;
+			const info = await this._getJson(`${HF_API_BASE}/api/models/${repoPath}`, headers, cancel);
+			if (info) {
+				contextWindow = sanitizeContextWindow(info.gguf?.context_length) ?? contextWindowFromConfig(info.config);
+			}
+			// 2) Fall back to config.json (transformers/MLX repos expose max_position_embeddings there).
+			if (contextWindow === undefined) {
+				const cfg = await this._getJson(`${HF_RESOLVE}/${repoPath}/resolve/main/config.json`, headers, cancel);
+				contextWindow = contextWindowFromConfig(cfg);
+			}
+
+			if (format === undefined && contextWindow === undefined) {
+				return;
+			}
+			await this.customLanguageModelsService.applyDerivedMetadata(model.id, { format, contextWindow });
+			this._log(`[LoCoPilot Download] Enriched ${repoId} metadata (format=${format ?? 'n/a'}, contextWindow=${contextWindow ?? 'n/a'}).`);
+		} catch (e) {
+			this._log(`[LoCoPilot Download] Metadata enrichment failed for ${model.modelName} (non-fatal): ${e}`);
+		}
+	}
+
+	/**
+	 * Derive `contextWindow` and tool-calling support from Ollama's /api/show (authoritative `capabilities`),
+	 * and write them via applyDerivedMetadata. Best-effort; failures are logged and ignored.
+	 */
+	private async _enrichOllamaMetadata(model: ICustomLanguageModel, baseUrl: string, cancel: CancellationToken): Promise<void> {
+		try {
+			const repoId = model.modelName.trim();
+			const res = await this.requestService.request({
+				type: 'POST',
+				url: `${baseUrl}/api/show`,
+				data: JSON.stringify({ name: repoId })
+			}, cancel);
+			if (res.res.statusCode !== 200) {
+				return;
+			}
+			const raw = await streamToBuffer(res.stream).then(b => b.toString());
+			const info = JSON.parse(raw) as { capabilities?: string[]; model_info?: Record<string, unknown> };
+
+			let contextWindow: number | undefined;
+			const modelInfo = info.model_info ?? {};
+			for (const [key, value] of Object.entries(modelInfo)) {
+				if (key.endsWith('.context_length')) {
+					contextWindow = sanitizeContextWindow(value);
+					break;
+				}
+			}
+			// `capabilities` is the ground truth for tool support; if absent we leave the optimistic default on.
+			const useNativeTools = Array.isArray(info.capabilities) ? info.capabilities.includes('tools') : undefined;
+
+			if (contextWindow === undefined && useNativeTools === undefined) {
+				return;
+			}
+			await this.customLanguageModelsService.applyDerivedMetadata(model.id, { contextWindow, useNativeTools });
+			this._log(`[LoCoPilot Ollama] Enriched ${repoId} metadata (contextWindow=${contextWindow ?? 'n/a'}, tools=${useNativeTools ?? 'n/a'}).`);
+		} catch (e) {
+			this._log(`[LoCoPilot Ollama] Metadata enrichment failed for ${model.modelName} (non-fatal): ${e}`);
 		}
 	}
 

@@ -3,8 +3,9 @@
  *  Licensed under the MIT License. See License.txt in the project root for license information.
  *--------------------------------------------------------------------------------------------*/
 
-import { $ } from '../../../../../../base/browser/dom.js';
+import { $, append } from '../../../../../../base/browser/dom.js';
 import { ButtonWithIcon } from '../../../../../../base/browser/ui/button/button.js';
+import { FileAccess } from '../../../../../../base/common/network.js';
 import { HoverStyle } from '../../../../../../base/browser/ui/hover/hover.js';
 import { Codicon } from '../../../../../../base/common/codicons.js';
 import { IMarkdownString, MarkdownString } from '../../../../../../base/common/htmlContent.js';
@@ -41,6 +42,30 @@ export abstract class ChatCollapsibleContentPart extends Disposable implements I
 
 	public set icon(value: ThemeIcon | undefined) {
 		this._overrideIcon.set(value, undefined);
+	}
+
+	protected _setLoadingIcon(): void {
+		if (!this._collapseButton) { return; }
+		const iconEl = this._collapseButton.iconElement;
+		iconEl.classList.value = '';
+		while (iconEl.firstChild) { iconEl.removeChild(iconEl.firstChild); }
+		iconEl.classList.add('locopilot-logo-loader');
+		iconEl.style.cssText = 'width:14px;height:14px;display:inline-flex;flex-shrink:0;';
+		const logoUri = FileAccess.asFileUri('vs/workbench/contrib/chat/browser/widget/input/media/locopilot-logo.png');
+		const src = FileAccess.uriToBrowserUri(logoUri).toString(true);
+		const track = $<HTMLImageElement>('img.logo-track');
+		track.src = src; track.alt = '';
+		const fill = $<HTMLImageElement>('img.logo-fill');
+		fill.src = src; fill.alt = '';
+		append(iconEl, track, fill);
+	}
+
+	protected _clearLoadingIcon(): void {
+		if (!this._collapseButton) { return; }
+		const iconEl = this._collapseButton.iconElement;
+		iconEl.classList.remove('locopilot-logo-loader');
+		iconEl.style.cssText = '';
+		while (iconEl.firstChild) { iconEl.removeChild(iconEl.firstChild); }
 	}
 
 	protected readonly element: ChatTreeItem;

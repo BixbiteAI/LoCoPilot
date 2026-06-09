@@ -450,8 +450,11 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 			inputBoxStyles: locopilotSettingsInputBoxStyles
 		}));
 
-		// Context window (single user-set number; input/output budgets are derived from it)
+		// Context window is auto-derived from HF/Ollama after download (or service default), and overridden
+		// from the model list - so it is not collected on the Add form. The widget is kept (hidden) to avoid
+		// churn in the form-state helpers that still reference it.
 		const contextWindowRow = DOM.append(formContainer, $('.form-field.form-field-tokens'));
+		contextWindowRow.style.display = 'none';
 		const contextWindowLabel = DOM.append(contextWindowRow, $('label.form-label'));
 		contextWindowLabel.textContent = localize('addCustomModel.contextWindow', 'Context window');
 		const contextWindowWrap = DOM.append(contextWindowRow, $('.form-input-with-suffix'));
@@ -561,14 +564,12 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 			if (apiKeyContainer) { apiKeyContainer.style.display = ''; }
 			if (tokenContainer) { tokenContainer.style.display = 'none'; }
 			if (this.addFormModelFormatContainer) { this.addFormModelFormatContainer.style.display = 'none'; }
-			// Tools toggle: hidden for normal cloud (always on), shown for HF cloud so the user can
-			// disable function-calling for models that don't support it.
-			if (this.addFormUseNativeToolsContainer) { this.addFormUseNativeToolsContainer.style.display = isHfCloud ? '' : 'none'; }
+			// Tools / MTP / context window are auto-derived or overridden from the model list, never on the Add form.
+			if (this.addFormUseNativeToolsContainer) { this.addFormUseNativeToolsContainer.style.display = 'none'; }
 			if (this.addFormMtpContainer) { this.addFormMtpContainer.style.display = 'none'; }
 			if (this.addFormHfFastestContainer) { this.addFormHfFastestContainer.style.display = isHfCloud ? '' : 'none'; }
-			// Reset toggles to defaults each time HF cloud is selected (cheapest on, tools off)
+			// Reset HF cloud routing toggle to its default (cheapest on) when HF cloud is selected.
 			if (isHfCloud && this.addFormHfFastestToggle) { this.addFormHfFastestToggle.checked = true; }
-			if (isHfCloud && this.addFormUseNativeToolsToggle) { this.addFormUseNativeToolsToggle.checked = false; }
 			this.addFormContextWindowInput.value = String(LoCoPilotSettingsEditor.DEFAULT_CONTEXT_WINDOW);
 		} else {
 			if (this.addFormHfFastestContainer) { this.addFormHfFastestContainer.style.display = 'none'; }
@@ -583,10 +584,11 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 					? 'http://localhost:11434'
 					: localize('addCustomModel.tokenPlaceholder', 'Enter your token (e.g., HuggingFace token)'));
 			}
-			if (this.addFormModelFormatContainer) { this.addFormModelFormatContainer.style.display = isHuggingFace ? '' : 'none'; }
-			if (this.addFormUseNativeToolsContainer) { this.addFormUseNativeToolsContainer.style.display = ''; }
-			// MTP is a llama.cpp (GGUF) feature, so only relevant to HuggingFace local models.
-			if (this.addFormMtpContainer) { this.addFormMtpContainer.style.display = isHuggingFace ? '' : 'none'; }
+			// Format / Tools / MTP / context window are auto-derived (HF/Ollama) or overridden from the model list,
+			// so none are collected on the Add form for local providers either.
+			if (this.addFormModelFormatContainer) { this.addFormModelFormatContainer.style.display = 'none'; }
+			if (this.addFormUseNativeToolsContainer) { this.addFormUseNativeToolsContainer.style.display = 'none'; }
+			if (this.addFormMtpContainer) { this.addFormMtpContainer.style.display = 'none'; }
 			// All local providers (HuggingFace, Ollama, Localhost) default to the smaller local context window.
 			this.addFormContextWindowInput.value = String(LoCoPilotSettingsEditor.LOCAL_DEFAULT_CONTEXT_WINDOW);
 		}
@@ -652,12 +654,10 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 		const modelName = this.addFormModelNameInputBox.value.trim();
 		const apiKey = this.addFormCurrentModelType === 'cloud' ? this.addFormApiKeyInputBox.value.trim() : undefined;
 		const token = (this.addFormCurrentModelType === 'local' && !isLocalhost) ? this.addFormTokenInputBox.value.trim() : undefined;
-		const format = (this.addFormCurrentModelType === 'local' && providerValue === 'huggingface') ? this.addFormModelFormatInputBox.value.trim() : undefined;
 
 		// For Ollama, token field holds the Base URL
 		const ollamaUrl = (providerValue === 'ollama' && token) ? token : 'http://localhost:11434';
 
-		const contextWindowResult = this.parseContextWindow(this.addFormContextWindowInput.value);
 		const displayNameOpt = this.addFormDisplayNameInputBox.value.trim();
 		const localhostServerModelId = isLocalhost ? this.addFormLocalhostModelIdInputBox.value.trim() : '';
 		if (isLocalhost) {
@@ -675,10 +675,6 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 		}
 		if (this.addFormCurrentModelType === 'cloud' && !apiKey) {
 			await this.dialogService.error(localize('addCustomModel.error.apiKeyRequired', 'API key is required for cloud providers'));
-			return;
-		}
-		if (!contextWindowResult.valid) {
-			await this.dialogService.error(contextWindowResult.error);
 			return;
 		}
 
@@ -704,13 +700,12 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 				provider: providerValue,
 				apiKey,
 				token: providerValue === 'ollama' ? undefined : token, // Don't store URL in token secret for Ollama
-				format: format || undefined,
+				// format / contextWindow / useNativeTools / mtp are intentionally omitted here: they are
+				// auto-derived from HuggingFace/Ollama after download (see applyDerivedMetadata) and otherwise
+				// fall back to service defaults. The user can override any of them from the model list.
 				modelName: modelName,
 				localhostOpenAiModel: isLocalhost ? localhostServerModelId : undefined,
 				localPath: providerValue === 'ollama' ? ollamaUrl : undefined, // Store Base URL in localPath for Ollama
-				contextWindow: contextWindowResult.value,
-				useNativeTools: this.addFormUseNativeToolsToggle.checked,
-				mtp: this.addFormMtpToggle.checked,
 				hfFastest: isHfCloud ? !this.addFormHfFastestToggle.checked : undefined,
 			});
 			const listLabel = getCustomModelListLabel(addedModel);

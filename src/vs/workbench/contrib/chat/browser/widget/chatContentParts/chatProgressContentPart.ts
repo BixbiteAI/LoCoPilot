@@ -138,7 +138,9 @@ export class ChatProgressSubPart extends Disposable {
 		this.domNode = $('.progress-container');
 
 		// Use the custom logo loader instead of the default round spinner
-		const isSpinner = icon.id === Codicon.loading.id;
+		// ThemeIcon.modify appends '~spin' so strip any modifier before comparing
+		const baseIconId = icon.id.includes('~') ? icon.id.substring(0, icon.id.indexOf('~')) : icon.id;
+		const isSpinner = baseIconId === Codicon.loading.id;
 		let iconElement: HTMLElement;
 		if (isSpinner) {
 			iconElement = buildLogoLoader(14);

@@ -2195,6 +2195,13 @@ have to be updated for changes to the rules above, or to support more deeply nes
 	display: none;
 }
 
+/* Hide the thinking collapsible content area when it has no visible content
+(empty = no thinking text, or all children are hidden empty tool invocations) */
+.chat-used-context-list.chat-thinking-collapsible:empty,
+.chat-used-context-list.chat-thinking-collapsible:not(:has(> :not(.chat-tool-invocation-part:has(> .chat-tool-empty)))) {
+	display: none;
+}
+
 .interactive-response-progress-tree,
 .interactive-session .chat-summary-list,
 .interactive-session .chat-used-context-list {
