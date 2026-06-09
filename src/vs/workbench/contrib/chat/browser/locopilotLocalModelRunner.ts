@@ -55,6 +55,8 @@ export interface ILoCoPilotLocalModelRunner {
 	readonly _serviceBrand: undefined;
 	readonly onDidServerStateChange: Event<string>;
 	readonly onDidLogUpdate: Event<string>;
+	/** Fired when a server launch fails. Payload contains modelId and a human-readable reason. */
+	readonly onDidServerStartFailed: Event<{ modelId: string; message: string }>;
 	getBackend(): LlamaBackend;
 	getBackendPriority(): LlamaBackend[];
 	getServerBaseUrl(modelId: string): string | undefined;
@@ -63,6 +65,8 @@ export interface ILoCoPilotLocalModelRunner {
 	stopServer(modelId: string): void;
 	runOllamaModelInTerminal(modelId: string): Promise<void>;
 	isServerRunning(modelId: string): boolean;
+	/** True while the server process is being launched (between button click and first state change). */
+	isServerStarting(modelId: string): boolean;
 }
 
 export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotLocalModelRunner {
@@ -75,8 +79,13 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 	private readonly _onDidLogUpdate = this._register(new Emitter<string>());
 	readonly onDidLogUpdate = this._onDidLogUpdate.event;
 
+	private readonly _onDidServerStartFailed = this._register(new Emitter<{ modelId: string; message: string }>());
+	readonly onDidServerStartFailed = this._onDidServerStartFailed.event;
+
 	private static readonly MAX_LOG_LINES = 2000;
 
+	/** Models whose server launch is in progress (sent to terminal but not yet confirmed running/failed). */
+	private startingServers = new Set<string>();
 	private runningServers = new Map<string, { port: number; terminal: ITerminalInstance; kind: 'llama' | 'mlx'; logs: string[] }>();
 
 	constructor(
@@ -152,6 +161,10 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 
 	isServerRunning(modelId: string): boolean {
 		return this.runningServers.has(modelId);
+	}
+
+	isServerStarting(modelId: string): boolean {
+		return this.startingServers.has(modelId);
 	}
 
 	getServerLogs(modelId: string): string[] {
@@ -398,6 +411,21 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 		});
 	}
 
+	/** Mark a model as starting and notify the UI immediately so it can show a spinner. */
+	private _beginStarting(modelId: string): void {
+		this.startingServers.add(modelId);
+		this._onDidServerStateChange.fire(modelId);
+	}
+
+	/** Clear the starting state and optionally fire a failure event with a reason for the UI. */
+	private _endStarting(modelId: string, failureMessage?: string): void {
+		this.startingServers.delete(modelId);
+		if (failureMessage) {
+			this._onDidServerStartFailed.fire({ modelId, message: failureMessage });
+		}
+		this._onDidServerStateChange.fire(modelId);
+	}
+
 	/**
 	 * Starts the llama.cpp server for the given model in a new terminal.
 	 * Uses recommended backend (GPU/Metal/CPU). The server runs until the terminal is closed.
@@ -469,6 +497,7 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 		this._log(`[LoCoPilot Runner] Executing: ${cmdLine}`);
 		this._log(`[LoCoPilot Runner] Using llama-server: ${serverPath} (bundled = ${serverPath === getBundledLlamaServerPath(this._appRoot)}).`);
 
+		this._beginStarting(modelId);
 		try {
 			const terminal = await this.terminalService.createTerminal({
 				config: {
@@ -478,7 +507,11 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 			await new Promise<void>(resolve => setTimeout(resolve, 400));
 			await terminal.sendText(cmdLine, true);
 
+			// Wait for the server process to initialise before switching the UI to running state.
+			await timeout(5000);
+
 			const logs: string[] = [];
+			this.startingServers.delete(modelId); // running state replaces starting state
 			this.runningServers.set(modelId, { port, terminal, kind: 'llama', logs });
 			this._onDidServerStateChange.fire(modelId);
 
@@ -506,6 +539,7 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 			this._log(`[LoCoPilot Runner] Terminal started with: ${cmdLine}`);
 		} catch (e) {
 			this._log(`[LoCoPilot Runner] Failed to start terminal: ${e}`);
+			this._endStarting(modelId, `Failed to start llama-server terminal: ${e}`);
 			throw e;
 		}
 	}
@@ -524,6 +558,7 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 
 		this._log(`[LoCoPilot Runner] Starting mlx-lm server for model ${modelId} on port ${port}: ${cmdLine}`);
 
+		this._beginStarting(modelId);
 		try {
 			const terminal = await this.terminalService.createTerminal({
 				config: {
@@ -533,7 +568,10 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 			await new Promise<void>(resolve => setTimeout(resolve, 400));
 			await terminal.sendText(cmdLine, true);
 
+			await timeout(5000);
+
 			const logs: string[] = [];
+			this.startingServers.delete(modelId);
 			this.runningServers.set(modelId, { port, terminal, kind: 'mlx', logs });
 			this._onDidServerStateChange.fire(modelId);
 
@@ -555,12 +593,10 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 		} catch (e) {
 			this._log(`[LoCoPilot Runner] Failed to start MLX terminal: ${e}`);
 			const usingBundled = pythonCmd === getBundledMlxPython(this._appRoot);
-			this.notificationService.notify({
-				severity: Severity.Error,
-				message: usingBundled
-					? `Failed to start the bundled MLX runtime. This is unexpected - try reinstalling LoCoPilot. To use your own Python instead, set "locopilot.mlx.pythonPath".`
-					: `Failed to start MLX server with "${pythonCmd}". Install mlx-lm (${pythonCmd} -m pip install 'mlx-lm', Apple Silicon only), or set "locopilot.mlx.pythonPath".`,
-			});
+			const failMsg = usingBundled
+				? `Failed to start the bundled MLX runtime. This is unexpected - try reinstalling LoCoPilot. To use your own Python instead, set "locopilot.mlx.pythonPath".`
+				: `Failed to start MLX server with "${pythonCmd}". Install mlx-lm (${pythonCmd} -m pip install 'mlx-lm', Apple Silicon only), or set "locopilot.mlx.pythonPath".`;
+			this._endStarting(modelId, failMsg);
 			throw e;
 		}
 	}
@@ -587,6 +623,7 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 		const keepAliveArg = keepAlive ? ` --keepalive ${keepAlive}` : '';
 		const cmdLine = `${hostEnv}ollama run${keepAliveArg} ${model.modelName}`;
 		this._log(`[LoCoPilot Runner] Running Ollama model: ${cmdLine}`);
+		this._beginStarting(modelId);
 		try {
 			const terminal = await this.terminalService.createTerminal({
 				config: {
@@ -596,7 +633,10 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 			await new Promise<void>(resolve => setTimeout(resolve, 400));
 			await terminal.sendText(cmdLine, true);
 
+			await timeout(5000);
+
 			const logs: string[] = [];
+			this.startingServers.delete(modelId);
 			// For Ollama, we don't manage the port, it's always the baseUrl port, but we track the terminal
 			this.runningServers.set(modelId, { port: 11434, terminal, kind: 'llama', logs });
 			this._onDidServerStateChange.fire(modelId);
@@ -618,6 +658,7 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 			}));
 		} catch (e) {
 			this._log(`[LoCoPilot Runner] Failed to run Ollama in terminal: ${e}`);
+			this._endStarting(modelId, `Failed to start Ollama terminal: ${e}`);
 			throw e;
 		}
 	}

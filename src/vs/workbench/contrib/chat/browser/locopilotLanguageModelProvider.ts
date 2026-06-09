@@ -141,7 +141,7 @@ export class LoCoPilotLanguageModelProvider extends Disposable implements ILangu
 	/** Chat error panel renders this as Markdown; includes a command link (see chatListRenderer trusted command for this id). */
 	private _getLocalLlamaServerNotRunningMessage(modelName: string): string {
 		const openLanguageModels = createMarkdownCommandLink({
-			title: 'Open Language Models',
+			title: 'Open My Models',
 			id: 'workbench.action.chat.openLoCoPilotSettings',
 			arguments: [{ section: LOCOPILOT_SETTINGS_SECTION_LIST_MODELS }],
 		});

@@ -398,3 +398,34 @@
 	white-space: pre-wrap;
 	word-break: break-all;
 }
+
+/* Server starting state - spinner + label shown in the run button slot */
+.model-server-starting {
+	display: flex;
+	align-items: center;
+	gap: 6px;
+	padding: 2px 4px;
+	opacity: 0.85;
+}
+
+.model-server-starting-label {
+	font-size: 12px;
+	color: var(--vscode-descriptionForeground);
+}
+
+/* Server start error state - inline error label + retry button */
+.model-server-error {
+	display: flex;
+	align-items: center;
+	gap: 6px;
+}
+
+.model-server-error-label {
+	font-size: 12px;
+	color: var(--vscode-errorForeground);
+	cursor: help;
+	max-width: 120px;
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+}

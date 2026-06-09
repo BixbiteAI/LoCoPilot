@@ -4,6 +4,7 @@
  *--------------------------------------------------------------------------------------------*/
 
 import { $, append } from '../../../../../../base/browser/dom.js';
+import { FileAccess } from '../../../../../../base/common/network.js';
 import { alert } from '../../../../../../base/browser/ui/aria/aria.js';
 import { Codicon } from '../../../../../../base/common/codicons.js';
 import { MarkdownString, type IMarkdownString } from '../../../../../../base/common/htmlContent.js';
@@ -135,8 +136,16 @@ export class ChatProgressSubPart extends Disposable {
 		super();
 
 		this.domNode = $('.progress-container');
-		const iconElement = $('div');
-		iconElement.classList.add(...ThemeIcon.asClassNameArray(icon));
+
+		// Use the custom logo loader instead of the default round spinner
+		const isSpinner = icon.id === Codicon.loading.id;
+		let iconElement: HTMLElement;
+		if (isSpinner) {
+			iconElement = buildLogoLoader(14);
+		} else {
+			iconElement = $('div');
+			iconElement.classList.add(...ThemeIcon.asClassNameArray(icon));
+		}
 		if (tooltip) {
 			this._register(hoverService.setupDelayedHover(iconElement, {
 				content: tooltip,
@@ -148,6 +157,27 @@ export class ChatProgressSubPart extends Disposable {
 		messageElement.classList.add('progress-step');
 		append(this.domNode, messageElement);
 	}
+}
+
+function buildLogoLoader(size: number): HTMLElement {
+	const wrap = $('.locopilot-logo-loader');
+	wrap.style.width = `${size}px`;
+	wrap.style.height = `${size}px`;
+
+	const logoUri = FileAccess.asFileUri('vs/workbench/contrib/chat/browser/widget/input/media/locopilot-logo.png');
+	const src = FileAccess.uriToBrowserUri(logoUri).toString(true);
+
+	const track = $<HTMLImageElement>('img.logo-track');
+	track.src = src;
+	track.alt = '';
+	append(wrap, track);
+
+	const fill = $<HTMLImageElement>('img.logo-fill');
+	fill.src = src;
+	fill.alt = '';
+	append(wrap, fill);
+
+	return wrap;
 }
 
 export class ChatWorkingProgressContentPart extends ChatProgressContentPart implements IChatContentPart {

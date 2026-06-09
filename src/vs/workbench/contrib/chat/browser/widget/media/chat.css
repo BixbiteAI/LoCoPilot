@@ -82,6 +82,18 @@
 	font-size: var(--vscode-chat-font-size-body-s);
 	color: var(--vscode-descriptionForeground);
 	overflow: hidden;
+	display: flex;
+	align-items: center;
+	gap: 4px;
+}
+
+.interactive-item-container .detail-container > .locopilot-logo-loader.detail-loader {
+	flex-shrink: 0;
+}
+
+/* Hide the animated ellipsis when the logo loader is shown instead */
+.interactive-item-container .detail-container:has(.detail-loader[style*="inline-flex"]) .chat-animated-ellipsis {
+	display: none;
 }
 
 .interactive-item-container .detail-container .detail .agentOrSlashCommandDetected A {
@@ -1119,7 +1131,13 @@ have to be updated for changes to the rules above, or to support more deeply nes
 	font-variant-numeric: tabular-nums;
 }
 
-/* Logo loader - the logo pulses with a fade-in/out cycle to indicate loading */
+/* Logo loader - clockwise fill sweep: the logo reveals itself from 0 to 360 degrees */
+@property --loco-fill {
+	syntax: '<angle>';
+	initial-value: 0deg;
+	inherits: false;
+}
+
 .locopilot-logo-loader {
 	position: relative;
 	display: inline-flex;
@@ -1136,29 +1154,22 @@ have to be updated for changes to the rules above, or to support more deeply nes
 	object-fit: contain;
 }
 
+/* Faint ghost - logo silhouette always visible as the track */
 .locopilot-logo-loader > .logo-track {
-	opacity: 0.25;
+	opacity: 0.28;
 }
 
-/* Pulsing fill layer: fades from transparent to full opacity and back */
+/* Fill layer - revealed clockwise via a growing conic mask from 12 o'clock */
 .locopilot-logo-loader > .logo-fill {
-	animation: loco-pulse 1500ms ease-in-out infinite;
+	-webkit-mask-image: conic-gradient(from -90deg, #000 var(--loco-fill), transparent 0);
+	mask-image: conic-gradient(from -90deg, #000 var(--loco-fill), transparent 0);
+	animation: loco-fill 1500ms cubic-bezier(0.4, 0, 0.2, 1) infinite;
 }
 
-@keyframes loco-pulse {
-	0%   { opacity: 0.2; }
-	50%  { opacity: 1; }
-	100% { opacity: 0.2; }
-}
-
-@media (prefers-reduced-motion: reduce) {
-	.locopilot-logo-loader > .logo-fill {
-		animation: none;
-		opacity: 0.9;
-	}
-	.locopilot-logo-loader > .logo-track {
-		opacity: 0;
-	}
+@keyframes loco-fill {
+	0%   { --loco-fill: 0deg; }
+	80%  { --loco-fill: 360deg; }
+	100% { --loco-fill: 360deg; }
 }
 
 @media (prefers-reduced-motion: reduce) {
@@ -1166,6 +1177,7 @@ have to be updated for changes to the rules above, or to support more deeply nes
 		animation: none;
 		-webkit-mask-image: none;
 		mask-image: none;
+		opacity: 0.9;
 	}
 	.locopilot-logo-loader > .logo-track {
 		opacity: 0;
@@ -2320,6 +2332,11 @@ have to be updated for changes to the rules above, or to support more deeply nes
 		&::before {
 			font-size: var(--vscode-chat-font-size-body-s);
 		}
+	}
+
+	> .locopilot-logo-loader {
+		flex-shrink: 0;
+		margin: 0 .2em;
 	}
 
 	.codicon {

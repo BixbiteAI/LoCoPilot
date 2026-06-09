@@ -126,6 +126,7 @@ export interface IChatListItemTemplate {
 	readonly footerDetailsContainer: HTMLElement;
 	readonly avatarContainer: HTMLElement;
 	readonly username: HTMLElement;
+	readonly detailLogoLoader: HTMLElement;
 	readonly detail: HTMLElement;
 	readonly value: HTMLElement;
 	readonly contextKeyService: IContextKeyService;
@@ -465,6 +466,8 @@ export class ChatListItemRenderer extends Disposable implements ITreeRenderer<Ch
 		const username = dom.append(user, $('h3.username'));
 		username.tabIndex = 0;
 		const detailContainer = dom.append(detailContainerParent ?? user, $('span.detail-container'));
+		const detailLogoLoader = this._buildInlineLogoLoader(12);
+		dom.append(detailContainer, detailLogoLoader);
 		const detail = dom.append(detailContainer, $('span.detail'));
 		dom.append(detailContainer, $('span.chat-animated-ellipsis'));
 		const value = dom.append(valueParent, $('.value'));
@@ -537,7 +540,7 @@ export class ChatListItemRenderer extends Disposable implements ITreeRenderer<Ch
 				this.hoverService.hideHover();
 			}
 		}));
-		const template: IChatListItemTemplate = { header, avatarContainer, requestHover, username, detail, value, rowContainer, elementDisposables, templateDisposables, contextKeyService, instantiationService: scopedInstantiationService, agentHover, titleToolbar, footerToolbar, footerDetailsContainer, disabledOverlay, checkpointToolbar, checkpointRestoreToolbar, checkpointContainer, checkpointRestoreContainer };
+		const template: IChatListItemTemplate = { header, avatarContainer, requestHover, username, detailLogoLoader, detail, value, rowContainer, elementDisposables, templateDisposables, contextKeyService, instantiationService: scopedInstantiationService, agentHover, titleToolbar, footerToolbar, footerDetailsContainer, disabledOverlay, checkpointToolbar, checkpointRestoreToolbar, checkpointContainer, checkpointRestoreContainer };
 
 		templateDisposables.add(this._onDidUpdateViewModel.event(() => {
 			if (!template.currentElement || !this.viewModel?.sessionResource || !isEqual(template.currentElement.sessionResource, this.viewModel.sessionResource)) {
@@ -763,6 +766,12 @@ export class ChatListItemRenderer extends Disposable implements ITreeRenderer<Ch
 
 	private renderDetail(element: IChatResponseViewModel, templateData: IChatListItemTemplate): void {
 		dom.clearNode(templateData.detail);
+		const showingProgress = !element.agentOrSlashCommandDetected
+			&& this.rendererOptions.renderStyle !== 'minimal'
+			&& !element.isComplete
+			&& !checkModeOption(this.delegate.currentChatMode(), this.rendererOptions.progressMessageAtBottomOfResponse);
+
+		templateData.detailLogoLoader.style.display = showingProgress ? 'inline-flex' : 'none';
 
 		if (element.agentOrSlashCommandDetected) {
 			const msg = element.slashCommand ? localize('usedAgentSlashCommand', "used {0} [[(rerun without)]]", `${chatSubcommandLeader}${element.slashCommand.name}`) : localize('usedAgent', "[[(rerun without)]]");
@@ -775,7 +784,7 @@ export class ChatListItemRenderer extends Disposable implements ITreeRenderer<Ch
 				}
 			}, $('span.agentOrSlashCommandDetected')));
 
-		} else if (this.rendererOptions.renderStyle !== 'minimal' && !element.isComplete && !checkModeOption(this.delegate.currentChatMode(), this.rendererOptions.progressMessageAtBottomOfResponse)) {
+		} else if (showingProgress) {
 			templateData.detail.textContent = localize('working', "Working ");
 		}
 	}
@@ -802,6 +811,28 @@ export class ChatListItemRenderer extends Disposable implements ITreeRenderer<Ch
 			const avatarIcon = dom.$(ThemeIcon.asCSSSelector(icon));
 			templateData.avatarContainer.replaceChildren(dom.$('.avatar.codicon-avatar', undefined, avatarIcon));
 		}
+	}
+
+	private _buildInlineLogoLoader(size: number): HTMLElement {
+		const wrap = dom.$('.locopilot-logo-loader.detail-loader');
+		wrap.style.width = `${size}px`;
+		wrap.style.height = `${size}px`;
+		wrap.style.display = 'none';
+
+		const logoUri = FileAccess.asFileUri('vs/workbench/contrib/chat/browser/widget/input/media/locopilot-logo.png');
+		const src = FileAccess.uriToBrowserUri(logoUri).toString(true);
+
+		const track = dom.$<HTMLImageElement>('img.logo-track');
+		track.src = src;
+		track.alt = '';
+		wrap.appendChild(track);
+
+		const fill = dom.$<HTMLImageElement>('img.logo-fill');
+		fill.src = src;
+		fill.alt = '';
+		wrap.appendChild(fill);
+
+		return wrap;
 	}
 
 	private getAgentIcon(agent: IChatAgentMetadata | undefined): URI | ThemeIcon {
