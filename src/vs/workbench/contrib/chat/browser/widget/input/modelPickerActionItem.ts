@@ -7,7 +7,9 @@ import * as dom from '../../../../../../base/browser/dom.js';
 import { IActionProvider } from '../../../../../../base/browser/ui/dropdown/dropdown.js';
 import { IManagedHoverContent } from '../../../../../../base/browser/ui/hover/hover.js';
 import { renderIcon, renderLabelWithIcons } from '../../../../../../base/browser/ui/iconLabel/iconLabels.js';
-import { IAction, Separator } from '../../../../../../base/common/actions.js';
+import { IAction, Separator, toAction } from '../../../../../../base/common/actions.js';
+import { Codicon } from '../../../../../../base/common/codicons.js';
+import { ThemeIcon } from '../../../../../../base/common/themables.js';
 import { IDisposable } from '../../../../../../base/common/lifecycle.js';
 import { autorun, IObservable } from '../../../../../../base/common/observable.js';
 import { localize } from '../../../../../../nls.js';
@@ -24,7 +26,7 @@ import { MANAGE_CHAT_COMMAND_ID } from '../../../common/constants.js';
 import { ILanguageModelChatMetadataAndIdentifier } from '../../../common/languageModels.js';
 import { DEFAULT_MODEL_PICKER_CATEGORY } from '../../../common/widget/input/modelPickerWidget.js';
 import { ChatInputPickerActionViewItem, IChatInputPickerOptions } from './chatInputPickerActionItem.js';
-import { ICustomLanguageModelsService, getCustomModelListLabel, isCustomModelReadyForChat } from '../../../common/customLanguageModelsService.js';
+import { ICustomLanguageModelsService, getCustomModelListLabel } from '../../../common/customLanguageModelsService.js';
 import { LOCOPILOT_SETTINGS_SECTION_LIST_MODELS } from '../../chatManagement/locopilotSettingsEditorInput.js';
 import { ExtensionIdentifier } from '../../../../../../platform/extensions/common/extensions.js';
 
@@ -47,7 +49,7 @@ type ChatModelChangeEvent = {
 };
 
 
-function modelDelegateToWidgetActionsProvider(delegate: IModelPickerDelegate, telemetryService: ITelemetryService, customLanguageModelsService: ICustomLanguageModelsService): IActionWidgetDropdownActionProvider {
+function modelDelegateToWidgetActionsProvider(delegate: IModelPickerDelegate, telemetryService: ITelemetryService, customLanguageModelsService: ICustomLanguageModelsService, actionWidgetService: IActionWidgetService): IActionWidgetDropdownActionProvider {
 	return {
 		getActions: () => {
 			// Custom models are sourced here (not from delegate.getModels()), so locopilot vendor models are
@@ -56,27 +58,58 @@ function modelDelegateToWidgetActionsProvider(delegate: IModelPickerDelegate, te
 			// shows an in-chat download prompt with its configuration + a Download button.
 			const models = delegate.getModels().filter(m => m.metadata.vendor !== 'locopilot');
 			const customModels = customLanguageModelsService.getVisibleCustomModels();
+			const hiddenCustomModels = customLanguageModelsService.getCustomModels().filter(m => m.hidden);
 
 			// Convert custom models to ILanguageModelChatMetadataAndIdentifier format
 			const selectedCustomModelId = customLanguageModelsService.getSelectedCustomModelId();
 			const customModelActions: IActionWidgetDropdownAction[] = customModels.map(customModel => {
-				const ready = isCustomModelReadyForChat(customModel);
-				const baseDesc = `${customModel.type === 'cloud' ? 'Cloud' : 'Local'} | ${customModel.provider}`;
 				return {
 					id: customModel.id,
 					enabled: true,
 					checked: customModel.id === selectedCustomModelId,
 					category: { label: 'Custom Models', order: 100 },
 					class: undefined,
-					description: ready ? baseDesc : `${baseDesc} | ${localize('chat.modelPicker.notDownloaded', 'not downloaded')}`,
+					description: customModel.type === 'cloud' ? localize('chat.modelPicker.cloud', 'Cloud') : localize('chat.modelPicker.local', 'Local'),
 					tooltip: getCustomModelListLabel(customModel),
 					label: getCustomModelListLabel(customModel),
-					hover: { content: localize('chat.modelPicker.customModel.description', "Custom {0} model from {1}", customModel.type, customModel.provider) },
+					hover: undefined,
 					run: () => {
-						// Store selected custom model ID
 						customLanguageModelsService.setSelectedCustomModelId(customModel.id);
-						// Update the label to show selected model
-						// The label will be updated via the autorun in ModelPickerActionItem constructor
+					}
+				};
+			});
+
+			// Hidden custom models - only visible when searching
+			const hiddenModelActions: IActionWidgetDropdownAction[] = hiddenCustomModels.map(hiddenModel => {
+				return {
+					id: hiddenModel.id,
+					enabled: true,
+					checked: false,
+					category: { label: 'Custom Models', order: 100 },
+					class: undefined,
+					description: hiddenModel.type === 'cloud' ? localize('chat.modelPicker.cloud', 'Cloud') : localize('chat.modelPicker.local', 'Local'),
+					tooltip: getCustomModelListLabel(hiddenModel),
+					label: getCustomModelListLabel(hiddenModel),
+					hover: undefined,
+					searchOnly: true,
+					toolbarActions: [
+						toAction({
+							id: `unhide-${hiddenModel.id}`,
+							label: localize('chat.modelPicker.unhide', 'Show model'),
+							class: ThemeIcon.asClassName(Codicon.eye),
+							tooltip: localize('chat.modelPicker.unhide.tooltip', 'Show this model in the picker'),
+							run: async () => {
+								// Unhide then select - close picker after both
+								await customLanguageModelsService.hideCustomModel(hiddenModel.id, false);
+								customLanguageModelsService.setSelectedCustomModelId(hiddenModel.id);
+								actionWidgetService.hide();
+							}
+						})
+					],
+					run: async () => {
+						await customLanguageModelsService.hideCustomModel(hiddenModel.id, false);
+						customLanguageModelsService.setSelectedCustomModelId(hiddenModel.id);
+						actionWidgetService.hide();
 					}
 				};
 			});
@@ -89,16 +122,15 @@ function modelDelegateToWidgetActionsProvider(delegate: IModelPickerDelegate, te
 					checked: true,
 					category: DEFAULT_MODEL_PICKER_CATEGORY,
 					class: undefined,
-					description: localize('chat.modelPicker.auto.detail', "Best for your request based on capacity and performance."),
+					description: undefined,
 					tooltip: localize('chat.modelPicker.auto', "Auto"),
 					label: localize('chat.modelPicker.auto', "Auto"),
-					hover: { content: localize('chat.modelPicker.auto.description', "Automatically selects the best model for your task based on context and complexity.") },
+					hover: undefined,
 					run: () => { }
 				} satisfies IActionWidgetDropdownAction];
 			}
 
 			const standardModelActions = models.map(model => {
-				const hoverContent = model.metadata.tooltip;
 				return {
 					id: model.metadata.id,
 					enabled: true,
@@ -106,13 +138,12 @@ function modelDelegateToWidgetActionsProvider(delegate: IModelPickerDelegate, te
 					checked: model.identifier === delegate.currentModel.get()?.identifier,
 					category: model.metadata.modelPickerCategory || DEFAULT_MODEL_PICKER_CATEGORY,
 					class: undefined,
-					description: model.metadata.multiplier ?? model.metadata.detail,
-					tooltip: hoverContent ? '' : model.metadata.name,
-					hover: hoverContent ? { content: hoverContent } : undefined,
+					description: undefined,
+					tooltip: model.metadata.name,
+					hover: undefined,
 					label: model.metadata.name,
 					run: () => {
 						const previousModel = delegate.currentModel.get();
-						// Clear custom model selection when selecting a standard model
 						customLanguageModelsService.setSelectedCustomModelId(undefined);
 						telemetryService.publicLog2<ChatModelChangeEvent, ChatModelChangeClassification>('chat.modelChange', {
 							fromModel: previousModel?.metadata.vendor === 'copilot' ? new TelemetryTrustedValue(previousModel.identifier) : 'unknown',
@@ -123,8 +154,8 @@ function modelDelegateToWidgetActionsProvider(delegate: IModelPickerDelegate, te
 				} satisfies IActionWidgetDropdownAction;
 			});
 
-			// Combine standard and custom models
-			return [...standardModelActions, ...customModelActions];
+			// Combine standard models, visible custom models, and hidden custom models (searchOnly)
+			return [...standardModelActions, ...customModelActions, ...hiddenModelActions];
 		}
 	};
 }
@@ -260,9 +291,11 @@ export class ModelPickerActionItem extends ChatInputPickerActionViewItem {
 		};
 
 		const modelPickerActionWidgetOptions: Omit<IActionWidgetDropdownOptions, 'label' | 'labelRenderer'> = {
-			actionProvider: modelDelegateToWidgetActionsProvider(delegate, telemetryService, customLanguageModelsService),
+			actionProvider: modelDelegateToWidgetActionsProvider(delegate, telemetryService, customLanguageModelsService, actionWidgetService),
 			actionBarActionProvider: getModelPickerActionBarActionProvider(commandService, chatEntitlementService, productService, customLanguageModelsService),
 			reporter: { name: 'ChatModelPicker', includeOptions: true },
+			searchable: true,
+			maxVisibleItems: 10,
 		};
 
 		super(actionWithLabel, widgetOptions ?? modelPickerActionWidgetOptions, pickerOptions, actionWidgetService, keybindingService, contextKeyService, telemetryService);

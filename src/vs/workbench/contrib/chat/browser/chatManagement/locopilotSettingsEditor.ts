@@ -98,6 +98,7 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 	private listModelsPanel!: HTMLElement;
 	private listModelsContainer!: HTMLElement;
 	private agentSettingsPanel!: HTMLElement;
+	private modelSearchQuery: string = '';
 
 	// Add Language Model form
 	private addFormModelTypeSelectBox!: SelectBox;
@@ -762,11 +763,14 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 
 	private renderListModels(): void {
 		if (!this.listModelsContainer) { return; }
-		// Preserve scroll position so re-renders don't jump the list
 		const savedScroll = this.contentsContainer?.scrollTop ?? 0;
+		// Track whether the search input had focus so we can restore it after re-render
+		const activeEl = DOM.getActiveWindow().document.activeElement;
+		const searchWasFocused = this.listModelsContainer.contains(activeEl) &&
+			(activeEl as HTMLElement)?.classList?.contains('models-search-input');
 		DOM.clearNode(this.listModelsContainer);
-		const models = this.customLanguageModelsService.getCustomModels();
-		if (models.length === 0) {
+		const allModels = this.customLanguageModelsService.getCustomModels();
+		if (allModels.length === 0) {
 			const emptyContainer = DOM.append(this.listModelsContainer, $('.models-list-empty'));
 			const icon = DOM.append(emptyContainer, $('.empty-icon'));
 			icon.appendChild(renderIcon(Codicon.add));
@@ -779,10 +783,61 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 			}));
 			return;
 		}
-		const title = DOM.append(this.listModelsContainer, $('h2.models-list-title'));
+
+		// Sticky top bar: title + search
+		const stickyTop = DOM.append(this.listModelsContainer, $('.models-list-sticky-top'));
+		const title = DOM.append(stickyTop, $('h2.models-list-title'));
 		title.textContent = localize('customLanguageModels.list.title', 'My Models');
-		const listContainer = DOM.append(this.listModelsContainer, $('.models-list-container'));
-		models.forEach((model: ICustomLanguageModel) => this.renderListModelItem(model, listContainer));
+		const searchWrap = DOM.append(stickyTop, $('.models-search-wrap'));
+		const searchInput = DOM.append(searchWrap, $('input.models-search-input')) as HTMLInputElement;
+		searchInput.type = 'text';
+		searchInput.placeholder = localize('customLanguageModels.search.placeholder', 'Search by name, provider…');
+		searchInput.value = this.modelSearchQuery;
+		searchInput.addEventListener('input', () => {
+			this.modelSearchQuery = searchInput.value;
+			this.renderListModels();
+		});
+		if (searchWasFocused) { searchInput.focus(); }
+
+		const q = this.modelSearchQuery.toLowerCase().trim();
+		const matchesSearch = (m: ICustomLanguageModel): boolean => {
+			if (!q) { return true; }
+			const label = getCustomModelListLabel(m).toLowerCase();
+			return label.includes(q) || (m.provider || '').toLowerCase().includes(q) || (m.modelName || '').toLowerCase().includes(q) || (m.type || '').toLowerCase().includes(q);
+		};
+
+		const sortAZ = (a: ICustomLanguageModel, b: ICustomLanguageModel) =>
+			getCustomModelListLabel(a).localeCompare(getCustomModelListLabel(b));
+
+		const visibleModels = allModels.filter(m => !m.hidden && matchesSearch(m)).sort(sortAZ);
+		const hiddenModels = allModels.filter(m => m.hidden && matchesSearch(m)).sort(sortAZ);
+
+		// Section: visible models
+		const visibleHeader = DOM.append(this.listModelsContainer, $('.models-section-header'));
+		visibleHeader.textContent = localize('customLanguageModels.section.visible', 'Visible on model picker');
+		const visibleContainer = DOM.append(this.listModelsContainer, $('.models-list-container'));
+		if (visibleModels.length === 0) {
+			const noResults = DOM.append(visibleContainer, $('.models-section-empty'));
+			noResults.textContent = q
+				? localize('customLanguageModels.section.visible.noSearch', 'No visible models match your search')
+				: localize('customLanguageModels.section.visible.none', 'No visible models');
+		} else {
+			visibleModels.forEach((model: ICustomLanguageModel) => this.renderListModelItem(model, visibleContainer));
+		}
+
+		// Section: hidden models
+		const hiddenHeader = DOM.append(this.listModelsContainer, $('.models-section-header.models-section-header-hidden'));
+		hiddenHeader.textContent = localize('customLanguageModels.section.hidden', 'Hidden from model picker');
+		const hiddenContainer = DOM.append(this.listModelsContainer, $('.models-list-container'));
+		if (hiddenModels.length === 0) {
+			const noResults = DOM.append(hiddenContainer, $('.models-section-empty'));
+			noResults.textContent = q
+				? localize('customLanguageModels.section.hidden.noSearch', 'No hidden models match your search')
+				: localize('customLanguageModels.section.hidden.none', 'No hidden models');
+		} else {
+			hiddenModels.forEach((model: ICustomLanguageModel) => this.renderListModelItem(model, hiddenContainer));
+		}
+
 		if (this.contentsContainer) { this.contentsContainer.scrollTop = savedScroll; }
 	}
 
@@ -827,6 +882,7 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 			const hideWrap = DOM.append(actionsContainer, $('.model-action-hide'));
 			const hideButton = this._register(new Button(hideWrap, { ...defaultButtonStyles, secondary: true }));
 			hideButton.label = model.hidden ? localize('customLanguageModels.show', 'Show') : localize('customLanguageModels.hide', 'Hide');
+			hideButton.element.classList.add(model.hidden ? 'model-btn-show' : 'model-btn-hide');
 			this._register(hideButton.onDidClick(async () => {
 				await this.customLanguageModelsService.hideCustomModel(model.id, !model.hidden);
 			}));

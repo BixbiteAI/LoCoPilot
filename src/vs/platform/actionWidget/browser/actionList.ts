@@ -65,6 +65,19 @@ export interface IActionListItem<T> {
 	 * Optional toolbar actions shown when the item is focused or hovered.
 	 */
 	readonly toolbarActions?: IAction[];
+	/**
+	 * When true, only show this item when there is an active search query.
+	 */
+	readonly searchOnly?: boolean;
+	/**
+	 * When true, the item row is styled as the currently selected option.
+	 */
+	readonly checked?: boolean;
+}
+
+export interface IActionListOptions {
+	searchable?: boolean;
+	maxVisibleItems?: number;
 }
 
 interface IActionMenuTemplateData {
@@ -210,6 +223,8 @@ class ActionItemRenderer<T> implements IListRenderer<IActionListItem<T>, IAction
 		const actionTitle = this._keybindingService.lookupKeybinding(acceptSelectedActionCommand)?.getLabel();
 		const previewTitle = this._keybindingService.lookupKeybinding(previewSelectedActionCommand)?.getLabel();
 		data.container.classList.toggle('option-disabled', element.disabled);
+		data.container.classList.toggle('option-checked', !!element.checked);
+		data.container.classList.toggle('search-only', !!element.searchOnly);
 		if (element.hover !== undefined) {
 			// Don't show tooltip when hover content is configured - the rich hover will show instead
 			data.container.title = '';
@@ -268,8 +283,12 @@ export class ActionList<T> extends Disposable {
 	private readonly _actionLineHeight = 28;
 	private readonly _headerLineHeight = 28;
 	private readonly _separatorLineHeight = 8;
+	private readonly _searchInputHeight = 36;
 
 	private readonly _allMenuItems: readonly IActionListItem<T>[];
+	private _visibleItems: readonly IActionListItem<T>[] = [];
+	private _filterQuery: string = '';
+	private _searchInput: HTMLInputElement | undefined;
 
 	private readonly cts = this._register(new CancellationTokenSource());
 
@@ -281,6 +300,7 @@ export class ActionList<T> extends Disposable {
 		items: readonly IActionListItem<T>[],
 		private readonly _delegate: IActionListDelegate<T>,
 		accessibilityProvider: Partial<IListAccessibilityProvider<IActionListItem<T>>> | undefined,
+		private readonly _listOptions: IActionListOptions | undefined,
 		@IContextViewService private readonly _contextViewService: IContextViewService,
 		@IKeybindingService private readonly _keybindingService: IKeybindingService,
 		@ILayoutService private readonly _layoutService: ILayoutService,
@@ -289,6 +309,36 @@ export class ActionList<T> extends Disposable {
 		super();
 		this.domNode = document.createElement('div');
 		this.domNode.classList.add('actionList');
+
+		if (_listOptions?.searchable) {
+			const searchContainer = dom.$('div.action-list-search-container');
+			this._searchInput = dom.$('input.action-list-search-input') as HTMLInputElement;
+			this._searchInput.type = 'text';
+			this._searchInput.placeholder = 'Search models…';
+			this._searchInput.setAttribute('autocomplete', 'off');
+			this._searchInput.setAttribute('spellcheck', 'false');
+			searchContainer.appendChild(this._searchInput);
+			this.domNode.appendChild(searchContainer);
+
+			this._register(dom.addDisposableListener(this._searchInput, dom.EventType.INPUT, () => {
+				this._filterQuery = this._searchInput!.value;
+				this._updateFilter();
+			}));
+
+			// Prevent arrow keys in search from propagating to the list widget
+			this._register(dom.addDisposableListener(this._searchInput, dom.EventType.KEY_DOWN, (e) => {
+				if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+					e.preventDefault();
+					if (e.key === 'ArrowDown') { this.focusNext(); }
+					else { this.focusPrevious(); }
+				} else if (e.key === 'Enter') {
+					e.preventDefault();
+					this.acceptSelected();
+				} else if (e.key === 'Escape') {
+					this.hide(true);
+				}
+			}));
+		}
 		const virtualDelegate: IListVirtualDelegate<IActionListItem<T>> = {
 			getHeight: element => {
 				switch (element.kind) {
@@ -350,8 +400,43 @@ export class ActionList<T> extends Disposable {
 		this._register(this._list.onDidChangeSelection(e => this.onListSelection(e)));
 
 		this._allMenuItems = items;
-		this._list.splice(0, this._list.length, this._allMenuItems);
+		// Without a search query, hide searchOnly items, then sort A-Z
+		const initialVisible = items.filter(i => !i.searchOnly);
+		this._visibleItems = this._sortItems(initialVisible as IActionListItem<T>[]);
+		this._list.splice(0, this._list.length, this._visibleItems);
 
+		if (this._list.length) {
+			this.focusNext();
+		}
+	}
+
+	private _sortItems(items: IActionListItem<T>[]): IActionListItem<T>[] {
+		// Only sort action items; leave headers and separators in place
+		return [...items].sort((a, b) => {
+			if (a.kind !== ActionListItemKind.Action || b.kind !== ActionListItemKind.Action) { return 0; }
+			if (!a.label || !b.label) { return 0; }
+			return a.label.localeCompare(b.label, undefined, { sensitivity: 'base' });
+		});
+	}
+
+	private _updateFilter(): void {
+		const query = this._filterQuery.toLowerCase().trim();
+		let filtered: IActionListItem<T>[];
+		if (!query) {
+			filtered = this._allMenuItems.filter(i => !i.searchOnly);
+		} else {
+			// In search mode: include searchOnly items, hide separators/headers, filter by label
+			filtered = this._allMenuItems.filter(item => {
+				if (item.kind === ActionListItemKind.Separator || item.kind === ActionListItemKind.Header) {
+					return false;
+				}
+				return item.label?.toLowerCase().includes(query);
+			});
+		}
+		// Always sort A-Z by label
+		this._visibleItems = this._sortItems(filtered as IActionListItem<T>[]);
+		this._list.splice(0, this._list.length, this._visibleItems);
+		// Focus first match
 		if (this._list.length) {
 			this.focusNext();
 		}
@@ -369,20 +454,14 @@ export class ActionList<T> extends Disposable {
 	}
 
 	layout(minWidth: number): number {
-		// Updating list height, depending on how many separators and headers there are.
-		const numHeaders = this._allMenuItems.filter(item => item.kind === 'header').length;
-		const numSeparators = this._allMenuItems.filter(item => item.kind === 'separator').length;
-		const itemsHeight = this._allMenuItems.length * this._actionLineHeight;
-		const heightWithHeaders = itemsHeight + numHeaders * this._headerLineHeight - numHeaders * this._actionLineHeight;
-		const heightWithSeparators = heightWithHeaders + numSeparators * this._separatorLineHeight - numSeparators * this._actionLineHeight;
-		this._list.layout(heightWithSeparators);
-		let maxWidth = minWidth;
+		const items = this._visibleItems;
 
-		if (this._allMenuItems.length >= 50) {
+		// Measure max width from currently visible items
+		let maxWidth = minWidth;
+		if (items.length >= 50) {
 			maxWidth = 380;
 		} else {
-			// For finding width dynamically (not using resize observer)
-			const itemWidths: number[] = this._allMenuItems.map((_, index): number => {
+			const itemWidths: number[] = items.map((_, index): number => {
 				const element = this._getRowElement(index);
 				if (element) {
 					element.style.width = 'auto';
@@ -392,18 +471,36 @@ export class ActionList<T> extends Disposable {
 				}
 				return 0;
 			});
-
-			// resize observer - can be used in the future since list widget supports dynamic height but not width
 			maxWidth = Math.max(...itemWidths, minWidth);
 		}
 
+		// When maxVisibleItems is set, use a fixed list height so the dropdown doesn't
+		// jump when the filter produces fewer results. Items scroll inside this fixed window.
 		const maxVhPrecentage = 0.7;
-		const height = Math.min(heightWithSeparators, this._layoutService.getContainer(dom.getWindow(this.domNode)).clientHeight * maxVhPrecentage);
-		this._list.layout(height, maxWidth);
+		const containerClientHeight = this._layoutService.getContainer(dom.getWindow(this.domNode)).clientHeight;
+		let listHeight: number;
+		if (this._listOptions?.maxVisibleItems) {
+			const fixedHeight = this._listOptions.maxVisibleItems * this._actionLineHeight;
+			listHeight = Math.min(fixedHeight, containerClientHeight * maxVhPrecentage);
+		} else {
+			const numHeaders = items.filter(item => item.kind === 'header').length;
+			const numSeparators = items.filter(item => item.kind === 'separator').length;
+			const itemsHeight = items.length * this._actionLineHeight;
+			const heightWithHeaders = itemsHeight + numHeaders * this._headerLineHeight - numHeaders * this._actionLineHeight;
+			const heightWithSeparators = heightWithHeaders + numSeparators * this._separatorLineHeight - numSeparators * this._actionLineHeight;
+			listHeight = Math.min(heightWithSeparators, containerClientHeight * maxVhPrecentage);
+		}
 
-		this.domNode.style.height = `${height}px`;
+		this._list.layout(listHeight, maxWidth);
 
-		this._list.domFocus();
+		const totalHeight = listHeight + (this._searchInput ? this._searchInputHeight : 0);
+		this.domNode.style.height = `${totalHeight}px`;
+
+		if (this._searchInput) {
+			this._searchInput.focus();
+		} else {
+			this._list.domFocus();
+		}
 		return maxWidth;
 	}
 

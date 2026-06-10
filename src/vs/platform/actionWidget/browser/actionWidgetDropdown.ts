@@ -6,7 +6,7 @@
 import { IActionWidgetService } from './actionWidget.js';
 import { IAction } from '../../../base/common/actions.js';
 import { BaseDropdown, IActionProvider, IBaseDropdownOptions } from '../../../base/browser/ui/dropdown/dropdown.js';
-import { ActionListItemKind, IActionListDelegate, IActionListItem, IActionListItemHover } from './actionList.js';
+import { ActionListItemKind, IActionListDelegate, IActionListItem, IActionListItemHover, IActionListOptions } from './actionList.js';
 import { ThemeIcon } from '../../../base/common/themables.js';
 import { Codicon } from '../../../base/common/codicons.js';
 import { getActiveElement, isHTMLElement } from '../../../base/browser/dom.js';
@@ -26,6 +26,10 @@ export interface IActionWidgetDropdownAction extends IAction {
 	 * Optional toolbar actions shown when the item is focused or hovered.
 	 */
 	toolbarActions?: IAction[];
+	/**
+	 * When true, only show this item when there is an active search query.
+	 */
+	searchOnly?: boolean;
 }
 
 // TODO @lramos15 - Should we just make IActionProvider templated?
@@ -33,7 +37,7 @@ export interface IActionWidgetDropdownActionProvider {
 	getActions(): IActionWidgetDropdownAction[];
 }
 
-export interface IActionWidgetDropdownOptions extends IBaseDropdownOptions {
+export interface IActionWidgetDropdownOptions extends IBaseDropdownOptions, IActionListOptions {
 	// These are the actions that are shown in the action widget split up by category
 	readonly actions?: IActionWidgetDropdownAction[];
 	readonly actionProvider?: IActionWidgetDropdownActionProvider;
@@ -126,6 +130,8 @@ export class ActionWidgetDropdown extends BaseDropdown {
 					description: action.description,
 					hover: action.hover,
 					toolbarActions: action.toolbarActions,
+					searchOnly: action.searchOnly,
+					checked: action.checked,
 					kind: ActionListItemKind.Action,
 					canPreview: false,
 					group: { title: '', icon: action.icon ?? ThemeIcon.fromId(action.checked ? Codicon.check.id : Codicon.blank.id) },
@@ -200,7 +206,8 @@ export class ActionWidgetDropdown extends BaseDropdown {
 			this._options.getAnchor?.() ?? this.element,
 			undefined,
 			actionBarActions,
-			accessibilityProvider
+			accessibilityProvider,
+			{ searchable: this._options.searchable, maxVisibleItems: this._options.maxVisibleItems }
 		);
 	}
 

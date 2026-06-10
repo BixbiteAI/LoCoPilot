@@ -215,3 +215,49 @@
 	gap: 4px;
 	font-size: 12px;
 }
+
+/* Search input inside action list */
+.actionList .action-list-search-container {
+	padding: 4px 4px 2px 4px;
+}
+
+.actionList .action-list-search-input {
+	width: 100%;
+	box-sizing: border-box;
+	background: var(--vscode-input-background);
+	color: var(--vscode-input-foreground);
+	border: 1px solid var(--vscode-input-border, transparent);
+	border-radius: 3px;
+	padding: 4px 8px;
+	font-size: 12px;
+	font-family: inherit;
+	outline: none;
+	height: 26px;
+}
+
+.actionList .action-list-search-input:focus {
+	border-color: var(--vscode-focusBorder);
+}
+
+.actionList .action-list-search-input::placeholder {
+	color: var(--vscode-input-placeholderForeground);
+}
+
+/* Scrollbar gutter so description text doesn't overlap the scrollbar */
+.actionList .monaco-scrollable-element {
+	scrollbar-gutter: stable;
+}
+
+.action-widget .monaco-list-row.action .description {
+	margin-right: 4px;
+}
+
+/* Highlight the currently-selected (checked) item */
+.action-widget .monaco-list-row.action.option-checked {
+	background-color: var(--vscode-list-inactiveSelectionBackground);
+}
+
+/* Always show toolbar for hidden/searchOnly items */
+.action-widget .monaco-list-row.action.search-only .action-list-item-toolbar {
+	display: flex;
+}

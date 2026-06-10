@@ -7,13 +7,83 @@
 	display: flex;
 	flex-direction: column;
 	padding: 20px 20px 40px;
+	/* The sticky top bar needs the editor background to cover content scrolling beneath it.
+	 * overflow: visible is intentional so position:sticky works relative to the scroll ancestor. */
+}
+
+/* Sticky top bar: title + search.
+ * Negative top margin + matching padding-top pulls the element up into the container's
+ * 20px padding zone so the background covers content that scrolls behind it. */
+.models-list-sticky-top {
+	position: sticky;
+	top: -20px;
+	z-index: 10;
+	background: var(--vscode-editor-background);
+	margin-top: -20px;
+	padding-top: 20px;
+	padding-bottom: 12px;
+	margin-bottom: 4px;
 }
 
 .models-list-title {
-	margin: 0 0 24px 0;
+	margin: 0 0 10px 0;
 	font-size: 20px;
 	font-weight: 600;
 	color: var(--vscode-foreground);
+}
+
+/* Search bar */
+.models-search-wrap {
+	position: relative;
+}
+
+.models-search-input {
+	width: 100%;
+	box-sizing: border-box;
+	height: 28px;
+	padding: 4px 10px;
+	font-size: 13px;
+	font-family: inherit;
+	color: var(--vscode-input-foreground);
+	background: var(--vscode-input-background);
+	border: 1px solid var(--vscode-input-border, transparent);
+	border-radius: 4px;
+	outline: none;
+}
+
+.models-search-input:focus {
+	border-color: var(--vscode-focusBorder);
+	outline: none;
+}
+
+.models-search-input::placeholder {
+	color: var(--vscode-input-placeholderForeground);
+}
+
+/* Section headers (sticky below the title+search bar).
+ * top = sticky-top.padding-top(20) + title(28) + title-margin(10) + search(28) + sticky-top.padding-bottom(12) - sticky-top.top-offset(20) = 78px */
+.models-section-header {
+	position: sticky;
+	top: 60px;
+	z-index: 9;
+	background: var(--vscode-editor-background);
+	font-size: 11px;
+	font-weight: 600;
+	text-transform: uppercase;
+	letter-spacing: 0.06em;
+	color: var(--vscode-descriptionForeground);
+	padding: 8px 0 6px 0;
+	margin-top: 8px;
+	border-bottom: 1px solid var(--vscode-settings-headerBorder);
+	margin-bottom: 10px;
+}
+
+.models-section-empty {
+	font-size: 12px;
+	color: var(--vscode-descriptionForeground);
+	padding: 10px 0;
+	font-style: italic;
+	opacity: 0.8;
 }
 
 .models-list-container {
@@ -84,7 +154,33 @@
 }
 
 .model-item.hidden {
-	opacity: 0.5;
+	/* Same background as visible models; distinction is via section grouping and button style only */
+}
+
+/* "Hide" button: accented - model is visible, clicking will hide it; draw attention so user knows it's an action */
+.model-action-hide .monaco-button.model-btn-hide {
+	border-color: var(--vscode-focusBorder);
+	color: var(--vscode-button-foreground);
+	background-color: var(--vscode-button-background);
+	opacity: 1;
+}
+
+.model-action-hide .monaco-button.model-btn-hide:hover {
+	background-color: var(--vscode-button-hoverBackground);
+}
+
+/* "Show" button: muted/ghost - model is already hidden, low-key until hovered */
+.model-action-hide .monaco-button.model-btn-show {
+	opacity: 0.55;
+	border-color: transparent;
+	background: transparent;
+	color: var(--vscode-foreground);
+}
+
+.model-action-hide .monaco-button.model-btn-show:hover {
+	opacity: 1;
+	border-color: var(--vscode-button-border, var(--vscode-contrastBorder, transparent));
+	background: var(--vscode-toolbar-hoverBackground);
 }
 
 .model-item-row1 .model-name {
