@@ -12,7 +12,7 @@ import { CancellationToken } from '../../../../../base/common/cancellation.js';
 import { Codicon } from '../../../../../base/common/codicons.js';
 import { toErrorMessage } from '../../../../../base/common/errorMessage.js';
 import { Emitter, Event } from '../../../../../base/common/event.js';
-import { MarkdownString } from '../../../../../base/common/htmlContent.js';
+import { MarkdownString, createMarkdownCommandLink } from '../../../../../base/common/htmlContent.js';
 import { Lazy } from '../../../../../base/common/lazy.js';
 import { Disposable, DisposableStore, IDisposable } from '../../../../../base/common/lifecycle.js';
 import { URI } from '../../../../../base/common/uri.js';
@@ -35,7 +35,9 @@ import { IChatProgress, IChatService } from '../../common/chatService/chatServic
 import { IChatRequestToolEntry, IChatRequestVariableEntry, isPromptFileVariableEntry, isPromptTextVariableEntry } from '../../common/attachments/chatVariableEntries.js';
 import { ChatAgentLocation, ChatConfiguration, ChatModeKind } from '../../common/constants.js';
 import { ChatMessageRole, IChatMessage, ILanguageModelsService } from '../../common/languageModels.js';
-import { ICustomLanguageModelsService } from '../../common/customLanguageModelsService.js';
+import { ICustomLanguageModelsService, getCustomModelListLabel, needsDownloadOrPullRetry } from '../../common/customLanguageModelsService.js';
+import { findCatalogEntry } from '../locopilotModelCatalog.js';
+import { LOCOPILOT_SETTINGS_SECTION_LIST_MODELS } from '../chatManagement/locopilotSettingsEditorInput.js';
 import { IFileService } from '../../../../../platform/files/common/files.js';
 import { ITextModelService } from '../../../../../editor/common/services/resolverService.js';
 import { basename, relativePath } from '../../../../../base/common/resources.js';
@@ -897,6 +899,82 @@ export class AICodeActionsHelper {
 	}
 }
 
+// ---- Download prompt helpers (module-level so they can be used without a class instance) ----------
+
+/** Human-readable size string from a byte count. */
+function _formatModelBytes(bytes: number | undefined): string | undefined {
+	if (!bytes || bytes <= 0) { return undefined; }
+	const gb = bytes / (1024 ** 3);
+	return gb >= 1 ? `${gb.toFixed(1)} GB` : `${Math.round(bytes / (1024 ** 2))} MB`;
+}
+
+/**
+ * The command ids referenced in the download prompt. They MUST be listed in `isTrusted.enabledCommands`
+ * on the MarkdownString so the chat renderer allows them as clickable links.
+ */
+const DOWNLOAD_PROMPT_TRUSTED_COMMANDS = [
+	'locopilot.downloadModel',
+	'locopilot.cancelModelDownload',
+	'workbench.action.chat.openLoCoPilotSettings',
+] as const;
+
+/**
+ * Build the markdown shown in the chat panel when the user picks a not-yet-downloaded model.
+ * Returns a {@link MarkdownString} with `isTrusted` set so command-scheme links are clickable.
+ */
+function buildDownloadPromptMarkdown(model: Parameters<typeof getCustomModelListLabel>[0]): MarkdownString {
+	const label = getCustomModelListLabel(model);
+	const openModelList = createMarkdownCommandLink({
+		title: 'Open Model List',
+		id: 'workbench.action.chat.openLoCoPilotSettings',
+		arguments: [{ section: LOCOPILOT_SETTINGS_SECTION_LIST_MODELS }],
+	});
+
+	let text: string;
+
+	if (model.isDownloading) {
+		const pct = model.downloadProgress ?? 0;
+		const stopLink = createMarkdownCommandLink({
+			title: 'Stop Download',
+			id: 'locopilot.cancelModelDownload',
+			arguments: [model.id],
+		});
+		text = [
+			`**${label}** is downloading - ${pct}% complete.`,
+			'',
+			`Once it finishes, send your message again to start chatting. ${stopLink} | ${openModelList}`,
+		].join('\n');
+	} else {
+		const downloadLink = createMarkdownCommandLink({
+			title: `Download ${label}`,
+			id: 'locopilot.downloadModel',
+			arguments: [model.id],
+		});
+
+		const lines: string[] = [`**${label}** hasn't been downloaded yet.`];
+		const entry = findCatalogEntry(model.modelName, model.format);
+		if (entry) {
+			const specs: string[] = [entry.engine === 'mlx' ? 'MLX · Apple Silicon' : `GGUF · ${entry.format}`];
+			const size = _formatModelBytes(entry.approxSizeBytes);
+			if (size) { specs.push(`~${size}`); }
+			specs.push(`${entry.minRamGB} GB+ RAM recommended`);
+			if (entry.blurb) { lines.push('', `_${entry.blurb}_`); }
+			lines.push('', specs.map(s => `\`${s}\``).join('  '));
+		}
+		lines.push(
+			'',
+			`${downloadLink} - once it finishes, send your message again.`,
+			'',
+			`Or ${openModelList} to browse and download a different model.`,
+		);
+		text = lines.join('\n');
+	}
+
+	return new MarkdownString(text, { isTrusted: { enabledCommands: [...DOWNLOAD_PROMPT_TRUSTED_COMMANDS] } });
+}
+
+// -----------------------------------------------------------------------------------------------------
+
 /**
  * Custom built-in LoCoPilot agent that works without requiring extensions.
  * This agent tries to use existing agents when available, otherwise provides basic functionality.
@@ -1725,16 +1803,20 @@ Message: ${firstMessage.substring(0, 500)}`;
 		// Also check the widget's current language model selection
 		const widgetModelId = widget?.input.currentLanguageModel;
 
-		// Check custom models service directly
-		const customModels = this.customLanguageModelsService.getChatSelectableCustomModels();
+		// Check custom models service directly.
+		// Use ALL visible models (not just chat-ready) so a selected not-yet-downloaded catalog model is
+		// found and its id is passed along - sendChatRequest will then show the download prompt.
+		const allCustomModels = this.customLanguageModelsService.getVisibleCustomModels();
+		const chatSelectableCustomModels = this.customLanguageModelsService.getChatSelectableCustomModels();
 		const selectedCustomModelId = this.customLanguageModelsService.getSelectedCustomModelId();
 
 		// Try to find a custom model - check userSelectedModelId first, then widget's selection, then selected custom model, then any custom model
 		let modelId = userSelectedModelId || widgetModelId || selectedCustomModelId;
 
-		// If no explicit selection, try to find any custom model from the service
-		if (!modelId && customModels.length > 0) {
-			modelId = customModels[0].id;
+		// If no explicit selection, fall back to any downloaded (chat-ready) model so we don't accidentally
+		// queue a download prompt when the user hasn't picked one yet.
+		if (!modelId && chatSelectableCustomModels.length > 0) {
+			modelId = chatSelectableCustomModels[0].id;
 			this._log(`[LoCoPilot] No explicit model selected, using first available custom model: ${modelId}`);
 		}
 
@@ -1750,7 +1832,7 @@ Message: ${firstMessage.substring(0, 500)}`;
 
 		this._log(`[LoCoPilot] Invoke - userSelectedModelId: ${userSelectedModelId}, widgetModelId: ${widgetModelId}, selectedCustomModelId: ${selectedCustomModelId}, final modelId: ${modelId}`);
 		this._log(`[LoCoPilot] Available model IDs from service: ${allModelIds.join(', ') || '(none)'}`);
-		this._log(`[LoCoPilot] Available custom models: ${customModels.map(m => m.id).join(', ') || '(none)'}`);
+		this._log(`[LoCoPilot] Available custom models: ${allCustomModels.map(m => m.id).join(', ') || '(none)'}`);
 
 		if (modelId) {
 			this._log(`[LoCoPilot] Using model: ${modelId}`);
@@ -1842,6 +1924,14 @@ Message: ${firstMessage.substring(0, 500)}`;
 					messages = await this.buildMessages(requestWithMergedVars, historyToUse, modelMetadata, modeInfo);
 					this._log(`[LoCoPilot] After summarization: ${historyToUse.length} history entries, ${messages.length} messages`);
 				}
+				// Not-downloaded catalog model: show a clickable download prompt with trusted command links.
+				const selectedModel = this.customLanguageModelsService.getCustomModels().find(m => m.id === modelId);
+				if (selectedModel && (selectedModel.provider === 'huggingface' || selectedModel.provider === 'ollama')
+					&& (selectedModel.isDownloading || needsDownloadOrPullRetry(selectedModel))) {
+					progress([{ kind: 'markdownContent', content: buildDownloadPromptMarkdown(selectedModel) }]);
+					return {};
+				}
+
 				// Main agentic loop - handle tool calls iteratively
 				return this.unifiedAgent.run(request, progress, messages, modelId, token);
 			} catch (e) {

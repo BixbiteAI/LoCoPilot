@@ -177,6 +177,11 @@ export class LoCoPilotModelDownloadService extends Disposable implements IWorkbe
 				super({ id: 'locopilot.downloadModel', title: 'Download Model' });
 			}
 			async run(accessor: ServicesAccessor, modelId: string): Promise<void> {
+				// If already downloading this model, do nothing - the link in the chat panel
+				// stays visible but is now harmless to click (won't cancel+restart the download).
+				if (self._downloadTokens.has(modelId)) {
+					return;
+				}
 				await self.downloadModel(modelId);
 			}
 		});

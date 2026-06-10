@@ -64,6 +64,7 @@ import { ILoCoPilotFileLog, LoCoPilotFileLog } from './locopilotFileLog.js';
 import { ILoCoPilotAgentSettingsService, LoCoPilotAgentSettingsService } from './locopilotAgentSettingsService.js';
 import { LoCoPilotLanguageModelProvider } from './locopilotLanguageModelProvider.js';
 import { LoCoPilotModelDownloadService } from './locopilotModelDownloadService.js';
+import { LoCoPilotCatalogSeedContribution } from './locopilotCatalogSeedService.js';
 import { ILoCoPilotLocalModelRunner, LoCoPilotLocalModelRunner } from './locopilotLocalModelRunner.js';
 import { ILoCoPilotOllamaService, LoCoPilotOllamaService } from './locopilotOllamaService.js';
 import { LanguageModelToolsExtensionPointHandler } from '../common/tools/languageModelToolsContribution.js';
@@ -123,7 +124,8 @@ import { QuickChatService } from './widgetHosts/chatQuick.js';
 import { ChatResponseAccessibleView } from './accessibility/chatResponseAccessibleView.js';
 import { ChatTerminalOutputAccessibleView } from './accessibility/chatTerminalOutputAccessibleView.js';
 import { ChatSetupContribution, ChatTeardownContribution } from './chatSetup/chatSetupContributions.js';
-import { ChatStatusBarEntry } from './chatStatus/chatStatusEntry.js';
+// ChatStatusBarEntry: import disabled along with its (commented-out) registration below.
+// import { ChatStatusBarEntry } from './chatStatus/chatStatusEntry.js';
 import { ChatVariablesService } from './attachments/chatVariables.js';
 import { ChatWidget } from './widget/chatWidget.js';
 import { ChatCodeBlockContextProviderService } from './codeBlockContextProviderService.js';
@@ -1499,6 +1501,7 @@ registerWorkbenchContribution2(LanguageModelToolsExtensionPointHandler.ID, Langu
 registerWorkbenchContribution2(ChatPromptFilesExtensionPointHandler.ID, ChatPromptFilesExtensionPointHandler, WorkbenchPhase.BlockRestore);
 registerWorkbenchContribution2('locopilot.languageModelProvider', LoCoPilotLanguageModelProvider, WorkbenchPhase.AfterRestored);
 registerWorkbenchContribution2(LoCoPilotModelDownloadService.ID, LoCoPilotModelDownloadService, WorkbenchPhase.Eventually);
+registerWorkbenchContribution2(LoCoPilotCatalogSeedContribution.ID, LoCoPilotCatalogSeedContribution, WorkbenchPhase.Eventually);
 registerWorkbenchContribution2(ChatCompatibilityNotifier.ID, ChatCompatibilityNotifier, WorkbenchPhase.Eventually);
 registerWorkbenchContribution2(CodeBlockActionRendering.ID, CodeBlockActionRendering, WorkbenchPhase.BlockRestore);
 registerWorkbenchContribution2(ChatImplicitContextContribution.ID, ChatImplicitContextContribution, WorkbenchPhase.Eventually);

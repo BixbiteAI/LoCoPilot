@@ -25,6 +25,7 @@ import { ILanguageModelChatMetadataAndIdentifier } from '../../../common/languag
 import { DEFAULT_MODEL_PICKER_CATEGORY } from '../../../common/widget/input/modelPickerWidget.js';
 import { ChatInputPickerActionViewItem, IChatInputPickerOptions } from './chatInputPickerActionItem.js';
 import { ICustomLanguageModelsService, getCustomModelListLabel, isCustomModelReadyForChat } from '../../../common/customLanguageModelsService.js';
+import { LOCOPILOT_SETTINGS_SECTION_LIST_MODELS } from '../../chatManagement/locopilotSettingsEditorInput.js';
 import { ExtensionIdentifier } from '../../../../../../platform/extensions/common/extensions.js';
 
 export interface IModelPickerDelegate {
@@ -49,28 +50,36 @@ type ChatModelChangeEvent = {
 function modelDelegateToWidgetActionsProvider(delegate: IModelPickerDelegate, telemetryService: ITelemetryService, customLanguageModelsService: ICustomLanguageModelsService): IActionWidgetDropdownActionProvider {
 	return {
 		getActions: () => {
-			const models = delegate.getModels();
-			const customModels = customLanguageModelsService.getChatSelectableCustomModels();
+			// Custom models are sourced here (not from delegate.getModels()), so locopilot vendor models are
+			// filtered out of the standard list below to avoid listing them twice. Use the VISIBLE set (not
+			// just chat-ready) so curated not-yet-downloaded catalog models appear; selecting one and sending
+			// shows an in-chat download prompt with its configuration + a Download button.
+			const models = delegate.getModels().filter(m => m.metadata.vendor !== 'locopilot');
+			const customModels = customLanguageModelsService.getVisibleCustomModels();
 
 			// Convert custom models to ILanguageModelChatMetadataAndIdentifier format
 			const selectedCustomModelId = customLanguageModelsService.getSelectedCustomModelId();
-			const customModelActions: IActionWidgetDropdownAction[] = customModels.map(customModel => ({
-				id: customModel.id,
-				enabled: true,
-				checked: customModel.id === selectedCustomModelId,
-				category: { label: 'Custom Models', order: 100 },
-				class: undefined,
-				description: `${customModel.type === 'cloud' ? 'Cloud' : 'Local'} | ${customModel.provider}`,
-				tooltip: getCustomModelListLabel(customModel),
-				label: getCustomModelListLabel(customModel),
-				hover: { content: localize('chat.modelPicker.customModel.description', "Custom {0} model from {1}", customModel.type, customModel.provider) },
-				run: () => {
-					// Store selected custom model ID
-					customLanguageModelsService.setSelectedCustomModelId(customModel.id);
-					// Update the label to show selected model
-					// The label will be updated via the autorun in ModelPickerActionItem constructor
-				}
-			}));
+			const customModelActions: IActionWidgetDropdownAction[] = customModels.map(customModel => {
+				const ready = isCustomModelReadyForChat(customModel);
+				const baseDesc = `${customModel.type === 'cloud' ? 'Cloud' : 'Local'} | ${customModel.provider}`;
+				return {
+					id: customModel.id,
+					enabled: true,
+					checked: customModel.id === selectedCustomModelId,
+					category: { label: 'Custom Models', order: 100 },
+					class: undefined,
+					description: ready ? baseDesc : `${baseDesc} | ${localize('chat.modelPicker.notDownloaded', 'not downloaded')}`,
+					tooltip: getCustomModelListLabel(customModel),
+					label: getCustomModelListLabel(customModel),
+					hover: { content: localize('chat.modelPicker.customModel.description', "Custom {0} model from {1}", customModel.type, customModel.provider) },
+					run: () => {
+						// Store selected custom model ID
+						customLanguageModelsService.setSelectedCustomModelId(customModel.id);
+						// Update the label to show selected model
+						// The label will be updated via the autorun in ModelPickerActionItem constructor
+					}
+				};
+			});
 
 			if (models.length === 0 && customModelActions.length === 0) {
 				// Show a fake "Auto" entry when no models are available
@@ -125,6 +134,19 @@ function getModelPickerActionBarActionProvider(commandService: ICommandService, 
 	const actionProvider: IActionProvider = {
 		getActions: () => {
 			const additionalActions: IAction[] = [];
+
+			// Always offer a way to reach the full model list, where users can Show hidden catalog models,
+			// download, hide, or delete. The picker itself only shows the curated/visible few.
+			additionalActions.push({
+				id: 'locopilotManageModels',
+				label: localize('chat.manageModels', "Manage Models"),
+				enabled: true,
+				tooltip: localize('chat.manageModels.tooltip', "Open the model list to show, hide, download, or remove models"),
+				class: undefined,
+				run: () => {
+					commandService.executeCommand('workbench.action.chat.openLoCoPilotSettings', { section: LOCOPILOT_SETTINGS_SECTION_LIST_MODELS });
+				}
+			});
 
 			// Add "Original" option (existing Language Models screen)
 			if (
@@ -222,8 +244,8 @@ export class ModelPickerActionItem extends ChatInputPickerActionViewItem {
 		let initialLabel = localize('chat.modelPicker.auto', "Auto");
 
 		if (initialCustomModelId) {
-			const customModel = customLanguageModelsService.getChatSelectableCustomModels().find(m => m.id === initialCustomModelId);
-			if (customModel && isCustomModelReadyForChat(customModel)) {
+			const customModel = customLanguageModelsService.getCustomModels().find(m => m.id === initialCustomModelId);
+			if (customModel && !customModel.hidden) {
 				initialLabel = getCustomModelListLabel(customModel);
 			}
 		} else if (initialModel) {
@@ -253,8 +275,8 @@ export class ModelPickerActionItem extends ChatInputPickerActionViewItem {
 
 			// If a custom model is selected, use it; otherwise use the standard model
 			if (selectedCustomModelId) {
-				const customModel = customLanguageModelsService.getChatSelectableCustomModels().find(m => m.id === selectedCustomModelId);
-				if (customModel && isCustomModelReadyForChat(customModel)) {
+				const customModel = customLanguageModelsService.getCustomModels().find(m => m.id === selectedCustomModelId);
+				if (customModel && !customModel.hidden) {
 					// Create a synthetic model metadata for display
 					this.currentModel = {
 						identifier: customModel.id,
@@ -294,8 +316,8 @@ export class ModelPickerActionItem extends ChatInputPickerActionViewItem {
 			const model = delegate.currentModel.get();
 
 			if (selectedCustomModelId) {
-				const customModel = customLanguageModelsService.getChatSelectableCustomModels().find(m => m.id === selectedCustomModelId);
-				if (customModel && isCustomModelReadyForChat(customModel)) {
+				const customModel = customLanguageModelsService.getCustomModels().find(m => m.id === selectedCustomModelId);
+				if (customModel && !customModel.hidden) {
 					this.currentModel = {
 						identifier: customModel.id,
 						metadata: {

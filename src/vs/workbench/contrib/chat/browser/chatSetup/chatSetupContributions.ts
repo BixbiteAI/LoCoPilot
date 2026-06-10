@@ -309,6 +309,7 @@ export class ChatSetupContribution extends Disposable implements IWorkbenchContr
 			}
 		}
 
+		/* ChatSetupFromAccountsAction: disabled along with its (commented-out) registerAction2 below.
 		class ChatSetupFromAccountsAction extends Action2 {
 
 			constructor() {
@@ -336,6 +337,7 @@ export class ChatSetupContribution extends Disposable implements IWorkbenchContr
 				return commandService.executeCommand(CHAT_SETUP_ACTION_ID);
 			}
 		}
+		*/
 
 		const windowFocusListener = this._register(new MutableDisposable());
 		class UpgradePlanAction extends Action2 {

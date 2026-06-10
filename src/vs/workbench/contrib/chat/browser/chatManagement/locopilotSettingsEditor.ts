@@ -822,14 +822,14 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 				this.commandService.executeCommand('locopilot.cancelModelDownload', model.id);
 			}));
 		} else {
-			if (!needsDownloadOrPullRetry(model)) {
-				const hideWrap = DOM.append(actionsContainer, $('.model-action-hide'));
-				const hideButton = this._register(new Button(hideWrap, { ...defaultButtonStyles, secondary: true }));
-				hideButton.label = model.hidden ? localize('customLanguageModels.show', 'Show') : localize('customLanguageModels.hide', 'Hide');
-				this._register(hideButton.onDidClick(async () => {
-					await this.customLanguageModelsService.hideCustomModel(model.id, !model.hidden);
-				}));
-			}
+			// Hide/Show is available for every model regardless of download state, so users can control which
+			// models appear in the chat picker (including not-yet-downloaded catalog models).
+			const hideWrap = DOM.append(actionsContainer, $('.model-action-hide'));
+			const hideButton = this._register(new Button(hideWrap, { ...defaultButtonStyles, secondary: true }));
+			hideButton.label = model.hidden ? localize('customLanguageModels.show', 'Show') : localize('customLanguageModels.hide', 'Hide');
+			this._register(hideButton.onDidClick(async () => {
+				await this.customLanguageModelsService.hideCustomModel(model.id, !model.hidden);
+			}));
 			const deleteButton = this._register(new Button(actionsContainer, { ...defaultButtonStyles, secondary: true }));
 			deleteButton.label = localize('customLanguageModels.delete', 'Delete');
 			this._register(deleteButton.onDidClick(async () => {

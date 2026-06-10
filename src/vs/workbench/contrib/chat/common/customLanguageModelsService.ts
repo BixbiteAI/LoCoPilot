@@ -250,7 +250,7 @@ export class CustomLanguageModelsService extends Disposable implements ICustomLa
 		} catch (e) {
 			this.models = [];
 		}
-		const cleared = this._clearSelectedIfNotChatReady();
+		const cleared = this._clearSelectedIfUnavailable();
 		if (cleared) {
 			this._onDidChangeCustomModels.fire();
 		}
@@ -280,13 +280,16 @@ export class CustomLanguageModelsService extends Disposable implements ICustomLa
 		return `${SECRET_PREFIX}${modelId}:${type}`;
 	}
 
-	private _clearSelectedIfNotChatReady(): boolean {
+	private _clearSelectedIfUnavailable(): boolean {
 		const prev = this.selectedCustomModelId;
 		if (!prev) {
 			return false;
 		}
 		const model = this.models.find(m => m.id === prev);
-		if (model && isCustomModelReadyForChat(model)) {
+		// Keep the selection as long as the model still exists and is visible. A not-yet-downloaded or
+		// in-progress download stays selected - chat shows a download prompt for it - so the picker no
+		// longer resets to Auto mid-download. Only clear when the model was deleted or hidden.
+		if (model && !model.hidden) {
 			return false;
 		}
 		this.selectedCustomModelId = undefined;
@@ -421,7 +424,7 @@ export class CustomLanguageModelsService extends Disposable implements ICustomLa
 			}
 			this.models[index] = merged;
 			await this.saveModels();
-			this._clearSelectedIfNotChatReady();
+			this._clearSelectedIfUnavailable();
 			this._onDidChangeCustomModels.fire();
 		}
 	}

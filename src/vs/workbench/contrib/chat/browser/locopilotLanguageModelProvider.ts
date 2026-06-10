@@ -62,7 +62,9 @@ export class LoCoPilotLanguageModelProvider extends Disposable implements ILangu
 			vendor: 'locopilot',
 			displayName: 'LoCoPilot',
 			configuration: undefined,
-			managementCommand: undefined,
+			// Adds a "Manage LoCoPilot..." entry in the model picker that opens LoCoPilot Settings (the model
+			// list), where users can Show hidden catalog models, download, or manage them.
+			managementCommand: 'workbench.action.chat.openLoCoPilotSettings',
 			when: undefined
 		}], []);
 
@@ -170,7 +172,12 @@ export class LoCoPilotLanguageModelProvider extends Disposable implements ILangu
 	}
 
 	async provideLanguageModelChatInfo(options: ILanguageModelChatInfoOptions, token: CancellationToken): Promise<ILanguageModelChatMetadataAndIdentifier[]> {
-		const customModels = this.customLanguageModelsService.getChatSelectableCustomModels();
+		// Include not-yet-downloaded local models (catalog entries) so they are selectable in the picker;
+		// sendChatRequest then shows an in-chat download prompt with config + progress instead of an error.
+		// Sort A-Z by label so the model picker is alphabetical and easy to scan.
+		const customModels = this.customLanguageModelsService.getVisibleCustomModels()
+			.slice()
+			.sort((a, b) => getCustomModelListLabel(a).localeCompare(getCustomModelListLabel(b), undefined, { sensitivity: 'base', numeric: true }));
 		this._log(`[LoCoPilot Provider] provideLanguageModelChatInfo called, found ${customModels.length} custom models`);
 		const result = customModels.map(m => {
 			// Input/output budgets are derived from the single user-set context window.
@@ -213,6 +220,7 @@ export class LoCoPilotLanguageModelProvider extends Disposable implements ILangu
 		}
 
 		this._log(`[LoCoPilot Provider] Found model: ${getCustomModelListLabel(customModel)} (${customModel.provider}), sending request...`);
+
 		if (options.tools) {
 			this._log(`[LoCoPilot Provider] Tools provided: ${Array.isArray(options.tools) ? options.tools.length : 'unknown'}`);
 		}
