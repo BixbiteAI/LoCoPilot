@@ -964,8 +964,6 @@ function buildDownloadPromptMarkdown(model: Parameters<typeof getCustomModelList
 		lines.push(
 			'',
 			`${downloadLink} - once it finishes, send your message again.`,
-			'',
-			`Or ${openModelList} to browse and download a different model.`,
 		);
 		text = lines.join('\n');
 	}

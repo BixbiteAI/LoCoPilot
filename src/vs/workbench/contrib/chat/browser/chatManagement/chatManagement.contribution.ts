@@ -244,10 +244,11 @@ class ChatManagementActionsContribution extends Disposable implements IWorkbench
 					f1: true,
 				});
 			}
-			async run(accessor: ServicesAccessor, args?: { section?: string }) {
+			async run(accessor: ServicesAccessor, args?: { section?: string; focusModelId?: string }) {
 				const editorGroupsService = accessor.get(IEditorGroupsService);
 				const section = args && typeof args.section === 'string' ? args.section : undefined;
-				await editorGroupsService.activeGroup.openEditor(new LoCoPilotSettingsEditorInput(section), { pinned: true });
+				const focusModelId = args && typeof args.focusModelId === 'string' ? args.focusModelId : undefined;
+				await editorGroupsService.activeGroup.openEditor(new LoCoPilotSettingsEditorInput(section, focusModelId), { pinned: true });
 			}
 		}));
 

@@ -27,6 +27,8 @@ import { streamToBuffer } from '../../../../base/common/buffer.js';
 import { INotificationService } from '../../../../platform/notification/common/notification.js';
 import { toErrorMessage } from '../../../../base/common/errorMessage.js';
 import { CancellationError, isCancellationError } from '../../../../base/common/errors.js';
+import { ICommandService } from '../../../../platform/commands/common/commands.js';
+import { LOCOPILOT_SETTINGS_SECTION_LIST_MODELS } from './chatManagement/locopilotSettingsEditorInput.js';
 
 const HF_API_BASE = 'https://huggingface.co';
 const HF_RESOLVE = `${HF_API_BASE}`;
@@ -182,6 +184,12 @@ export class LoCoPilotModelDownloadService extends Disposable implements IWorkbe
 				if (self._downloadTokens.has(modelId)) {
 					return;
 				}
+				// Open the model list focused on this model so the user can track download progress.
+				const commandService = accessor.get(ICommandService);
+				commandService.executeCommand('workbench.action.chat.openLoCoPilotSettings', {
+					section: LOCOPILOT_SETTINGS_SECTION_LIST_MODELS,
+					focusModelId: modelId,
+				});
 				await self.downloadModel(modelId);
 			}
 		});

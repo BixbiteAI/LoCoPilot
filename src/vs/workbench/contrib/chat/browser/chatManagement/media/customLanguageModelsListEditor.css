@@ -60,11 +60,132 @@
 	color: var(--vscode-input-placeholderForeground);
 }
 
-/* Section headers (sticky below the title+search bar).
- * top = sticky-top.padding-top(20) + title(28) + title-margin(10) + search(28) + sticky-top.padding-bottom(12) - sticky-top.top-offset(20) = 78px */
+/* Filter row: fieldset/legend dropdowns + toggle switches */
+.models-filters-row {
+	display: flex;
+	flex-wrap: wrap;
+	gap: 8px 12px;
+	align-items: center;
+	margin-top: 10px;
+}
+
+/* Each filter is a <fieldset> with no border - label floats as a caption above the control */
+.models-filter {
+	display: inline-flex;
+	flex-direction: column;
+	align-items: flex-start;
+	margin: 0;
+	padding: 0;
+	border: none;
+	background: transparent;
+	gap: 3px;
+}
+
+/* <legend> as a small caption above */
+.models-filter-label {
+	font-size: 10px;
+	font-weight: 600;
+	text-transform: uppercase;
+	letter-spacing: 0.06em;
+	color: var(--vscode-descriptionForeground);
+	white-space: nowrap;
+	padding: 0;
+	line-height: 1;
+}
+
+/* Dropdown - single box, no nesting */
+.models-filter-select {
+	height: 26px;
+	padding: 0 22px 0 8px;
+	font-size: 12px;
+	font-family: inherit;
+	color: var(--vscode-settings-dropdownForeground, var(--vscode-foreground));
+	background-color: var(--vscode-settings-dropdownBackground, var(--vscode-dropdown-background, var(--vscode-input-background)));
+	background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16' fill='%23808080'><path d='M8 11L3 6h10z'/></svg>");
+	background-repeat: no-repeat;
+	background-position: right 5px center;
+	background-size: 11px;
+	border: 1px solid var(--vscode-settings-dropdownBorder, var(--vscode-dropdown-border, var(--vscode-input-border, rgba(128,128,128,0.4))));
+	border-radius: 4px;
+	outline: none;
+	cursor: pointer;
+	-webkit-appearance: none;
+	-moz-appearance: none;
+	appearance: none;
+}
+
+.models-filter-select:hover {
+	border-color: var(--vscode-focusBorder);
+}
+
+.models-filter-select:focus {
+	border-color: var(--vscode-focusBorder);
+}
+
+.models-filter-select option {
+	color: var(--vscode-input-foreground);
+	background-color: var(--vscode-dropdown-background, var(--vscode-input-background));
+}
+
+/* Toggle switch - sits directly under the label caption, no wrapper box */
+.models-filter-toggle-track {
+	display: inline-flex;
+	align-items: center;
+	cursor: pointer;
+	width: 32px;
+	height: 18px;
+	position: relative;
+	/* vertically centred with the dropdown height (26px) */
+	margin-top: 4px;
+}
+
+.models-filter-toggle-input {
+	opacity: 0;
+	width: 0;
+	height: 0;
+	position: absolute;
+}
+
+.models-filter-toggle-thumb {
+	position: absolute;
+	inset: 0;
+	border-radius: 9px;
+	background: var(--vscode-titleBar-inactiveForeground, rgba(128,128,128,0.35));
+	transition: background 0.15s;
+}
+
+.models-filter-toggle-thumb::after {
+	content: '';
+	position: absolute;
+	top: 2px;
+	left: 2px;
+	width: 14px;
+	height: 14px;
+	border-radius: 50%;
+	background: var(--vscode-editor-background, #fff);
+	transition: transform 0.15s;
+	box-shadow: 0 1px 3px rgba(0,0,0,0.3);
+}
+
+.models-filter-toggle-input:checked + .models-filter-toggle-thumb {
+	background: var(--vscode-button-background);
+}
+
+.models-filter-toggle-input:checked + .models-filter-toggle-thumb::after {
+	transform: translateX(14px);
+}
+
+.models-filter-toggle-input:focus-visible + .models-filter-toggle-thumb {
+	outline: 1px solid var(--vscode-focusBorder);
+	outline-offset: 1px;
+}
+
+/* Section headers (sticky below the title+search+filters bar).
+ * The pin offset is measured at render time (--models-section-header-top) because the bar height
+ * changes when the filter dropdowns wrap; falls back to 114px before the variable is set. */
 .models-section-header {
 	position: sticky;
-	top: 60px;
+	top: var(--models-section-header-top, 114px);
 	z-index: 9;
 	background: var(--vscode-editor-background);
 	font-size: 11px;
@@ -155,6 +276,16 @@
 
 .model-item.hidden {
 	/* Same background as visible models; distinction is via section grouping and button style only */
+}
+
+@keyframes model-item-pulse {
+	0%   { border-color: var(--vscode-focusBorder); box-shadow: 0 0 0 2px var(--vscode-focusBorder); }
+	50%  { border-color: var(--vscode-button-background); box-shadow: 0 0 0 4px color-mix(in srgb, var(--vscode-focusBorder) 30%, transparent); }
+	100% { border-color: var(--vscode-focusBorder); box-shadow: 0 0 0 2px var(--vscode-focusBorder); }
+}
+
+.model-item.model-item-highlight {
+	animation: model-item-pulse 0.7s ease-in-out 3;
 }
 
 /* "Hide" button: accented - model is visible, clicking will hide it; draw attention so user knows it's an action */
@@ -436,10 +567,13 @@
 	min-width: 120px;
 }
 
-/* Per-model logs overlay - appears at the bottom of the list panel when "Logs" is clicked */
+/* Per-model logs overlay - appears at the bottom of the list panel when "Logs" is clicked.
+ * z-index must exceed the sticky top bar (10) and section headers (9) so the overlay
+ * is never obscured when the user scrolls to the bottom of the list. */
 .model-logs-overlay {
 	position: sticky;
 	bottom: 12px;
+	z-index: 20;
 	margin: 16px 20px 24px;
 	border: 1px solid var(--vscode-panel-border);
 	border-radius: 6px;

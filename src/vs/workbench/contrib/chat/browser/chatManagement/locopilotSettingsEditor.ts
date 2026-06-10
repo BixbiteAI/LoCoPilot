@@ -99,6 +99,11 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 	private listModelsContainer!: HTMLElement;
 	private agentSettingsPanel!: HTMLElement;
 	private modelSearchQuery: string = '';
+	private modelTypeFilter: 'all' | 'local' | 'cloud' = 'all';
+	private modelStatusFilter: 'all' | 'downloaded' | 'not-downloaded' = 'all';
+	private modelVisibilityFilter: 'all' | 'shown' | 'hidden' = 'all';
+	private modelToolsFilter: boolean = false;
+	private modelMtpFilter: boolean = false;
 
 	// Add Language Model form
 	private addFormModelTypeSelectBox!: SelectBox;
@@ -784,7 +789,7 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 			return;
 		}
 
-		// Sticky top bar: title + search
+		// Sticky top bar: title + search + filters
 		const stickyTop = DOM.append(this.listModelsContainer, $('.models-list-sticky-top'));
 		const title = DOM.append(stickyTop, $('h2.models-list-title'));
 		title.textContent = localize('customLanguageModels.list.title', 'My Models');
@@ -799,8 +804,111 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 		});
 		if (searchWasFocused) { searchInput.focus(); }
 
+		// Filters row: fieldset/legend dropdowns (label cuts the border) + toggle filters
+		const filtersRow = DOM.append(stickyTop, $('.models-filters-row'));
+
+		// Dropdown filter using <fieldset>/<legend> so the label natively cuts the top border
+		const makeDropdownFilter = (labelText: string, options: { label: string; value: string }[], current: string, onSelect: (v: string) => void) => {
+			const fieldset = DOM.append(filtersRow, $('fieldset.models-filter'));
+			const legend = DOM.append(fieldset, $('legend.models-filter-label'));
+			legend.textContent = labelText;
+			const select = DOM.append(fieldset, $('select.models-filter-select')) as HTMLSelectElement;
+			select.setAttribute('aria-label', labelText);
+			for (const opt of options) {
+				const optionEl = DOM.append(select, $('option')) as HTMLOptionElement;
+				optionEl.value = opt.value;
+				optionEl.textContent = opt.label;
+				if (opt.value === current) { optionEl.selected = true; }
+			}
+			select.value = current;
+			select.addEventListener('change', () => {
+				onSelect(select.value);
+				this.renderListModels();
+			});
+		};
+
+		// Toggle filter using <fieldset>/<legend> - same border-cut label, toggle switch inside
+		const makeToggleFilter = (labelText: string, checked: boolean, onToggle: (v: boolean) => void) => {
+			const fieldset = DOM.append(filtersRow, $('fieldset.models-filter'));
+			const legend = DOM.append(fieldset, $('legend.models-filter-label'));
+			legend.textContent = labelText;
+			const track = DOM.append(fieldset, $('label.models-filter-toggle-track'));
+			const checkbox = DOM.append(track, $('input.models-filter-toggle-input')) as HTMLInputElement;
+			checkbox.type = 'checkbox';
+			checkbox.checked = checked;
+			DOM.append(track, $('span.models-filter-toggle-thumb'));
+			checkbox.addEventListener('change', () => {
+				onToggle(checkbox.checked);
+				this.renderListModels();
+			});
+		};
+
+		makeDropdownFilter(
+			localize('customLanguageModels.filter.typeLabel', 'Type'),
+			[
+				{ label: localize('customLanguageModels.filter.all', 'All'), value: 'all' },
+				{ label: localize('customLanguageModels.filter.local', 'Local'), value: 'local' },
+				{ label: localize('customLanguageModels.filter.cloud', 'Cloud'), value: 'cloud' },
+			],
+			this.modelTypeFilter,
+			(v) => { this.modelTypeFilter = v as 'all' | 'local' | 'cloud'; }
+		);
+
+		makeDropdownFilter(
+			localize('customLanguageModels.filter.statusLabel', 'Status'),
+			[
+				{ label: localize('customLanguageModels.filter.statusAll', 'All'), value: 'all' },
+				{ label: localize('customLanguageModels.filter.downloaded', 'Downloaded'), value: 'downloaded' },
+				{ label: localize('customLanguageModels.filter.notDownloaded', 'Not downloaded'), value: 'not-downloaded' },
+			],
+			this.modelStatusFilter,
+			(v) => { this.modelStatusFilter = v as 'all' | 'downloaded' | 'not-downloaded'; }
+		);
+
+		makeDropdownFilter(
+			localize('customLanguageModels.filter.visibilityLabel', 'Visibility'),
+			[
+				{ label: localize('customLanguageModels.filter.visAll', 'All'), value: 'all' },
+				{ label: localize('customLanguageModels.filter.shown', 'Shown'), value: 'shown' },
+				{ label: localize('customLanguageModels.filter.hidden', 'Hidden'), value: 'hidden' },
+			],
+			this.modelVisibilityFilter,
+			(v) => { this.modelVisibilityFilter = v as 'all' | 'shown' | 'hidden'; }
+		);
+
+		makeToggleFilter(
+			localize('customLanguageModels.filter.toolsLabel', 'Tools'),
+			this.modelToolsFilter,
+			(v) => { this.modelToolsFilter = v; }
+		);
+
+		makeToggleFilter(
+			localize('customLanguageModels.filter.mtpLabel', 'MTP'),
+			this.modelMtpFilter,
+			(v) => { this.modelMtpFilter = v; }
+		);
+
+		// Pin the section headers exactly below the sticky top bar. The bar's height varies (search +
+		// three filter dropdowns may wrap on narrow widths), so measure it instead of hard-coding an
+		// offset - otherwise list items peek through the gap, or the headers overlap, while scrolling.
+		// The sticky bar uses top:-20px (it scrolls 20px up into the container padding before pinning),
+		// so the headers stick at (barHeight - 20). The -1px forces a hairline overlap; the bar has the
+		// higher z-index, so it covers the seam rather than leaving a sub-pixel gap.
+		const stickyTopHeight = stickyTop.offsetHeight;
+		const sectionHeaderTop = Math.max(0, stickyTopHeight - 21);
+		this.listModelsContainer.style.setProperty('--models-section-header-top', `${sectionHeaderTop}px`);
+
 		const q = this.modelSearchQuery.toLowerCase().trim();
-		const matchesSearch = (m: ICustomLanguageModel): boolean => {
+		const isModelDownloaded = (m: ICustomLanguageModel): boolean => {
+			if (m.type === 'cloud') { return true; }
+			return !!(m.localPath && !needsDownloadOrPullRetry(m) && !m.isDownloading);
+		};
+		const matchesFilters = (m: ICustomLanguageModel): boolean => {
+			if (this.modelTypeFilter !== 'all' && m.type !== this.modelTypeFilter) { return false; }
+			if (this.modelStatusFilter === 'downloaded' && !isModelDownloaded(m)) { return false; }
+			if (this.modelStatusFilter === 'not-downloaded' && isModelDownloaded(m)) { return false; }
+			if (this.modelToolsFilter && !m.useNativeTools) { return false; }
+			if (this.modelMtpFilter && !m.mtp) { return false; }
 			if (!q) { return true; }
 			const label = getCustomModelListLabel(m).toLowerCase();
 			return label.includes(q) || (m.provider || '').toLowerCase().includes(q) || (m.modelName || '').toLowerCase().includes(q) || (m.type || '').toLowerCase().includes(q);
@@ -809,33 +917,38 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 		const sortAZ = (a: ICustomLanguageModel, b: ICustomLanguageModel) =>
 			getCustomModelListLabel(a).localeCompare(getCustomModelListLabel(b));
 
-		const visibleModels = allModels.filter(m => !m.hidden && matchesSearch(m)).sort(sortAZ);
-		const hiddenModels = allModels.filter(m => m.hidden && matchesSearch(m)).sort(sortAZ);
+		const visibleModels = allModels.filter(m => !m.hidden && matchesFilters(m)).sort(sortAZ);
+		const hiddenModels = allModels.filter(m => m.hidden && matchesFilters(m)).sort(sortAZ);
+		const hasActiveFilter = this.modelTypeFilter !== 'all' || this.modelStatusFilter !== 'all' || this.modelVisibilityFilter !== 'all' || this.modelToolsFilter || this.modelMtpFilter;
 
-		// Section: visible models
-		const visibleHeader = DOM.append(this.listModelsContainer, $('.models-section-header'));
-		visibleHeader.textContent = localize('customLanguageModels.section.visible', 'Visible on model picker');
-		const visibleContainer = DOM.append(this.listModelsContainer, $('.models-list-container'));
-		if (visibleModels.length === 0) {
-			const noResults = DOM.append(visibleContainer, $('.models-section-empty'));
-			noResults.textContent = q
-				? localize('customLanguageModels.section.visible.noSearch', 'No visible models match your search')
-				: localize('customLanguageModels.section.visible.none', 'No visible models');
-		} else {
-			visibleModels.forEach((model: ICustomLanguageModel) => this.renderListModelItem(model, visibleContainer));
+		// Section: visible models (skipped when the visibility filter is set to Hidden only)
+		if (this.modelVisibilityFilter !== 'hidden') {
+			const visibleHeader = DOM.append(this.listModelsContainer, $('.models-section-header'));
+			visibleHeader.textContent = localize('customLanguageModels.section.visible', 'Visible on model picker');
+			const visibleContainer = DOM.append(this.listModelsContainer, $('.models-list-container'));
+			if (visibleModels.length === 0) {
+				const noResults = DOM.append(visibleContainer, $('.models-section-empty'));
+				noResults.textContent = (q || hasActiveFilter)
+					? localize('customLanguageModels.section.visible.noSearch', 'No visible models match your search')
+					: localize('customLanguageModels.section.visible.none', 'No visible models');
+			} else {
+				visibleModels.forEach((model: ICustomLanguageModel) => this.renderListModelItem(model, visibleContainer));
+			}
 		}
 
-		// Section: hidden models
-		const hiddenHeader = DOM.append(this.listModelsContainer, $('.models-section-header.models-section-header-hidden'));
-		hiddenHeader.textContent = localize('customLanguageModels.section.hidden', 'Hidden from model picker');
-		const hiddenContainer = DOM.append(this.listModelsContainer, $('.models-list-container'));
-		if (hiddenModels.length === 0) {
-			const noResults = DOM.append(hiddenContainer, $('.models-section-empty'));
-			noResults.textContent = q
-				? localize('customLanguageModels.section.hidden.noSearch', 'No hidden models match your search')
-				: localize('customLanguageModels.section.hidden.none', 'No hidden models');
-		} else {
-			hiddenModels.forEach((model: ICustomLanguageModel) => this.renderListModelItem(model, hiddenContainer));
+		// Section: hidden models (skipped when the visibility filter is set to Shown only)
+		if (this.modelVisibilityFilter !== 'shown') {
+			const hiddenHeader = DOM.append(this.listModelsContainer, $('.models-section-header.models-section-header-hidden'));
+			hiddenHeader.textContent = localize('customLanguageModels.section.hidden', 'Hidden from model picker');
+			const hiddenContainer = DOM.append(this.listModelsContainer, $('.models-list-container'));
+			if (hiddenModels.length === 0) {
+				const noResults = DOM.append(hiddenContainer, $('.models-section-empty'));
+				noResults.textContent = (q || hasActiveFilter)
+					? localize('customLanguageModels.section.hidden.noSearch', 'No hidden models match your search')
+					: localize('customLanguageModels.section.hidden.none', 'No hidden models');
+			} else {
+				hiddenModels.forEach((model: ICustomLanguageModel) => this.renderListModelItem(model, hiddenContainer));
+			}
 		}
 
 		if (this.contentsContainer) { this.contentsContainer.scrollTop = savedScroll; }
@@ -855,8 +968,8 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 		const downloadingHFOrOllama = model.isDownloading && (model.provider === 'huggingface' || isOllama);
 		if (needsDownloadOrPullRetry(model)) {
 			const resumeTooltip = localize('customLanguageModels.resumeDownloadTitle', 'Start or resume downloading this model');
-			const resumeButton = this._register(new Button(runSlot, { ...defaultButtonStyles, secondary: true, title: resumeTooltip }));
-			resumeButton.label = localize('customLanguageModels.resumeDownload', 'Download');
+			const resumeButton = this._register(new Button(runSlot, { ...defaultButtonStyles, secondary: true, title: resumeTooltip, supportIcons: true }));
+			resumeButton.label = '$(cloud-download) ' + localize('customLanguageModels.resumeDownload', 'Download');
 			this._register(resumeButton.onDidClick(() => {
 				this.commandService.executeCommand('locopilot.downloadModel', model.id);
 			}));
@@ -871,8 +984,8 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 		if (downloadingHFOrOllama) {
 			const stopWrap = DOM.append(actionsContainer, $('.model-action-stop-download'));
 			const tooltip = localize('customLanguageModels.stopDownloadTitle', 'Stop the download or pull and discard partial files');
-			const stopDownloadButton = this._register(new Button(stopWrap, { ...defaultButtonStyles, secondary: true, title: tooltip }));
-			stopDownloadButton.label = localize('customLanguageModels.stopDownload', 'Stop download');
+			const stopDownloadButton = this._register(new Button(stopWrap, { ...defaultButtonStyles, secondary: true, title: tooltip, supportIcons: true }));
+			stopDownloadButton.label = '$(stop-circle) ' + localize('customLanguageModels.stopDownload', 'Stop download');
 			this._register(stopDownloadButton.onDidClick(() => {
 				this.commandService.executeCommand('locopilot.cancelModelDownload', model.id);
 			}));
@@ -880,14 +993,16 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 			// Hide/Show is available for every model regardless of download state, so users can control which
 			// models appear in the chat picker (including not-yet-downloaded catalog models).
 			const hideWrap = DOM.append(actionsContainer, $('.model-action-hide'));
-			const hideButton = this._register(new Button(hideWrap, { ...defaultButtonStyles, secondary: true }));
-			hideButton.label = model.hidden ? localize('customLanguageModels.show', 'Show') : localize('customLanguageModels.hide', 'Hide');
+			const hideButton = this._register(new Button(hideWrap, { ...defaultButtonStyles, secondary: true, supportIcons: true }));
+			hideButton.label = model.hidden
+				? '$(eye) ' + localize('customLanguageModels.show', 'Show')
+				: '$(eye-closed) ' + localize('customLanguageModels.hide', 'Hide');
 			hideButton.element.classList.add(model.hidden ? 'model-btn-show' : 'model-btn-hide');
 			this._register(hideButton.onDidClick(async () => {
 				await this.customLanguageModelsService.hideCustomModel(model.id, !model.hidden);
 			}));
-			const deleteButton = this._register(new Button(actionsContainer, { ...defaultButtonStyles, secondary: true }));
-			deleteButton.label = localize('customLanguageModels.delete', 'Delete');
+			const deleteButton = this._register(new Button(actionsContainer, { ...defaultButtonStyles, secondary: true, supportIcons: true }));
+			deleteButton.label = '$(trash) ' + localize('customLanguageModels.delete', 'Delete');
 			this._register(deleteButton.onDidClick(async () => {
 				const confirmed = await this.dialogService.confirm({
 					title: localize('customLanguageModels.delete.confirm.title', 'Delete Model'),
@@ -1543,6 +1658,22 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 				this.sectionsList.setFocus([idx]);
 			}
 			this.renderSelectedSection();
+		}
+		if (input.focusModelId) {
+			const focusedModel = this.customLanguageModelsService.getCustomModels().find(m => m.id === input.focusModelId);
+			if (focusedModel) {
+				// Filter the list to show only this model; user can clear the search to see all
+				this.modelSearchQuery = getCustomModelListLabel(focusedModel);
+				this.renderListModels();
+				// Scroll the tile into view and briefly highlight it
+				// eslint-disable-next-line no-restricted-syntax
+				const tile = this.listModelsContainer?.querySelector(`[data-model-id="${input.focusModelId}"]`) as HTMLElement | null;
+				if (tile) {
+					tile.classList.add('model-item-highlight');
+					tile.scrollIntoView({ behavior: 'smooth', block: 'center' });
+					setTimeout(() => tile.classList.remove('model-item-highlight'), 2000);
+				}
+			}
 		}
 		if (this.dimension) {
 			this.layout(this.dimension);

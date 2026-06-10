@@ -904,6 +904,7 @@
 		"--background-light",
 		"--chat-editing-last-edit-shift",
 		"--loco-fill",
+		"--models-section-header-top",
 		"--chat-current-response-min-height",
 		"--inline-chat-frame-progress",
 		"--insert-border-color",

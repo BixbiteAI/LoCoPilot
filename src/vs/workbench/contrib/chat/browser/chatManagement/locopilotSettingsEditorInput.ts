@@ -24,7 +24,8 @@ export class LoCoPilotSettingsEditorInput extends EditorInput {
 	readonly resource = undefined;
 
 	constructor(
-		readonly initialSection?: string
+		readonly initialSection?: string,
+		readonly focusModelId?: string,
 	) {
 		super();
 	}
