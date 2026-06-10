@@ -75,20 +75,8 @@ export class ActionWidgetDropdown extends BaseDropdown {
 		super(container, _options);
 	}
 
-	override show(): void {
-		if (!this._enabled) {
-			return;
-		}
-
-		let actionBarActions = this._options.actionBarActions ?? this._options.actionBarActionProvider?.getActions() ?? [];
-		const actions = this._options.actions ?? this._options.actionProvider?.getActions() ?? [];
-
-		// Track the currently selected option before opening
-		const optionBeforeOpen: IActionWidgetDropdownAction | undefined = actions.find(a => a.checked);
-		let selectedOption: IActionWidgetDropdownAction | undefined = optionBeforeOpen;
-
+	private _buildListItems(actions: IActionWidgetDropdownAction[]): IActionListItem<IActionWidgetDropdownAction>[] {
 		const actionWidgetItems: IActionListItem<IActionWidgetDropdownAction>[] = [];
-
 		const actionsByCategory = new Map<string, IActionWidgetDropdownAction[]>();
 		for (const action of actions) {
 			let category = action.category;
@@ -100,29 +88,18 @@ export class ActionWidgetDropdown extends BaseDropdown {
 			}
 			actionsByCategory.get(category.label)!.push(action);
 		}
-
-		// Sort categories by order
 		const sortedCategories = Array.from(actionsByCategory.entries())
 			.sort((a, b) => {
 				const aOrder = a[1][0]?.category?.order ?? Number.MAX_SAFE_INTEGER;
 				const bOrder = b[1][0]?.category?.order ?? Number.MAX_SAFE_INTEGER;
 				return aOrder - bOrder;
 			});
-
 		for (let i = 0; i < sortedCategories.length; i++) {
 			const [categoryLabel, categoryActions] = sortedCategories[i];
 			const showHeader = categoryActions[0]?.category?.showHeader ?? false;
 			if (showHeader && categoryLabel) {
-				actionWidgetItems.push({
-					kind: ActionListItemKind.Header,
-					label: categoryLabel,
-					canPreview: false,
-					disabled: false,
-					hideIcon: false,
-				});
+				actionWidgetItems.push({ kind: ActionListItemKind.Header, label: categoryLabel, canPreview: false, disabled: false, hideIcon: false });
 			}
-
-			// Push actions for each category
 			for (const action of categoryActions) {
 				actionWidgetItems.push({
 					item: action,
@@ -138,26 +115,37 @@ export class ActionWidgetDropdown extends BaseDropdown {
 					disabled: !action.enabled,
 					hideIcon: false,
 					label: action.label,
-					keybinding: this._options.showItemKeybindings ?
-						this.keybindingService.lookupKeybinding(action.id) :
-						undefined,
+					keybinding: this._options.showItemKeybindings ? this.keybindingService.lookupKeybinding(action.id) : undefined,
 				});
 			}
-
-			// Add separator after each category except the last one
 			if (i < sortedCategories.length - 1) {
-				actionWidgetItems.push({
-					label: '',
-					kind: ActionListItemKind.Separator,
-					canPreview: false,
-					disabled: false,
-					hideIcon: false,
-				});
+				actionWidgetItems.push({ label: '', kind: ActionListItemKind.Separator, canPreview: false, disabled: false, hideIcon: false });
 			}
 		}
+		return actionWidgetItems;
+	}
+
+	override show(): void {
+		if (!this._enabled) {
+			return;
+		}
+
+		let actionBarActions = this._options.actionBarActions ?? this._options.actionBarActionProvider?.getActions() ?? [];
+		const actions = this._options.actions ?? this._options.actionProvider?.getActions() ?? [];
+
+		// Track the currently selected option before opening
+		const optionBeforeOpen: IActionWidgetDropdownAction | undefined = actions.find(a => a.checked);
+		let selectedOption: IActionWidgetDropdownAction | undefined = optionBeforeOpen;
+
+		const actionWidgetItems = this._buildListItems(actions);
+
+		// Provider used by refreshItems() to rebuild the list without closing the dropdown
+		const itemsProvider = () => {
+			const fresh = this._options.actions ?? this._options.actionProvider?.getActions() ?? [];
+			return this._buildListItems(fresh);
+		};
 
 		const previouslyFocusedElement = getActiveElement();
-
 
 		const actionWidgetDelegate: IActionListDelegate<IActionWidgetDropdownAction> = {
 			onSelect: (action, preview) => {
@@ -207,7 +195,8 @@ export class ActionWidgetDropdown extends BaseDropdown {
 			undefined,
 			actionBarActions,
 			accessibilityProvider,
-			{ searchable: this._options.searchable, maxVisibleItems: this._options.maxVisibleItems }
+			{ searchable: this._options.searchable, maxVisibleItems: this._options.maxVisibleItems },
+			itemsProvider
 		);
 	}
 

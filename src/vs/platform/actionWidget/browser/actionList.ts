@@ -285,7 +285,7 @@ export class ActionList<T> extends Disposable {
 	private readonly _separatorLineHeight = 8;
 	private readonly _searchInputHeight = 36;
 
-	private readonly _allMenuItems: readonly IActionListItem<T>[];
+	private _allMenuItems: readonly IActionListItem<T>[];
 	private _visibleItems: readonly IActionListItem<T>[] = [];
 	private _filterQuery: string = '';
 	private _searchInput: HTMLInputElement | undefined;
@@ -417,6 +417,15 @@ export class ActionList<T> extends Disposable {
 			if (!a.label || !b.label) { return 0; }
 			return a.label.localeCompare(b.label, undefined, { sensitivity: 'base' });
 		});
+	}
+
+	/**
+	 * Replace the full item set and re-apply the current search filter + sort.
+	 * Keeps the dropdown open; only the list contents change.
+	 */
+	setAllItems(items: readonly IActionListItem<T>[]): void {
+		this._allMenuItems = items;
+		this._updateFilter();
 	}
 
 	private _updateFilter(): void {

@@ -36,7 +36,13 @@ export const IActionWidgetService = createDecorator<IActionWidgetService>('actio
 export interface IActionWidgetService {
 	readonly _serviceBrand: undefined;
 
-	show<T>(user: string, supportsPreview: boolean, items: readonly IActionListItem<T>[], delegate: IActionListDelegate<T>, anchor: HTMLElement | StandardMouseEvent | IAnchor, container: HTMLElement | undefined, actionBarActions?: readonly IAction[], accessibilityProvider?: Partial<IListAccessibilityProvider<IActionListItem<T>>>, listOptions?: IActionListOptions): void;
+	show<T>(user: string, supportsPreview: boolean, items: readonly IActionListItem<T>[], delegate: IActionListDelegate<T>, anchor: HTMLElement | StandardMouseEvent | IAnchor, container: HTMLElement | undefined, actionBarActions?: readonly IAction[], accessibilityProvider?: Partial<IListAccessibilityProvider<IActionListItem<T>>>, listOptions?: IActionListOptions, itemsProvider?: () => readonly IActionListItem<T>[]): void;
+
+	/**
+	 * Refresh the list by re-fetching items from the provider supplied to `show()`.
+	 * The dropdown stays open; only the list contents are updated.
+	 */
+	refreshItems(): void;
 
 	hide(didCancel?: boolean): void;
 
@@ -51,6 +57,7 @@ class ActionWidgetService extends Disposable implements IActionWidgetService {
 	}
 
 	private readonly _list = this._register(new MutableDisposable<ActionList<unknown>>());
+	private _itemsProvider: (() => readonly IActionListItem<unknown>[]) | undefined;
 
 	constructor(
 		@IContextViewService private readonly _contextViewService: IContextViewService,
@@ -60,8 +67,9 @@ class ActionWidgetService extends Disposable implements IActionWidgetService {
 		super();
 	}
 
-	show<T>(user: string, supportsPreview: boolean, items: readonly IActionListItem<T>[], delegate: IActionListDelegate<T>, anchor: HTMLElement | StandardMouseEvent | IAnchor, container: HTMLElement | undefined, actionBarActions?: readonly IAction[], accessibilityProvider?: Partial<IListAccessibilityProvider<IActionListItem<T>>>, listOptions?: IActionListOptions): void {
+	show<T>(user: string, supportsPreview: boolean, items: readonly IActionListItem<T>[], delegate: IActionListDelegate<T>, anchor: HTMLElement | StandardMouseEvent | IAnchor, container: HTMLElement | undefined, actionBarActions?: readonly IAction[], accessibilityProvider?: Partial<IListAccessibilityProvider<IActionListItem<T>>>, listOptions?: IActionListOptions, itemsProvider?: () => readonly IActionListItem<T>[]): void {
 		const visibleContext = ActionWidgetContextKeys.Visible.bindTo(this._contextKeyService);
+		this._itemsProvider = itemsProvider as (() => readonly IActionListItem<unknown>[]) | undefined;
 
 		const list = this._instantiationService.createInstance(ActionList, user, supportsPreview, items, delegate, accessibilityProvider, listOptions);
 		this._contextViewService.showContextView({
@@ -79,6 +87,13 @@ class ActionWidgetService extends Disposable implements IActionWidgetService {
 
 	acceptSelected(preview?: boolean) {
 		this._list.value?.acceptSelected(preview);
+	}
+
+	refreshItems(): void {
+		if (this._itemsProvider && this._list.value) {
+			const newItems = this._itemsProvider();
+			this._list.value.setAllItems(newItems);
+		}
 	}
 
 	focusPrevious() {

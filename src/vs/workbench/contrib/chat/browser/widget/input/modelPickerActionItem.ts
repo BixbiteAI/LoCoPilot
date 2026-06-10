@@ -73,6 +73,23 @@ function modelDelegateToWidgetActionsProvider(delegate: IModelPickerDelegate, te
 					tooltip: getCustomModelListLabel(customModel),
 					label: getCustomModelListLabel(customModel),
 					hover: undefined,
+					toolbarActions: [
+						toAction({
+							id: `hide-${customModel.id}`,
+							label: localize('chat.modelPicker.hide', 'Hide model'),
+							class: ThemeIcon.asClassName(Codicon.eyeClosed),
+							tooltip: localize('chat.modelPicker.hide.tooltip', 'Hide this model from the picker'),
+							run: async () => {
+								await customLanguageModelsService.hideCustomModel(customModel.id, true);
+								// If the hidden model was selected, clear the selection
+								if (customLanguageModelsService.getSelectedCustomModelId() === customModel.id) {
+									customLanguageModelsService.setSelectedCustomModelId(undefined);
+								}
+								// Refresh list in-place - dropdown stays open
+								actionWidgetService.refreshItems();
+							}
+						})
+					],
 					run: () => {
 						customLanguageModelsService.setSelectedCustomModelId(customModel.id);
 					}
