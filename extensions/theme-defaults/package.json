@@ -38,13 +38,13 @@
         "path": "./themes/light_modern.json"
       },
       {
-        "id": "Visual Studio Dark",
+        "id": "LoCoPilot Dark",
         "label": "%darkColorThemeLabel%",
         "uiTheme": "vs-dark",
         "path": "./themes/dark_vs.json"
       },
       {
-        "id": "Visual Studio Light",
+        "id": "LoCoPilot Light",
         "label": "%lightColorThemeLabel%",
         "uiTheme": "vs",
         "path": "./themes/light_vs.json"
