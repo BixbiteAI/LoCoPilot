@@ -64,9 +64,11 @@
 .models-filters-row {
 	display: flex;
 	flex-wrap: wrap;
-	gap: 8px 12px;
-	align-items: center;
-	margin-top: 10px;
+	gap: 12px 20px;
+	align-items: flex-end;
+	margin-top: 14px;
+	padding-top: 14px;
+	border-top: 1px solid var(--vscode-settings-headerBorder, var(--vscode-input-border));
 }
 
 /* Each filter is a <fieldset> with no border - label floats as a caption above the control */
@@ -78,11 +80,16 @@
 	padding: 0;
 	border: none;
 	background: transparent;
-	gap: 3px;
+	gap: 8px;
+	min-inline-size: 0;
 }
 
-/* <legend> as a small caption above */
+/* <legend> as a small caption above (block so it stacks cleanly above the control, not on its border) */
 .models-filter-label {
+	display: block;
+	float: none;
+	width: auto;
+	margin: 0 0 1px 0;
 	font-size: 10px;
 	font-weight: 600;
 	text-transform: uppercase;
@@ -95,15 +102,16 @@
 
 /* Dropdown - single box, no nesting */
 .models-filter-select {
-	height: 26px;
-	padding: 0 22px 0 8px;
+	height: 28px;
+	min-width: 132px;
+	padding: 0 26px 0 10px;
 	font-size: 12px;
 	font-family: inherit;
 	color: var(--vscode-settings-dropdownForeground, var(--vscode-foreground));
 	background-color: var(--vscode-settings-dropdownBackground, var(--vscode-dropdown-background, var(--vscode-input-background)));
 	background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16' fill='%23808080'><path d='M8 11L3 6h10z'/></svg>");
 	background-repeat: no-repeat;
-	background-position: right 5px center;
+	background-position: right 8px center;
 	background-size: 11px;
 	border: 1px solid var(--vscode-settings-dropdownBorder, var(--vscode-dropdown-border, var(--vscode-input-border, rgba(128,128,128,0.4))));
 	border-radius: 4px;
@@ -135,8 +143,8 @@
 	width: 32px;
 	height: 18px;
 	position: relative;
-	/* vertically centred with the dropdown height (26px) */
-	margin-top: 4px;
+	/* Center the 18px switch within the 28px control band so it lines up with the dropdowns */
+	margin-bottom: 5px;
 }
 
 .models-filter-toggle-input {

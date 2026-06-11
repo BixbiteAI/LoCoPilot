@@ -1126,19 +1126,13 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 			addChip(localize('customLanguageModels.nativeTools', 'Native Tools'), 'muted');
 		}
 		if (model.format) { addChip(model.format, 'muted'); }
-		// Status badge (colored by state)
+		// Status badge: only show the in-progress download/pull state. Steady-state
+		// (Downloaded / Download not finished / Ready) chips are intentionally omitted.
 		if (model.isDownloading) {
 			addChip(isOllama
 				? localize('customLanguageModels.pullingInProgress', 'Pulling...')
 				: `${localize('customLanguageModels.downloading', 'Downloading')} ${model.downloadProgress ?? 0}%`,
 				'status', 'pending');
-		} else if (model.provider === 'huggingface' || isOllama) {
-			if (!needsDownloadOrPullRetry(model)) {
-				addChip(isOllama ? localize('customLanguageModels.ready', 'Ready') : localize('customLanguageModels.downloaded', 'Downloaded'),
-					'status', 'ready');
-			} else {
-				addChip(localize('customLanguageModels.downloadNotFinished', 'Download not finished'), 'status', 'error');
-			}
 		}
 
 		// Context window input sits on the right of row 2, inline with the details text
