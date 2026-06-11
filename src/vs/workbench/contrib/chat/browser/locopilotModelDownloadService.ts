@@ -17,14 +17,14 @@ import type { IRequestToFileProgressEvent } from '../../../../platform/request/c
 import { ILogService } from '../../../../platform/log/common/log.js';
 import { IFileService } from '../../../../platform/files/common/files.js';
 import { IEnvironmentService } from '../../../../platform/environment/common/environment.js';
-import { ICustomLanguageModelsService, ICustomLanguageModel, MIN_CONTEXT_WINDOW, MAX_CONTEXT_WINDOW } from '../common/customLanguageModelsService.js';
+import { ICustomLanguageModelsService, ICustomLanguageModel, MIN_CONTEXT_WINDOW, MAX_CONTEXT_WINDOW, getCustomModelListLabel } from '../common/customLanguageModelsService.js';
 import { ILoCoPilotFileLog } from './locopilotFileLog.js';
 import { ILoCoPilotOllamaService } from './locopilotOllamaService.js';
 import { registerAction2, Action2 } from '../../../../platform/actions/common/actions.js';
 import { ServicesAccessor } from '../../../../platform/instantiation/common/instantiation.js';
 import { IWorkbenchContribution } from '../../../common/contributions.js';
 import { streamToBuffer } from '../../../../base/common/buffer.js';
-import { INotificationService } from '../../../../platform/notification/common/notification.js';
+import { INotificationService, Severity } from '../../../../platform/notification/common/notification.js';
 import { toErrorMessage } from '../../../../base/common/errorMessage.js';
 import { CancellationError, isCancellationError } from '../../../../base/common/errors.js';
 import { ICommandService } from '../../../../platform/commands/common/commands.js';
@@ -166,6 +166,7 @@ export class LoCoPilotModelDownloadService extends Disposable implements IWorkbe
 		@ILogService private readonly logService: ILogService,
 		@ILoCoPilotFileLog private readonly locopilotFileLog: ILoCoPilotFileLog,
 		@INotificationService private readonly notificationService: INotificationService,
+		@ICommandService private readonly commandService: ICommandService,
 		@ILoCoPilotOllamaService private readonly ollamaService: ILoCoPilotOllamaService,
 	) {
 		super();
@@ -183,6 +184,12 @@ export class LoCoPilotModelDownloadService extends Disposable implements IWorkbe
 				// stays visible but is now harmless to click (won't cancel+restart the download).
 				if (self._downloadTokens.has(modelId)) {
 					return;
+				}
+				// Acknowledge the click right away so the user knows it registered, before the redirect
+				// and any time it takes for the progress bar to appear.
+				const startModel = self.customLanguageModelsService.getCustomModels().find(m => m.id === modelId);
+				if (startModel) {
+					self.notificationService.info(`Download started for "${getCustomModelListLabel(startModel)}". You can keep working - I'll let you know when it's ready.`);
 				}
 				// Open the model list focused on this model so the user can track download progress.
 				const commandService = accessor.get(ICommandService);
@@ -328,6 +335,15 @@ export class LoCoPilotModelDownloadService extends Disposable implements IWorkbe
 			} else if (model.provider === 'ollama') {
 				await this._pullOllamaModel(model, cancel);
 			}
+			// Download finished successfully (not cancelled): let the user know it's ready and offer a
+			// one-click way back to chatting, so they don't have to watch the progress bar to know when
+			// to send their message.
+			if (!cancel.isCancellationRequested) {
+				const ready = this.customLanguageModelsService.getCustomModels().find(m => m.id === modelId);
+				if (ready && !ready.isDownloading) {
+					this._notifyDownloadReady(ready);
+				}
+			}
 		} finally {
 			this._downloadTokens.delete(modelId);
 			cts.dispose();
@@ -336,6 +352,29 @@ export class LoCoPilotModelDownloadService extends Disposable implements IWorkbe
 
 	cancelModelDownload(modelId: string): void {
 		this._downloadTokens.get(modelId)?.cancel();
+	}
+
+	/**
+	 * Tell the user a model finished downloading and is ready to use, with a one-click action to jump
+	 * back to the chat input. Without this, the in-chat download prompt only updates when the user
+	 * re-sends, so there's no signal that the download is done.
+	 */
+	private _notifyDownloadReady(model: ICustomLanguageModel): void {
+		const label = getCustomModelListLabel(model);
+		this.notificationService.notify({
+			severity: Severity.Info,
+			message: `"${label}" is ready. Send your message to start chatting.`,
+			actions: {
+				primary: [{
+					id: 'locopilot.startChattingAfterDownload',
+					label: 'Start chatting',
+					tooltip: '',
+					class: undefined,
+					enabled: true,
+					run: () => this.commandService.executeCommand('workbench.action.chat.open'),
+				}],
+			},
+		});
 	}
 
 	private async _deleteIncompleteHfFolder(uri: URI): Promise<void> {
