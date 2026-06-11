@@ -45,6 +45,7 @@ import { ICommandService } from '../../../../../platform/commands/common/command
 import { ILogService } from '../../../../../platform/log/common/log.js';
 import { toErrorMessage } from '../../../../../base/common/errorMessage.js';
 import { Codicon } from '../../../../../base/common/codicons.js';
+import { ThemeIcon } from '../../../../../base/common/themables.js';
 import { renderIcon } from '../../../../../base/browser/ui/iconLabel/iconLabels.js';
 import { MarkdownString } from '../../../../../base/common/htmlContent.js';
 import { IMarkdownRendererService } from '../../../../../platform/markdown/browser/markdownRenderer.js';
@@ -88,6 +89,8 @@ export const locopilotSettingsSashBorder = registerColor('locopilotSettings.sash
 interface SectionItem {
 	id: string;
 	label: string;
+	icon: ThemeIcon;
+	description?: string;
 }
 
 /**
@@ -301,15 +304,15 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 		this.splitView.addView({
 			onDidChange: Event.None,
 			element: sidebarView,
-			minimumSize: 150,
-			maximumSize: 350,
+			minimumSize: 210,
+			maximumSize: 360,
 			layout: (width, _, height) => {
 				sidebarContainer.style.width = `${width}px`;
 				if (this.sectionsList && height !== undefined) {
 					this.sectionsList.layout(height, width);
 				}
 			}
-		}, 200, undefined, true);
+		}, 250, undefined, true);
 
 		this.splitView.addView({
 			onDidChange: Event.None,
@@ -344,9 +347,9 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 
 	private renderSidebar(parent: HTMLElement): void {
 		this.sections = [
-			{ id: LOCOPILOT_SETTINGS_SECTION_ADD_MODEL, label: localize('locopilotSettings.addModel', "Add Model") },
-			{ id: LOCOPILOT_SETTINGS_SECTION_LIST_MODELS, label: localize('locopilotSettings.myModels', "My Models") },
-			{ id: LOCOPILOT_SETTINGS_SECTION_AGENT_SETTINGS, label: localize('locopilotSettings.agentSettings', "Agent Settings") },
+			{ id: LOCOPILOT_SETTINGS_SECTION_ADD_MODEL, label: localize('locopilotSettings.addModel', "Add Model"), icon: Codicon.add, description: localize('locopilotSettings.addModel.desc', "Connect a new local model") },
+			{ id: LOCOPILOT_SETTINGS_SECTION_LIST_MODELS, label: localize('locopilotSettings.myModels', "My Models"), icon: Codicon.layers, description: localize('locopilotSettings.myModels.desc', "Manage installed models") },
+			{ id: LOCOPILOT_SETTINGS_SECTION_AGENT_SETTINGS, label: localize('locopilotSettings.agentSettings', "Agent Settings"), icon: Codicon.settingsGear, description: localize('locopilotSettings.agentSettings.desc', "Prompts & behavior") },
 		];
 
 		const delegate = new SectionItemDelegate();
@@ -1802,13 +1805,15 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 
 class SectionItemDelegate implements IListVirtualDelegate<SectionItem> {
 	getHeight(element: SectionItem) {
-		return 22;
+		return 48;
 	}
 	getTemplateId() { return 'locopilotSectionItem'; }
 }
 
 interface ISectionItemTemplateData {
+	readonly icon: HTMLElement;
 	readonly label: HTMLElement;
+	readonly description: HTMLElement;
 }
 
 class SectionItemRenderer {
@@ -1816,12 +1821,19 @@ class SectionItemRenderer {
 
 	renderTemplate(container: HTMLElement): ISectionItemTemplateData {
 		container.classList.add('section-list-item');
-		const label = DOM.append(container, $('.section-list-item-label'));
-		return { label };
+		const icon = DOM.append(container, $('.section-list-item-icon'));
+		const text = DOM.append(container, $('.section-list-item-text'));
+		const label = DOM.append(text, $('.section-list-item-label'));
+		const description = DOM.append(text, $('.section-list-item-description'));
+		return { icon, label, description };
 	}
 
 	renderElement(element: SectionItem, index: number, templateData: ISectionItemTemplateData): void {
+		DOM.clearNode(templateData.icon);
+		templateData.icon.appendChild(renderIcon(element.icon));
 		templateData.label.textContent = element.label;
+		templateData.description.textContent = element.description ?? '';
+		templateData.description.style.display = element.description ? '' : 'none';
 	}
 
 	disposeTemplate(templateData: ISectionItemTemplateData): void {
