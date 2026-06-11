@@ -27,9 +27,10 @@ import { localize } from '../../../../../nls.js';
 import { Orientation, Sizing, SplitView } from '../../../../../base/browser/ui/splitview/splitview.js';
 import { IListVirtualDelegate } from '../../../../../base/browser/ui/list/list.js';
 import { WorkbenchList } from '../../../../../platform/list/browser/listService.js';
-import { Event } from '../../../../../base/common/event.js';
+import { Event, Emitter } from '../../../../../base/common/event.js';
+import { Disposable } from '../../../../../base/common/lifecycle.js';
 import { Dimension } from '../../../../../base/browser/dom.js';
-import { registerColor } from '../../../../../platform/theme/common/colorRegistry.js';
+import { registerColor, foreground, listActiveSelectionBackground, listActiveSelectionForeground } from '../../../../../platform/theme/common/colorRegistry.js';
 import { PANEL_BORDER } from '../../../../common/theme.js';
 import { ILoCoPilotAgentSettingsService, DEFAULT_MAX_ITERATIONS } from '../locopilotAgentSettingsService.js';
 import { InputBox } from '../../../../../base/browser/ui/inputbox/inputBox.js';
@@ -61,7 +62,12 @@ const locopilotSettingsSelectBoxStyles = getSelectBoxStyles({
 	selectBackground: settingsSelectBackground,
 	selectForeground: settingsSelectForeground,
 	selectBorder: settingsSelectBorder,
-	selectListBorder: settingsSelectListBorder
+	selectListBorder: settingsSelectListBorder,
+	// Use the theme's standard list-selection colors for the open dropdown instead of the
+	// quick-input/picker defaults (which render an accent blue many themes don't override).
+	listFocusBackground: listActiveSelectionBackground,
+	listFocusForeground: listActiveSelectionForeground,
+	decoratorRightForeground: foreground
 });
 
 const CLOUD_PROVIDERS_ADD: ISelectOptionItem[] = [
@@ -82,6 +88,60 @@ export const locopilotSettingsSashBorder = registerColor('locopilotSettings.sash
 interface SectionItem {
 	id: string;
 	label: string;
+}
+
+/**
+ * Two-option segmented control for prompt mode: "Default" (use LoCoPilot's built-in prompt)
+ * vs "Override" (user supplies their own). `checked === true` means Default is selected.
+ * API mirrors the subset of Toggle used by the settings editor (`checked`, `onChange`, `domNode`).
+ */
+class PromptModeControl extends Disposable {
+	private readonly _domNode: HTMLElement;
+	private readonly _defaultBtn: HTMLElement;
+	private readonly _overrideBtn: HTMLElement;
+	private _checked: boolean;
+	private readonly _onChange = this._register(new Emitter<boolean>());
+	readonly onChange = this._onChange.event;
+
+	constructor(initialChecked: boolean, ariaLabel: string) {
+		super();
+		this._checked = initialChecked;
+		this._domNode = $('.locopilot-segmented');
+		this._domNode.setAttribute('role', 'radiogroup');
+		this._domNode.setAttribute('aria-label', ariaLabel);
+
+		this._defaultBtn = DOM.append(this._domNode, $('button.locopilot-segmented-option'));
+		this._defaultBtn.textContent = localize('locopilotSettings.promptModeDefault', "Default");
+		this._defaultBtn.setAttribute('role', 'radio');
+		this._defaultBtn.title = localize('locopilotSettings.promptModeDefaultTitle', "Use LoCoPilot's built-in coding prompt.");
+
+		this._overrideBtn = DOM.append(this._domNode, $('button.locopilot-segmented-option'));
+		this._overrideBtn.textContent = localize('locopilotSettings.promptModeOverride', "Override");
+		this._overrideBtn.setAttribute('role', 'radio');
+		this._overrideBtn.title = localize('locopilotSettings.promptModeOverrideTitle', "Write your own system prompt.");
+
+		this._register(DOM.addDisposableListener(this._defaultBtn, 'click', () => this._set(true, true)));
+		this._register(DOM.addDisposableListener(this._overrideBtn, 'click', () => this._set(false, true)));
+		this._update();
+	}
+
+	get domNode(): HTMLElement { return this._domNode; }
+	get checked(): boolean { return this._checked; }
+	set checked(value: boolean) { this._set(value, false); }
+
+	private _set(value: boolean, fire: boolean): void {
+		if (this._checked === value) { return; }
+		this._checked = value;
+		this._update();
+		if (fire) { this._onChange.fire(value); }
+	}
+
+	private _update(): void {
+		this._defaultBtn.classList.toggle('selected', this._checked);
+		this._defaultBtn.setAttribute('aria-checked', String(this._checked));
+		this._overrideBtn.classList.toggle('selected', !this._checked);
+		this._overrideBtn.setAttribute('aria-checked', String(!this._checked));
+	}
 }
 
 export class LoCoPilotSettingsEditor extends EditorPane {
@@ -106,7 +166,8 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 	private modelMtpFilter: boolean = false;
 
 	// Add Language Model form
-	private addFormModelTypeSelectBox!: SelectBox;
+	/** Cloud / Local segmented control buttons (index 0 = Cloud, 1 = Local). */
+	private addFormModelTypeSegments: HTMLElement[] = [];
 	private addFormProviderSelectBox!: SelectBox;
 	private addFormApiKeyInputBox!: InputBox;
 	private addFormTokenInputBox!: InputBox;
@@ -127,6 +188,7 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 	private addFormHfFastestToggle!: Toggle;
 	private addFormHfFastestContainer!: HTMLElement;
 	private addFormAddButton!: Button;
+	private addFormResetButton!: Button;
 	private addFormCurrentModelType: 'cloud' | 'local' = 'cloud';
 	private addFormCurrentProviderIndex: number = 0;
 
@@ -143,8 +205,12 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 	private askPromptFormattedView!: HTMLElement;
 	private agentPromptFormattedRendered: { dispose(): void } | undefined;
 	private askPromptFormattedRendered: { dispose(): void } | undefined;
-	private askCodingSystemPromptToggle!: Toggle;
-	private agentCodingSystemPromptToggle!: Toggle;
+	private askCodingSystemPromptToggle!: PromptModeControl;
+	private agentCodingSystemPromptToggle!: PromptModeControl;
+	/** Inline validation hint shown under the max-iterations input. */
+	private maxIterationsHint!: HTMLElement;
+	/** "Unsaved changes" indicator in the sticky footer. */
+	private agentSettingsDirtyIndicator!: HTMLElement;
 	private agentSettingsSaveBtn!: Button;
 	private agentSettingsCancelBtn!: Button;
 	private agentSettingsBaseline: {
@@ -383,29 +449,28 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 
 		const title = DOM.append(formContainer, $('h2.form-title'));
 		title.textContent = localize('addCustomModel.title', 'Add Model');
+		const subtitle = DOM.append(formContainer, $('.form-subtitle'));
+		subtitle.textContent = localize('addCustomModel.subtitle', "Connect a cloud provider with an API key, or add a local model to download and run on this machine.");
 
-		const modelTypeContainer = DOM.append(formContainer, $('.form-field'));
+		const card = DOM.append(formContainer, $('.add-model-card'));
+
+		const modelTypeContainer = DOM.append(card, $('.form-field'));
 		const modelTypeLabel = DOM.append(modelTypeContainer, $('label.form-label'));
 		modelTypeLabel.textContent = localize('addCustomModel.modelType', 'Model Type');
-		const modelTypeSelectContainer = DOM.append(modelTypeContainer, $('.form-input-container'));
-		this.addFormModelTypeSelectBox = this._register(new SelectBox(
-			[
-				{ text: localize('addCustomModel.cloud', 'Cloud'), description: '' },
-				{ text: localize('addCustomModel.local', 'Local'), description: '' }
-			],
-			0,
-			this.contextViewService,
-			locopilotSettingsSelectBoxStyles
-		));
-		this.addFormModelTypeSelectBox.render(modelTypeSelectContainer);
-		this._register(this.addFormModelTypeSelectBox.onDidSelect((e: ISelectData) => {
-			this.addFormCurrentModelType = e.index === 0 ? 'cloud' : 'local';
-			this.addFormCurrentProviderIndex = 0;
-			this.addFormUpdateProviderOptions();
-			this.addFormUpdateInputFields();
-		}));
+		const segmented = DOM.append(modelTypeContainer, $('.segmented-control'));
+		segmented.setAttribute('role', 'radiogroup');
+		segmented.setAttribute('aria-label', localize('addCustomModel.modelType', 'Model Type'));
+		const segmentLabels = [localize('addCustomModel.cloud', 'Cloud'), localize('addCustomModel.local', 'Local')];
+		this.addFormModelTypeSegments = segmentLabels.map((text, index) => {
+			const seg = DOM.append(segmented, $('button.segment'));
+			seg.textContent = text;
+			seg.setAttribute('role', 'radio');
+			this._register(DOM.addDisposableListener(seg, 'click', () => this.selectModelTypeSegment(index, true)));
+			return seg;
+		});
+		this.selectModelTypeSegment(0, false);
 
-		const providerContainer = DOM.append(formContainer, $('.form-field'));
+		const providerContainer = DOM.append(card, $('.form-field'));
 		const providerLabel = DOM.append(providerContainer, $('label.form-label'));
 		providerLabel.textContent = localize('addCustomModel.provider', 'Model Provider');
 		const providerSelectContainer = DOM.append(providerContainer, $('.form-input-container'));
@@ -416,7 +481,7 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 			this.addFormUpdateInputFields();
 		}));
 
-		const apiKeyContainer = DOM.append(formContainer, $('.form-field'));
+		const apiKeyContainer = DOM.append(card, $('.form-field'));
 		const apiKeyLabel = DOM.append(apiKeyContainer, $('label.form-label'));
 		apiKeyLabel.textContent = localize('addCustomModel.apiKey', 'API Key');
 		const apiKeyInputContainer = DOM.append(apiKeyContainer, $('.form-input-container'));
@@ -426,7 +491,7 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 			inputBoxStyles: locopilotSettingsInputBoxStyles
 		}));
 
-		const tokenContainer = DOM.append(formContainer, $('.form-field'));
+		const tokenContainer = DOM.append(card, $('.form-field'));
 		tokenContainer.style.display = 'none';
 		this.addFormTokenLabel = DOM.append(tokenContainer, $('label.form-label'));
 		this.addFormTokenLabel.textContent = localize('addCustomModel.token', 'Token (Optional)');
@@ -437,7 +502,7 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 			inputBoxStyles: locopilotSettingsInputBoxStyles
 		}));
 
-		this.addFormModelFormatContainer = DOM.append(formContainer, $('.form-field'));
+		this.addFormModelFormatContainer = DOM.append(card, $('.form-field'));
 		this.addFormModelFormatContainer.style.display = 'none';
 		const formatLabel = DOM.append(this.addFormModelFormatContainer, $('label.form-label'));
 		formatLabel.textContent = localize('addCustomModel.modelFormat', 'Model Format');
@@ -447,7 +512,7 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 			inputBoxStyles: locopilotSettingsInputBoxStyles
 		}));
 
-		const modelNameContainer = DOM.append(formContainer, $('.form-field'));
+		const modelNameContainer = DOM.append(card, $('.form-field'));
 		this.addFormModelNameLabel = DOM.append(modelNameContainer, $('label.form-label'));
 		this.addFormModelNameLabel.textContent = localize('addCustomModel.modelName', 'Model Name');
 		const modelNameInputContainer = DOM.append(modelNameContainer, $('.form-input-container'));
@@ -457,7 +522,7 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 		}));
 
 		// Localhost only: required OpenAI `model` string (e.g. from GET /v1/models)
-		this.addFormLocalhostModelIdContainer = DOM.append(formContainer, $('.form-field'));
+		this.addFormLocalhostModelIdContainer = DOM.append(card, $('.form-field'));
 		this.addFormLocalhostModelIdContainer.style.display = 'none';
 		const localhostModelIdLabel = DOM.append(this.addFormLocalhostModelIdContainer, $('label.form-label'));
 		localhostModelIdLabel.textContent = localize('addCustomModel.localhostServerModelId', 'Server model id');
@@ -467,7 +532,7 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 			inputBoxStyles: locopilotSettingsInputBoxStyles
 		}));
 
-		this.addFormDisplayNameContainer = DOM.append(formContainer, $('.form-field'));
+		this.addFormDisplayNameContainer = DOM.append(card, $('.form-field'));
 		const displayNameLabel = DOM.append(this.addFormDisplayNameContainer, $('label.form-label'));
 		displayNameLabel.textContent = localize('addCustomModel.displayNameOptional', 'Display name (optional)');
 		const displayNameInputContainer = DOM.append(this.addFormDisplayNameContainer, $('.form-input-container'));
@@ -479,7 +544,7 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 		// Context window is auto-derived from HF/Ollama after download (or service default), and overridden
 		// from the model list - so it is not collected on the Add form. The widget is kept (hidden) to avoid
 		// churn in the form-state helpers that still reference it.
-		const contextWindowRow = DOM.append(formContainer, $('.form-field.form-field-tokens'));
+		const contextWindowRow = DOM.append(card, $('.form-field.form-field-tokens'));
 		contextWindowRow.style.display = 'none';
 		const contextWindowLabel = DOM.append(contextWindowRow, $('label.form-label'));
 		contextWindowLabel.textContent = localize('addCustomModel.contextWindow', 'Context window');
@@ -497,7 +562,7 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 		this._register(this.addFormContextWindowInput.onDidChange(() => this.syncAddFormContextWindowTooltip()));
 
 		// Use Native Tools toggle (for local models)
-		this.addFormUseNativeToolsContainer = DOM.append(formContainer, $('.form-field'));
+		this.addFormUseNativeToolsContainer = DOM.append(card, $('.form-field'));
 		this.addFormUseNativeToolsContainer.style.display = 'none';
 		const useNativeToolsLabel = DOM.append(this.addFormUseNativeToolsContainer, $('label.form-label'));
 		useNativeToolsLabel.textContent = localize('addCustomModel.useNativeTools', 'Tools');
@@ -510,7 +575,7 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 		DOM.append(useNativeToolsToggleContainer, this.addFormUseNativeToolsToggle.domNode);
 
 		// Multi-Token Prediction toggle (llama.cpp GGUF models only)
-		this.addFormMtpContainer = DOM.append(formContainer, $('.form-field'));
+		this.addFormMtpContainer = DOM.append(card, $('.form-field'));
 		this.addFormMtpContainer.style.display = 'none';
 		const mtpLabel = DOM.append(this.addFormMtpContainer, $('label.form-label'));
 		mtpLabel.textContent = localize('addCustomModel.mtp', 'Multi-Token Prediction');
@@ -523,7 +588,7 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 		DOM.append(mtpToggleContainer, this.addFormMtpToggle.domNode);
 
 		// HF cloud routing toggle (shown only for Hugging Face cloud): on = cheapest, off = fastest
-		this.addFormHfFastestContainer = DOM.append(formContainer, $('.form-field'));
+		this.addFormHfFastestContainer = DOM.append(card, $('.form-field'));
 		this.addFormHfFastestContainer.style.display = 'none';
 		const hfFastestLabel = DOM.append(this.addFormHfFastestContainer, $('label.form-label'));
 		hfFastestLabel.textContent = localize('addCustomModel.hfCheapest', 'Cheapest');
@@ -536,6 +601,10 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 		DOM.append(hfFastestToggleContainer, this.addFormHfFastestToggle.domNode);
 
 		const buttonContainer = DOM.append(formContainer, $('.form-actions'));
+		this.addFormResetButton = this._register(new Button(buttonContainer, { ...defaultButtonStyles, secondary: true }));
+		this.addFormResetButton.label = localize('addCustomModel.reset', 'Reset');
+		this.addFormResetButton.element.title = localize('addCustomModel.resetTitle', 'Clear all fields and reset the form to defaults');
+		this._register(this.addFormResetButton.onDidClick(() => this.resetAddModelFormToDefaults()));
 		this.addFormAddButton = this._register(new Button(buttonContainer, { ...defaultButtonStyles }));
 		this.addFormAddButton.label = localize('addCustomModel.add', 'Add Model');
 		this._register(this.addFormAddButton.onDidClick(() => this.handleAddModel()));
@@ -552,9 +621,7 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 
 	/** Cloud + first provider, cleared fields, default token limits - use when (re)entering the Add Language Model section. */
 	private resetAddModelFormToDefaults(): void {
-		this.addFormCurrentModelType = 'cloud';
-		this.addFormCurrentProviderIndex = 0;
-		this.addFormModelTypeSelectBox.select(0);
+		this.selectModelTypeSegment(0, false);
 		this.addFormUpdateProviderOptions();
 		this.addFormModelNameInputBox.value = '';
 		this.addFormDisplayNameInputBox.value = '';
@@ -565,6 +632,20 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 		this.addFormUseNativeToolsToggle.checked = false;
 		this.addFormMtpToggle.checked = false;
 		this.addFormUpdateInputFields();
+	}
+
+	/** Selects the Cloud (0) / Local (1) segment, updating the active style and dependent fields. */
+	private selectModelTypeSegment(index: number, fireChange: boolean): void {
+		this.addFormModelTypeSegments.forEach((seg, i) => {
+			seg.classList.toggle('active', i === index);
+			seg.setAttribute('aria-checked', String(i === index));
+		});
+		this.addFormCurrentModelType = index === 0 ? 'cloud' : 'local';
+		this.addFormCurrentProviderIndex = 0;
+		if (fireChange) {
+			this.addFormUpdateProviderOptions();
+			this.addFormUpdateInputFields();
+		}
 	}
 
 	private addFormUpdateProviderOptions(): void {
@@ -1024,31 +1105,41 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 			}));
 		}
 
-		// Row 2: left = local/cloud | provider | model, right = Tools toggle, Max In, Max Out
+		// Row 2: left = type/provider/model/status chips, right = context window input
 		const row2 = DOM.append(itemContainer, $('.model-item-row.model-item-row2'));
-		let details = `${model.type === 'cloud' ? 'Cloud' : 'Local'} | ${model.provider} | ${model.modelName}`;
+		const detailsLabel = DOM.append(row2, $('.model-details'));
+		const addChip = (text: string, ...variants: string[]): HTMLElement => {
+			const chip = DOM.append(detailsLabel, $('span.model-chip' + variants.map(v => '.model-chip-' + v).join('')));
+			chip.textContent = text;
+			return chip;
+		};
+		// Type badge (colored): Cloud vs Local
+		addChip(model.type === 'cloud' ? localize('customLanguageModels.cloud', 'Cloud') : localize('customLanguageModels.local', 'Local'),
+			model.type === 'cloud' ? 'cloud' : 'local');
+		// Provider + model name (muted metadata)
+		if (model.provider) { addChip(model.provider, 'muted'); }
+		if (model.modelName) { addChip(model.modelName, 'muted', 'mono'); }
 		if (model.provider === 'localhost' && model.localhostOpenAiModel) {
-			details += ` | ${localize('customLanguageModels.localhostModelId', 'API model: {0}', model.localhostOpenAiModel)}`;
+			addChip(localize('customLanguageModels.localhostModelId', 'API model: {0}', model.localhostOpenAiModel), 'muted', 'mono');
 		}
 		if (model.type === 'local' && model.useNativeTools) {
-			details += ` | ${localize('customLanguageModels.nativeTools', 'Native Tools')}`;
+			addChip(localize('customLanguageModels.nativeTools', 'Native Tools'), 'muted');
 		}
-		if (model.format) {
-			details += ` | ${model.format}`;
-		}
+		if (model.format) { addChip(model.format, 'muted'); }
+		// Status badge (colored by state)
 		if (model.isDownloading) {
-			details += isOllama
-				? ` | ${localize('customLanguageModels.pullingInProgress', 'Pulling...')}`
-				: ` | ${localize('customLanguageModels.downloading', 'Downloading')} ${model.downloadProgress ?? 0}%`;
+			addChip(isOllama
+				? localize('customLanguageModels.pullingInProgress', 'Pulling...')
+				: `${localize('customLanguageModels.downloading', 'Downloading')} ${model.downloadProgress ?? 0}%`,
+				'status', 'pending');
 		} else if (model.provider === 'huggingface' || isOllama) {
 			if (!needsDownloadOrPullRetry(model)) {
-				details += ` | ${isOllama ? localize('customLanguageModels.ready', 'Ready') : localize('customLanguageModels.downloaded', 'Downloaded')}`;
+				addChip(isOllama ? localize('customLanguageModels.ready', 'Ready') : localize('customLanguageModels.downloaded', 'Downloaded'),
+					'status', 'ready');
 			} else {
-				details += ` | ${localize('customLanguageModels.downloadNotFinished', 'Download not finished')}`;
+				addChip(localize('customLanguageModels.downloadNotFinished', 'Download not finished'), 'status', 'error');
 			}
 		}
-		const detailsLabel = DOM.append(row2, $('.model-details'));
-		detailsLabel.textContent = details;
 
 		// Context window input sits on the right of row 2, inline with the details text
 		const contextWindowContainer = DOM.append(row2, $('.model-max-input-container'));
@@ -1303,24 +1394,42 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 	private renderAgentSettings(container: HTMLElement): void {
 		const title = DOM.append(container, $('h2.agent-settings-title'));
 		title.textContent = localize('locopilotSettings.agentSettingsTitle', 'Agent Settings');
+		const subtitle = DOM.append(container, $('.agent-settings-subtitle'));
+		subtitle.textContent = localize('locopilotSettings.agentSettingsSubtitle', "Control how the agent runs and which system prompt it uses.");
+
+		// --- Card: Execution -------------------------------------------------
+		const execCard = DOM.append(container, $('.agent-setting-card'));
+		const execHeader = DOM.append(execCard, $('.agent-setting-card-header'));
+		execHeader.textContent = localize('locopilotSettings.executionSection', "Execution");
 
 		// Max iterations per request
-		const maxIterSection = DOM.append(container, $('.agent-setting-row'));
-		const maxIterLabel = DOM.append(maxIterSection, $('label.locopilot-setting-label'));
+		const maxIterSection = DOM.append(execCard, $('.agent-setting-row'));
+		const maxIterText = DOM.append(maxIterSection, $('.agent-setting-text'));
+		const maxIterLabel = DOM.append(maxIterText, $('label.locopilot-setting-label'));
 		maxIterLabel.textContent = localize('locopilotSettings.maxIterations', "Max iterations per request");
-		const maxIterWrap = DOM.append(maxIterSection, $('.agent-setting-input-wrap'));
+		const maxIterDesc = DOM.append(maxIterText, $('.agent-setting-description'));
+		maxIterDesc.textContent = localize('locopilotSettings.maxIterationsDescription', "How many tool/LLM steps the agent may take to answer a single request.");
+		// Hint/error lives in the left text column so the input never shifts when its text changes width.
+		this.maxIterationsHint = DOM.append(maxIterText, $('.agent-setting-hint'));
+		this.maxIterationsHint.textContent = localize('locopilotSettings.maxIterationsHint', "Between 10 and 500.");
+		const maxIterControl = DOM.append(maxIterSection, $('.agent-setting-control'));
+		const maxIterWrap = DOM.append(maxIterControl, $('.agent-setting-input-wrap'));
 		this.maxIterationsInput = this._register(new InputBox(DOM.append(maxIterWrap, $('div')), this.contextViewService, {
 			placeholder: String(DEFAULT_MAX_ITERATIONS),
 			inputBoxStyles: locopilotSettingsInputBoxStyles
 		}));
 		this.maxIterationsInput.value = String(this.agentSettingsService.getMaxIterationsPerRequest());
-		this._register(this.maxIterationsInput.onDidChange(() => this.updateAgentSettingsDirtyIndicators()));
+		this._register(this.maxIterationsInput.onDidChange(() => { this.validateMaxIterations(); this.updateAgentSettingsDirtyIndicators(); }));
 
 		// Auto approve terminal commands (on/off switch; default off)
-		const autoRunRow = DOM.append(container, $('.agent-setting-row'));
-		const autoRunLabel = DOM.append(autoRunRow, $('label.locopilot-setting-label'));
+		const autoRunRow = DOM.append(execCard, $('.agent-setting-row'));
+		const autoRunText = DOM.append(autoRunRow, $('.agent-setting-text'));
+		const autoRunLabel = DOM.append(autoRunText, $('label.locopilot-setting-label'));
 		autoRunLabel.textContent = localize('locopilotSettings.autoApproveTerminalCommands', "Auto approve terminal commands");
-		const autoRunWrap = DOM.append(autoRunRow, $('.agent-setting-toggle-wrap.agent-setting-switch-wrap'));
+		const autoRunDesc = DOM.append(autoRunText, $('.agent-setting-description.agent-setting-description-warning'));
+		DOM.append(autoRunDesc, renderIcon(Codicon.warning));
+		DOM.append(autoRunDesc, $('span', undefined, localize('locopilotSettings.autoApproveTerminalCommandsHint', "Runs terminal commands without asking. Off by default.")));
+		const autoRunWrap = DOM.append(autoRunRow, $('.agent-setting-control.agent-setting-toggle-wrap.agent-setting-switch-wrap'));
 		this.autoRunCommandsInSandboxToggle = this._register(new Toggle({
 			title: localize('locopilotSettings.autoApproveTerminalCommandsDescription', "When on, terminal commands from the LLM agent run without asking for permission. Commands are allowed in sandbox. Default: off."),
 			isChecked: this.agentSettingsService.getAutoRunCommandsInSandbox(),
@@ -1335,75 +1444,17 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 		// Power users can still override via the hidden settings locopilot.llamaCpp.serverPath and
 		// locopilot.mlx.pythonPath (e.g. to point at a custom build or their own Python).
 
-		// LoCoPilot prompt - Agent (toggle label only; no separate section heading)
-		const agentSection = DOM.append(container, $('.agent-setting-block'));
-		const agentCodingRow = DOM.append(agentSection, $('.agent-setting-row'));
-		const agentCodingLabel = DOM.append(agentCodingRow, $('label.locopilot-setting-label'));
-		agentCodingLabel.textContent = localize('locopilotSettings.locopilotPromptAgent', "LoCoPilot's prompt (Agent)");
-		const agentCodingWrap = DOM.append(agentCodingRow, $('.agent-setting-toggle-wrap.agent-setting-switch-wrap'));
-		this.agentCodingSystemPromptToggle = this._register(new Toggle({
-			title: localize('locopilotSettings.locopilotPromptAgentDescription', "When on, Agent mode uses LoCoPilot's built-in coding prompt (tools are appended). When off, you can optionally edit below; leave blank for a short default opener."),
-			isChecked: this.agentSettingsService.getAgentUseCodingSystemPrompt(),
-			...defaultToggleStyles
-		}));
-		DOM.append(agentCodingWrap, this.agentCodingSystemPromptToggle.domNode);
-		this._register(this.agentCodingSystemPromptToggle.onChange(() => {
-			this.updateCodingPromptUIMode('agent');
-			this._renderFormattedPrompt('agent');
-			this.updateAgentSettingsDirtyIndicators();
-		}));
+		// --- Card: System Prompts -------------------------------------------
+		const promptCard = DOM.append(container, $('.agent-setting-card'));
+		const promptHeader = DOM.append(promptCard, $('.agent-setting-card-header'));
+		promptHeader.textContent = localize('locopilotSettings.systemPromptsSection', "System Prompts");
+		this.renderPromptBlock(promptCard, 'agent');
+		this.renderPromptBlock(promptCard, 'ask');
 
-		const agentBox = DOM.append(agentSection, $('.locopilot-prompt-box'));
-		this.agentPromptFormattedView = DOM.append(agentBox, $('.locopilot-prompt-formatted'));
-		this.agentPromptFormattedView.setAttribute('role', 'button');
-		this.agentPromptFormattedView.setAttribute('tabindex', '0');
-		this.agentPromptFormattedView.title = localize('locopilotSettings.clickToEdit', "Click to edit");
-		this.agentPromptTextarea = DOM.append(agentBox, $('textarea.locopilot-prompt-textarea')) as HTMLTextAreaElement;
-		this.agentPromptTextarea.placeholder = localize('locopilotSettings.agentPromptPlaceholder', "Optional when LoCoPilot's prompt is off. Blank uses a one-line default opener.");
-		this.agentPromptTextarea.value = this.agentSettingsService.getAgentModeSystemPrompt();
-		this.agentPromptTextarea.classList.add('locopilot-prompt-textarea-hidden');
-		this.updateCodingPromptUIMode('agent');
-		this._renderFormattedPrompt('agent');
-		this._register(DOM.addDisposableListener(this.agentPromptFormattedView, 'click', () => this._switchToEditPrompt('agent')));
-		this._register(DOM.addDisposableListener(this.agentPromptFormattedView, 'keydown', (e: KeyboardEvent) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); this._switchToEditPrompt('agent'); } }));
-		this._register(DOM.addDisposableListener(this.agentPromptTextarea, 'blur', () => this._switchToFormattedPrompt('agent')));
-		this._register(DOM.addDisposableListener(this.agentPromptTextarea, 'input', () => this.updateAgentSettingsDirtyIndicators()));
-
-		// LoCoPilot prompt - Ask (toggle label only; no separate section heading)
-		const askSection = DOM.append(container, $('.agent-setting-block'));
-		const askCodingRow = DOM.append(askSection, $('.agent-setting-row'));
-		const askCodingLabel = DOM.append(askCodingRow, $('label.locopilot-setting-label'));
-		askCodingLabel.textContent = localize('locopilotSettings.locopilotPromptAsk', "LoCoPilot's prompt (Ask)");
-		const askCodingWrap = DOM.append(askCodingRow, $('.agent-setting-toggle-wrap.agent-setting-switch-wrap'));
-		this.askCodingSystemPromptToggle = this._register(new Toggle({
-			title: localize('locopilotSettings.locopilotPromptAskDescription', "When on, Ask mode uses LoCoPilot's built-in coding prompt for Ask mode (tools are appended). When off, you can optionally edit below; leave blank for a short default opener."),
-			isChecked: this.agentSettingsService.getAskUseCodingSystemPrompt(),
-			...defaultToggleStyles
-		}));
-		DOM.append(askCodingWrap, this.askCodingSystemPromptToggle.domNode);
-		this._register(this.askCodingSystemPromptToggle.onChange(() => {
-			this.updateCodingPromptUIMode('ask');
-			this._renderFormattedPrompt('ask');
-			this.updateAgentSettingsDirtyIndicators();
-		}));
-
-		const askBox = DOM.append(askSection, $('.locopilot-prompt-box'));
-		this.askPromptFormattedView = DOM.append(askBox, $('.locopilot-prompt-formatted'));
-		this.askPromptFormattedView.setAttribute('role', 'button');
-		this.askPromptFormattedView.setAttribute('tabindex', '0');
-		this.askPromptFormattedView.title = localize('locopilotSettings.clickToEdit', "Click to edit");
-		this.askPromptTextarea = DOM.append(askBox, $('textarea.locopilot-prompt-textarea')) as HTMLTextAreaElement;
-		this.askPromptTextarea.placeholder = localize('locopilotSettings.askPromptPlaceholder', "Optional when LoCoPilot's prompt is off. Blank uses a one-line default opener.");
-		this.askPromptTextarea.value = this.agentSettingsService.getAskModeSystemPrompt();
-		this.askPromptTextarea.classList.add('locopilot-prompt-textarea-hidden');
-		this.updateCodingPromptUIMode('ask');
-		this._renderFormattedPrompt('ask');
-		this._register(DOM.addDisposableListener(this.askPromptFormattedView, 'click', () => this._switchToEditPrompt('ask')));
-		this._register(DOM.addDisposableListener(this.askPromptFormattedView, 'keydown', (e: KeyboardEvent) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); this._switchToEditPrompt('ask'); } }));
-		this._register(DOM.addDisposableListener(this.askPromptTextarea, 'blur', () => this._switchToFormattedPrompt('ask')));
-		this._register(DOM.addDisposableListener(this.askPromptTextarea, 'input', () => this.updateAgentSettingsDirtyIndicators()));
-
+		// --- Sticky footer ---------------------------------------------------
 		const footerRow = DOM.append(container, $('.agent-setting-footer'));
+		this.agentSettingsDirtyIndicator = DOM.append(footerRow, $('.agent-setting-dirty-indicator'));
+		this.agentSettingsDirtyIndicator.textContent = localize('locopilotSettings.unsavedChanges', "Unsaved changes");
 		this.agentSettingsCancelBtn = this._register(new Button(footerRow, { ...defaultButtonStyles, secondary: true }));
 		this.agentSettingsCancelBtn.label = localize('locopilotSettings.cancel', "Cancel");
 		this.agentSettingsCancelBtn.enabled = false;
@@ -1413,8 +1464,75 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 		this.agentSettingsSaveBtn.enabled = false;
 		this.agentSettingsSaveBtn.onDidClick(() => { this.saveAgentSettings(); });
 
+		this.validateMaxIterations();
 		this.captureAgentSettingsBaselineFromPersisted();
 		this.updateAgentSettingsDirtyIndicators();
+	}
+
+	/** Builds one prompt mode block (Default/Override segmented control + editable prompt box). */
+	private renderPromptBlock(container: HTMLElement, which: 'agent' | 'ask'): void {
+		const isAgent = which === 'agent';
+		const section = DOM.append(container, $('.agent-setting-block'));
+		const headerRow = DOM.append(section, $('.agent-setting-row'));
+		const text = DOM.append(headerRow, $('.agent-setting-text'));
+		const label = DOM.append(text, $('label.locopilot-setting-label'));
+		label.textContent = isAgent
+			? localize('locopilotSettings.promptAgentLabel', "Agent mode prompt")
+			: localize('locopilotSettings.promptAskLabel', "Ask mode prompt");
+		const desc = DOM.append(text, $('.agent-setting-description'));
+		desc.textContent = isAgent
+			? localize('locopilotSettings.promptAgentDesc', "Default uses LoCoPilot's built-in coding prompt. Override to write your own.")
+			: localize('locopilotSettings.promptAskDesc', "Default uses LoCoPilot's built-in Ask prompt. Override to write your own.");
+
+		const control = this._register(new PromptModeControl(
+			isAgent ? this.agentSettingsService.getAgentUseCodingSystemPrompt() : this.agentSettingsService.getAskUseCodingSystemPrompt(),
+			isAgent ? localize('locopilotSettings.promptAgentLabel', "Agent mode prompt") : localize('locopilotSettings.promptAskLabel', "Ask mode prompt")
+		));
+		DOM.append(headerRow, $('.agent-setting-control', undefined, control.domNode));
+		this._register(control.onChange(() => {
+			this.updateCodingPromptUIMode(which);
+			this._renderFormattedPrompt(which);
+			this.updateAgentSettingsDirtyIndicators();
+		}));
+
+		const box = DOM.append(section, $('.locopilot-prompt-box'));
+		const formatted = DOM.append(box, $('.locopilot-prompt-formatted'));
+		formatted.setAttribute('role', 'button');
+		formatted.setAttribute('tabindex', '0');
+		formatted.title = localize('locopilotSettings.clickToEdit', "Click to edit");
+		const textarea = DOM.append(box, $('textarea.locopilot-prompt-textarea')) as HTMLTextAreaElement;
+		textarea.placeholder = localize('locopilotSettings.promptPlaceholder', "Write your system prompt. Leave blank for a short default opener.");
+		textarea.value = isAgent ? this.agentSettingsService.getAgentModeSystemPrompt() : this.agentSettingsService.getAskModeSystemPrompt();
+		textarea.classList.add('locopilot-prompt-textarea-hidden');
+
+		if (isAgent) {
+			this.agentCodingSystemPromptToggle = control;
+			this.agentPromptFormattedView = formatted;
+			this.agentPromptTextarea = textarea;
+		} else {
+			this.askCodingSystemPromptToggle = control;
+			this.askPromptFormattedView = formatted;
+			this.askPromptTextarea = textarea;
+		}
+
+		this.updateCodingPromptUIMode(which);
+		this._renderFormattedPrompt(which);
+		this._register(DOM.addDisposableListener(formatted, 'click', () => this._switchToEditPrompt(which)));
+		this._register(DOM.addDisposableListener(formatted, 'keydown', (e: KeyboardEvent) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); this._switchToEditPrompt(which); } }));
+		this._register(DOM.addDisposableListener(textarea, 'blur', () => this._switchToFormattedPrompt(which)));
+		this._register(DOM.addDisposableListener(textarea, 'input', () => this.updateAgentSettingsDirtyIndicators()));
+	}
+
+	/** Live-validates the max-iterations field, toggling an error state + hint text. */
+	private validateMaxIterations(): void {
+		if (!this.maxIterationsInput || !this.maxIterationsHint) { return; }
+		const n = parseInt(this.maxIterationsInput.value.trim(), 10);
+		const valid = !isNaN(n) && n >= 10 && n <= 500;
+		this.maxIterationsInput.element.classList.toggle('agent-setting-input-invalid', !valid);
+		this.maxIterationsHint.classList.toggle('agent-setting-hint-error', !valid);
+		this.maxIterationsHint.textContent = valid
+			? localize('locopilotSettings.maxIterationsHint', "Between 10 and 500.")
+			: localize('locopilotSettings.maxIterationsHintError', "Enter a number between 10 and 500.");
 	}
 
 	private takeAgentSettingsSnapshotFromPersisted(): {
@@ -1478,24 +1596,29 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 		const dirty = this.isAgentSettingsDirty();
 		this.agentSettingsSaveBtn.enabled = dirty;
 		this.agentSettingsCancelBtn.enabled = dirty;
+		if (this.agentSettingsDirtyIndicator) {
+			this.agentSettingsDirtyIndicator.classList.toggle('visible', dirty);
+		}
 	}
 
 	private updateCodingPromptUIMode(which: 'agent' | 'ask'): void {
+		// `checked === true` means Default (built-in prompt): hide the prompt box entirely.
+		// Override (false) reveals the editable box.
 		const useBuiltin = which === 'agent' ? this.agentCodingSystemPromptToggle.checked : this.askCodingSystemPromptToggle.checked;
 		const textarea = which === 'agent' ? this.agentPromptTextarea : this.askPromptTextarea;
 		const formatted = which === 'agent' ? this.agentPromptFormattedView : this.askPromptFormattedView;
-		const wrap = formatted.parentElement;
+		const box = formatted.parentElement; // .locopilot-prompt-box
 		textarea.disabled = useBuiltin;
 		if (useBuiltin) {
-			formatted.removeAttribute('role');
-			formatted.tabIndex = -1;
-			formatted.removeAttribute('title');
-			wrap?.classList.add('locopilot-prompt-box-disabled');
+			box?.classList.add('locopilot-prompt-box-hidden');
 		} else {
+			box?.classList.remove('locopilot-prompt-box-hidden');
+			// Reset to the read-only formatted view whenever Override is (re)selected.
+			formatted.classList.remove('locopilot-prompt-formatted-hidden');
 			formatted.setAttribute('role', 'button');
 			formatted.tabIndex = 0;
 			formatted.title = localize('locopilotSettings.clickToEdit', "Click to edit");
-			wrap?.classList.remove('locopilot-prompt-box-disabled');
+			textarea.classList.add('locopilot-prompt-textarea-hidden');
 		}
 	}
 
@@ -1506,6 +1629,7 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 
 	private loadAgentPanelFromPersisted(): void {
 		this.maxIterationsInput.value = String(this.agentSettingsService.getMaxIterationsPerRequest());
+		this.validateMaxIterations();
 		this.autoRunCommandsInSandboxToggle.checked = this.agentSettingsService.getAutoRunCommandsInSandbox();
 		this.askCodingSystemPromptToggle.checked = this.agentSettingsService.getAskUseCodingSystemPrompt();
 		this.agentCodingSystemPromptToggle.checked = this.agentSettingsService.getAgentUseCodingSystemPrompt();
@@ -1556,7 +1680,6 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 	private _renderFormattedPrompt(which: 'agent' | 'ask'): void {
 		const textarea = which === 'agent' ? this.agentPromptTextarea : this.askPromptTextarea;
 		const container = which === 'agent' ? this.agentPromptFormattedView : this.askPromptFormattedView;
-		const useCodingBuiltin = which === 'agent' ? this.agentCodingSystemPromptToggle.checked : this.askCodingSystemPromptToggle.checked;
 		const setRendered = (r: { dispose(): void } | undefined) => {
 			if (which === 'agent') { this.agentPromptFormattedRendered = r; } else { this.askPromptFormattedRendered = r; }
 		};
@@ -1565,20 +1688,7 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 			prev.dispose();
 			setRendered(undefined);
 		}
-		if (useCodingBuiltin) {
-			DOM.reset(container);
-			container.textContent = which === 'agent'
-				? localize(
-					'locopilotSettings.locopilotBuiltinPromptActiveAgent',
-					'LoCoPilot\'s built-in coding prompt is active. Turn off "LoCoPilot\'s prompt (Agent)" to customize.'
-				)
-				: localize(
-					'locopilotSettings.locopilotBuiltinPromptActiveAsk',
-					'LoCoPilot\'s built-in coding prompt is active. Turn off "LoCoPilot\'s prompt (Ask)" to customize.'
-				);
-			container.classList.add('locopilot-prompt-is-default');
-			return;
-		}
+		// In Default mode the whole box is hidden, so only the Override content matters here.
 		const trimmed = textarea.value.trim();
 		if (!trimmed) {
 			DOM.reset(container);

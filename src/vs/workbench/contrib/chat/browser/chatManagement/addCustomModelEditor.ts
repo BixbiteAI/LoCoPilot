@@ -62,7 +62,7 @@ export class AddCustomModelEditor extends EditorPane {
 	private dimension: Dimension | undefined;
 	private bodyContainer: HTMLElement | undefined;
 
-	private modelTypeSelectBox!: SelectBox;
+	private modelTypeSegments: HTMLElement[] = [];
 	private providerSelectBox!: SelectBox;
 	private apiKeyInputBox!: InputBox;
 	private tokenInputBox!: InputBox;
@@ -107,28 +107,34 @@ export class AddCustomModelEditor extends EditorPane {
 		// Title
 		const title = DOM.append(formContainer, $('h2.form-title'));
 		title.textContent = localize('addCustomModel.title', 'Add Language Model');
+		const subtitle = DOM.append(formContainer, $('p.form-subtitle'));
+		subtitle.textContent = localize('addCustomModel.subtitle', 'Connect a cloud provider or a local model. It will appear in the model list and the Auto dropdown.');
 
-		// Model Type
+		// Model Type (segmented control)
 		const modelTypeContainer = DOM.append(formContainer, $('.form-field'));
 		const modelTypeLabel = DOM.append(modelTypeContainer, $('label.form-label'));
 		modelTypeLabel.textContent = localize('addCustomModel.modelType', 'Model Type');
-		const modelTypeSelectContainer = DOM.append(modelTypeContainer, $('.form-input-container'));
-		this.modelTypeSelectBox = this._register(new SelectBox(
-			[
-				{ text: localize('addCustomModel.cloud', 'Cloud'), description: '' },
-				{ text: localize('addCustomModel.local', 'Local'), description: '' }
-			],
-			0,
-			this.contextViewService,
-			settingsStyleSelectBox
-		));
-		this.modelTypeSelectBox.render(modelTypeSelectContainer);
-		this._register(this.modelTypeSelectBox.onDidSelect((e: ISelectData) => {
-			this.currentModelType = e.index === 0 ? 'cloud' : 'local';
-			this.currentProviderIndex = 0;
-			this.updateProviderOptions();
-			this.updateInputFields();
-		}));
+		const segmented = DOM.append(modelTypeContainer, $('.segmented-control'));
+		const segmentDefs: Array<{ label: string; type: 'cloud' | 'local' }> = [
+			{ label: localize('addCustomModel.cloud', 'Cloud'), type: 'cloud' },
+			{ label: localize('addCustomModel.local', 'Local'), type: 'local' }
+		];
+		this.modelTypeSegments = segmentDefs.map(def => {
+			const seg = DOM.append(segmented, $('button.segment'));
+			seg.textContent = def.label;
+			seg.classList.toggle('active', def.type === this.currentModelType);
+			this._register(DOM.addDisposableListener(seg, DOM.EventType.CLICK, () => {
+				if (this.currentModelType === def.type) {
+					return;
+				}
+				this.currentModelType = def.type;
+				this.currentProviderIndex = 0;
+				this.modelTypeSegments.forEach((s, i) => s.classList.toggle('active', segmentDefs[i].type === def.type));
+				this.updateProviderOptions();
+				this.updateInputFields();
+			}));
+			return seg;
+		});
 
 		// Provider
 		const providerContainer = DOM.append(formContainer, $('.form-field'));
@@ -158,6 +164,8 @@ export class AddCustomModelEditor extends EditorPane {
 		tokenContainer.style.display = 'none';
 		const tokenLabel = DOM.append(tokenContainer, $('label.form-label'));
 		tokenLabel.textContent = localize('addCustomModel.token', 'Token (Optional)');
+		const tokenHelp = DOM.append(tokenContainer, $('span.form-help'));
+		tokenHelp.textContent = localize('addCustomModel.tokenHelp', 'Needed only for gated or private models.');
 		const tokenInputContainer = DOM.append(tokenContainer, $('.form-input-container'));
 		this.tokenInputBox = this._register(new InputBox(tokenInputContainer, this.contextViewService, {
 			placeholder: localize('addCustomModel.tokenPlaceholder', 'Enter your token (e.g., HuggingFace token)'),
@@ -179,6 +187,8 @@ export class AddCustomModelEditor extends EditorPane {
 		this.localhostModelIdContainer.style.display = 'none';
 		const lmLabel = DOM.append(this.localhostModelIdContainer, $('label.form-label'));
 		lmLabel.textContent = localize('addCustomModel.localhostServerModelId', 'Server model id');
+		const lmHelp = DOM.append(this.localhostModelIdContainer, $('span.form-help'));
+		lmHelp.textContent = localize('addCustomModel.localhostServerModelIdHelp', 'The OpenAI `model` field your server expects (see GET /v1/models).');
 		const lmInputWrap = DOM.append(this.localhostModelIdContainer, $('.form-input-container'));
 		this.localhostModelIdInputBox = this._register(new InputBox(lmInputWrap, this.contextViewService, {
 			placeholder: localize('addCustomModel.localhostServerModelIdPlaceholder', 'e.g. Qwen/Qwen3-4B-MLX-4bit'),
@@ -206,8 +216,11 @@ export class AddCustomModelEditor extends EditorPane {
 			inputBoxStyles: settingsStyleInputBox
 		}));
 
-		// Add Button
+		// Actions: Reset (secondary) + Add Model (primary), right-aligned
 		const buttonContainer = DOM.append(formContainer, $('.form-actions'));
+		const resetButton = this._register(new Button(buttonContainer, { ...defaultButtonStyles, secondary: true }));
+		resetButton.label = localize('addCustomModel.reset', 'Reset');
+		this._register(resetButton.onDidClick(() => this.resetForm()));
 		this.addButton = this._register(new Button(buttonContainer, { ...defaultButtonStyles }));
 		this.addButton.label = localize('addCustomModel.add', 'Add Model');
 		this._register(this.addButton.onDidClick(() => this.handleAddModel()));
@@ -276,6 +289,24 @@ export class AddCustomModelEditor extends EditorPane {
 			this.modelNameLabel.textContent = localize('addCustomModel.modelName', 'Model Name');
 			this.modelNameInputBox.setPlaceHolder(localize('addCustomModel.modelNamePlaceholder', 'e.g., gpt-4, claude-3-opus, llama-2-7b'));
 		}
+	}
+
+	private resetForm(): void {
+		// Reset selections back to defaults (Cloud + first provider)
+		this.currentModelType = 'cloud';
+		this.currentProviderIndex = 0;
+		this.modelTypeSegments.forEach((s, i) => s.classList.toggle('active', i === 0));
+		this.updateProviderOptions();
+		this.updateInputFields();
+
+		// Clear all input values
+		this.modelNameInputBox.value = '';
+		this.displayNameInputBox.value = '';
+		this.localhostModelIdInputBox.value = '';
+		this.apiKeyInputBox.value = '';
+		this.tokenInputBox.value = '';
+		this.hfFastestCheckbox.checked = false;
+		this.modelNameInputBox.focus();
 	}
 
 	private async handleAddModel(): Promise<void> {

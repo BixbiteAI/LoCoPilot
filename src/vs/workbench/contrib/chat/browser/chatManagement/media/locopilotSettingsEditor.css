@@ -162,17 +162,153 @@
 }
 
 .locopilot-settings-editor .agent-settings-title {
-	margin: 0 0 4px 0;
+	margin: 0 0 2px 0;
 	font-size: 20px;
 	font-weight: 600;
 	color: var(--vscode-foreground);
 }
 
-.locopilot-settings-editor .agent-setting-row {
+.locopilot-settings-editor .agent-settings-subtitle {
+	margin: 0 0 4px 0;
+	font-size: 13px;
+	color: var(--vscode-descriptionForeground);
+}
+
+/* Card grouping for related settings */
+.locopilot-settings-editor .agent-setting-card {
+	display: flex;
+	flex-direction: column;
+	gap: 16px;
+	padding: 16px;
+	border: 1px solid var(--vscode-settings-headerBorder, var(--vscode-input-border));
+	border-radius: 8px;
+	background: var(--vscode-editorWidget-background, transparent);
+}
+
+.locopilot-settings-editor .agent-setting-card-header {
+	font-size: 11px;
+	font-weight: 700;
+	text-transform: uppercase;
+	letter-spacing: 0.06em;
+	color: var(--vscode-descriptionForeground);
+}
+
+/* A row's text column (label + description) grows; its control stays its natural size */
+.locopilot-settings-editor .agent-setting-text {
+	display: flex;
+	flex-direction: column;
+	gap: 3px;
+	flex: 1 1 auto;
+	min-width: 0;
+}
+
+.locopilot-settings-editor .agent-setting-control {
+	flex: 0 0 auto;
+	display: flex;
+	flex-direction: column;
+	gap: 4px;
+	align-items: flex-start;
+}
+
+.locopilot-settings-editor .agent-setting-description {
+	font-size: 12px;
+	color: var(--vscode-descriptionForeground);
+	line-height: 1.4;
+}
+
+.locopilot-settings-editor .agent-setting-description-warning {
 	display: flex;
 	align-items: center;
+	gap: 5px;
+	color: var(--vscode-notificationsWarningIcon-foreground, var(--vscode-editorWarning-foreground));
+}
+
+.locopilot-settings-editor .agent-setting-description-warning .codicon {
+	font-size: 13px;
+}
+
+.locopilot-settings-editor .agent-setting-hint {
+	font-size: 11px;
+	color: var(--vscode-descriptionForeground);
+}
+
+.locopilot-settings-editor .agent-setting-hint-error {
+	color: var(--vscode-inputValidation-errorForeground, var(--vscode-errorForeground));
+}
+
+.locopilot-settings-editor .agent-setting-input-invalid.monaco-inputbox,
+.locopilot-settings-editor .agent-setting-input-invalid .monaco-inputbox {
+	border-color: var(--vscode-inputValidation-errorBorder) !important;
+}
+
+/* Two-option segmented control: Default / Override */
+.locopilot-settings-editor .locopilot-segmented {
+	display: inline-flex;
+	border: 1px solid var(--vscode-input-border);
+	border-radius: 6px;
+	overflow: hidden;
+	background: var(--vscode-input-background);
+}
+
+.locopilot-settings-editor .locopilot-segmented-option {
+	appearance: none;
+	border: none;
+	background: transparent;
+	color: var(--vscode-foreground);
+	font: inherit;
+	font-size: 12px;
+	padding: 4px 14px;
+	cursor: pointer;
+	transition: background-color 0.12s ease, color 0.12s ease;
+}
+
+.locopilot-settings-editor .locopilot-segmented-option + .locopilot-segmented-option {
+	border-left: 1px solid var(--vscode-input-border);
+}
+
+/* Match each end button's corners to the container so the selected fill and the
+	focus box-shadow round cleanly instead of showing a clipped square corner. */
+.locopilot-settings-editor .locopilot-segmented-option:first-child {
+	border-top-left-radius: 5px;
+	border-bottom-left-radius: 5px;
+}
+.locopilot-settings-editor .locopilot-segmented-option:last-child {
+	border-top-right-radius: 5px;
+	border-bottom-right-radius: 5px;
+}
+
+.locopilot-settings-editor .locopilot-segmented-option:hover:not(.selected) {
+	background: var(--vscode-inputOption-hoverBackground, var(--vscode-toolbar-hoverBackground));
+}
+
+.locopilot-settings-editor .locopilot-segmented-option.selected {
+	background: var(--vscode-inputOption-activeBackground, var(--vscode-button-background));
+	color: var(--vscode-inputOption-activeForeground, var(--vscode-button-foreground));
+	font-weight: 600;
+}
+
+/* Use an inset box-shadow (clipped by the container's rounded overflow:hidden)
+	instead of an outline, which would poke square corners past the rounded edge. */
+.locopilot-settings-editor .locopilot-segmented-option:focus-visible {
+	outline: none;
+	box-shadow: inset 0 0 0 1px var(--vscode-focusBorder);
+}
+
+/* Default mode hides the prompt editor entirely (only shown in Override) */
+.locopilot-settings-editor .locopilot-prompt-box-hidden {
+	display: none;
+}
+
+.locopilot-settings-editor .agent-setting-row {
+	display: flex;
+	align-items: flex-start;
 	gap: 12px;
-	flex-wrap: wrap;
+	flex-wrap: nowrap;
+}
+
+/* Keep the control (input/toggle/segmented) pinned to the right, aligned with the label line */
+.locopilot-settings-editor .agent-setting-row > .agent-setting-control {
+	margin-left: auto;
 }
 
 .locopilot-settings-editor .locopilot-setting-label {
@@ -409,9 +545,14 @@
 	align-items: center;
 	justify-content: space-between;
 	gap: 12px;
-	margin-top: 16px;
-	padding-top: 16px;
+	margin-top: 8px;
+	padding-top: 12px;
+	padding-bottom: 4px;
 	border-top: 1px solid var(--vscode-settings-headerBorder);
+	position: sticky;
+	bottom: 0;
+	background: var(--vscode-editor-background);
+	z-index: 1;
 }
 
 .locopilot-settings-editor .agent-setting-footer .monaco-button {
@@ -420,9 +561,16 @@
 	min-width: max-content;
 }
 
-/* Push Restore and Save to the right, keep Cancel on the left */
-.locopilot-settings-editor .agent-setting-footer .monaco-button:nth-child(2) {
-	margin-left: auto;
+/* "Unsaved changes" indicator sits on the left and pushes the buttons to the right */
+.locopilot-settings-editor .agent-setting-dirty-indicator {
+	margin-right: auto;
+	font-size: 12px;
+	color: var(--vscode-descriptionForeground);
+	opacity: 0;
+	transition: opacity 0.15s ease;
+}
+.locopilot-settings-editor .agent-setting-dirty-indicator.visible {
+	opacity: 1;
 }
 
 /* Add model form: token fields with K suffix */

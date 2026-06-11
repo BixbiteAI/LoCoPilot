@@ -1,43 +1,74 @@
+/*---------------------------------------------------------------------------------------------
+ *  Copyright (c) Microsoft Corporation. All rights reserved.
+ *  Licensed under the MIT License. See License.txt in the project root for license information.
+ *--------------------------------------------------------------------------------------------*/
+
 .add-custom-model-editor {
 	display: flex;
 	flex-direction: column;
-	padding: 20px 20px 40px;
+	padding: 28px 20px 48px;
+	overflow: auto;
 }
 
 .add-custom-model-form {
-	max-width: 600px;
+	max-width: 520px;
 	margin: 0 auto;
 	width: 100%;
 }
 
 .form-title {
-	margin: 0 0 30px 0;
-	font-size: 24px;
+	margin: 0 0 6px 0;
+	font-size: 22px;
 	font-weight: 600;
 }
 
+.form-subtitle {
+	margin: 0 0 28px 0;
+	font-size: 13px;
+	line-height: 1.5;
+	color: var(--vscode-descriptionForeground);
+}
+
+/* Card grouping the form fields for a more structured look */
+.add-model-card {
+	padding: 20px 20px 4px;
+	border: 1px solid var(--vscode-settings-headerBorder, var(--vscode-input-border));
+	border-radius: 8px;
+	background: var(--vscode-editorWidget-background, transparent);
+}
+
 .form-field {
-	margin-bottom: 24px;
+	margin-bottom: 22px;
+}
+
+.add-model-card .form-field:last-child {
+	margin-bottom: 16px;
 }
 
 .form-label {
 	display: block;
-	margin-bottom: 8px;
+	margin-bottom: 6px;
 	font-size: 13px;
 	font-weight: 600;
 	color: var(--vscode-foreground);
 }
 
-.form-input-container {
-	width: 100%;
-	min-width: 400px;
-	max-width: 400px;
+.form-help {
+	display: block;
+	margin: -2px 0 8px 0;
+	font-size: 12px;
+	line-height: 1.4;
+	color: var(--vscode-descriptionForeground);
 }
 
-/* Match main Settings editor (e.g. Text Editor) control sizing and look */
+.form-input-container {
+	width: 100%;
+}
+
+/* Match main Settings editor control sizing and look */
 .form-input-container .monaco-inputbox {
 	width: 100%;
-	min-height: 22px;
+	min-height: 26px;
 	padding: 2px 6px;
 	font: inherit;
 	border-radius: 4px;
@@ -50,21 +81,78 @@
 
 .form-input-container .monaco-select-box {
 	width: 100%;
-	height: 26px;
+	height: 28px;
 	padding: 2px 6px;
 	font: inherit;
 	border-radius: 4px;
 	box-sizing: border-box;
 }
 
+/* Segmented control for Cloud / Local */
+.segmented-control {
+	display: inline-flex;
+	width: 100%;
+	border: 1px solid var(--vscode-settings-textInputBorder, var(--vscode-input-border, transparent));
+	border-radius: 6px;
+	padding: 2px;
+	gap: 2px;
+	background: var(--vscode-settings-textInputBackground, var(--vscode-input-background));
+	box-sizing: border-box;
+}
+
+.segmented-control .segment {
+	flex: 1;
+	appearance: none;
+	border: none;
+	background: transparent;
+	color: var(--vscode-foreground);
+	font: inherit;
+	font-weight: 500;
+	height: 26px;
+	border-radius: 4px;
+	cursor: pointer;
+	transition: background 80ms ease, color 80ms ease;
+}
+
+.segmented-control .segment:hover:not(.active) {
+	background: var(--vscode-toolbar-hoverBackground);
+}
+
+.segmented-control .segment.active {
+	background: var(--vscode-button-background);
+	color: var(--vscode-button-foreground);
+}
+
+.segmented-control .segment:focus-visible {
+	outline: 1px solid var(--vscode-focusBorder);
+	outline-offset: -1px;
+}
+
+/* Inline routing toggle */
+.hf-routing-toggle {
+	display: inline-flex;
+	align-items: center;
+	gap: 8px;
+	cursor: pointer;
+	font-size: 13px;
+}
+
+.hf-routing-toggle input {
+	margin: 0;
+}
+
 .form-actions {
-	margin-top: 32px;
+	margin-top: 28px;
+	padding-top: 24px;
+	border-top: 1px solid var(--vscode-widget-border, var(--vscode-editorWidget-border, transparent));
 	display: flex;
-	gap: 12px;
+	justify-content: flex-end;
+	gap: 10px;
 }
 
 .form-actions .monaco-button {
-	width: 100%;
-	min-width: 400px;
-	max-width: 400px;
+	width: auto;
+	min-width: 96px;
+	height: 30px;
+	padding: 0 16px;
 }
