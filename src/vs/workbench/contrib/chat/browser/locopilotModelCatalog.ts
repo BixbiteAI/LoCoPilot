@@ -279,6 +279,51 @@ export const LOCOPILOT_DEFAULT_CATALOG: readonly ICatalogModel[] = [
 		mtp: true,
 	},
 
+	// ---- DiffusionGemma 26B-A4B (Google) - diffusion LM, hidden until stable ----
+	{
+		catalogId: 'diffusiongemma-26b-a4b-gguf',
+		displayName: 'DiffusionGemma 26B-A4B',
+		vendor: 'Google',
+		blurb: 'Diffusion-based Gemma MoE (26B total, ~4B active); experimental non-autoregressive generation.',
+		repoId: 'unsloth/diffusiongemma-26B-A4B-it-GGUF',
+		format: 'Q4_K_M',
+		engine: 'gguf',
+		approxSizeBytes: Math.round(16 * GB),
+		minRamGB: 32,
+		tier: '32 GB+',
+		defaultHidden: true,
+	},
+	{
+		catalogId: 'diffusiongemma-26b-a4b-mlx',
+		displayName: 'DiffusionGemma 26B-A4B (MLX)',
+		vendor: 'Google',
+		blurb: 'DiffusionGemma 26B-A4B tuned for Apple Silicon via MLX; experimental.',
+		repoId: 'mlx-community/diffusiongemma-26B-A4B-it-4bit',
+		format: 'mlx',
+		engine: 'mlx',
+		approxSizeBytes: Math.round(15 * GB),
+		minRamGB: 32,
+		tier: '32 GB+',
+		requiresAppleSilicon: true,
+		defaultHidden: true,
+	},
+
+	// ---- Qwen 3.6 MTP (Alibaba) - MTP heads for speculative decoding, hidden until tested ----
+	{
+		catalogId: 'qwen36-27b-mtp-gguf',
+		displayName: 'Qwen3.6 27B (MTP)',
+		vendor: 'Alibaba (Qwen)',
+		blurb: 'Qwen3.6 27B dense coder with Multi-Token Prediction heads; faster decoding via llama.cpp speculative.',
+		repoId: 'unsloth/Qwen3.6-27B-MTP-GGUF',
+		format: 'Q4_K_M',
+		engine: 'gguf',
+		approxSizeBytes: Math.round(16 * GB),
+		minRamGB: 32,
+		tier: '32 GB+',
+		mtp: true,
+		defaultHidden: true,
+	},
+
 	// =========================================================================================
 	// Proven prior generation (verified working). Keep or comment out as desired.
 	// =========================================================================================

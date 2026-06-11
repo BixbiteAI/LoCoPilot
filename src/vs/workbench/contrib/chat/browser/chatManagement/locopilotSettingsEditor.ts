@@ -876,11 +876,11 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 			(v) => { this.modelVisibilityFilter = v as 'all' | 'shown' | 'hidden'; }
 		);
 
-		makeToggleFilter(
-			localize('customLanguageModels.filter.toolsLabel', 'Tools'),
-			this.modelToolsFilter,
-			(v) => { this.modelToolsFilter = v; }
-		);
+		// makeToggleFilter(
+		// 	localize('customLanguageModels.filter.toolsLabel', 'Tools'),
+		// 	this.modelToolsFilter,
+		// 	(v) => { this.modelToolsFilter = v; }
+		// );
 
 		makeToggleFilter(
 			localize('customLanguageModels.filter.mtpLabel', 'MTP'),
