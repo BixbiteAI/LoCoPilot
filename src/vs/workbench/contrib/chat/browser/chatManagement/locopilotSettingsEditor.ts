@@ -911,21 +911,22 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 			});
 		};
 
-		// Toggle filter using <fieldset>/<legend> - same border-cut label, toggle switch inside
-		const makeToggleFilter = (labelText: string, checked: boolean, onToggle: (v: boolean) => void) => {
-			const fieldset = DOM.append(filtersRow, $('fieldset.models-filter'));
-			const legend = DOM.append(fieldset, $('legend.models-filter-label'));
-			legend.textContent = labelText;
-			const track = DOM.append(fieldset, $('label.models-filter-toggle-track'));
-			const checkbox = DOM.append(track, $('input.models-filter-toggle-input')) as HTMLInputElement;
-			checkbox.type = 'checkbox';
-			checkbox.checked = checked;
-			DOM.append(track, $('span.models-filter-toggle-thumb'));
-			checkbox.addEventListener('change', () => {
-				onToggle(checkbox.checked);
-				this.renderListModels();
-			});
-		};
+		// Toggle filter using <fieldset>/<legend> - same border-cut label, toggle switch inside.
+		// Currently unused: the Tools and MTP toggle filters are commented out below.
+		// const makeToggleFilter = (labelText: string, checked: boolean, onToggle: (v: boolean) => void) => {
+		// 	const fieldset = DOM.append(filtersRow, $('fieldset.models-filter'));
+		// 	const legend = DOM.append(fieldset, $('legend.models-filter-label'));
+		// 	legend.textContent = labelText;
+		// 	const track = DOM.append(fieldset, $('label.models-filter-toggle-track'));
+		// 	const checkbox = DOM.append(track, $('input.models-filter-toggle-input')) as HTMLInputElement;
+		// 	checkbox.type = 'checkbox';
+		// 	checkbox.checked = checked;
+		// 	DOM.append(track, $('span.models-filter-toggle-thumb'));
+		// 	checkbox.addEventListener('change', () => {
+		// 		onToggle(checkbox.checked);
+		// 		this.renderListModels();
+		// 	});
+		// };
 
 		makeDropdownFilter(
 			localize('customLanguageModels.filter.typeLabel', 'Type'),
@@ -966,11 +967,11 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 		// 	(v) => { this.modelToolsFilter = v; }
 		// );
 
-		makeToggleFilter(
-			localize('customLanguageModels.filter.mtpLabel', 'MTP'),
-			this.modelMtpFilter,
-			(v) => { this.modelMtpFilter = v; }
-		);
+		// makeToggleFilter(
+		// 	localize('customLanguageModels.filter.mtpLabel', 'MTP'),
+		// 	this.modelMtpFilter,
+		// 	(v) => { this.modelMtpFilter = v; }
+		// );
 
 		// Pin the section headers exactly below the sticky top bar. The bar's height varies (search +
 		// three filter dropdowns may wrap on narrow widths), so measure it instead of hard-coding an

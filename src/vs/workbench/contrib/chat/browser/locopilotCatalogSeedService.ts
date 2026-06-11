@@ -181,10 +181,15 @@ export class LoCoPilotCatalogSeedContribution extends Disposable implements IWor
 		}
 		const o = e as Partial<ICatalogModel>;
 		const engineOk: CatalogEngine[] = ['gguf', 'mlx'];
+		// `contextWindow` is optional, but if present it must be a sane positive integer - reject the
+		// whole entry otherwise, so a malformed remote value (string, NaN, negative) can never be seeded.
+		const contextWindowOk = o.contextWindow === undefined
+			|| (typeof o.contextWindow === 'number' && Number.isInteger(o.contextWindow) && o.contextWindow > 0);
 		return typeof o.catalogId === 'string' && o.catalogId.length > 0
 			&& typeof o.displayName === 'string' && o.displayName.length > 0
 			&& typeof o.repoId === 'string' && /.+\/.+/.test(o.repoId)
 			&& typeof o.format === 'string' && o.format.length > 0
-			&& typeof o.engine === 'string' && engineOk.includes(o.engine as CatalogEngine);
+			&& typeof o.engine === 'string' && engineOk.includes(o.engine as CatalogEngine)
+			&& contextWindowOk;
 	}
 }
