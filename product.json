@@ -1,6 +1,8 @@
 {
 	"nameShort": "LoCoPilot",
 	"nameLong": "LoCoPilot",
+	"locopilotCatalogUrl": "https://locopilot.bixbite.ai/models.json",
+	"locopilotUpdateUrl": "https://locopilot.bixbite.ai/update.json",
 	"crashReporter": {
 		"companyName": "Bixbite AI",
 		"productName": "LoCoPilot"

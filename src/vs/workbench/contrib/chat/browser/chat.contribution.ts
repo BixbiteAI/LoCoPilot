@@ -65,6 +65,7 @@ import { ILoCoPilotAgentSettingsService, LoCoPilotAgentSettingsService } from '.
 import { LoCoPilotLanguageModelProvider } from './locopilotLanguageModelProvider.js';
 import { LoCoPilotModelDownloadService } from './locopilotModelDownloadService.js';
 import { LoCoPilotCatalogSeedContribution } from './locopilotCatalogSeedService.js';
+import { LoCoPilotUpdateCheckContribution } from './locopilotUpdateCheckService.js';
 import { ILoCoPilotLocalModelRunner, LoCoPilotLocalModelRunner } from './locopilotLocalModelRunner.js';
 import { ILoCoPilotOllamaService, LoCoPilotOllamaService } from './locopilotOllamaService.js';
 import { LanguageModelToolsExtensionPointHandler } from '../common/tools/languageModelToolsContribution.js';
@@ -1502,6 +1503,7 @@ registerWorkbenchContribution2(ChatPromptFilesExtensionPointHandler.ID, ChatProm
 registerWorkbenchContribution2('locopilot.languageModelProvider', LoCoPilotLanguageModelProvider, WorkbenchPhase.AfterRestored);
 registerWorkbenchContribution2(LoCoPilotModelDownloadService.ID, LoCoPilotModelDownloadService, WorkbenchPhase.Eventually);
 registerWorkbenchContribution2(LoCoPilotCatalogSeedContribution.ID, LoCoPilotCatalogSeedContribution, WorkbenchPhase.Eventually);
+registerWorkbenchContribution2(LoCoPilotUpdateCheckContribution.ID, LoCoPilotUpdateCheckContribution, WorkbenchPhase.Eventually);
 registerWorkbenchContribution2(ChatCompatibilityNotifier.ID, ChatCompatibilityNotifier, WorkbenchPhase.Eventually);
 registerWorkbenchContribution2(CodeBlockActionRendering.ID, CodeBlockActionRendering, WorkbenchPhase.BlockRestore);
 registerWorkbenchContribution2(ChatImplicitContextContribution.ID, ChatImplicitContextContribution, WorkbenchPhase.Eventually);

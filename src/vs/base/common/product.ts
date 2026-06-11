@@ -70,6 +70,11 @@ export interface IProductConfiguration {
 	readonly quality?: string;
 	readonly commit?: string;
 
+	/** LoCoPilot: hosted models.json for the remote model catalog (overrides the in-code constant when set). */
+	readonly locopilotCatalogUrl?: string;
+	/** LoCoPilot: hosted update-feed JSON used to notify users when a newer app build is available. */
+	readonly locopilotUpdateUrl?: string;
+
 	readonly nameShort: string;
 	readonly nameLong: string;
 
