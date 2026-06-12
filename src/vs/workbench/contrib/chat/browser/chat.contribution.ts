@@ -68,6 +68,8 @@ import { LoCoPilotCatalogSeedContribution } from './locopilotCatalogSeedService.
 import { LoCoPilotUpdateCheckContribution } from './locopilotUpdateCheckService.js';
 import { ILoCoPilotLocalModelRunner, LoCoPilotLocalModelRunner } from './locopilotLocalModelRunner.js';
 import { ILoCoPilotOllamaService, LoCoPilotOllamaService } from './locopilotOllamaService.js';
+import { ILoCoPilotProjectMemoryService, LoCoPilotProjectMemoryService } from './locopilotProjectMemoryService.js';
+import { LoCoPilotProjectMemoryToolsContribution } from './tools/projectMemoryToolsContribution.js';
 import { LanguageModelToolsExtensionPointHandler } from '../common/tools/languageModelToolsContribution.js';
 import { BuiltinToolsContribution } from '../common/tools/builtinTools/tools.js';
 import './retrieval/retrievalService.js'; // registers ILoCoPilotRetrievalService singleton
@@ -1516,6 +1518,7 @@ registerWorkbenchContribution2(ChatTeardownContribution.ID, ChatTeardownContribu
 // registerWorkbenchContribution2(ChatStatusBarEntry.ID, ChatStatusBarEntry, WorkbenchPhase.BlockRestore);
 registerWorkbenchContribution2(BuiltinToolsContribution.ID, BuiltinToolsContribution, WorkbenchPhase.Eventually);
 registerWorkbenchContribution2(LoCoPilotRetrievalContribution.ID, LoCoPilotRetrievalContribution, WorkbenchPhase.Eventually);
+registerWorkbenchContribution2(LoCoPilotProjectMemoryToolsContribution.ID, LoCoPilotProjectMemoryToolsContribution, WorkbenchPhase.Eventually);
 registerWorkbenchContribution2(ChatAgentSettingContribution.ID, ChatAgentSettingContribution, WorkbenchPhase.AfterRestored);
 registerWorkbenchContribution2(ChatAgentActionsContribution.ID, ChatAgentActionsContribution, WorkbenchPhase.Eventually);
 registerWorkbenchContribution2(ToolReferenceNamesContribution.ID, ToolReferenceNamesContribution, WorkbenchPhase.AfterRestored);
@@ -1588,6 +1591,7 @@ registerSingleton(IChatOutputRendererService, ChatOutputRendererService, Instant
 registerSingleton(IChatLayoutService, ChatLayoutService, InstantiationType.Delayed);
 registerSingleton(ILoCoPilotFileLog, LoCoPilotFileLog, InstantiationType.Delayed);
 registerSingleton(ILoCoPilotAgentSettingsService, LoCoPilotAgentSettingsService, InstantiationType.Delayed);
+registerSingleton(ILoCoPilotProjectMemoryService, LoCoPilotProjectMemoryService, InstantiationType.Delayed);
 registerSingleton(ILoCoPilotLocalModelRunner, LoCoPilotLocalModelRunner, InstantiationType.Delayed);
 registerSingleton(ILoCoPilotOllamaService, LoCoPilotOllamaService, InstantiationType.Delayed);
 

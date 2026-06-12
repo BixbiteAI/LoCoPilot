@@ -33,6 +33,7 @@ import { Dimension } from '../../../../../base/browser/dom.js';
 import { registerColor, foreground, listActiveSelectionBackground, listActiveSelectionForeground } from '../../../../../platform/theme/common/colorRegistry.js';
 import { PANEL_BORDER } from '../../../../common/theme.js';
 import { ILoCoPilotAgentSettingsService, DEFAULT_MAX_ITERATIONS } from '../locopilotAgentSettingsService.js';
+import { ILoCoPilotProjectMemoryService } from '../locopilotProjectMemoryService.js';
 import { InputBox } from '../../../../../base/browser/ui/inputbox/inputBox.js';
 import { IContextViewService } from '../../../../../platform/contextview/browser/contextView.js';
 import { defaultButtonStyles, getInputBoxStyle, getSelectBoxStyles, defaultToggleStyles } from '../../../../../platform/theme/browser/defaultStyles.js';
@@ -223,9 +224,12 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 		agentCoding: boolean;
 		askPrompt: string;
 		agentPrompt: string;
+		workspaceInstructions: string;
 	} | undefined;
 	private maxIterationsInput!: InputBox;
 	private autoRunCommandsInSandboxToggle!: Toggle;
+	/** Phase 3: per-workspace ("this project only") agent instructions. */
+	private workspaceInstructionsTextarea!: HTMLTextAreaElement;
 	private agentSettingsService!: ILoCoPilotAgentSettingsService;
 	private customLanguageModelsService!: ICustomLanguageModelsService;
 	private localModelRunner!: ILoCoPilotLocalModelRunner;
@@ -257,6 +261,7 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 		@ILogService private readonly logService: ILogService,
 		@IMarkdownRendererService private readonly markdownRendererService: IMarkdownRendererService,
 		@ILoCoPilotLocalModelRunner localModelRunner: ILoCoPilotLocalModelRunner,
+		@ILoCoPilotProjectMemoryService private readonly projectMemoryService: ILoCoPilotProjectMemoryService,
 	) {
 		super(LoCoPilotSettingsEditor.ID, group, telemetryService, themeService, storageService);
 		this.agentSettingsService = agentSettingsService;
@@ -880,7 +885,7 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 		const searchWrap = DOM.append(stickyTop, $('.models-search-wrap'));
 		const searchInput = DOM.append(searchWrap, $('input.models-search-input')) as HTMLInputElement;
 		searchInput.type = 'text';
-		searchInput.placeholder = localize('customLanguageModels.search.placeholder', 'Search by name, provider…');
+		searchInput.placeholder = localize('customLanguageModels.search.placeholder', 'Search by name, provider...');
 		searchInput.value = this.modelSearchQuery;
 		searchInput.addEventListener('input', () => {
 			this.modelSearchQuery = searchInput.value;
@@ -1449,6 +1454,9 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 		this.renderPromptBlock(promptCard, 'agent');
 		this.renderPromptBlock(promptCard, 'ask');
 
+		// --- Card: Project Memory (per-workspace instructions) ---------------
+		this.renderWorkspaceInstructions(container);
+
 		// --- Sticky footer ---------------------------------------------------
 		const footerRow = DOM.append(container, $('.agent-setting-footer'));
 		this.agentSettingsDirtyIndicator = DOM.append(footerRow, $('.agent-setting-dirty-indicator'));
@@ -1521,6 +1529,65 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 		this._register(DOM.addDisposableListener(textarea, 'input', () => this.updateAgentSettingsDirtyIndicators()));
 	}
 
+	/**
+	 * Project Memory card: a per-workspace instruction box. Unlike the Agent/Ask mode prompts above
+	 * (which are global), this applies only to the currently open project and is appended to the
+	 * agent's PROJECT MEMORY block on every request for this workspace.
+	 */
+	private renderWorkspaceInstructions(container: HTMLElement): void {
+		const card = DOM.append(container, $('.agent-setting-card'));
+
+		// Collapsible header: the body stays hidden until the user opens it, so the panel isn't
+		// dominated by a large empty textarea on first view.
+		const header = DOM.append(card, $('.agent-setting-card-header.agent-setting-card-header-collapsible'));
+		header.setAttribute('role', 'button');
+		header.setAttribute('tabindex', '0');
+		const chevron = DOM.append(header, $('.agent-setting-collapse-chevron'));
+		chevron.appendChild(renderIcon(Codicon.chevronRight));
+		DOM.append(header, $('span', undefined, localize('locopilotSettings.projectMemorySection', "Project Memory")));
+
+		const block = DOM.append(card, $('.agent-setting-block'));
+		block.style.display = 'none';
+
+		let expanded = false;
+		const setExpanded = (next: boolean) => {
+			expanded = next;
+			block.style.display = expanded ? '' : 'none';
+			header.classList.toggle('agent-setting-card-header-expanded', expanded);
+			header.setAttribute('aria-expanded', String(expanded));
+			if (expanded && !this.workspaceInstructionsTextarea.disabled) {
+				this.workspaceInstructionsTextarea.focus();
+			}
+		};
+		this._register(DOM.addDisposableListener(header, 'click', () => setExpanded(!expanded)));
+		this._register(DOM.addDisposableListener(header, 'keydown', (e: KeyboardEvent) => {
+			if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); setExpanded(!expanded); }
+		}));
+
+		const text = DOM.append(block, $('.agent-setting-text'));
+		const label = DOM.append(text, $('label.locopilot-setting-label'));
+		label.textContent = localize('locopilotSettings.workspaceInstructionsLabel', "Instructions for this project");
+		const desc = DOM.append(text, $('.agent-setting-description'));
+		desc.textContent = localize('locopilotSettings.workspaceInstructionsDesc', "Project-specific guidance the agent follows in THIS workspace only - added on top of the global prompt above, on every request. Great for conventions, commands, and \"don't touch\" areas. Stored per-project on this machine; not committed to the repo.");
+
+		const box = DOM.append(block, $('.locopilot-prompt-box'));
+		const textarea = DOM.append(box, $('textarea.locopilot-prompt-textarea')) as HTMLTextAreaElement;
+		textarea.classList.remove('locopilot-prompt-textarea-hidden');
+		textarea.rows = 8;
+		textarea.placeholder = localize(
+			'locopilotSettings.workspaceInstructionsPlaceholder',
+			"e.g.\n- This is a Next.js app; components live in src/components and use named exports.\n- Run tests with `npm run test`; lint with `npm run lint`.\n- Never edit anything under legacy/ - it is generated.\n- Prefer tabs over spaces; keep imports sorted."
+		);
+		textarea.value = this.projectMemoryService.getWorkspaceInstructions();
+		if (!this.projectMemoryService.hasWorkspace()) {
+			textarea.disabled = true;
+			const noWs = DOM.append(block, $('.agent-setting-hint'));
+			noWs.textContent = localize('locopilotSettings.workspaceInstructionsNoWorkspace', "Open a folder to set instructions for a project.");
+		}
+		this.workspaceInstructionsTextarea = textarea;
+		this._register(DOM.addDisposableListener(textarea, 'input', () => this.updateAgentSettingsDirtyIndicators()));
+	}
+
 	/** Live-validates the max-iterations field, toggling an error state + hint text. */
 	private validateMaxIterations(): void {
 		if (!this.maxIterationsInput || !this.maxIterationsHint) { return; }
@@ -1540,6 +1607,7 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 		agentCoding: boolean;
 		askPrompt: string;
 		agentPrompt: string;
+		workspaceInstructions: string;
 	} {
 		return {
 			maxIterations: this.agentSettingsService.getMaxIterationsPerRequest(),
@@ -1548,6 +1616,7 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 			agentCoding: this.agentSettingsService.getAgentUseCodingSystemPrompt(),
 			askPrompt: this.agentSettingsService.getAskModeSystemPrompt().trim(),
 			agentPrompt: this.agentSettingsService.getAgentModeSystemPrompt().trim(),
+			workspaceInstructions: this.projectMemoryService.getWorkspaceInstructions().trim(),
 		};
 	}
 
@@ -1558,6 +1627,7 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 		agentCoding: boolean;
 		askPrompt: string;
 		agentPrompt: string;
+		workspaceInstructions: string;
 	} {
 		const rawN = parseInt(this.maxIterationsInput.value.trim(), 10);
 		return {
@@ -1567,6 +1637,7 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 			agentCoding: this.agentCodingSystemPromptToggle.checked,
 			askPrompt: this.askPromptTextarea.value.trim(),
 			agentPrompt: this.agentPromptTextarea.value.trim(),
+			workspaceInstructions: this.workspaceInstructionsTextarea.value.trim(),
 		};
 	}
 
@@ -1586,7 +1657,8 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 			b.askCoding !== cur.askCoding ||
 			b.agentCoding !== cur.agentCoding ||
 			b.askPrompt !== cur.askPrompt ||
-			b.agentPrompt !== cur.agentPrompt
+			b.agentPrompt !== cur.agentPrompt ||
+			b.workspaceInstructions !== cur.workspaceInstructions
 		);
 	}
 
@@ -1633,6 +1705,7 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 		this.agentCodingSystemPromptToggle.checked = this.agentSettingsService.getAgentUseCodingSystemPrompt();
 		this.askPromptTextarea.value = this.agentSettingsService.getAskModeSystemPrompt();
 		this.agentPromptTextarea.value = this.agentSettingsService.getAgentModeSystemPrompt();
+		this.workspaceInstructionsTextarea.value = this.projectMemoryService.getWorkspaceInstructions();
 		this.updateCodingPromptUIModes();
 		this._renderFormattedPrompt('agent');
 		this._renderFormattedPrompt('ask');
@@ -1661,6 +1734,9 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 			this.agentSettingsService.setAgentUseCodingSystemPrompt(this.agentCodingSystemPromptToggle.checked);
 			this.agentSettingsService.setAskModeSystemPrompt(this.askPromptTextarea.value.trim());
 			this.agentSettingsService.setAgentModeSystemPrompt(this.agentPromptTextarea.value.trim());
+			if (this.projectMemoryService.hasWorkspace()) {
+				this.projectMemoryService.setWorkspaceInstructions(this.workspaceInstructionsTextarea.value.trim());
+			}
 			this.captureAgentSettingsBaselineFromPersisted();
 			this.updateAgentSettingsDirtyIndicators();
 			await this.dialogService.info(

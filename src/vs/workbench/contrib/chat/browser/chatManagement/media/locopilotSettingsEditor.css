@@ -270,6 +270,36 @@
 	color: var(--vscode-descriptionForeground);
 }
 
+/* Collapsible card header: clickable row with a rotating chevron. */
+.locopilot-settings-editor .agent-setting-card-header-collapsible {
+	display: flex;
+	align-items: center;
+	gap: 6px;
+	cursor: pointer;
+	user-select: none;
+	border-radius: 4px;
+	padding: 2px 4px;
+	margin: -2px -4px;
+}
+
+.locopilot-settings-editor .agent-setting-card-header-collapsible:hover {
+	color: var(--vscode-foreground);
+}
+
+.locopilot-settings-editor .agent-setting-card-header-collapsible:focus-visible {
+	outline: 1px solid var(--vscode-focusBorder);
+	outline-offset: -1px;
+}
+
+.locopilot-settings-editor .agent-setting-collapse-chevron {
+	display: inline-flex;
+	transition: transform 0.15s ease;
+}
+
+.locopilot-settings-editor .agent-setting-card-header-expanded .agent-setting-collapse-chevron {
+	transform: rotate(90deg);
+}
+
 /* A row's text column (label + description) grows; its control stays its natural size */
 .locopilot-settings-editor .agent-setting-text {
 	display: flex;

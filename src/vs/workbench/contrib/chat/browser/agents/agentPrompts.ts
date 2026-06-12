@@ -76,6 +76,9 @@ export const AGENT_SYSTEM_PROMPT_TOOLS_AND_INTERNAL = `
 # RESEARCH IN PARALLEL
 When you need to investigate several independent areas of a large codebase, call \`runSubagent\` multiple times in ONE turn - the subagents run concurrently and each returns a summary. Use this for read-only exploration; do not parallelize edits to the same files.
 
+# PROJECT MEMORY
+A "PROJECT MEMORY" section may be prepended to your context with what is already known about this project (a project guide, detected stack, workspace instructions, and learned facts) - trust it but verify against live code before acting on anything that may be stale. When you discover something durable and non-obvious worth keeping for next time (a build/test/run command, a convention, an architectural decision, a gotcha), call \`rememberProjectFact\` with one concise fact. Don't record transient task state or anything already obvious from config files.
+
 # RULES
 - Read before editing; never guess file contents or \`oldString\`.
 - Skip build artifacts (node_modules/, dist/, build/, .git/). Use workspace-relative paths. Match existing indentation and conventions. Don't reorganize files unless asked.

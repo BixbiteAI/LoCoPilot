@@ -67,6 +67,7 @@ import { IDefaultAccountService } from '../../../../../platform/defaultAccount/c
 import { IHostService } from '../../../../services/host/browser/host.js';
 import { UnifiedAgent } from '../agents/unifiedAgent.js';
 import { ILoCoPilotAgentSettingsService } from '../locopilotAgentSettingsService.js';
+import { ILoCoPilotProjectMemoryService } from '../locopilotProjectMemoryService.js';
 import { IWorkspaceContextService } from '../../../../../platform/workspace/common/workspace.js';
 import { ExtensionIdentifier } from '../../../../../platform/extensions/common/extensions.js';
 
@@ -1094,6 +1095,7 @@ export class LoCoPilotBuiltInAgent extends Disposable implements IChatAgentImple
 		@ICodeEditorService private readonly codeEditorService: ICodeEditorService,
 		@ILoCoPilotFileLog private readonly locopilotFileLog: ILoCoPilotFileLog,
 		@ILoCoPilotAgentSettingsService private readonly agentSettingsService: ILoCoPilotAgentSettingsService,
+		@ILoCoPilotProjectMemoryService private readonly projectMemoryService: ILoCoPilotProjectMemoryService,
 	) {
 		super();
 		const maxIterations = this.agentSettingsService.getMaxIterationsPerRequest();
@@ -1313,7 +1315,20 @@ Preserve: key facts, decisions, code changes, file names and paths, user prefere
 		}
 
 		const workspaceRoot = workspaceFolders[0].uri;
-		let context = `\n# WORKSPACE & EDITOR CONTEXT\n\n`;
+		let context = '';
+
+		// Project-wise memory: what we already know about THIS project (memory file, auto-detected
+		// profile, per-workspace instructions, learned facts). Placed first so it frames everything below.
+		try {
+			const projectMemory = await this.projectMemoryService.getProjectMemoryBlock(CancellationToken.None);
+			if (projectMemory) {
+				context += projectMemory + '\n\n';
+			}
+		} catch (e) {
+			this._log(`[LoCoPilot] Failed to build project memory block: ${e}`);
+		}
+
+		context += `\n# WORKSPACE & EDITOR CONTEXT\n\n`;
 		context += `**Workspace Root:** \`${workspaceRoot.fsPath}\`\n`;
 
 		// Add editor context (open files, active file, cursor position)
