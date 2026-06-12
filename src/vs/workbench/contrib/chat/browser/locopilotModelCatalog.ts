@@ -561,6 +561,13 @@ const DEFAULT_VISIBLE_CATALOG_IDS: ReadonlySet<string> = new Set([
 	'devstral-small-24b-gguf',
 ]);
 
+/**
+ * Repo id of the model pre-selected in the chat picker for first-time users (smallest, runs almost anywhere).
+ * Seeded models store the catalog `repoId` as their `modelName`, so the provider matches on this to flag the
+ * picker default. Once a user picks a different model, their choice is persisted and wins over this default.
+ */
+export const DEFAULT_PICKER_MODEL_REPO_ID = 'unsloth/Qwen3-4B-GGUF';
+
 /** Whether a catalog entry should be seeded hidden: explicit `defaultHidden` wins, else hidden unless allowlisted. */
 export function catalogDefaultHidden(entry: ICatalogModel): boolean {
 	return entry.defaultHidden ?? !DEFAULT_VISIBLE_CATALOG_IDS.has(entry.catalogId);

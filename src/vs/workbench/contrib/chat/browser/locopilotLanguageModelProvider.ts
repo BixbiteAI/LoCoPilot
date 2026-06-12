@@ -17,7 +17,8 @@ import { ExtensionIdentifier } from '../../../../platform/extensions/common/exte
 import { ILogService } from '../../../../platform/log/common/log.js';
 import { IRequestService } from '../../../../platform/request/common/request.js';
 import { IConfigurationService } from '../../../../platform/configuration/common/configuration.js';
-import { ChatConfiguration } from '../common/constants.js';
+import { ChatConfiguration, ChatAgentLocation } from '../common/constants.js';
+import { DEFAULT_PICKER_MODEL_REPO_ID } from './locopilotModelCatalog.js';
 import { ILoCoPilotFileLog } from './locopilotFileLog.js';
 import { INotificationService } from '../../../../platform/notification/common/notification.js';
 import { ICustomLanguageModelsService, ICustomLanguageModel, getCustomModelListLabel, deriveTokenLimits, defaultContextWindow, TOOL_FAILURE_DISABLE_THRESHOLD } from '../common/customLanguageModelsService.js';
@@ -185,6 +186,18 @@ export class LoCoPilotLanguageModelProvider extends Disposable implements ILangu
 			const contextWindow = m.contextWindow ?? defaultContextWindow(isLocal);
 			const { maxInputTokens, maxOutputTokens } = deriveTokenLimits(contextWindow, isLocal);
 
+			// First-time users land on the smallest seeded model. VS Code only honors this when nothing is
+			// persisted yet; once the user picks any other model their choice is stored and takes precedence.
+			const isPickerDefault = m.modelName === DEFAULT_PICKER_MODEL_REPO_ID;
+			const isDefaultForLocation = isPickerDefault
+				? {
+					[ChatAgentLocation.Chat]: true,
+					[ChatAgentLocation.Terminal]: true,
+					[ChatAgentLocation.Notebook]: true,
+					[ChatAgentLocation.EditorInline]: true,
+				}
+				: {};
+
 			return {
 				identifier: m.id,
 				metadata: {
@@ -196,7 +209,7 @@ export class LoCoPilotLanguageModelProvider extends Disposable implements ILangu
 					family: m.modelName,
 					maxInputTokens,
 					maxOutputTokens,
-					isDefaultForLocation: {},
+					isDefaultForLocation,
 					isUserSelectable: true,
 					modelPickerCategory: { label: 'Custom Models', order: 100 },
 					capabilities: {
