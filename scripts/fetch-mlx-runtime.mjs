@@ -31,7 +31,7 @@ import { spawnSync } from 'node:child_process';
 // Pin the python-build-standalone release and CPython version. Bump (and re-run) to update.
 // Tags/assets: https://github.com/astral-sh/python-build-standalone/releases
 const PBS_TAG = process.env.PBS_TAG || '20250612';
-const PY_VERSION = process.env.PY_VERSION || '3.12.4';
+const PY_VERSION = process.env.PY_VERSION || '3.12.11';
 // `install_only` is a relocatable, stripped runtime (no build artifacts) - ideal for bundling.
 const PBS_ASSET = `cpython-${PY_VERSION}+${PBS_TAG}-aarch64-apple-darwin-install_only.tar.gz`;
 const PBS_URL = `https://github.com/astral-sh/python-build-standalone/releases/download/${PBS_TAG}/${PBS_ASSET}`;
@@ -60,7 +60,9 @@ function run(cmd, args, cwd) {
 
 async function main() {
 	if (process.platform !== 'darwin' || process.arch !== 'arm64') {
-		throw new Error(`fetch-mlx-runtime is macOS Apple Silicon only (MLX requirement). Current: ${process.platform}/${process.arch}. Skip this on other targets.`);
+		process.stdout.write(`Skipping MLX runtime fetch: MLX is macOS Apple Silicon only (current: ${process.platform}/${process.arch}).\n`);
+		process.stdout.write(`Intel Mac (darwin-x64) builds use llama.cpp only - no action needed.\n`);
+		return;
 	}
 
 	if (await exists(pythonBin)) {

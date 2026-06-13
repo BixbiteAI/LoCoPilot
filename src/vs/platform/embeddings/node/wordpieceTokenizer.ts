@@ -64,9 +64,8 @@ export class WordPieceTokenizer {
 	}
 
 	private basicTokenize(text: string): string[] {
-		// Lowercase + strip accents (NFD then remove combining marks).
-		// allow-any-unicode-next-line
-		const lowered = text.toLowerCase().normalize('NFD').replace(/[̀-ͯ]/g, '');
+		// Lowercase + strip accents (NFD then remove combining marks U+0300-U+036F).
+		const lowered = text.toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '');
 		const out: string[] = [];
 		let current = '';
 		const flush = () => { if (current) { out.push(current); current = ''; } };

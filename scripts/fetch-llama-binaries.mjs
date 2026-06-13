@@ -34,7 +34,7 @@ const LLAMA_BUILD = process.env.LLAMA_BUILD || 'latest';
 const REPO = 'ggml-org/llama.cpp';
 
 // Asset selection per <platform>-<arch>. `asset` is matched as a substring against the release's
-// asset names so it survives the embedded build number (e.g. "llama-b6651-bin-macos-arm64.zip").
+// asset names so it survives the embedded build number (e.g. "llama-b9624-bin-macos-x64.tar.gz").
 // Default backend choices: Metal (mac), CPU on Windows/Linux (most compatible; GPU offload still
 // works via Vulkan/CUDA when the user has it - but a CPU build always runs). Override per your needs.
 const TARGETS = {
@@ -63,13 +63,17 @@ async function fetchJson(url) {
 	return res.json();
 }
 
+function isReleaseArchive(name) {
+	return name.endsWith('.zip') || name.endsWith('.tar.gz');
+}
+
 async function resolveAssetUrl(assetMatch) {
 	const relUrl = LLAMA_BUILD === 'latest'
 		? `https://api.github.com/repos/${REPO}/releases/latest`
 		: `https://api.github.com/repos/${REPO}/releases/tags/${LLAMA_BUILD}`;
 	const release = await fetchJson(relUrl);
 	const assets = release.assets || [];
-	const match = assets.find(a => a.name.includes(assetMatch) && a.name.endsWith('.zip'));
+	const match = assets.find(a => a.name.includes(assetMatch) && isReleaseArchive(a.name));
 	if (!match) {
 		const names = assets.map(a => a.name).join('\n  ');
 		throw new Error(`No asset matching "${assetMatch}" in release ${release.tag_name}. Available:\n  ${names}`);
@@ -83,12 +87,16 @@ async function download(url, dest) {
 	await pipeline(Readable.fromWeb(res.body), createWriteStream(dest));
 }
 
-function extract(zipPath, destDir) {
-	if (process.platform === 'win32') {
-		const r = spawnSync('powershell', ['-NoProfile', '-Command', `Expand-Archive -LiteralPath '${zipPath}' -DestinationPath '${destDir}' -Force`], { stdio: 'inherit' });
+function extract(archivePath, destDir) {
+	const lower = archivePath.toLowerCase();
+	if (lower.endsWith('.tar.gz')) {
+		const r = spawnSync('tar', ['-xzf', archivePath, '-C', destDir], { stdio: 'inherit' });
+		if (r.status !== 0) { throw new Error('tar failed (is `tar` installed?)'); }
+	} else if (process.platform === 'win32') {
+		const r = spawnSync('powershell', ['-NoProfile', '-Command', `Expand-Archive -LiteralPath '${archivePath}' -DestinationPath '${destDir}' -Force`], { stdio: 'inherit' });
 		if (r.status !== 0) { throw new Error('Expand-Archive failed'); }
 	} else {
-		const r = spawnSync('unzip', ['-o', '-q', zipPath, '-d', destDir], { stdio: 'inherit' });
+		const r = spawnSync('unzip', ['-o', '-q', archivePath, '-d', destDir], { stdio: 'inherit' });
 		if (r.status !== 0) { throw new Error('unzip failed (is `unzip` installed?)'); }
 	}
 }
@@ -144,11 +152,11 @@ async function main() {
 
 	const work = await mkdtemp(join(tmpdir(), 'locopilot-llama-'));
 	try {
-		const zipPath = join(work, name);
-		await download(url, zipPath);
-		const extractDir = join(work, 'unzipped');
+		const archivePath = join(work, name);
+		await download(url, archivePath);
+		const extractDir = join(work, 'extracted');
 		await mkdir(extractDir, { recursive: true });
-		extract(zipPath, extractDir);
+		extract(archivePath, extractDir);
 
 		const binDir = await findBinDir(extractDir, spec.bin);
 		if (!binDir) { throw new Error(`Could not find ${spec.bin} inside ${name}`); }
