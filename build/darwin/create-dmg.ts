@@ -18,6 +18,7 @@ interface DmgBuildSettings {
 	'icon-size'?: number;
 	'text-size'?: number;
 	format?: string;
+	size?: string;
 	window?: {
 		position?: { x: number; y: number };
 		size?: { width: number; height: number };
@@ -105,6 +106,7 @@ async function main(buildDir?: string, outDir?: string): Promise<void> {
 		icon: appIconPath,
 		background: backgroundPath,
 		format: 'ULMO',
+		size: '2g',
 		'text-size': 12,
 		window: {
 			position: { x: 100, y: 400 },
