@@ -49,6 +49,45 @@ type ChatModelChangeEvent = {
 };
 
 
+/**
+ * Push a custom (locopilot-vendor) model into the chat input's real selected model.
+ *
+ * The picker keeps two selection stores: `getSelectedCustomModelId()` only drives the picker label and
+ * checkmark, while `delegate.setModel(...)` updates the chat input's `_currentLanguageModel` - the value
+ * actually passed to sendChatRequest, the in-chat download prompt, and the local model runner. Selecting a
+ * custom model must update BOTH; otherwise the request keeps using whatever was selected at init (the
+ * default model) no matter what the user picks. Prefer the model registered with the language model service
+ * (so token limits/metadata are accurate); fall back to a synthetic entry keyed by the custom model id,
+ * which is enough for the provider to resolve and route the request.
+ */
+function selectCustomModelInChat(delegate: IModelPickerDelegate, customLanguageModelsService: ICustomLanguageModelsService, customModelId: string): void {
+	const registered = delegate.getModels().find(m => m.identifier === customModelId);
+	if (registered) {
+		delegate.setModel(registered);
+		return;
+	}
+	const customModel = customLanguageModelsService.getCustomModels().find(m => m.id === customModelId);
+	if (!customModel) {
+		return;
+	}
+	delegate.setModel({
+		identifier: customModel.id,
+		metadata: {
+			extension: new ExtensionIdentifier('custom'),
+			name: getCustomModelListLabel(customModel),
+			id: customModel.id,
+			vendor: customModel.provider,
+			version: '1.0.0',
+			family: customModel.type,
+			maxInputTokens: 0,
+			maxOutputTokens: 0,
+			isDefaultForLocation: {},
+			isUserSelectable: true,
+			modelPickerCategory: { label: 'Custom Models', order: 100 }
+		}
+	});
+}
+
 function modelDelegateToWidgetActionsProvider(delegate: IModelPickerDelegate, telemetryService: ITelemetryService, customLanguageModelsService: ICustomLanguageModelsService, actionWidgetService: IActionWidgetService): IActionWidgetDropdownActionProvider {
 	return {
 		getActions: () => {
@@ -92,6 +131,7 @@ function modelDelegateToWidgetActionsProvider(delegate: IModelPickerDelegate, te
 					],
 					run: () => {
 						customLanguageModelsService.setSelectedCustomModelId(customModel.id);
+						selectCustomModelInChat(delegate, customLanguageModelsService, customModel.id);
 					}
 				};
 			});
@@ -119,6 +159,7 @@ function modelDelegateToWidgetActionsProvider(delegate: IModelPickerDelegate, te
 								// Unhide then select - close picker after both
 								await customLanguageModelsService.hideCustomModel(hiddenModel.id, false);
 								customLanguageModelsService.setSelectedCustomModelId(hiddenModel.id);
+								selectCustomModelInChat(delegate, customLanguageModelsService, hiddenModel.id);
 								actionWidgetService.hide();
 							}
 						})
@@ -126,6 +167,7 @@ function modelDelegateToWidgetActionsProvider(delegate: IModelPickerDelegate, te
 					run: async () => {
 						await customLanguageModelsService.hideCustomModel(hiddenModel.id, false);
 						customLanguageModelsService.setSelectedCustomModelId(hiddenModel.id);
+						selectCustomModelInChat(delegate, customLanguageModelsService, hiddenModel.id);
 						actionWidgetService.hide();
 					}
 				};

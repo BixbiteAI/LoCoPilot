@@ -65,11 +65,11 @@ export class LoCoPilotAgentSettingsService implements ILoCoPilotAgentSettingsSer
 	}
 
 	getAskUseCodingSystemPrompt(): boolean {
-		return this.storageService.getBoolean(STORAGE_KEY_ASK_USE_CODING_SYSTEM_PROMPT, StorageScope.APPLICATION, false);
+		return this.storageService.getBoolean(STORAGE_KEY_ASK_USE_CODING_SYSTEM_PROMPT, StorageScope.APPLICATION, true);
 	}
 
 	getAgentUseCodingSystemPrompt(): boolean {
-		return this.storageService.getBoolean(STORAGE_KEY_AGENT_USE_CODING_SYSTEM_PROMPT, StorageScope.APPLICATION, false);
+		return this.storageService.getBoolean(STORAGE_KEY_AGENT_USE_CODING_SYSTEM_PROMPT, StorageScope.APPLICATION, true);
 	}
 
 	setAskUseCodingSystemPrompt(value: boolean): void {

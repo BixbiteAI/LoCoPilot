@@ -76,6 +76,9 @@ const vscodeResourceIncludes = [
 	'out-build/vs/workbench/browser/parts/editor/media/*.png',
 	'out-build/vs/workbench/contrib/debug/browser/media/*.png',
 
+	// LoCoPilot brand logo (chat loader, input, list, collapsible parts)
+	'out-build/vs/workbench/contrib/chat/browser/widget/input/media/*.{png,svg,gif}',
+
 	// External Terminal
 	'out-build/vs/workbench/contrib/externalTerminal/**/*.scpt',
 

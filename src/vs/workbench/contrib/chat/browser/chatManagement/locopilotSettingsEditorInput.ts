@@ -31,8 +31,12 @@ export class LoCoPilotSettingsEditorInput extends EditorInput {
 	}
 
 	override matches(otherInput: EditorInput | IUntypedEditorInput): boolean {
+		// Singleton: there is only ever one LoCoPilot Settings tab regardless of the section it was
+		// opened to. The section is navigated imperatively (see LoCoPilotSettingsEditor.switchToSection),
+		// so keying matches() off initialSection would spawn duplicate tabs and break section switching
+		// when a chat-panel link targets a section other than the one already open.
 		if (otherInput instanceof LoCoPilotSettingsEditorInput) {
-			return this.initialSection === otherInput.initialSection;
+			return true;
 		}
 		return super.matches(otherInput);
 	}

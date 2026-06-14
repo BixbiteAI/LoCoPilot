@@ -559,6 +559,13 @@ const DEFAULT_VISIBLE_CATALOG_IDS: ReadonlySet<string> = new Set([
 	'gemma4-12b-gguf',
 	'qwen36-27b-gguf',
 	'devstral-small-24b-gguf',
+	// Additional models surfaced in the picker by default.
+	'qwen35-0_8b-mtp-gguf',
+	'qwen35-4b-mtp-gguf',
+	'qwen35-9b-mtp-gguf',
+	'qwen36-35b-a3b-gguf',
+	'gemma4-e4b-gguf',
+	'gemma4-e4b-mlx',
 ]);
 
 /**

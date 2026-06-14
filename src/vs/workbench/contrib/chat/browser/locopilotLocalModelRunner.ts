@@ -28,6 +28,7 @@ import {
 	type KvCacheType
 } from './locopilotLlamaCppServer.js';
 import { dirname } from '../../../../base/common/path.js';
+import { isWindows, isMacintosh } from '../../../../base/common/platform.js';
 import {
 	getBundledMlxPython,
 	getMlxLmServerCommand,
@@ -100,6 +101,10 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 	/** Models whose server launch is in progress (sent to terminal but not yet confirmed running/failed). */
 	private startingServers = new Set<string>();
 	private runningServers = new Map<string, { port: number; terminal: ITerminalInstance; kind: 'llama' | 'mlx'; logs: string[] }>();
+	/** Models we are intentionally stopping, so the process-exit handler doesn't report a stop as a crash. */
+	private readonly _intentionalStops = new Set<string>();
+	/** Models whose server process exited before it ever became ready (so readiness polling can bail early). */
+	private readonly _crashedBeforeReady = new Set<string>();
 
 	constructor(
 		@ICustomLanguageModelsService private readonly customLanguageModelsService: ICustomLanguageModelsService,
@@ -187,6 +192,7 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 	stopServer(modelId: string): void {
 		const running = this.runningServers.get(modelId);
 		if (running) {
+			this._intentionalStops.add(modelId); // mark so onExit treats this as a clean stop, not a crash
 			running.terminal.dispose();
 			this.runningServers.delete(modelId);
 			this._onDidServerStateChange.fire(modelId);
@@ -216,6 +222,58 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 		const serverPath = this.configurationService.getValue<string>(ChatConfiguration.LocopilotLlamaCppServerPath);
 		const { command, args } = getLlamaCppServerCommand(model.localPath, backend, serverPath, LOCOPILOT_LLAMA_SERVER_PORT, this._getLlamaTuning(model));
 		return { command, args, backend };
+	}
+
+	/**
+	 * Environment additions so the dynamic loader finds the shared libraries that ship next to the
+	 * bundled llama-server (libllama/libggml/...). The binary already has an @loader_path rpath on
+	 * macOS and Windows searches the exe's own directory, but we set the platform library-path vars
+	 * too as belt-and-suspenders - especially for user-supplied builds whose libs sit in a sibling
+	 * dir. `strictEnv` is left false so this merges over the inherited VS Code environment.
+	 */
+	private _serverLaunchEnv(serverPath: string): { [key: string]: string | null } | undefined {
+		const dir = dirname(serverPath);
+		if (!dir) { return undefined; }
+		if (isMacintosh) { return { DYLD_LIBRARY_PATH: dir }; }
+		if (isWindows) { return undefined; } // Windows loads DLLs from the exe's own directory automatically.
+		return { LD_LIBRARY_PATH: dir };
+	}
+
+	/**
+	 * Reports a llama-server process that exited before becoming ready (i.e. crashed at launch). Builds
+	 * a concrete, platform-specific message - the usual culprit on Windows is a missing Microsoft Visual
+	 * C++ Redistributable, and on Linux a missing system library - then logs it, fires the failure event,
+	 * and shows an actionable notification so the user isn't left staring at a stuck "running" state.
+	 */
+	private _reportServerCrash(modelId: string, modelName: string, serverPath: string, exitCode: number | undefined, logs: string[]): void {
+		const tail = logs.slice(-12).join('\n');
+		const lower = tail.toLowerCase();
+		const code = exitCode ?? 'unknown';
+		this._log(`[LoCoPilot Runner] llama-server for "${modelName}" exited before serving (exit ${code}). Last output:\n${tail}`);
+
+		let message = `The local model engine for "${modelName}" failed to start (exit code ${code}).`;
+		const actions: { label: string; run: () => void }[] = [];
+
+		if (isWindows) {
+			// Missing-DLL crashes on Windows manifest as exit 0xC0000135 (-1073741515)/0xC000007B, or a
+			// "vcruntime140.dll/msvcp140.dll was not found" dialog. The llama.cpp Windows builds link
+			// dynamically against the MSVC runtime, which isn't bundled.
+			const looksLikeMissingRuntime = exitCode === -1073741515 || exitCode === -1073741701
+				|| lower.includes('vcruntime') || lower.includes('msvcp140') || lower.includes('0xc0000135') || lower.includes('0xc000007b');
+			if (looksLikeMissingRuntime || exitCode !== 0) {
+				message += ' This usually means the Microsoft Visual C++ Redistributable (x64) is not installed - the bundled engine needs it. Install it, then try again.';
+				actions.push({ label: 'Get VC++ Redistributable', run: () => this.openerService.open('https://aka.ms/vs/17/release/vc_redist.x64.exe') });
+			}
+		} else if (isMacintosh) {
+			message += ' The bundled engine could not load its libraries. Try reinstalling LoCoPilot, or point "locopilot.llamaCpp.serverPath" at your own llama.cpp build.';
+		} else {
+			message += ' The bundled engine could not load a required system library. Check the server terminal output for the missing library name.';
+		}
+
+		actions.push({ label: 'Show Logs', run: () => this.commandService.executeCommand('workbench.action.toggleDevTools') });
+
+		this._endStarting(modelId, message);
+		this.notificationService.prompt(Severity.Error, message, actions);
 	}
 
 	/**
@@ -509,13 +567,15 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 		const port = await this.findAvailablePort(LOCOPILOT_LLAMA_SERVER_PORT);
 		const { command, args } = getLlamaCppServerCommand(modelPath, backend, serverPath, port, this._getLlamaTuning(model));
 		this._log(`[LoCoPilot Runner] Starting llama.cpp server for model ${modelId} on port ${port} with backend: ${backend}`);
-		// Build command line for the user's shell. Quote ANY arg containing spaces/quotes (e.g. model
-		// paths under "Application Support", and --model-draft for MTP), not just the -m path.
-		const shellQuote = (a: string) => (a.includes(' ') || a.includes('"')) ? `"${a.replace(/"/g, '\\"')}"` : a;
-		const argsCli = args.map(shellQuote);
-		const cmdLine = [shellQuote(command), ...argsCli].join(' ');
 
-		this._log(`[LoCoPilot Runner] Executing: ${cmdLine}`);
+		// Launch the binary DIRECTLY as the terminal's process (executable + args[]), NOT by typing a
+		// command line into a shell. This avoids shell-specific quoting bugs - most importantly the
+		// PowerShell gotcha where a quoted path (e.g. an install under "C:\Program Files\...") is echoed
+		// as a string literal instead of executed, so llama-server.exe never starts and the port stays
+		// closed. Passing args as a string[] lets the pty escape them correctly on every platform.
+		const launchEnv = this._serverLaunchEnv(serverPath);
+		const cmdLineForLog = [command, ...args].join(' ');
+		this._log(`[LoCoPilot Runner] Executing: ${cmdLineForLog}`);
 		this._log(`[LoCoPilot Runner] Using llama-server: ${serverPath} (bundled = ${serverPath === getBundledLlamaServerPath(this._appRoot)}).`);
 
 		this._beginStarting(modelId);
@@ -523,18 +583,18 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 			const terminal = await this.terminalService.createTerminal({
 				config: {
 					name: `Llama Server - ${model.modelName}`,
+					executable: command,
+					args,
+					env: launchEnv ?? undefined,
+					// Keep the terminal open if the process exits/crashes so the real error (e.g. a missing
+					// dependency) stays visible instead of the window vanishing.
+					waitOnExit: true,
 				}
 			});
-			await new Promise<void>(resolve => setTimeout(resolve, 400));
-			await terminal.sendText(cmdLine, true);
-
-			// Wait for the server process to initialise before switching the UI to running state.
-			await timeout(5000);
 
 			const logs: string[] = [];
-			this.startingServers.delete(modelId); // running state replaces starting state
-			this.runningServers.set(modelId, { port, terminal, kind: 'llama', logs });
-			this._onDidServerStateChange.fire(modelId);
+			this._crashedBeforeReady.delete(modelId);
+			this._intentionalStops.delete(modelId);
 
 			this._register(terminal.onLineData(line => {
 				logs.push(line);
@@ -544,20 +604,38 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 				this._onDidLogUpdate.fire(modelId);
 			}));
 
+			// If the process exits, decide whether it was an intentional stop or a real crash. A crash
+			// (non-zero/undefined exit, not user-initiated) is the cause of the classic "stuck on
+			// running, then connection refused" symptom: the binary died at launch (missing dependency,
+			// unsupported CPU, etc.) so nothing ever bound the port. Surface a concrete message instead.
+			this._register(terminal.onExit(code => {
+				const exitCode = typeof code === 'number' ? code : undefined;
+				const wasIntentional = this._intentionalStops.delete(modelId);
+				if (this.runningServers.has(modelId)) {
+					this.runningServers.delete(modelId);
+					this._onDidServerStateChange.fire(modelId);
+				}
+				if (wasIntentional) {
+					this._log(`[LoCoPilot Runner] Server for model ${modelId} stopped (exit ${exitCode ?? 'n/a'}).`);
+					return;
+				}
+				this._crashedBeforeReady.add(modelId);
+				this._reportServerCrash(modelId, model.modelName, serverPath, exitCode, logs);
+			}));
+
+			// Wait for the server process to initialise before switching the UI to running state.
+			await timeout(5000);
+
+			this.startingServers.delete(modelId); // running state replaces starting state
+			this.runningServers.set(modelId, { port, terminal, kind: 'llama', logs });
+			this._onDidServerStateChange.fire(modelId);
+
 			// Warm up in the background so the first real message has no kernel-JIT / cache lag.
 			if (this.configurationService.getValue<boolean>(ChatConfiguration.LocopilotLlamaCppWarmup) !== false) {
 				this._warmUpLlamaServer(port, model.modelName);
 			}
 
-			this._register(terminal.onDisposed(() => {
-				if (this.runningServers.has(modelId)) {
-					this.runningServers.delete(modelId);
-					this._onDidServerStateChange.fire(modelId);
-					this._log(`[LoCoPilot Runner] Terminal closed for model ${modelId}`);
-				}
-			}));
-
-			this._log(`[LoCoPilot Runner] Terminal started with: ${cmdLine}`);
+			this._log(`[LoCoPilot Runner] Terminal started with: ${cmdLineForLog}`);
 		} catch (e) {
 			this._log(`[LoCoPilot Runner] Failed to start terminal: ${e}`);
 			this._endStarting(modelId, `Failed to start llama-server terminal: ${e}`);
@@ -592,7 +670,7 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 			return undefined;
 		}
 
-		const ready = await this._waitForServerReady(baseUrl, token);
+		const ready = await this._waitForServerReady(baseUrl, token, modelId);
 		return ready ? baseUrl : undefined;
 	}
 
@@ -600,11 +678,16 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 	 * Polls the OpenAI-compatible `/models` endpoint (served by both llama.cpp and mlx-lm) until it
 	 * responds 200 or the timeout/cancellation hits. Engine-agnostic readiness check.
 	 */
-	private async _waitForServerReady(baseUrl: string, token: CancellationToken): Promise<boolean> {
+	private async _waitForServerReady(baseUrl: string, token: CancellationToken, modelId?: string): Promise<boolean> {
 		const url = `${baseUrl}/models`;
 		// Large models can take a while to load; poll for up to ~2 minutes.
 		for (let attempt = 0; attempt < 120; attempt++) {
 			if (token.isCancellationRequested) {
+				return false;
+			}
+			// If the server process already exited (crashed at launch), stop polling immediately - the
+			// onExit handler has surfaced the real reason. Avoids the old 2-minute "running" hang.
+			if (modelId && this._crashedBeforeReady.has(modelId)) {
 				return false;
 			}
 			try {

@@ -1503,7 +1503,11 @@ registerWorkbenchContribution2(ChatExtensionPointHandler.ID, ChatExtensionPointH
 registerWorkbenchContribution2(LanguageModelToolsExtensionPointHandler.ID, LanguageModelToolsExtensionPointHandler, WorkbenchPhase.BlockRestore);
 registerWorkbenchContribution2(ChatPromptFilesExtensionPointHandler.ID, ChatPromptFilesExtensionPointHandler, WorkbenchPhase.BlockRestore);
 registerWorkbenchContribution2('locopilot.languageModelProvider', LoCoPilotLanguageModelProvider, WorkbenchPhase.AfterRestored);
-registerWorkbenchContribution2(LoCoPilotModelDownloadService.ID, LoCoPilotModelDownloadService, WorkbenchPhase.Eventually);
+// AfterRestored (not Eventually): this service registers the locopilot.downloadModel / cancelModelDownload
+// commands that back the chat-panel links. The language model provider that renders those links also loads
+// AfterRestored, so registering later left a window (visible in builds) where a link was clickable but its
+// command did not yet exist, and the click silently did nothing.
+registerWorkbenchContribution2(LoCoPilotModelDownloadService.ID, LoCoPilotModelDownloadService, WorkbenchPhase.AfterRestored);
 registerWorkbenchContribution2(LoCoPilotCatalogSeedContribution.ID, LoCoPilotCatalogSeedContribution, WorkbenchPhase.Eventually);
 registerWorkbenchContribution2(LoCoPilotUpdateCheckContribution.ID, LoCoPilotUpdateCheckContribution, WorkbenchPhase.Eventually);
 registerWorkbenchContribution2(ChatCompatibilityNotifier.ID, ChatCompatibilityNotifier, WorkbenchPhase.Eventually);

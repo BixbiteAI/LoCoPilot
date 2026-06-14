@@ -50,7 +50,7 @@ export class LoCoPilotCatalogSeedContribution extends Disposable implements IWor
 	private static readonly SEEDED_IDS_KEY = 'locopilot.catalog.seededIds';
 
 	/** One-time flag: re-apply default hidden/visible state to already-seeded catalog models. */
-	private static readonly VISIBILITY_MIGRATION_KEY = 'locopilot.catalog.visibilityMigration.v1';
+	private static readonly VISIBILITY_MIGRATION_KEY = 'locopilot.catalog.visibilityMigration.v2';
 
 	constructor(
 		@ICustomLanguageModelsService private readonly customLanguageModelsService: ICustomLanguageModelsService,

@@ -248,6 +248,23 @@ class ChatManagementActionsContribution extends Disposable implements IWorkbench
 				const editorGroupsService = accessor.get(IEditorGroupsService);
 				const section = args && typeof args.section === 'string' ? args.section : undefined;
 				const focusModelId = args && typeof args.focusModelId === 'string' ? args.focusModelId : undefined;
+
+				// If a LoCoPilot Settings tab is already open (in any group), reveal it and switch the
+				// section imperatively. openEditor on an already-open input only reveals it - it does not
+				// re-run setInput - so without this the section requested by a chat-panel link would be
+				// ignored when the editor is already open (the reported "doesn't open the right tab" bug).
+				for (const group of editorGroupsService.groups) {
+					const existing = group.editors.find(e => e instanceof LoCoPilotSettingsEditorInput);
+					if (existing) {
+						const pane = await group.openEditor(existing, { pinned: true });
+						editorGroupsService.activateGroup(group);
+						if (pane instanceof LoCoPilotSettingsEditor) {
+							pane.switchToSection(section, focusModelId);
+						}
+						return;
+					}
+				}
+
 				await editorGroupsService.activeGroup.openEditor(new LoCoPilotSettingsEditorInput(section, focusModelId), { pinned: true });
 			}
 		}));

@@ -398,6 +398,9 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 				if (newSection === LOCOPILOT_SETTINGS_SECTION_ADD_MODEL && previousSection !== LOCOPILOT_SETTINGS_SECTION_ADD_MODEL) {
 					this.resetAddModelFormToDefaults();
 				}
+				if (newSection === LOCOPILOT_SETTINGS_SECTION_LIST_MODELS && previousSection !== LOCOPILOT_SETTINGS_SECTION_LIST_MODELS) {
+					this.resetModelFilters();
+				}
 				this.renderSelectedSection();
 			}
 		}));
@@ -1799,6 +1802,16 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 		this.loadAgentPanelFromPersisted();
 	}
 
+	/** Clear any active search text / filters so the My Models list opens fresh each visit. */
+	private resetModelFilters(): void {
+		this.modelSearchQuery = '';
+		this.modelTypeFilter = 'all';
+		this.modelStatusFilter = 'all';
+		this.modelVisibilityFilter = 'all';
+		this.modelToolsFilter = false;
+		this.modelMtpFilter = false;
+	}
+
 	private renderSelectedSection(): void {
 		this.addModelsPanel.style.display = 'none';
 		this.listModelsPanel.style.display = 'none';
@@ -1829,29 +1842,46 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 
 	override async setInput(input: LoCoPilotSettingsEditorInput, options: IEditorOptions | undefined, context: IEditorOpenContext, token: CancellationToken): Promise<void> {
 		await super.setInput(input, options, context, token);
-		const initialSection = input.initialSection;
-		if (initialSection) {
+		this.switchToSection(input.initialSection, input.focusModelId);
+	}
+
+	/**
+	 * Navigate the (already open) settings editor to a section and optionally focus a model.
+	 * Called from setInput when the editor is first opened, and directly by the
+	 * `openLoCoPilotSettings` command when the editor is already open in some tab/group -
+	 * in that case openEditor just reveals the existing input without re-running setInput,
+	 * so the command must drive the section switch itself. This is what makes chat-panel
+	 * links (Open My Models, etc.) work even when LoCoPilot Settings is already open.
+	 */
+	switchToSection(section?: string, focusModelId?: string): void {
+		if (section) {
 			const previousSection = this.selectedSection;
-			this.selectedSection = initialSection;
-			if (initialSection === LOCOPILOT_SETTINGS_SECTION_ADD_MODEL && previousSection !== LOCOPILOT_SETTINGS_SECTION_ADD_MODEL) {
+			this.selectedSection = section;
+			if (section === LOCOPILOT_SETTINGS_SECTION_ADD_MODEL && previousSection !== LOCOPILOT_SETTINGS_SECTION_ADD_MODEL) {
 				this.resetAddModelFormToDefaults();
 			}
-			const idx = this.sections.findIndex(s => s.id === initialSection);
+			if (section === LOCOPILOT_SETTINGS_SECTION_LIST_MODELS && previousSection !== LOCOPILOT_SETTINGS_SECTION_LIST_MODELS) {
+				this.resetModelFilters();
+			}
+			const idx = this.sections.findIndex(s => s.id === section);
 			if (idx >= 0 && this.sectionsList) {
 				this.sectionsList.setSelection([idx]);
 				this.sectionsList.setFocus([idx]);
 			}
 			this.renderSelectedSection();
 		}
-		if (input.focusModelId) {
-			const focusedModel = this.customLanguageModelsService.getCustomModels().find(m => m.id === input.focusModelId);
+		if (focusModelId) {
+			const focusedModel = this.customLanguageModelsService.getCustomModels().find(m => m.id === focusModelId);
 			if (focusedModel) {
+				// Clear any pre-existing filters so the focused model can't be hidden by a
+				// stale type/status/visibility filter, then apply our own focus search.
+				this.resetModelFilters();
 				// Filter the list to show only this model; user can clear the search to see all
 				this.modelSearchQuery = getCustomModelListLabel(focusedModel);
 				this.renderListModels();
 				// Scroll the tile into view and briefly highlight it
 				// eslint-disable-next-line no-restricted-syntax
-				const tile = this.listModelsContainer?.querySelector(`[data-model-id="${input.focusModelId}"]`) as HTMLElement | null;
+				const tile = this.listModelsContainer?.querySelector(`[data-model-id="${focusModelId}"]`) as HTMLElement | null;
 				if (tile) {
 					tile.classList.add('model-item-highlight');
 					tile.scrollIntoView({ behavior: 'smooth', block: 'center' });

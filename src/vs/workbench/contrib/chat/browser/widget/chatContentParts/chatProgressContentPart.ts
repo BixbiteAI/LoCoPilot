@@ -169,14 +169,23 @@ function buildLogoLoader(size: number): HTMLElement {
 	const logoUri = FileAccess.asFileUri('vs/workbench/contrib/chat/browser/widget/input/media/locopilot-logo.png');
 	const src = FileAccess.uriToBrowserUri(logoUri).toString(true);
 
+	// If the brand logo fails to load (e.g. missing from a packaged build), fall
+	// back to the default spinning codicon so the loader never looks broken.
+	const fallBackToSpinner = () => {
+		wrap.textContent = '';
+		wrap.classList.add('locopilot-logo-loader-fallback');
+		wrap.classList.add(...ThemeIcon.asClassNameArray(ThemeIcon.modify(Codicon.loading, 'spin')));
+	};
+
 	const track = $<HTMLImageElement>('img.logo-track');
-	track.src = src;
 	track.alt = '';
+	track.addEventListener('error', fallBackToSpinner, { once: true });
+	track.src = src;
 	append(wrap, track);
 
 	const fill = $<HTMLImageElement>('img.logo-fill');
-	fill.src = src;
 	fill.alt = '';
+	fill.src = src;
 	append(wrap, fill);
 
 	return wrap;

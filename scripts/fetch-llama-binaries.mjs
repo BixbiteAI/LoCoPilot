@@ -20,7 +20,7 @@
 // (ggml-org/llama.cpp). Re-run after bumping LLAMA_BUILD to update the bundled engine.
 
 import { createWriteStream } from 'node:fs';
-import { mkdir, stat, rm, readdir, copyFile, chmod, mkdtemp } from 'node:fs/promises';
+import { mkdir, stat, lstat, rm, readdir, copyFile, chmod, mkdtemp, readlink, symlink, unlink } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
@@ -114,20 +114,48 @@ async function findBinDir(rootDir, binName) {
 	return undefined;
 }
 
+function looksLikeRuntimeFile(name) {
+	const lower = name.toLowerCase();
+	return lower.endsWith('.dylib') || lower.endsWith('.so') || lower.includes('.so.') || lower.endsWith('.dll');
+}
+
 async function copyDirFlat(srcDir, destDir) {
 	// Copy the binary and the runtime libraries that sit alongside it (*.dylib/.so/.dll), flattening
 	// into resources/bin/<target>/ so the loader finds them next to llama-server.
+	//
+	// CRITICAL: the macOS/Linux tarballs ship VERSIONED libs plus the major-version SYMLINKS the
+	// loader actually links against (e.g. libllama.0.dylib -> libllama.0.0.9623.dylib; the binary's
+	// LC_LOAD_DYLIB references @rpath/libllama.0.dylib). If we drop those symlinks the dynamic linker
+	// fails with "Library not loaded: @rpath/libllama.0.dylib" and llama-server exits instantly - it
+	// never binds the port, so LoCoPilot polls /health forever (ERR_CONNECTION_REFUSED). So we must
+	// preserve symlinks, not skip them. We copy real files first, then recreate the links.
 	const entries = await readdir(srcDir, { withFileTypes: true });
+	const symlinks = [];
 	for (const e of entries) {
-		if (!e.isFile()) { continue; }
-		const lower = e.name.toLowerCase();
-		const isLib = lower.endsWith('.dylib') || lower.endsWith('.so') || lower.includes('.so.') || lower.endsWith('.dll');
 		const isBin = e.name === 'llama-server' || e.name === 'llama-server.exe';
+		const isLib = looksLikeRuntimeFile(e.name);
 		if (!isLib && !isBin) { continue; }
+
+		// Symlinks (the major-version aliases) are recreated after the real files are in place.
+		if (e.isSymbolicLink()) {
+			symlinks.push(e.name);
+			continue;
+		}
+		if (!e.isFile()) { continue; }
+
 		const dest = join(destDir, e.name);
 		await copyFile(join(srcDir, e.name), dest);
 		if (isBin && process.platform !== 'win32') { await chmod(dest, 0o755); }
 		if (isBin) { process.stdout.write(`  binary: ${e.name}\n`); }
+	}
+
+	// Recreate the version-alias symlinks (relative, so they stay valid wherever the folder ships).
+	for (const name of symlinks) {
+		const linkTarget = await readlink(join(srcDir, name));
+		const dest = join(destDir, name);
+		try { await unlink(dest); } catch { /* not there yet */ }
+		await symlink(linkTarget, dest);
+		process.stdout.write(`  symlink: ${name} -> ${linkTarget}\n`);
 	}
 }
 
