@@ -150,18 +150,27 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 	}
 
 	/**
+	 * True when the user pointed `locopilot.llamaCpp.serverPath` at their own llama.cpp build.
+	 * Only then is it safe to attempt a GPU backend on non-Mac, since the bundled Windows/Linux
+	 * binaries are CPU-only and forcing GPU offload onto them breaks startup.
+	 */
+	private _hasCustomServerPath(): boolean {
+		return !!this.configurationService.getValue<string>(ChatConfiguration.LocopilotLlamaCppServerPath)?.trim();
+	}
+
+	/**
 	 * Returns the backend that will be used (or is recommended) for running the model.
-	 * Priority: GPU (CUDA) > Apple Metal > Vulkan > CPU.
+	 * Metal on Apple Silicon, GPU (CUDA/Vulkan) only for user-provided non-Mac builds, else CPU.
 	 */
 	getBackend(): LlamaBackend {
-		return getRecommendedBackend();
+		return getRecommendedBackend(this._hasCustomServerPath());
 	}
 
 	/**
 	 * Returns ordered list of backends to try (best first).
 	 */
 	getBackendPriority(): LlamaBackend[] {
-		return detectLlamaBackend();
+		return detectLlamaBackend(this._hasCustomServerPath());
 	}
 
 	/**
@@ -218,8 +227,8 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 		if (!model || !model.localPath) {
 			return undefined;
 		}
-		const backend = getRecommendedBackend();
 		const serverPath = this.configurationService.getValue<string>(ChatConfiguration.LocopilotLlamaCppServerPath);
+		const backend = getRecommendedBackend(!!serverPath?.trim());
 		const { command, args } = getLlamaCppServerCommand(model.localPath, backend, serverPath, LOCOPILOT_LLAMA_SERVER_PORT, this._getLlamaTuning(model));
 		return { command, args, backend };
 	}
@@ -562,7 +571,7 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 		}
 
 		const modelPath = await this.resolveModelFilePath(model.localPath);
-		const backend = getRecommendedBackend();
+		const backend = getRecommendedBackend(this._hasCustomServerPath());
 
 		const port = await this.findAvailablePort(LOCOPILOT_LLAMA_SERVER_PORT);
 		const { command, args } = getLlamaCppServerCommand(modelPath, backend, serverPath, port, this._getLlamaTuning(model));

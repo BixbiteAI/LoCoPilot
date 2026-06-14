@@ -70,29 +70,43 @@ export function getDefaultLlamaServerPaths(userHomeFsPath: string): string[] {
 }
 
 /**
- * Detects the best available backend for running GGUF models.
- * Order: GPU (CUDA) > Apple Metal > Vulkan > CPU.
- * In renderer we use heuristics (e.g. macOS => Metal); for full detection a native/main process would be needed.
+ * Detects the backends to try for running GGUF models, best first.
+ *
+ * We cannot probe the GPU from the renderer, so this is driven by what the *binary* in use can
+ * actually support, not by what hardware might be present:
+ *   - Apple Silicon: the bundled macOS arm64 binary is a Metal build -> Metal.
+ *   - Non-Mac with a user-provided build (`hasCustomServer`): that build may be compiled with
+ *     CUDA/Vulkan, so it is safe to attempt GPU offload -> CUDA, Vulkan, then CPU.
+ *   - Everything else (Intel Mac, and the bundled Windows/Linux binaries, which are CPU-only):
+ *     CPU. Forcing `--n-gpu-layers` onto a CPU-only binary breaks startup, so we must not claim a
+ *     GPU backend here.
+ *
+ * @param hasCustomServer true when `locopilot.llamaCpp.serverPath` points at the user's own build.
  */
-export function detectLlamaBackend(): LlamaBackend[] {
+export function detectLlamaBackend(hasCustomServer = false): LlamaBackend[] {
 	const order: LlamaBackend[] = [];
-	if (isMacintosh) {
-		// Apple Silicon or Intel Mac: Metal is the preferred GPU backend
+	const isAppleSilicon = isMacintosh && getBundledPlatformArch() === 'darwin-arm64';
+
+	if (isAppleSilicon) {
+		// Bundled macOS arm64 binary is a Metal build.
 		order.push('metal');
+	} else if (hasCustomServer && !isMacintosh) {
+		// Non-Mac custom build may be compiled with CUDA/Vulkan; only then is GPU offload safe to try.
+		order.push('cuda', 'vulkan');
 	}
-	// CUDA is typical on Linux/Windows with NVIDIA GPU (we cannot detect from renderer; user may have it)
-	order.push('cuda');
-	order.push('vulkan');
+	// CPU is always the safe fallback and the default for Intel Macs and bundled Windows/Linux binaries.
 	order.push('cpu');
-	// Dedupe and preserve priority
+
+	// Keep BACKEND_PRIORITY order; its entries are unique, so this also dedupes.
 	return BACKEND_PRIORITY.filter(b => order.includes(b));
 }
 
 /**
  * Returns the recommended backend to try first (best performance).
+ * @param hasCustomServer true when the user configured their own llama.cpp build path.
  */
-export function getRecommendedBackend(): LlamaBackend {
-	const ordered = detectLlamaBackend();
+export function getRecommendedBackend(hasCustomServer = false): LlamaBackend {
+	const ordered = detectLlamaBackend(hasCustomServer);
 	return ordered[0] ?? 'cpu';
 }
 
