@@ -358,7 +358,7 @@ export const LOCOPILOT_DEFAULT_CATALOG: readonly ICatalogModel[] = [
 		approxSizeBytes: Math.round(2.5 * GB),
 		minRamGB: 8,
 		tier: '8 GB',
-		contextWindow: 131072,
+		contextWindow: 32768,
 	},
 	{
 		catalogId: 'gemma3-4b-gguf',
@@ -400,7 +400,7 @@ export const LOCOPILOT_DEFAULT_CATALOG: readonly ICatalogModel[] = [
 		minRamGB: 16,
 		tier: '16 GB',
 		recommended: true,
-		contextWindow: 131072,
+		contextWindow: 32768,
 	},
 	{
 		catalogId: 'qwen3-8b-mlx',
@@ -414,7 +414,7 @@ export const LOCOPILOT_DEFAULT_CATALOG: readonly ICatalogModel[] = [
 		minRamGB: 16,
 		tier: '16 GB',
 		requiresAppleSilicon: true,
-		contextWindow: 131072,
+		contextWindow: 32768,
 	},
 	{
 		catalogId: 'gemma3-12b-gguf',
@@ -483,7 +483,7 @@ export const LOCOPILOT_DEFAULT_CATALOG: readonly ICatalogModel[] = [
 		minRamGB: 32,
 		tier: '32 GB+',
 		requiresAppleSilicon: true,
-		contextWindow: 131072,
+		contextWindow: 32768,
 	},
 	{
 		catalogId: 'deepseek-r1-distill-32b-gguf',
@@ -512,7 +512,7 @@ export const LOCOPILOT_DEFAULT_CATALOG: readonly ICatalogModel[] = [
 		approxSizeBytes: Math.round(18 * GB),
 		minRamGB: 32,
 		tier: '32 GB+',
-		contextWindow: 131072,
+		contextWindow: 32768,
 	},
 	{
 		catalogId: 'qwen3-30b-a3b-mlx',
@@ -526,7 +526,7 @@ export const LOCOPILOT_DEFAULT_CATALOG: readonly ICatalogModel[] = [
 		minRamGB: 32,
 		tier: '32 GB+',
 		requiresAppleSilicon: true,
-		contextWindow: 131072,
+		contextWindow: 32768,
 	},
 ];
 
