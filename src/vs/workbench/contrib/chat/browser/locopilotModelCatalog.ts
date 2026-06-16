@@ -580,6 +580,36 @@ export function catalogDefaultHidden(entry: ICatalogModel): boolean {
 	return entry.defaultHidden ?? !DEFAULT_VISIBLE_CATALOG_IDS.has(entry.catalogId);
 }
 
+/**
+ * How well a catalog model fits the current machine, used to badge/filter the model list:
+ * - `best`        - runs comfortably AND is sized for this machine's RAM tier (the sweet spot).
+ * - `ok`          - runs comfortably but is smaller than the machine could handle (fine, just not maximal).
+ * - `too-big`     - needs more RAM than detected; will be slow or fail. Surfaced as a soft warning.
+ * - `incompatible`- needs Apple Silicon (MLX) on a non-Apple-Silicon machine.
+ * - `unknown`     - not a catalog model (custom/cloud) or RAM not detected; show no hardware hint.
+ */
+export type ModelSuitability = 'best' | 'ok' | 'too-big' | 'incompatible' | 'unknown';
+
+/** Map detected system RAM (GB) to the catalog `tier` bucket that best fits it. */
+export function bestTierForRam(ramGB: number): ICatalogModel['tier'] {
+	if (ramGB >= 32) { return '32 GB+'; }
+	if (ramGB >= 16) { return '16 GB'; }
+	return '8 GB';
+}
+
+/**
+ * Rate how well a catalog entry suits the current hardware. `ramGB <= 0` means RAM is unknown
+ * (no startup metric yet) - we return `unknown` rather than guess. Apple-Silicon-only (MLX) builds
+ * are normally not even seeded off Apple Silicon, but we still guard here for robustness.
+ */
+export function getCatalogSuitability(entry: ICatalogModel | undefined, ramGB: number, isAppleSilicon: boolean): ModelSuitability {
+	if (!entry) { return 'unknown'; }
+	if (entry.requiresAppleSilicon && !isAppleSilicon) { return 'incompatible'; }
+	if (ramGB <= 0) { return 'unknown'; }
+	if (ramGB < entry.minRamGB) { return 'too-big'; }
+	return entry.tier === bestTierForRam(ramGB) ? 'best' : 'ok';
+}
+
 /** Find the catalog entry a stored model originated from, by matching its repo id + download format. */
 export function findCatalogEntry(repoId: string | undefined, format: string | undefined): ICatalogModel | undefined {
 	if (!repoId) {

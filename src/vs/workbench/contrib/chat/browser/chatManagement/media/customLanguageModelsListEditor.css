@@ -356,6 +356,16 @@
 	color: var(--vscode-foreground);
 }
 
+/* Circled tick marking a "Best for you" model, shown just after its name. Teal, theme-adaptive. Hover shows the recommendation. */
+.model-name-best-icon {
+	display: inline-flex;
+	align-items: center;
+	margin-left: 5px;
+	color: var(--vscode-terminal-ansiCyan, var(--vscode-charts-green, var(--vscode-textLink-foreground)));
+	vertical-align: text-bottom;
+	cursor: default;
+}
+
 .model-item-row2 .model-details {
 	flex: 1;
 	min-width: 0;
@@ -430,6 +440,19 @@
 	color: var(--vscode-errorForeground);
 	border-color: color-mix(in srgb, var(--vscode-errorForeground) 45%, transparent);
 	background: color-mix(in srgb, var(--vscode-errorForeground) 12%, transparent);
+}
+
+/* Hardware-fit badges: "Best for you" (green, sized for this machine) and "Needs N GB RAM" (amber warning) */
+.model-chip-best {
+	color: var(--vscode-charts-green, var(--vscode-testing-iconPassed));
+	border-color: color-mix(in srgb, var(--vscode-charts-green, var(--vscode-testing-iconPassed)) 50%, transparent);
+	background: color-mix(in srgb, var(--vscode-charts-green, var(--vscode-testing-iconPassed)) 14%, transparent);
+}
+
+.model-chip-warn {
+	color: var(--vscode-charts-orange, var(--vscode-editorWarning-foreground));
+	border-color: color-mix(in srgb, var(--vscode-charts-orange, var(--vscode-editorWarning-foreground)) 45%, transparent);
+	background: color-mix(in srgb, var(--vscode-charts-orange, var(--vscode-editorWarning-foreground)) 12%, transparent);
 }
 
 .model-secondary-settings {

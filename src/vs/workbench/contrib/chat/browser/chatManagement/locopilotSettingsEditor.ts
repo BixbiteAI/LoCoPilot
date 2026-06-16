@@ -52,6 +52,9 @@ import { renderIcon } from '../../../../../base/browser/ui/iconLabel/iconLabels.
 import { MarkdownString } from '../../../../../base/common/htmlContent.js';
 import { IMarkdownRendererService } from '../../../../../platform/markdown/browser/markdownRenderer.js';
 import { ILoCoPilotLocalModelRunner } from '../locopilotLocalModelRunner.js';
+import { ITimerService } from '../../../../services/timer/browser/timerService.js';
+import { isAppleSiliconMac } from '../locopilotMlxServer.js';
+import { findCatalogEntry, getCatalogSuitability, ModelSuitability } from '../locopilotModelCatalog.js';
 
 const $ = DOM.$;
 
@@ -167,6 +170,8 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 	private modelTypeFilter: 'all' | 'local' | 'cloud' = 'all';
 	private modelStatusFilter: 'all' | 'downloaded' | 'not-downloaded' = 'all';
 	private modelVisibilityFilter: 'all' | 'shown' | 'hidden' = 'all';
+	/** "Best for you" filter: when 'best', show only catalog models that fit this machine's RAM/engine. */
+	private modelBestFilter: 'all' | 'best' = 'all';
 	private modelToolsFilter: boolean = false;
 	private modelMtpFilter: boolean = false;
 
@@ -265,11 +270,13 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 		@ILoCoPilotLocalModelRunner localModelRunner: ILoCoPilotLocalModelRunner,
 		@ILoCoPilotProjectMemoryService private readonly projectMemoryService: ILoCoPilotProjectMemoryService,
 		@IClipboardService private readonly clipboardService: IClipboardService,
+		@ITimerService private readonly timerService: ITimerService,
 	) {
 		super(LoCoPilotSettingsEditor.ID, group, telemetryService, themeService, storageService);
 		this.agentSettingsService = agentSettingsService;
 		this.customLanguageModelsService = customLanguageModelsService;
 		this.localModelRunner = localModelRunner;
+		this.primeHardwareDetection();
 
 		this._register(this.localModelRunner.onDidServerStateChange((modelId) => {
 			this.renderListModels();
@@ -972,6 +979,21 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 			(v) => { this.modelVisibilityFilter = v as 'all' | 'shown' | 'hidden'; }
 		);
 
+		// "Best for you": filters to catalog models sized for the detected RAM / engine. Only useful
+		// when we actually detected RAM - otherwise everything reads as "unknown" and the filter would
+		// hide the whole list, so skip rendering it on machines where startup metrics gave us nothing.
+		if (this.detectedRamGB() > 0) {
+			makeDropdownFilter(
+				localize('customLanguageModels.filter.bestLabel', 'Best for you'),
+				[
+					{ label: localize('customLanguageModels.filter.bestAll', 'All'), value: 'all' },
+					{ label: localize('customLanguageModels.filter.bestOnly', 'Best for you'), value: 'best' },
+				],
+				this.modelBestFilter,
+				(v) => { this.modelBestFilter = v as 'all' | 'best'; }
+			);
+		}
+
 		// makeToggleFilter(
 		// 	localize('customLanguageModels.filter.toolsLabel', 'Tools'),
 		// 	this.modelToolsFilter,
@@ -1003,6 +1025,9 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 			if (this.modelTypeFilter !== 'all' && m.type !== this.modelTypeFilter) { return false; }
 			if (this.modelStatusFilter === 'downloaded' && !isModelDownloaded(m)) { return false; }
 			if (this.modelStatusFilter === 'not-downloaded' && isModelDownloaded(m)) { return false; }
+			if (this.modelVisibilityFilter === 'shown' && m.hidden) { return false; }
+			if (this.modelVisibilityFilter === 'hidden' && !m.hidden) { return false; }
+			if (this.modelBestFilter === 'best' && this.modelSuitability(m) !== 'best') { return false; }
 			if (this.modelToolsFilter && !m.useNativeTools) { return false; }
 			if (this.modelMtpFilter && !m.mtp) { return false; }
 			if (!q) { return true; }
@@ -1017,49 +1042,27 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 		const isRunning = (m: ICustomLanguageModel): boolean =>
 			this.localModelRunner.isServerRunning(m.id) || this.localModelRunner.isServerStarting(m.id);
 
-		// Running models are pulled out of their Visible/Hidden section and shown in a pinned
-		// "Running" section at the top. When stopped they fall back to their normal position.
-		const runningModels = allModels.filter(m => isRunning(m) && matchesFilters(m)).sort(sortAZ);
-		const visibleModels = allModels.filter(m => !isRunning(m) && !m.hidden && matchesFilters(m)).sort(sortAZ);
-		const hiddenModels = allModels.filter(m => !isRunning(m) && m.hidden && matchesFilters(m)).sort(sortAZ);
-		const hasActiveFilter = this.modelTypeFilter !== 'all' || this.modelStatusFilter !== 'all' || this.modelVisibilityFilter !== 'all' || this.modelToolsFilter || this.modelMtpFilter;
+		// One flat, A-Z sorted list with currently running/starting models pinned at the very top.
+		// (Visibility and "Best for you" are applied as filters in matchesFilters rather than as
+		// separate sections, so there are no sticky section titles anymore - hidden models stay in
+		// place, just dimmed via the .hidden row class.)
+		const matched = allModels.filter(matchesFilters);
+		const sortedModels = matched.sort((a, b) => {
+			const ra = isRunning(a) ? 0 : 1;
+			const rb = isRunning(b) ? 0 : 1;
+			if (ra !== rb) { return ra - rb; }
+			return sortAZ(a, b);
+		});
+		const hasActiveFilter = this.modelTypeFilter !== 'all' || this.modelStatusFilter !== 'all' || this.modelVisibilityFilter !== 'all' || this.modelBestFilter !== 'all' || this.modelToolsFilter || this.modelMtpFilter;
 
-		// Section: running models - only shown when at least one model is currently running/starting.
-		if (runningModels.length > 0) {
-			const runningHeader = DOM.append(this.listModelsContainer, $('.models-section-header.models-section-header-running'));
-			runningHeader.textContent = localize('customLanguageModels.section.running', 'Running');
-			const runningContainer = DOM.append(this.listModelsContainer, $('.models-list-container'));
-			runningModels.forEach((model: ICustomLanguageModel) => this.renderListModelItem(model, runningContainer));
-		}
-
-		// Section: visible models (skipped when the visibility filter is set to Hidden only)
-		if (this.modelVisibilityFilter !== 'hidden') {
-			const visibleHeader = DOM.append(this.listModelsContainer, $('.models-section-header'));
-			visibleHeader.textContent = localize('customLanguageModels.section.visible', 'Visible on model picker');
-			const visibleContainer = DOM.append(this.listModelsContainer, $('.models-list-container'));
-			if (visibleModels.length === 0) {
-				const noResults = DOM.append(visibleContainer, $('.models-section-empty'));
-				noResults.textContent = (q || hasActiveFilter)
-					? localize('customLanguageModels.section.visible.noSearch', 'No visible models match your search')
-					: localize('customLanguageModels.section.visible.none', 'No visible models');
-			} else {
-				visibleModels.forEach((model: ICustomLanguageModel) => this.renderListModelItem(model, visibleContainer));
-			}
-		}
-
-		// Section: hidden models (skipped when the visibility filter is set to Shown only)
-		if (this.modelVisibilityFilter !== 'shown') {
-			const hiddenHeader = DOM.append(this.listModelsContainer, $('.models-section-header.models-section-header-hidden'));
-			hiddenHeader.textContent = localize('customLanguageModels.section.hidden', 'Hidden from model picker');
-			const hiddenContainer = DOM.append(this.listModelsContainer, $('.models-list-container'));
-			if (hiddenModels.length === 0) {
-				const noResults = DOM.append(hiddenContainer, $('.models-section-empty'));
-				noResults.textContent = (q || hasActiveFilter)
-					? localize('customLanguageModels.section.hidden.noSearch', 'No hidden models match your search')
-					: localize('customLanguageModels.section.hidden.none', 'No hidden models');
-			} else {
-				hiddenModels.forEach((model: ICustomLanguageModel) => this.renderListModelItem(model, hiddenContainer));
-			}
+		const listContainer = DOM.append(this.listModelsContainer, $('.models-list-container'));
+		if (sortedModels.length === 0) {
+			const noResults = DOM.append(listContainer, $('.models-section-empty'));
+			noResults.textContent = (q || hasActiveFilter)
+				? localize('customLanguageModels.list.noMatch', 'No models match your search')
+				: localize('customLanguageModels.list.none', 'No models');
+		} else {
+			sortedModels.forEach((model: ICustomLanguageModel) => this.renderListModelItem(model, listContainer));
 		}
 
 		if (this.contentsContainer) { this.contentsContainer.scrollTop = savedScroll; }
@@ -1073,7 +1076,14 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 		// Row 1: left = model name, right = Run model / Server, Hide, Delete
 		const row1 = DOM.append(itemContainer, $('.model-item-row.model-item-row1'));
 		const nameLabel = DOM.append(row1, $('.model-name'));
-		nameLabel.textContent = getCustomModelListLabel(model);
+		const nameText = DOM.append(nameLabel, $('span.model-name-text'));
+		nameText.textContent = getCustomModelListLabel(model);
+		// "Best for you" models get a double-tick after the name; hovering it explains the recommendation.
+		if (this.modelSuitability(model) === 'best') {
+			const bestIcon = DOM.append(nameLabel, $('span.model-name-best-icon'));
+			bestIcon.appendChild(renderIcon(Codicon.pass));
+			bestIcon.title = localize('customLanguageModels.bestForYou.tooltip', 'Recommended: sized for your system memory.');
+		}
 		const actionsContainer = DOM.append(row1, $('.model-actions'));
 		const runSlot = DOM.append(actionsContainer, $('.model-actions-run-slot'));
 		const downloadingHFOrOllama = model.isDownloading && (model.provider === 'huggingface' || isOllama);
@@ -1143,6 +1153,20 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 			chip.textContent = text;
 			return chip;
 		};
+		// Hardware-fit badge (catalog models only): "Best for you" when sized for this machine, or a
+		// soft "Needs N GB RAM" / Apple-Silicon warning when it won't run comfortably here.
+		const suitability = this.modelSuitability(model);
+		if (suitability === 'best') {
+			const chip = addChip(localize('customLanguageModels.bestForYou', 'Best for you'), 'best');
+			chip.title = localize('customLanguageModels.bestForYou.tooltip', 'Recommended: sized for your system memory.');
+		} else if (suitability === 'too-big') {
+			const entry = findCatalogEntry(model.modelName, model.format);
+			const chip = addChip(localize('customLanguageModels.needsRam', 'Needs {0} GB RAM', entry?.minRamGB ?? '?'), 'warn');
+			chip.title = localize('customLanguageModels.needsRam.tooltip', 'Needs more memory than detected; may run slowly or fail to load.');
+		} else if (suitability === 'incompatible') {
+			const chip = addChip(localize('customLanguageModels.needsApple', 'Apple Silicon only'), 'warn');
+			chip.title = localize('customLanguageModels.needsApple.tooltip', 'This MLX build runs only on Apple Silicon Macs.');
+		}
 		// Type badge (colored): Cloud vs Local
 		addChip(model.type === 'cloud' ? localize('customLanguageModels.cloud', 'Cloud') : localize('customLanguageModels.local', 'Local'),
 			model.type === 'cloud' ? 'cloud' : 'local');
@@ -1834,8 +1858,43 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 		this.modelTypeFilter = 'all';
 		this.modelStatusFilter = 'all';
 		this.modelVisibilityFilter = 'all';
+		this.modelBestFilter = 'all';
 		this.modelToolsFilter = false;
 		this.modelMtpFilter = false;
+	}
+
+	/**
+	 * Detected system RAM in GB (0 until measured). Sourced from the startup metrics the timer service
+	 * collects on every platform (Win/macOS/Linux), so no node `os` import is needed in this browser-layer
+	 * editor. Cached because `timerService.startupMetrics` THROWS if read before `whenReady()` resolves -
+	 * {@link primeHardwareDetection} fills this in and re-renders once metrics are available.
+	 */
+	private detectedRamGBValue = 0;
+
+	private detectedRamGB(): number {
+		return this.detectedRamGBValue;
+	}
+
+	/** Read system RAM once startup metrics are ready, then re-render so the badges/Best filter appear. */
+	private primeHardwareDetection(): void {
+		this.timerService.whenReady().then(() => {
+			let totalmem: number | undefined;
+			try {
+				totalmem = this.timerService.startupMetrics.totalmem;
+			} catch {
+				totalmem = undefined;
+			}
+			if (typeof totalmem === 'number' && totalmem > 0) {
+				this.detectedRamGBValue = totalmem / (1024 * 1024 * 1024);
+				if (this.listModelsContainer) { this.renderListModels(); }
+			}
+		});
+	}
+
+	/** How well a stored model fits this machine. Non-catalog (custom/cloud) models return 'unknown'. */
+	private modelSuitability(model: ICustomLanguageModel): ModelSuitability {
+		const entry = findCatalogEntry(model.modelName, model.format);
+		return getCatalogSuitability(entry, this.detectedRamGB(), isAppleSiliconMac());
 	}
 
 	private renderSelectedSection(): void {
