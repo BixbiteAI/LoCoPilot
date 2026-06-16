@@ -42,6 +42,7 @@ import { Toggle } from '../../../../../base/browser/ui/toggle/toggle.js';
 import { SelectBox, ISelectOptionItem, ISelectData } from '../../../../../base/browser/ui/selectBox/selectBox.js';
 import { ICustomLanguageModelsService, ICustomLanguageModel, getCustomModelListLabel, needsDownloadOrPullRetry, DEFAULT_CONTEXT_WINDOW_CLOUD, DEFAULT_CONTEXT_WINDOW_LOCAL, MIN_CONTEXT_WINDOW, MAX_CONTEXT_WINDOW } from '../../common/customLanguageModelsService.js';
 import { IDialogService } from '../../../../../platform/dialogs/common/dialogs.js';
+import { IClipboardService } from '../../../../../platform/clipboard/common/clipboardService.js';
 import { ICommandService } from '../../../../../platform/commands/common/commands.js';
 import { ILogService } from '../../../../../platform/log/common/log.js';
 import { toErrorMessage } from '../../../../../base/common/errorMessage.js';
@@ -193,7 +194,7 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 	private addFormHfFastestContainer!: HTMLElement;
 	private addFormAddButton!: Button;
 	private addFormResetButton!: Button;
-	private addFormCurrentModelType: 'cloud' | 'local' = 'cloud';
+	private addFormCurrentModelType: 'cloud' | 'local' = 'local';
 	private addFormCurrentProviderIndex: number = 0;
 
 	private static readonly DEFAULT_CONTEXT_WINDOW = DEFAULT_CONTEXT_WINDOW_CLOUD;
@@ -246,6 +247,7 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 	private logsBadgeEl: HTMLElement | undefined;
 	private logsBodyEl: HTMLElement | undefined;
 	private logsFooterInfoEl: HTMLElement | undefined;
+	private logsCopyBtn: HTMLElement | undefined;
 
 	constructor(
 		group: IEditorGroup,
@@ -262,6 +264,7 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 		@IMarkdownRendererService private readonly markdownRendererService: IMarkdownRendererService,
 		@ILoCoPilotLocalModelRunner localModelRunner: ILoCoPilotLocalModelRunner,
 		@ILoCoPilotProjectMemoryService private readonly projectMemoryService: ILoCoPilotProjectMemoryService,
+		@IClipboardService private readonly clipboardService: IClipboardService,
 	) {
 		super(LoCoPilotSettingsEditor.ID, group, telemetryService, themeService, storageService);
 		this.agentSettingsService = agentSettingsService;
@@ -428,10 +431,10 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 		this.logsBadgeEl = DOM.append(logsHeaderLeft, $('.model-logs-badge'));
 		this.logsBadgeEl.style.display = 'none';
 		const logsHeaderActions = DOM.append(logsHeader, $('.model-logs-header-actions'));
-		const logsCopyBtn = DOM.append(logsHeaderActions, $('button.model-logs-action-btn'));
-		logsCopyBtn.textContent = localize('customLanguageModels.logs.copy', 'Copy');
-		logsCopyBtn.title = localize('customLanguageModels.logs.copyTooltip', 'Copy all logs to clipboard');
-		this._register(DOM.addDisposableListener(logsCopyBtn, 'click', () => this._copyLogs()));
+		this.logsCopyBtn = DOM.append(logsHeaderActions, $('button.model-logs-action-btn'));
+		this.logsCopyBtn.textContent = localize('customLanguageModels.logs.copy', 'Copy');
+		this.logsCopyBtn.title = localize('customLanguageModels.logs.copyTooltip', 'Copy all logs to clipboard');
+		this._register(DOM.addDisposableListener(this.logsCopyBtn, 'click', () => this._copyLogs()));
 		const logsClearBtn = DOM.append(logsHeaderActions, $('button.model-logs-action-btn'));
 		logsClearBtn.textContent = localize('customLanguageModels.logs.clear', 'Clear');
 		logsClearBtn.title = localize('customLanguageModels.logs.clearTooltip', 'Clear log view');
@@ -471,7 +474,7 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 		const segmented = DOM.append(modelTypeContainer, $('.segmented-control'));
 		segmented.setAttribute('role', 'radiogroup');
 		segmented.setAttribute('aria-label', localize('addCustomModel.modelType', 'Model Type'));
-		const segmentLabels = [localize('addCustomModel.cloud', 'Cloud'), localize('addCustomModel.local', 'Local')];
+		const segmentLabels = [localize('addCustomModel.local', 'Local'), localize('addCustomModel.cloud', 'Cloud')];
 		this.addFormModelTypeSegments = segmentLabels.map((text, index) => {
 			const seg = DOM.append(segmented, $('button.segment'));
 			seg.textContent = text;
@@ -485,7 +488,7 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 		const providerLabel = DOM.append(providerContainer, $('label.form-label'));
 		providerLabel.textContent = localize('addCustomModel.provider', 'Model Provider');
 		const providerSelectContainer = DOM.append(providerContainer, $('.form-input-container'));
-		this.addFormProviderSelectBox = this._register(new SelectBox(CLOUD_PROVIDERS_ADD, 0, this.contextViewService, locopilotSettingsSelectBoxStyles));
+		this.addFormProviderSelectBox = this._register(new SelectBox(LOCAL_PROVIDERS_ADD, 0, this.contextViewService, locopilotSettingsSelectBoxStyles));
 		this.addFormProviderSelectBox.render(providerSelectContainer);
 		this._register(this.addFormProviderSelectBox.onDidSelect((e: ISelectData) => {
 			this.addFormCurrentProviderIndex = e.index;
@@ -645,13 +648,13 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 		this.addFormUpdateInputFields();
 	}
 
-	/** Selects the Cloud (0) / Local (1) segment, updating the active style and dependent fields. */
+	/** Selects the Local (0) / Cloud (1) segment, updating the active style and dependent fields. */
 	private selectModelTypeSegment(index: number, fireChange: boolean): void {
 		this.addFormModelTypeSegments.forEach((seg, i) => {
 			seg.classList.toggle('active', i === index);
 			seg.setAttribute('aria-checked', String(i === index));
 		});
-		this.addFormCurrentModelType = index === 0 ? 'cloud' : 'local';
+		this.addFormCurrentModelType = index === 0 ? 'local' : 'cloud';
 		this.addFormCurrentProviderIndex = 0;
 		if (fireChange) {
 			this.addFormUpdateProviderOptions();
@@ -1010,9 +1013,24 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 		const sortAZ = (a: ICustomLanguageModel, b: ICustomLanguageModel) =>
 			getCustomModelListLabel(a).localeCompare(getCustomModelListLabel(b));
 
-		const visibleModels = allModels.filter(m => !m.hidden && matchesFilters(m)).sort(sortAZ);
-		const hiddenModels = allModels.filter(m => m.hidden && matchesFilters(m)).sort(sortAZ);
+		// A model counts as "running" while its local server is starting up or already serving.
+		const isRunning = (m: ICustomLanguageModel): boolean =>
+			this.localModelRunner.isServerRunning(m.id) || this.localModelRunner.isServerStarting(m.id);
+
+		// Running models are pulled out of their Visible/Hidden section and shown in a pinned
+		// "Running" section at the top. When stopped they fall back to their normal position.
+		const runningModels = allModels.filter(m => isRunning(m) && matchesFilters(m)).sort(sortAZ);
+		const visibleModels = allModels.filter(m => !isRunning(m) && !m.hidden && matchesFilters(m)).sort(sortAZ);
+		const hiddenModels = allModels.filter(m => !isRunning(m) && m.hidden && matchesFilters(m)).sort(sortAZ);
 		const hasActiveFilter = this.modelTypeFilter !== 'all' || this.modelStatusFilter !== 'all' || this.modelVisibilityFilter !== 'all' || this.modelToolsFilter || this.modelMtpFilter;
+
+		// Section: running models - only shown when at least one model is currently running/starting.
+		if (runningModels.length > 0) {
+			const runningHeader = DOM.append(this.listModelsContainer, $('.models-section-header.models-section-header-running'));
+			runningHeader.textContent = localize('customLanguageModels.section.running', 'Running');
+			const runningContainer = DOM.append(this.listModelsContainer, $('.models-list-container'));
+			runningModels.forEach((model: ICustomLanguageModel) => this.renderListModelItem(model, runningContainer));
+		}
 
 		// Section: visible models (skipped when the visibility filter is set to Hidden only)
 		if (this.modelVisibilityFilter !== 'hidden') {
@@ -1392,9 +1410,17 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 	}
 
 	private _copyLogs(): void {
-		if (!this.logsBodyEl) { return; }
+		if (!this.logsBodyEl || !this.logsCopyBtn) { return; }
 		const lines = Array.from(this.logsBodyEl.children).map(el => (el as HTMLElement).textContent ?? '');
-		navigator.clipboard?.writeText(lines.join('\n'));
+		const text = lines.join('\n');
+		this.clipboardService.writeText(text);
+		const btn = this.logsCopyBtn;
+		btn.textContent = localize('customLanguageModels.logs.copied', 'Copied');
+		btn.style.opacity = '0.7';
+		setTimeout(() => {
+			btn.textContent = localize('customLanguageModels.logs.copy', 'Copy');
+			btn.style.opacity = '';
+		}, 2000);
 	}
 
 	private renderAgentSettings(container: HTMLElement): void {

@@ -670,7 +670,10 @@ export class ChatListItemRenderer extends Disposable implements ITreeRenderer<Ch
 		templateData.rowContainer.classList.toggle('interactive-request', isRequestVM(element));
 		templateData.rowContainer.classList.toggle('interactive-response', isResponseVM(element));
 		const progressMessageAtBottomOfResponse = checkModeOption(this.delegate.currentChatMode(), this.rendererOptions.progressMessageAtBottomOfResponse);
-		templateData.rowContainer.classList.toggle('show-detail-progress', isResponseVM(element) && !element.isComplete && !element.progressMessages.length && !progressMessageAtBottomOfResponse);
+		// Don't show the header progress ("Working ...") while a thinking part is active -
+		// the thinking collapsible already shows its own "Working..." loader, otherwise two appear at once.
+		const hasActiveThinking = isResponseVM(element) && !!this.getLastThinkingPart(templateData.renderedParts);
+		templateData.rowContainer.classList.toggle('show-detail-progress', isResponseVM(element) && !element.isComplete && !element.progressMessages.length && !progressMessageAtBottomOfResponse && !hasActiveThinking);
 		if (!this.rendererOptions.noHeader) {
 			this.renderAvatar(element, templateData);
 		}
@@ -769,7 +772,10 @@ export class ChatListItemRenderer extends Disposable implements ITreeRenderer<Ch
 		const showingProgress = !element.agentOrSlashCommandDetected
 			&& this.rendererOptions.renderStyle !== 'minimal'
 			&& !element.isComplete
-			&& !checkModeOption(this.delegate.currentChatMode(), this.rendererOptions.progressMessageAtBottomOfResponse);
+			&& !checkModeOption(this.delegate.currentChatMode(), this.rendererOptions.progressMessageAtBottomOfResponse)
+			// Suppress the header "Working " loader while a thinking part is active so we don't
+			// show it alongside the thinking collapsible's own "Working..." loader.
+			&& !this.getLastThinkingPart(templateData.renderedParts);
 
 		templateData.detailLogoLoader.style.display = showingProgress ? 'inline-flex' : 'none';
 

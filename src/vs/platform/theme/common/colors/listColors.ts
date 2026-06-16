@@ -63,7 +63,7 @@ export const listInactiveFocusOutline = registerColor('list.inactiveFocusOutline
 	nls.localize('listInactiveFocusOutline', "List/Tree outline color for the focused item when the list/tree is inactive. An active list/tree has keyboard focus, an inactive does not."));
 
 export const listHoverBackground = registerColor('list.hoverBackground',
-	{ dark: '#00796b', light: '#00796b', hcDark: Color.white.transparent(0.1), hcLight: Color.fromHex('#004d40').transparent(0.1) },
+	{ dark: '#2a2d2e', light: '#e8e8e8', hcDark: Color.white.transparent(0.1), hcLight: Color.fromHex('#004d40').transparent(0.1) },
 	nls.localize('listHoverBackground', "List/Tree background when hovering over items using the mouse."));
 
 export const listHoverForeground = registerColor('list.hoverForeground',

@@ -480,7 +480,7 @@ export class ActionList<T> extends Disposable {
 				}
 				return 0;
 			});
-			maxWidth = Math.max(...itemWidths, minWidth);
+			maxWidth = Math.max(...itemWidths, minWidth) + 28;
 		}
 
 		// When maxVisibleItems is set, use a fixed list height so the dropdown doesn't

@@ -208,7 +208,7 @@ export class ModePickerActionItem extends ChatInputPickerActionViewItem {
 			actionBarActionProvider: {
 				getActions: () => this.getModePickerActionBarActions()
 			},
-			showItemKeybindings: true,
+			showItemKeybindings: false,
 			reporter: { name: 'ChatModePicker', includeOptions: true },
 		};
 
@@ -248,9 +248,7 @@ export class ModePickerActionItem extends ChatInputPickerActionViewItem {
 		if (icon) {
 			labelElements.push(...renderLabelWithIcons(`$(${icon.id})`));
 		}
-		if (!isDefault || !icon || !this.pickerOptions.onlyShowIconsForDefaultActions.get()) {
-			labelElements.push(dom.$('span.chat-input-picker-label', undefined, state));
-		}
+		labelElements.push(dom.$('span.chat-input-picker-label', undefined, state));
 		labelElements.push(...renderLabelWithIcons(`$(chevron-down)`));
 
 		dom.reset(element, ...labelElements);
