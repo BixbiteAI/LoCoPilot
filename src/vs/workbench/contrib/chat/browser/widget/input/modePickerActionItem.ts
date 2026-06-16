@@ -235,7 +235,6 @@ export class ModePickerActionItem extends ChatInputPickerActionViewItem {
 		this.setAriaLabelAttributes(element);
 
 		const currentMode = this.delegate.currentMode.get();
-		const isDefault = currentMode.id === ChatMode.Agent.id;
 		const state = currentMode.label.get();
 		let icon = currentMode.icon.get();
 
