@@ -215,12 +215,16 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 
 	private askPromptTextarea!: HTMLTextAreaElement;
 	private agentPromptTextarea!: HTMLTextAreaElement;
+	private planPromptTextarea!: HTMLTextAreaElement;
 	private agentPromptFormattedView!: HTMLElement;
 	private askPromptFormattedView!: HTMLElement;
+	private planPromptFormattedView!: HTMLElement;
 	private agentPromptFormattedRendered: { dispose(): void } | undefined;
 	private askPromptFormattedRendered: { dispose(): void } | undefined;
+	private planPromptFormattedRendered: { dispose(): void } | undefined;
 	private askCodingSystemPromptToggle!: PromptModeControl;
 	private agentCodingSystemPromptToggle!: PromptModeControl;
+	private planCodingSystemPromptToggle!: PromptModeControl;
 	/** Inline validation hint shown under the max-iterations input. */
 	private maxIterationsHint!: HTMLElement;
 	/** "Unsaved changes" indicator in the sticky footer. */
@@ -232,8 +236,10 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 		autoRunSandbox: boolean;
 		askCoding: boolean;
 		agentCoding: boolean;
+		planCoding: boolean;
 		askPrompt: string;
 		agentPrompt: string;
+		planPrompt: string;
 		workspaceInstructions: string;
 	} | undefined;
 	private maxIterationsInput!: InputBox;
@@ -1560,6 +1566,7 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 		promptHeader.textContent = localize('locopilotSettings.systemPromptsSection', "System Prompts");
 		this.renderPromptBlock(promptCard, 'agent');
 		this.renderPromptBlock(promptCard, 'ask');
+		this.renderPromptBlock(promptCard, 'plan');
 
 		// --- Card: Project Memory (per-workspace instructions) ---------------
 		this.renderWorkspaceInstructions(container);
@@ -1582,24 +1589,71 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 		this.updateAgentSettingsDirtyIndicators();
 	}
 
+	/** Resolves the UI controls bound to a given prompt mode. Assigned during {@link renderPromptBlock}. */
+	private promptModeFields(which: 'agent' | 'ask' | 'plan'): {
+		toggle: PromptModeControl;
+		textarea: HTMLTextAreaElement;
+		formatted: HTMLElement;
+		getRendered: () => { dispose(): void } | undefined;
+		setRendered: (r: { dispose(): void } | undefined) => void;
+	} {
+		switch (which) {
+			case 'agent':
+				return { toggle: this.agentCodingSystemPromptToggle, textarea: this.agentPromptTextarea, formatted: this.agentPromptFormattedView, getRendered: () => this.agentPromptFormattedRendered, setRendered: r => { this.agentPromptFormattedRendered = r; } };
+			case 'ask':
+				return { toggle: this.askCodingSystemPromptToggle, textarea: this.askPromptTextarea, formatted: this.askPromptFormattedView, getRendered: () => this.askPromptFormattedRendered, setRendered: r => { this.askPromptFormattedRendered = r; } };
+			case 'plan':
+				return { toggle: this.planCodingSystemPromptToggle, textarea: this.planPromptTextarea, formatted: this.planPromptFormattedView, getRendered: () => this.planPromptFormattedRendered, setRendered: r => { this.planPromptFormattedRendered = r; } };
+		}
+	}
+
+	/** Persisted "use built-in prompt" toggle for a mode. */
+	private getUseCodingPrompt(which: 'agent' | 'ask' | 'plan'): boolean {
+		switch (which) {
+			case 'agent': return this.agentSettingsService.getAgentUseCodingSystemPrompt();
+			case 'ask': return this.agentSettingsService.getAskUseCodingSystemPrompt();
+			case 'plan': return this.agentSettingsService.getPlanUseCodingSystemPrompt();
+		}
+	}
+
+	/** Persisted custom prompt text for a mode. */
+	private getModePrompt(which: 'agent' | 'ask' | 'plan'): string {
+		switch (which) {
+			case 'agent': return this.agentSettingsService.getAgentModeSystemPrompt();
+			case 'ask': return this.agentSettingsService.getAskModeSystemPrompt();
+			case 'plan': return this.agentSettingsService.getPlanModeSystemPrompt();
+		}
+	}
+
+	private promptModeLabel(which: 'agent' | 'ask' | 'plan'): string {
+		switch (which) {
+			case 'agent': return localize('locopilotSettings.promptAgentLabel', "Agent mode prompt");
+			case 'ask': return localize('locopilotSettings.promptAskLabel', "Ask mode prompt");
+			case 'plan': return localize('locopilotSettings.promptPlanLabel', "Plan mode prompt");
+		}
+	}
+
+	private promptModeDesc(which: 'agent' | 'ask' | 'plan'): string {
+		switch (which) {
+			case 'agent': return localize('locopilotSettings.promptAgentDesc', "Default uses LoCoPilot's built-in coding prompt. Override to write your own.");
+			case 'ask': return localize('locopilotSettings.promptAskDesc', "Default uses LoCoPilot's built-in Ask prompt. Override to write your own.");
+			case 'plan': return localize('locopilotSettings.promptPlanDesc', "Default uses LoCoPilot's built-in Plan prompt (research, no edits). Override to write your own.");
+		}
+	}
+
 	/** Builds one prompt mode block (Default/Override segmented control + editable prompt box). */
-	private renderPromptBlock(container: HTMLElement, which: 'agent' | 'ask'): void {
-		const isAgent = which === 'agent';
+	private renderPromptBlock(container: HTMLElement, which: 'agent' | 'ask' | 'plan'): void {
 		const section = DOM.append(container, $('.agent-setting-block'));
 		const headerRow = DOM.append(section, $('.agent-setting-row'));
 		const text = DOM.append(headerRow, $('.agent-setting-text'));
 		const label = DOM.append(text, $('label.locopilot-setting-label'));
-		label.textContent = isAgent
-			? localize('locopilotSettings.promptAgentLabel', "Agent mode prompt")
-			: localize('locopilotSettings.promptAskLabel', "Ask mode prompt");
+		label.textContent = this.promptModeLabel(which);
 		const desc = DOM.append(text, $('.agent-setting-description'));
-		desc.textContent = isAgent
-			? localize('locopilotSettings.promptAgentDesc', "Default uses LoCoPilot's built-in coding prompt. Override to write your own.")
-			: localize('locopilotSettings.promptAskDesc', "Default uses LoCoPilot's built-in Ask prompt. Override to write your own.");
+		desc.textContent = this.promptModeDesc(which);
 
 		const control = this._register(new PromptModeControl(
-			isAgent ? this.agentSettingsService.getAgentUseCodingSystemPrompt() : this.agentSettingsService.getAskUseCodingSystemPrompt(),
-			isAgent ? localize('locopilotSettings.promptAgentLabel', "Agent mode prompt") : localize('locopilotSettings.promptAskLabel', "Ask mode prompt")
+			this.getUseCodingPrompt(which),
+			this.promptModeLabel(which)
 		));
 		DOM.append(headerRow, $('.agent-setting-control', undefined, control.domNode));
 		this._register(control.onChange(() => {
@@ -1615,17 +1669,25 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 		formatted.title = localize('locopilotSettings.clickToEdit', "Click to edit");
 		const textarea = DOM.append(box, $('textarea.locopilot-prompt-textarea')) as HTMLTextAreaElement;
 		textarea.placeholder = localize('locopilotSettings.promptPlaceholder', "Write your system prompt. Leave blank for a short default opener.");
-		textarea.value = isAgent ? this.agentSettingsService.getAgentModeSystemPrompt() : this.agentSettingsService.getAskModeSystemPrompt();
+		textarea.value = this.getModePrompt(which);
 		textarea.classList.add('locopilot-prompt-textarea-hidden');
 
-		if (isAgent) {
-			this.agentCodingSystemPromptToggle = control;
-			this.agentPromptFormattedView = formatted;
-			this.agentPromptTextarea = textarea;
-		} else {
-			this.askCodingSystemPromptToggle = control;
-			this.askPromptFormattedView = formatted;
-			this.askPromptTextarea = textarea;
+		switch (which) {
+			case 'agent':
+				this.agentCodingSystemPromptToggle = control;
+				this.agentPromptFormattedView = formatted;
+				this.agentPromptTextarea = textarea;
+				break;
+			case 'ask':
+				this.askCodingSystemPromptToggle = control;
+				this.askPromptFormattedView = formatted;
+				this.askPromptTextarea = textarea;
+				break;
+			case 'plan':
+				this.planCodingSystemPromptToggle = control;
+				this.planPromptFormattedView = formatted;
+				this.planPromptTextarea = textarea;
+				break;
 		}
 
 		this.updateCodingPromptUIMode(which);
@@ -1712,8 +1774,10 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 		autoRunSandbox: boolean;
 		askCoding: boolean;
 		agentCoding: boolean;
+		planCoding: boolean;
 		askPrompt: string;
 		agentPrompt: string;
+		planPrompt: string;
 		workspaceInstructions: string;
 	} {
 		return {
@@ -1721,8 +1785,10 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 			autoRunSandbox: this.agentSettingsService.getAutoRunCommandsInSandbox(),
 			askCoding: this.agentSettingsService.getAskUseCodingSystemPrompt(),
 			agentCoding: this.agentSettingsService.getAgentUseCodingSystemPrompt(),
+			planCoding: this.agentSettingsService.getPlanUseCodingSystemPrompt(),
 			askPrompt: this.agentSettingsService.getAskModeSystemPrompt().trim(),
 			agentPrompt: this.agentSettingsService.getAgentModeSystemPrompt().trim(),
+			planPrompt: this.agentSettingsService.getPlanModeSystemPrompt().trim(),
 			workspaceInstructions: this.projectMemoryService.getWorkspaceInstructions().trim(),
 		};
 	}
@@ -1732,8 +1798,10 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 		autoRunSandbox: boolean;
 		askCoding: boolean;
 		agentCoding: boolean;
+		planCoding: boolean;
 		askPrompt: string;
 		agentPrompt: string;
+		planPrompt: string;
 		workspaceInstructions: string;
 	} {
 		const rawN = parseInt(this.maxIterationsInput.value.trim(), 10);
@@ -1742,8 +1810,10 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 			autoRunSandbox: this.autoRunCommandsInSandboxToggle.checked,
 			askCoding: this.askCodingSystemPromptToggle.checked,
 			agentCoding: this.agentCodingSystemPromptToggle.checked,
+			planCoding: this.planCodingSystemPromptToggle.checked,
 			askPrompt: this.askPromptTextarea.value.trim(),
 			agentPrompt: this.agentPromptTextarea.value.trim(),
+			planPrompt: this.planPromptTextarea.value.trim(),
 			workspaceInstructions: this.workspaceInstructionsTextarea.value.trim(),
 		};
 	}
@@ -1763,8 +1833,10 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 			b.autoRunSandbox !== cur.autoRunSandbox ||
 			b.askCoding !== cur.askCoding ||
 			b.agentCoding !== cur.agentCoding ||
+			b.planCoding !== cur.planCoding ||
 			b.askPrompt !== cur.askPrompt ||
 			b.agentPrompt !== cur.agentPrompt ||
+			b.planPrompt !== cur.planPrompt ||
 			b.workspaceInstructions !== cur.workspaceInstructions
 		);
 	}
@@ -1778,12 +1850,11 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 		}
 	}
 
-	private updateCodingPromptUIMode(which: 'agent' | 'ask'): void {
+	private updateCodingPromptUIMode(which: 'agent' | 'ask' | 'plan'): void {
 		// `checked === true` means Default (built-in prompt): hide the prompt box entirely.
 		// Override (false) reveals the editable box.
-		const useBuiltin = which === 'agent' ? this.agentCodingSystemPromptToggle.checked : this.askCodingSystemPromptToggle.checked;
-		const textarea = which === 'agent' ? this.agentPromptTextarea : this.askPromptTextarea;
-		const formatted = which === 'agent' ? this.agentPromptFormattedView : this.askPromptFormattedView;
+		const { toggle, textarea, formatted } = this.promptModeFields(which);
+		const useBuiltin = toggle.checked;
 		const box = formatted.parentElement; // .locopilot-prompt-box
 		textarea.disabled = useBuiltin;
 		if (useBuiltin) {
@@ -1802,6 +1873,7 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 	private updateCodingPromptUIModes(): void {
 		this.updateCodingPromptUIMode('agent');
 		this.updateCodingPromptUIMode('ask');
+		this.updateCodingPromptUIMode('plan');
 	}
 
 	private loadAgentPanelFromPersisted(): void {
@@ -1810,16 +1882,21 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 		this.autoRunCommandsInSandboxToggle.checked = this.agentSettingsService.getAutoRunCommandsInSandbox();
 		this.askCodingSystemPromptToggle.checked = this.agentSettingsService.getAskUseCodingSystemPrompt();
 		this.agentCodingSystemPromptToggle.checked = this.agentSettingsService.getAgentUseCodingSystemPrompt();
+		this.planCodingSystemPromptToggle.checked = this.agentSettingsService.getPlanUseCodingSystemPrompt();
 		this.askPromptTextarea.value = this.agentSettingsService.getAskModeSystemPrompt();
 		this.agentPromptTextarea.value = this.agentSettingsService.getAgentModeSystemPrompt();
+		this.planPromptTextarea.value = this.agentSettingsService.getPlanModeSystemPrompt();
 		this.workspaceInstructionsTextarea.value = this.projectMemoryService.getWorkspaceInstructions();
 		this.updateCodingPromptUIModes();
 		this._renderFormattedPrompt('agent');
 		this._renderFormattedPrompt('ask');
+		this._renderFormattedPrompt('plan');
 		this.agentPromptFormattedView.classList.remove('locopilot-prompt-formatted-hidden');
 		this.askPromptFormattedView.classList.remove('locopilot-prompt-formatted-hidden');
+		this.planPromptFormattedView.classList.remove('locopilot-prompt-formatted-hidden');
 		this.agentPromptTextarea.classList.add('locopilot-prompt-textarea-hidden');
 		this.askPromptTextarea.classList.add('locopilot-prompt-textarea-hidden');
+		this.planPromptTextarea.classList.add('locopilot-prompt-textarea-hidden');
 		this.captureAgentSettingsBaselineFromPersisted();
 		this.updateAgentSettingsDirtyIndicators();
 	}
@@ -1839,8 +1916,10 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 			this.agentSettingsService.setAutoRunCommandsInSandbox(this.autoRunCommandsInSandboxToggle.checked);
 			this.agentSettingsService.setAskUseCodingSystemPrompt(this.askCodingSystemPromptToggle.checked);
 			this.agentSettingsService.setAgentUseCodingSystemPrompt(this.agentCodingSystemPromptToggle.checked);
+			this.agentSettingsService.setPlanUseCodingSystemPrompt(this.planCodingSystemPromptToggle.checked);
 			this.agentSettingsService.setAskModeSystemPrompt(this.askPromptTextarea.value.trim());
 			this.agentSettingsService.setAgentModeSystemPrompt(this.agentPromptTextarea.value.trim());
+			this.agentSettingsService.setPlanModeSystemPrompt(this.planPromptTextarea.value.trim());
 			if (this.projectMemoryService.hasWorkspace()) {
 				this.projectMemoryService.setWorkspaceInstructions(this.workspaceInstructionsTextarea.value.trim());
 			}
@@ -1858,13 +1937,9 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 		}
 	}
 
-	private _renderFormattedPrompt(which: 'agent' | 'ask'): void {
-		const textarea = which === 'agent' ? this.agentPromptTextarea : this.askPromptTextarea;
-		const container = which === 'agent' ? this.agentPromptFormattedView : this.askPromptFormattedView;
-		const setRendered = (r: { dispose(): void } | undefined) => {
-			if (which === 'agent') { this.agentPromptFormattedRendered = r; } else { this.askPromptFormattedRendered = r; }
-		};
-		const prev = which === 'agent' ? this.agentPromptFormattedRendered : this.askPromptFormattedRendered;
+	private _renderFormattedPrompt(which: 'agent' | 'ask' | 'plan'): void {
+		const { textarea, formatted: container, getRendered, setRendered } = this.promptModeFields(which);
+		const prev = getRendered();
 		if (prev) {
 			prev.dispose();
 			setRendered(undefined);
@@ -1883,20 +1958,18 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 		this._register(rendered);
 	}
 
-	private _switchToEditPrompt(which: 'agent' | 'ask'): void {
-		if ((which === 'agent' && this.agentCodingSystemPromptToggle.checked) || (which === 'ask' && this.askCodingSystemPromptToggle.checked)) {
+	private _switchToEditPrompt(which: 'agent' | 'ask' | 'plan'): void {
+		const { toggle, formatted, textarea } = this.promptModeFields(which);
+		if (toggle.checked) {
 			return;
 		}
-		const formatted = which === 'agent' ? this.agentPromptFormattedView : this.askPromptFormattedView;
-		const textarea = which === 'agent' ? this.agentPromptTextarea : this.askPromptTextarea;
 		formatted.classList.add('locopilot-prompt-formatted-hidden');
 		textarea.classList.remove('locopilot-prompt-textarea-hidden');
 		textarea.focus();
 	}
 
-	private _switchToFormattedPrompt(which: 'agent' | 'ask'): void {
-		const formatted = which === 'agent' ? this.agentPromptFormattedView : this.askPromptFormattedView;
-		const textarea = which === 'agent' ? this.agentPromptTextarea : this.askPromptTextarea;
+	private _switchToFormattedPrompt(which: 'agent' | 'ask' | 'plan'): void {
+		const { formatted, textarea } = this.promptModeFields(which);
 		this._renderFormattedPrompt(which);
 		formatted.classList.remove('locopilot-prompt-formatted-hidden');
 		textarea.classList.add('locopilot-prompt-textarea-hidden');

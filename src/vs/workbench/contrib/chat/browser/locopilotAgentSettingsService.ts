@@ -5,7 +5,7 @@
 
 import { createDecorator } from '../../../../platform/instantiation/common/instantiation.js';
 import { IStorageService, StorageScope, StorageTarget } from '../../../../platform/storage/common/storage.js';
-import { AGENT_SYSTEM_PROMPT_GENERAL, AGENT_SYSTEM_PROMPT_TOOLS_AND_INTERNAL, ASK_MODE_SYSTEM_PROMPT, INITIAL_USER_GENERAL_SYSTEM_PROMPT, TOOLS_PROMPT_WITHOUT_EDIT } from './agents/agentPrompts.js';
+import { AGENT_SYSTEM_PROMPT_GENERAL, AGENT_SYSTEM_PROMPT_TOOLS_AND_INTERNAL, ASK_MODE_SYSTEM_PROMPT, INITIAL_USER_GENERAL_SYSTEM_PROMPT, PLAN_MODE_SYSTEM_PROMPT, TOOLS_PROMPT_WITHOUT_EDIT } from './agents/agentPrompts.js';
 
 export const ILoCoPilotAgentSettingsService = createDecorator<ILoCoPilotAgentSettingsService>('locopilotAgentSettingsService');
 
@@ -14,8 +14,10 @@ const LEGACY_STORED_FULL_BUILTIN_GENERAL_MARKER = '\uE000LOCOPILOT_FULL_BUILTIN_
 
 const STORAGE_KEY_ASK_PROMPT = 'locopilot.agentSettings.askModeSystemPrompt';
 const STORAGE_KEY_AGENT_PROMPT = 'locopilot.agentSettings.agentModeSystemPrompt';
+const STORAGE_KEY_PLAN_PROMPT = 'locopilot.agentSettings.planModeSystemPrompt';
 const STORAGE_KEY_ASK_USE_CODING_SYSTEM_PROMPT = 'locopilot.agentSettings.askUseCodingSystemPrompt';
 const STORAGE_KEY_AGENT_USE_CODING_SYSTEM_PROMPT = 'locopilot.agentSettings.agentUseCodingSystemPrompt';
+const STORAGE_KEY_PLAN_USE_CODING_SYSTEM_PROMPT = 'locopilot.agentSettings.planUseCodingSystemPrompt';
 const STORAGE_KEY_MAX_ITERATIONS = 'locopilot.agentSettings.maxIterationsPerRequest';
 const STORAGE_KEY_AUTO_RUN_SANDBOX = 'locopilot.agentSettings.autoRunCommandsInSandbox';
 
@@ -26,17 +28,22 @@ export interface ILoCoPilotAgentSettingsService {
 
 	getAskModeSystemPrompt(): string;
 	getAgentModeSystemPrompt(): string;
+	getPlanModeSystemPrompt(): string;
 	getAskUseCodingSystemPrompt(): boolean;
 	getAgentUseCodingSystemPrompt(): boolean;
+	getPlanUseCodingSystemPrompt(): boolean;
 	getFullAskModeSystemPrompt(): string;
 	getFullAgentModeSystemPrompt(): string;
+	getFullPlanModeSystemPrompt(): string;
 	getMaxIterationsPerRequest(): number;
 	getAutoRunCommandsInSandbox(): boolean;
 
 	setAskModeSystemPrompt(value: string): void;
 	setAgentModeSystemPrompt(value: string): void;
+	setPlanModeSystemPrompt(value: string): void;
 	setAskUseCodingSystemPrompt(value: boolean): void;
 	setAgentUseCodingSystemPrompt(value: boolean): void;
+	setPlanUseCodingSystemPrompt(value: boolean): void;
 	setMaxIterationsPerRequest(value: number): void;
 	setAutoRunCommandsInSandbox(value: boolean): void;
 }
@@ -80,6 +87,14 @@ export class LoCoPilotAgentSettingsService implements ILoCoPilotAgentSettingsSer
 		this.storageService.store(STORAGE_KEY_AGENT_USE_CODING_SYSTEM_PROMPT, String(value), StorageScope.APPLICATION, StorageTarget.USER);
 	}
 
+	getPlanUseCodingSystemPrompt(): boolean {
+		return this.storageService.getBoolean(STORAGE_KEY_PLAN_USE_CODING_SYSTEM_PROMPT, StorageScope.APPLICATION, true);
+	}
+
+	setPlanUseCodingSystemPrompt(value: boolean): void {
+		this.storageService.store(STORAGE_KEY_PLAN_USE_CODING_SYSTEM_PROMPT, String(value), StorageScope.APPLICATION, StorageTarget.USER);
+	}
+
 	/** User-editable general fragment when Ask "coding system prompt" is off. */
 	getAskModeSystemPrompt(): string {
 		const stored = this.storageService.get(STORAGE_KEY_ASK_PROMPT, StorageScope.APPLICATION);
@@ -111,6 +126,22 @@ export class LoCoPilotAgentSettingsService implements ILoCoPilotAgentSettingsSer
 		return general + AGENT_SYSTEM_PROMPT_TOOLS_AND_INTERNAL;
 	}
 
+	/** User-editable general fragment when Plan "coding system prompt" is off. */
+	getPlanModeSystemPrompt(): string {
+		const stored = this.storageService.get(STORAGE_KEY_PLAN_PROMPT, StorageScope.APPLICATION);
+		return stored ?? '';
+	}
+
+	/** Plan mode LLM payload: built-in Plan prompt + read-only tools when toggled on; else optional custom + fallback + read-only tools. */
+	getFullPlanModeSystemPrompt(): string {
+		if (this.getPlanUseCodingSystemPrompt()) {
+			return PLAN_MODE_SYSTEM_PROMPT + TOOLS_PROMPT_WITHOUT_EDIT;
+		}
+		const user = this.getPlanModeSystemPrompt().trim();
+		const general = user.length ? user : INITIAL_USER_GENERAL_SYSTEM_PROMPT;
+		return general + TOOLS_PROMPT_WITHOUT_EDIT;
+	}
+
 	getMaxIterationsPerRequest(): number {
 		const stored = this.storageService.get(STORAGE_KEY_MAX_ITERATIONS, StorageScope.APPLICATION);
 		if (stored === undefined || stored === '') {
@@ -127,6 +158,10 @@ export class LoCoPilotAgentSettingsService implements ILoCoPilotAgentSettingsSer
 
 	setAgentModeSystemPrompt(value: string): void {
 		this.storageService.store(STORAGE_KEY_AGENT_PROMPT, value, StorageScope.APPLICATION, StorageTarget.USER);
+	}
+
+	setPlanModeSystemPrompt(value: string): void {
+		this.storageService.store(STORAGE_KEY_PLAN_PROMPT, value, StorageScope.APPLICATION, StorageTarget.USER);
 	}
 
 	setMaxIterationsPerRequest(value: number): void {

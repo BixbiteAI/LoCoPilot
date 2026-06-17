@@ -1622,7 +1622,11 @@ Preserve: key facts, decisions, code changes, file names and paths, user prefere
 	/**
 	 * Get full system prompt for LLM: general (from settings) + tools prompt.
 	 */
-	private getDefaultSystemPrompt(modeKind: ChatModeKind | undefined): string {
+	private getDefaultSystemPrompt(modeKind: ChatModeKind | undefined, modeId?: IChatRequestModeInfo['modeId']): string {
+		// Plan runs on the Agent kind, so it must be distinguished by modeId before the kind switch.
+		if (modeId === 'plan') {
+			return this.agentSettingsService.getFullPlanModeSystemPrompt();
+		}
 		switch (modeKind) {
 			case ChatModeKind.Agent:
 				return this.agentSettingsService.getFullAgentModeSystemPrompt();
@@ -1667,8 +1671,8 @@ Focus on making the exact changes requested while preserving code structure and 
 		if (!systemPrompt) {
 			// Use modeInfo.kind if available, otherwise fallback based on location
 			const modeKind = modeInfo?.kind ?? (request.location === ChatAgentLocation.EditorInline ? ChatModeKind.Edit : ChatModeKind.Ask);
-			systemPrompt = this.getDefaultSystemPrompt(modeKind);
-			this._log(`[LoCoPilot] Using default system prompt for mode: ${modeKind} (modeInfo.kind=${modeInfo?.kind}, location=${request.location})`);
+			systemPrompt = this.getDefaultSystemPrompt(modeKind, modeInfo?.modeId);
+			this._log(`[LoCoPilot] Using default system prompt for mode: ${modeInfo?.modeId ?? modeKind} (modeInfo.kind=${modeInfo?.kind}, location=${request.location})`);
 		}
 
 		// Add workspace context for Agent mode

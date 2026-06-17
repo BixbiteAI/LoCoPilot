@@ -210,7 +210,9 @@ export class ChatModeService extends Disposable implements IChatModeService {
 		// - It's disabled by policy (so we can show it with a lock icon)
 		// But hide it if the user manually disabled it via settings
 		if (this.chatAgentService.hasToolsAgent || this.isAgentModeDisabledByPolicy()) {
-			builtinModes.unshift(ChatMode.Agent);
+			// Plan reuses the Agent runtime, so gate it on the same condition and keep it
+			// next to Agent. Result order: [Agent, Plan, Ask, ...].
+			builtinModes.unshift(ChatMode.Agent, ChatMode.Plan);
 		}
 		builtinModes.push(ChatMode.Edit);
 		return builtinModes;
@@ -478,13 +480,22 @@ export class BuiltinChatMode implements IChatMode {
 	public readonly description: IObservable<string>;
 	public readonly icon: IObservable<ThemeIcon>;
 
+	private readonly _id: string;
+
 	constructor(
 		public readonly kind: ChatModeKind,
 		label: string,
 		description: string,
 		icon: ThemeIcon,
+		/**
+		 * Optional id override. Builtin modes default their id to {@link kind}, but a mode
+		 * that reuses an existing kind (e.g. Plan, which runs on the Agent kind) needs a
+		 * distinct id so it can be selected, persisted, and routed independently.
+		 */
+		id?: string,
 	) {
-		this.name = constObservable(kind);
+		this._id = id ?? kind;
+		this.name = constObservable(this._id);
 		this.label = constObservable(label);
 		this.description = observableValue('description', description);
 		this.icon = constObservable(icon);
@@ -495,8 +506,7 @@ export class BuiltinChatMode implements IChatMode {
 	}
 
 	get id(): string {
-		// Need a differentiator?
-		return this.kind;
+		return this._id;
 	}
 
 	get target(): IObservable<string | undefined> {
@@ -520,10 +530,15 @@ export namespace ChatMode {
 	export const Ask = new BuiltinChatMode(ChatModeKind.Ask, 'Ask', localize('chatDescription', "Explore and understand your code"), Codicon.question);
 	export const Edit = new BuiltinChatMode(ChatModeKind.Edit, 'Edit', localize('editsDescription', "Edit or refactor selected code"), Codicon.edit);
 	export const Agent = new BuiltinChatMode(ChatModeKind.Agent, 'Agent', localize('agentDescription', "Describe what to build next"), Codicon.agent);
+	// Plan runs on the Agent kind (tools, autonomous loop) but has a distinct id so it can be
+	// selected/persisted on its own and routed to its own system prompt. Its prompt lives in
+	// agentPrompts.ts and is user-overridable via the agent settings, exactly like Ask/Agent.
+	export const Plan = new BuiltinChatMode(ChatModeKind.Agent, 'Plan', localize('planDescription', "Research and draft an implementation plan"), Codicon.checklist, 'plan');
 }
 
 export function isBuiltinChatMode(mode: IChatMode): boolean {
 	return mode.id === ChatMode.Ask.id ||
 		mode.id === ChatMode.Edit.id ||
-		mode.id === ChatMode.Agent.id;
+		mode.id === ChatMode.Agent.id ||
+		mode.id === ChatMode.Plan.id;
 }

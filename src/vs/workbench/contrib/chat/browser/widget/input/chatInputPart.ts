@@ -378,7 +378,9 @@ export class ChatInputPart extends Disposable implements IHistoryNavigationWidge
 
 	public get currentModeInfo(): IChatRequestModeInfo {
 		const mode = this._currentModeObservable.get();
-		const modeId: 'ask' | 'agent' | 'edit' | 'custom' | undefined = mode.isBuiltin ? this.currentModeKind : 'custom';
+		// For builtins, report the mode's own id (e.g. 'plan') rather than its kind, so modes that
+		// share a kind (Plan runs on the Agent kind) can be told apart by the request handler.
+		const modeId: IChatRequestModeInfo['modeId'] = mode.isBuiltin ? (mode.id as IChatRequestModeInfo['modeId']) : 'custom';
 
 		const modeInstructions = mode.modeInstructions?.get();
 		return {
