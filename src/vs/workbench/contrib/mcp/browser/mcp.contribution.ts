@@ -17,6 +17,8 @@ import { registerWorkbenchContribution2, WorkbenchPhase } from '../../../common/
 import { EditorExtensions } from '../../../common/editor.js';
 import { mcpSchemaId } from '../../../services/configuration/common/configuration.js';
 import { ChatContextKeys } from '../../chat/common/actions/chatContextKeys.js';
+import { BundledMcpDiscovery } from '../common/discovery/bundledMcpDiscovery.js';
+import { PlaywrightMcpStatusContribution, TogglePlaywrightMcpAction } from './mcpChatInputAction.js';
 import { ExtensionMcpDiscovery } from '../common/discovery/extensionMcpDiscovery.js';
 import { InstalledMcpServersDiscovery } from '../common/discovery/installedMcpServersDiscovery.js';
 import { mcpDiscoveryRegistry } from '../common/discovery/mcpDiscovery.js';
@@ -56,12 +58,14 @@ mcpDiscoveryRegistry.register(new SyncDescriptor(RemoteNativeMpcDiscovery));
 mcpDiscoveryRegistry.register(new SyncDescriptor(InstalledMcpServersDiscovery));
 mcpDiscoveryRegistry.register(new SyncDescriptor(ExtensionMcpDiscovery));
 mcpDiscoveryRegistry.register(new SyncDescriptor(CursorWorkspaceMcpDiscoveryAdapter));
+mcpDiscoveryRegistry.register(new SyncDescriptor(BundledMcpDiscovery));
 
 registerWorkbenchContribution2('mcpDiscovery', McpDiscovery, WorkbenchPhase.AfterRestored);
 registerWorkbenchContribution2('mcpContextKeys', McpContextKeysController, WorkbenchPhase.BlockRestore);
 registerWorkbenchContribution2('mcpLanguageFeatures', McpLanguageFeatures, WorkbenchPhase.Eventually);
 registerWorkbenchContribution2('mcpResourceFilesystem', McpResourceFilesystem, WorkbenchPhase.BlockRestore);
 registerWorkbenchContribution2(McpLanguageModelToolContribution.ID, McpLanguageModelToolContribution, WorkbenchPhase.AfterRestored);
+registerWorkbenchContribution2(PlaywrightMcpStatusContribution.ID, PlaywrightMcpStatusContribution, WorkbenchPhase.AfterRestored);
 
 registerAction2(ListMcpServerCommand);
 registerAction2(McpServerOptionsCommand);
@@ -85,6 +89,7 @@ registerAction2(ShowInstalledMcpServersCommand);
 registerAction2(McpBrowseResourcesCommand);
 registerAction2(McpConfigureSamplingModels);
 registerAction2(McpStartPromptingServerCommand);
+registerAction2(TogglePlaywrightMcpAction);
 registerAction2(McpSkipCurrentAutostartCommand);
 
 registerWorkbenchContribution2('mcpActionRendering', MCPServerActionRendering, WorkbenchPhase.BlockRestore);

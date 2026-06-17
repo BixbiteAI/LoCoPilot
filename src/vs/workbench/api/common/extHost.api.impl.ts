@@ -1677,7 +1677,12 @@ export function createApiFactoryAndRegisterActors(accessor: ServicesAccessor): I
 
 		// eslint-disable-next-line local/code-no-dangerous-type-assertions
 		return <typeof vscode>{
-			version: initData.version,
+			// `vscode.version` is the extension API version. Extensions (e.g. those using
+			// vscode-languageclient, like the built-in JSON/HTML/CSS language features) validate
+			// against this and refuse to activate if it's too low. It must therefore report the
+			// upstream VS Code base this fork tracks (1.104.x), NOT the LoCoPilot brand version
+			// (initData.version, e.g. 1.3.0) which still drives the About dialog and product UI.
+			version: '1.104.0',
 			// namespaces
 			ai,
 			authentication,

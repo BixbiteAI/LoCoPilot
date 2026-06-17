@@ -1849,6 +1849,11 @@ have to be updated for changes to the rules above, or to support more deeply nes
 	flex-wrap: wrap;
 }
 
+/* Browser-tools (Playwright MCP) toggle: tint the globe icon with the theme accent when enabled so the on/off state is clearly visible (the `.checked` class is applied while the bundled server is starting/running). */
+.interactive-session .chat-attachment-toolbar .action-label.codicon-globe.checked {
+	color: var(--vscode-textLink-foreground) !important;
+}
+
 .interactive-session .interactive-input-part.compact .chat-attached-context {
 	padding-bottom: 0px;
 	display: flex;

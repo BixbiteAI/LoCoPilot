@@ -78,7 +78,7 @@ export class McpLanguageModelToolContribution extends Disposable implements IWor
 						server.definition.id,
 						referenceName,
 						{
-							icon: Codicon.mcp,
+							icon: server.readDefinitions().read(undefined).server?.presentation?.icon ?? Codicon.mcp,
 							description: localize('mcp.toolset', "{0}: All Tools", server.definition.label)
 						}
 					));

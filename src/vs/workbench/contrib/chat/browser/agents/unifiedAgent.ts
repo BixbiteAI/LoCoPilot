@@ -91,6 +91,13 @@ export class UnifiedAgent {
 		const modelMetadata = this.languageModelsService.lookupLanguageModel(modelId);
 		const allTools = await this.getAvailableTools(modelMetadata, request);
 
+		// LLM providers (Anthropic/OpenAI) require function names matching ^[a-zA-Z0-9_-]{1,64}$.
+		// Built-in tool ids satisfy this, but MCP/extension tool ids can contain other characters
+		// (or collide after truncation), which makes the provider reject the whole request. Build a
+		// bidirectional map: send sanitized names to the model, translate them back to real tool ids
+		// when invoking. The map is rebuilt per run so it always reflects the current tool set.
+		const { llmNameById, idByLlmName } = this.buildToolNameMap(allTools);
+
 		this._log(`[LoCoPilot] Available tools: ${allTools.length}`);
 		if (allTools.length > 0) {
 			this._log(`[LoCoPilot] Tools: ${allTools.map(t => t.id).join(', ')}`);
@@ -120,7 +127,7 @@ export class UnifiedAgent {
 			}
 
 			// Send request to LLM with tools
-			const tools = this.formatToolsForLLM(allTools);
+			const tools = this.formatToolsForLLM(allTools, llmNameById);
 			const options: any = {};
 			if (tools.length > 0) {
 				options.tools = tools;
@@ -267,7 +274,8 @@ export class UnifiedAgent {
 			const parallelIndexes: number[] = [];
 			const sequentialIndexes: number[] = [];
 			toolCalls.forEach((tc, i) => {
-				(PARALLELIZABLE_TOOL_IDS.has(tc.name) ? parallelIndexes : sequentialIndexes).push(i);
+				const realToolId = idByLlmName.get(tc.name) ?? tc.name;
+				(PARALLELIZABLE_TOOL_IDS.has(realToolId) ? parallelIndexes : sequentialIndexes).push(i);
 			});
 
 			if (parallelIndexes.length > 1) {
@@ -276,11 +284,11 @@ export class UnifiedAgent {
 
 			// Run all read-only calls concurrently...
 			await Promise.all(parallelIndexes.map(async i => {
-				results[i] = await this.executeToolCall(toolCalls[i], request, token);
+				results[i] = await this.executeToolCall(toolCalls[i], request, token, idByLlmName);
 			}));
 			// ...then the (potentially mutating) calls one at a time, preserving order.
 			for (const i of sequentialIndexes) {
-				results[i] = await this.executeToolCall(toolCalls[i], request, token);
+				results[i] = await this.executeToolCall(toolCalls[i], request, token, idByLlmName);
 			}
 
 			const toolResults: any[] = [];
@@ -341,17 +349,20 @@ export class UnifiedAgent {
 	private async executeToolCall(
 		toolCall: IChatResponseToolUsePart,
 		request: IChatAgentRequest,
-		token: CancellationToken
+		token: CancellationToken,
+		idByLlmName: Map<string, string>
 	): Promise<{ toolResult: any; images: IChatMessageImagePart[] }> {
 		const images: IChatMessageImagePart[] = [];
+		// The model calls tools by their sanitized name; map back to the real tool id to invoke.
+		const realToolId = idByLlmName.get(toolCall.name) ?? toolCall.name;
 		try {
-			this._log(`[LoCoPilot] Executing tool: ${toolCall.name}`);
+			this._log(`[LoCoPilot] Executing tool: ${toolCall.name} (id: ${realToolId})`);
 
 			// Tool display uses existing formats only: invokeTool appends toolInvocation via appendProgress when context is set; chat renders via ChatToolInvocationPart (no custom progress text here).
 			const result = await this.toolsService.invokeTool(
 				{
 					callId: toolCall.toolCallId,
-					toolId: toolCall.name,
+					toolId: realToolId,
 					parameters: toolCall.parameters,
 					context: request.sessionResource ? {
 						sessionId: request.sessionResource.toString(),
@@ -456,13 +467,39 @@ export class UnifiedAgent {
 	}
 
 	/**
+	 * Build a bidirectional map between real tool ids and provider-safe function names.
+	 * Provider rule: name must match ^[a-zA-Z0-9_-]{1,64}$. We replace illegal characters,
+	 * cap length at 64, and disambiguate collisions (e.g. two ids that match after truncation)
+	 * so every tool gets a unique, valid name that round-trips back to its real id.
+	 */
+	private buildToolNameMap(tools: IToolData[]): { llmNameById: Map<string, string>; idByLlmName: Map<string, string> } {
+		const llmNameById = new Map<string, string>();
+		const idByLlmName = new Map<string, string>();
+		for (const tool of tools) {
+			let name = tool.id.replace(/[^a-zA-Z0-9_-]/g, '_').slice(0, 64) || 'tool';
+			if (idByLlmName.has(name)) {
+				// Collision: append a numeric suffix, trimming the base to keep within 64 chars.
+				const base = name.slice(0, 58);
+				let i = 1;
+				while (idByLlmName.has(`${base}_${i}`)) {
+					i++;
+				}
+				name = `${base}_${i}`;
+			}
+			llmNameById.set(tool.id, name);
+			idByLlmName.set(name, tool.id);
+		}
+		return { llmNameById, idByLlmName };
+	}
+
+	/**
 	 * Format tools for LLM (OpenAI/Anthropic format)
 	 */
-	private formatToolsForLLM(tools: IToolData[]): any[] {
+	private formatToolsForLLM(tools: IToolData[], llmNameById: Map<string, string>): any[] {
 		return tools.map(tool => ({
 			type: 'function',
 			function: {
-				name: tool.id,
+				name: llmNameById.get(tool.id) ?? tool.id,
 				description: tool.modelDescription,
 				parameters: tool.inputSchema || {
 					type: 'object',

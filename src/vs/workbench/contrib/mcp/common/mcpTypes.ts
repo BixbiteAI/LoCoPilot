@@ -14,6 +14,7 @@ import { equals as objectsEqual } from '../../../../base/common/objects.js';
 import { IObservable, ObservableMap } from '../../../../base/common/observable.js';
 import { IIterativePager } from '../../../../base/common/paging.js';
 import Severity from '../../../../base/common/severity.js';
+import { ThemeIcon } from '../../../../base/common/themables.js';
 import { URI, UriComponents } from '../../../../base/common/uri.js';
 import { Location } from '../../../../editor/common/languages.js';
 import { localize } from '../../../../nls.js';
@@ -139,6 +140,8 @@ export interface McpServerDefinition {
 		readonly order?: number;
 		/** Place where this server is configured, used in workspace trust prompts and "show config" */
 		readonly origin?: Location;
+		/** Optional icon for the server, surfaced on its tool set in the chat tool picker. */
+		readonly icon?: ThemeIcon;
 	};
 }
 
