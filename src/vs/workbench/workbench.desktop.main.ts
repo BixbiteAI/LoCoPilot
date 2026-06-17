@@ -77,6 +77,7 @@ import './services/workingCopy/electron-browser/workingCopyBackupService.js';
 import './services/checksum/electron-browser/checksumService.js';
 import './services/embeddings/electron-browser/embeddingComputeService.js';
 import './services/locopilotGit/electron-browser/locopilotGitService.js';
+import './services/locopilotSystemInfo/electron-browser/locopilotSystemInfoService.js';
 import '../platform/remote/electron-browser/sharedProcessTunnelService.js';
 import './services/tunnel/electron-browser/tunnelService.js';
 import '../platform/diagnostics/electron-browser/diagnosticsService.js';

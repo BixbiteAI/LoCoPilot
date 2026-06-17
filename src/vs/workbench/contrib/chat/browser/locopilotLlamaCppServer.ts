@@ -30,16 +30,26 @@ function getBundledPlatformArch(): string {
 }
 
 /**
- * Full path to the llama-server binary bundled inside the installed app, or undefined when there is
- * no app root (e.g. web). Existence is not checked here - the caller stats it before use.
- * appRootFsPath: IEnvironmentService.appRoot.
+ * Which bundled engine variant to resolve:
+ *  - 'cpu'    : the always-present, most-compatible CPU build (resources/bin/<platform>-<arch>/).
+ *  - 'vulkan' : the optional GPU build (resources/bin/<platform>-<arch>-vulkan/), shipped on
+ *               Windows/Linux so machines with a capable GPU can offload without any user setup.
  */
-export function getBundledLlamaServerPath(appRootFsPath: string | undefined): string | undefined {
+export type BundledEngineVariant = 'cpu' | 'vulkan';
+
+/**
+ * Full path to a bundled llama-server binary inside the installed app, or undefined when there is
+ * no app root (e.g. web). Existence is not checked here - the caller stats it before use.
+ * appRootFsPath: IEnvironmentService.appRoot. The 'vulkan' variant lives in a sibling `-vulkan` dir
+ * and is only present when the build fetched/packaged it (see scripts/fetch-llama-binaries.mjs).
+ */
+export function getBundledLlamaServerPath(appRootFsPath: string | undefined, variant: BundledEngineVariant = 'cpu'): string | undefined {
 	if (!appRootFsPath) {
 		return undefined;
 	}
 	const binName = isWindows ? LLAMA_SERVER_BIN_WIN : LLAMA_SERVER_BIN;
-	return pathJoin(appRootFsPath, 'resources', 'bin', getBundledPlatformArch(), binName);
+	const dirName = variant === 'vulkan' ? `${getBundledPlatformArch()}-vulkan` : getBundledPlatformArch();
+	return pathJoin(appRootFsPath, 'resources', 'bin', dirName, binName);
 }
 
 /** Priority order for backends: first available is used. */
@@ -110,6 +120,38 @@ export function getRecommendedBackend(hasCustomServer = false): LlamaBackend {
 	return ordered[0] ?? 'cpu';
 }
 
+/** VRAM (bytes) at/above which an integrated/unknown GPU is considered worth using over the CPU. */
+export const VULKAN_MIN_DEDICATED_VRAM_BYTES = 4 * 1024 * 1024 * 1024; // 4 GB
+
+/** Minimal GPU shape needed to decide the bundled engine variant (subset of IGpuInfo). */
+export interface GpuLike {
+	vendor: 'nvidia' | 'amd' | 'intel' | 'apple' | 'unknown';
+	totalVramBytes: number;
+}
+
+/**
+ * Decides whether the machine's GPU is capable enough to prefer the bundled **Vulkan** engine over the
+ * CPU build (Windows/Linux only - Apple Silicon uses Metal and never reaches this path).
+ *
+ * The intent is "discrete/decent GPU -> Vulkan, weak integrated GPU -> CPU":
+ *  - NVIDIA or AMD -> yes. These are discrete cards (or capable AMD APUs); Vulkan offload clearly wins.
+ *  - Intel/unknown -> only when we measured a meaningful dedicated VRAM pool
+ *    ({@link VULKAN_MIN_DEDICATED_VRAM_BYTES}+), which weak integrated GPUs don't have. This keeps slow
+ *    iGPUs (where Vulkan can be *slower* than CPU) on the CPU build.
+ *  - Apple GPUs are ignored here (handled by the Metal path).
+ */
+export function shouldUseBundledVulkan(gpus: readonly GpuLike[]): boolean {
+	return gpus.some(g => {
+		if (g.vendor === 'nvidia' || g.vendor === 'amd') {
+			return true;
+		}
+		if (g.vendor === 'intel' || g.vendor === 'unknown') {
+			return g.totalVramBytes >= VULKAN_MIN_DEDICATED_VRAM_BYTES;
+		}
+		return false; // apple -> Metal path, not Vulkan
+	});
+}
+
 /**
  * Resolves the llama-server command from an optional configured path.
  * serverPath: empty = use binary from PATH; otherwise full path to binary or directory containing it.
@@ -128,10 +170,33 @@ export function resolveLlamaServerCommand(serverPath: string | undefined): strin
 }
 
 export type FlashAttentionMode = 'auto' | 'on' | 'off';
-export type KvCacheType = 'f16' | 'q8_0' | 'q4_0';
+/**
+ * KV cache precision. 'auto' lets us pick based on the context window: full-precision f16 for small
+ * windows (where the cache is cheap and quality matters most) and 8-bit q8_0 for large windows (where
+ * the cache dominates memory and q8_0's quality loss is negligible). f16/q8_0/q4_0 force a fixed type.
+ */
+export type KvCacheType = 'auto' | 'f16' | 'q8_0' | 'q4_0';
 
 /** Default context window when none is configured. Smaller than before for a smaller, faster KV cache. */
 export const DEFAULT_LLAMA_CONTEXT_SIZE = 16384;
+
+/**
+ * Context window at/above which 'auto' KV cache switches from f16 to q8_0. Below this the cache is small
+ * enough that full precision is the better trade; at/above it the cache dominates memory, so halving it
+ * with q8_0 (negligible quality impact) frees room for weights/compute and fits more context on-device.
+ */
+export const KV_AUTO_QUANT_CONTEXT_THRESHOLD = 32768;
+
+/**
+ * Resolves the concrete KV cache type to use. 'auto' chooses q8_0 once the context window reaches
+ * {@link KV_AUTO_QUANT_CONTEXT_THRESHOLD}, else f16. A fixed type is returned unchanged.
+ */
+export function resolveKvCacheType(kvCacheType: KvCacheType, contextSize: number): Exclude<KvCacheType, 'auto'> {
+	if (kvCacheType !== 'auto') {
+		return kvCacheType;
+	}
+	return contextSize >= KV_AUTO_QUANT_CONTEXT_THRESHOLD ? 'q8_0' : 'f16';
+}
 
 /**
  * Performance tuning options for the llama.cpp server.
@@ -162,6 +227,25 @@ export interface LlamaServerTuning {
 	 * prefixes (e.g. the system prompt in agent loops) skip reprocessing. Defaults to 256; 0 disables.
 	 */
 	cacheReuse?: number;
+	/**
+	 * Path to a separate, smaller GGUF draft model for speculative decoding (`--model-draft`). The big
+	 * model verifies tokens the small one drafts, giving 1.5-2.5x faster generation when they agree.
+	 * Independent of {@link multiTokenPrediction} (which uses an embedded draft head); MTP takes
+	 * precedence when both are set. Empty/unset disables it.
+	 */
+	draftModelPath?: string;
+	/** GPU layers to offload for the draft model (`--gpu-layers-draft`). Emitted only when > 0. */
+	draftGpuLayers?: number;
+	/**
+	 * Number of parallel request slots (`--parallel`). >1 lets the server handle several requests at once
+	 * (e.g. chat + inline completions) by splitting the KV cache into that many slots. Emitted only when > 0.
+	 */
+	parallelSlots?: number;
+	/**
+	 * Continuous batching (`-cb`): interleave decoding of concurrent requests for higher throughput when
+	 * `parallelSlots` > 1. Recent llama.cpp builds enable this by default; emitted only when explicitly on.
+	 */
+	continuousBatching?: boolean;
 	/** CPU threads for generation (`--threads`). Emitted only when > 0; otherwise llama.cpp auto-detects. */
 	threads?: number;
 	/** Logical batch size (`--batch-size`). Emitted only when > 0; default build value is 2048. */
@@ -172,6 +256,58 @@ export interface LlamaServerTuning {
 	extraArgs?: string;
 }
 
+/** Inputs for {@link computeGpuLayers}; all byte counts are absolute, layerCount is the model's blocks. */
+export interface GpuLayerInputs {
+	backend: LlamaBackend;
+	/** On-disk weight size in bytes. */
+	modelBytes: number;
+	/** Transformer block count from GGUF metadata, or undefined when unknown. */
+	layerCount: number | undefined;
+	/** Total dedicated VRAM in bytes for discrete GPUs (CUDA/Vulkan); 0/undefined when unknown. */
+	vramBytes?: number;
+	/** Total system RAM in bytes (used for Metal unified memory); 0/undefined when unknown. */
+	systemRamBytes?: number;
+	/** Fraction of VRAM/RAM the model may use before we offload only part of it. Defaults to 0.9. */
+	budgetFraction?: number;
+}
+
+/**
+ * Decides how many layers to offload to the GPU (`--n-gpu-layers`):
+ *  - `undefined` -> caller should use the default (full offload, 999, for GPU backends) - the model fits,
+ *    or we lack the data to size a partial split, so don't second-guess llama.cpp.
+ *  - a number    -> offload exactly that many layers; the rest run on CPU. Used when the model is bigger
+ *    than the GPU budget so a full offload would OOM the GPU.
+ *
+ * Only discrete-GPU backends (CUDA/Vulkan) with a known VRAM figure get a partial split: there, VRAM is a
+ * hard, separate limit. Metal (Apple Silicon) shares unified memory with the CPU, so splitting layers does
+ * not save memory - full offload is best and the runner's RAM budget/eviction handles pressure instead.
+ */
+export function computeGpuLayers(inputs: GpuLayerInputs): number | undefined {
+	const { backend, modelBytes, layerCount } = inputs;
+	if (backend === 'cpu') {
+		return undefined; // CPU backend forces 0 layers in the arg builder anyway.
+	}
+	if (backend !== 'cuda' && backend !== 'vulkan') {
+		return undefined; // Metal/unknown: full offload (unified memory; partial split doesn't help).
+	}
+	const vram = inputs.vramBytes ?? 0;
+	if (vram <= 0 || !layerCount || layerCount <= 0 || modelBytes <= 0) {
+		return undefined; // not enough info -> let the caller use full offload.
+	}
+	const fraction = inputs.budgetFraction && inputs.budgetFraction > 0 ? inputs.budgetFraction : 0.9;
+	const budget = vram * fraction;
+	if (modelBytes <= budget) {
+		return undefined; // whole model fits in VRAM -> full offload.
+	}
+	const perLayerBytes = modelBytes / layerCount;
+	if (perLayerBytes <= 0) {
+		return undefined;
+	}
+	const fit = Math.floor(budget / perLayerBytes);
+	// Clamp to [0, layerCount]. 0 means nothing fits -> run on CPU (caller may keep it on CPU).
+	return Math.max(0, Math.min(layerCount, fit));
+}
+
 /**
  * Builds the llama.cpp server command and args for the given model path and backend.
  * serverPath: optional path from settings (locopilot.llamaCpp.serverPath). Empty = use binary from PATH.
@@ -180,7 +316,8 @@ export interface LlamaServerTuning {
  */
 export function getLlamaCppServerCommand(modelPath: string, backend: LlamaBackend, serverPath?: string, port: number = LOCOPILOT_LLAMA_SERVER_PORT, tuning: LlamaServerTuning = {}): { command: string; args: string[] } {
 	const contextSize = tuning.contextSize && tuning.contextSize > 0 ? Math.floor(tuning.contextSize) : DEFAULT_LLAMA_CONTEXT_SIZE;
-	const kvCacheType: KvCacheType = tuning.kvCacheType ?? 'f16';
+	// 'auto' resolves to f16 for small windows and q8_0 for large ones (see resolveKvCacheType).
+	const kvCacheType = resolveKvCacheType(tuning.kvCacheType ?? 'auto', contextSize);
 
 	// V-cache quantization requires Flash Attention. If the user quantizes the KV cache but disabled FA,
 	// promote 'off' -> 'auto' so the server never errors out on an unsupported combination.
@@ -215,6 +352,23 @@ export function getLlamaCppServerCommand(modelPath: string, backend: LlamaBacken
 		args.push('--model-draft', modelPath);
 		const mtpArgs = (tuning.mtpArgs && tuning.mtpArgs.trim()) ? tuning.mtpArgs.trim() : '--spec-type draft-mtp';
 		args.push(...mtpArgs.split(/\s+/));
+	} else if (tuning.draftModelPath && tuning.draftModelPath.trim()) {
+		// Speculative decoding with a SEPARATE small draft model: the small model proposes tokens and the
+		// big model verifies them in one batch, so when they agree we generate several tokens per big-model
+		// pass. Only used when MTP (embedded draft head) is off, since both drive --model-draft.
+		args.push('--model-draft', tuning.draftModelPath.trim());
+		if (tuning.draftGpuLayers !== undefined && tuning.draftGpuLayers > 0) {
+			args.push('--gpu-layers-draft', String(Math.floor(tuning.draftGpuLayers)));
+		}
+	}
+
+	// Parallel request slots + continuous batching: serve concurrent requests (e.g. chat alongside inline
+	// completions) by splitting the KV cache into N slots and interleaving their decode steps.
+	if (tuning.parallelSlots && tuning.parallelSlots > 1) {
+		args.push('--parallel', String(Math.floor(tuning.parallelSlots)));
+		if (tuning.continuousBatching) {
+			args.push('-cb');
+		}
 	}
 
 	// Reuse cached KV for matching prompt prefixes (via KV shifting). Big win for agent loops that

@@ -12,6 +12,7 @@ import { ICustomLanguageModelsService, type ICustomLanguageModel } from '../comm
 import { ChatConfiguration } from '../common/constants.js';
 import { ILoCoPilotFileLog } from './locopilotFileLog.js';
 import { registerAction2, Action2 } from '../../../../platform/actions/common/actions.js';
+import { IQuickInputService, IQuickPickItem } from '../../../../platform/quickinput/common/quickInput.js';
 import { createDecorator, IInstantiationService, ServicesAccessor } from '../../../../platform/instantiation/common/instantiation.js';
 import {
 	detectLlamaBackend,
@@ -21,12 +22,16 @@ import {
 	getLlamaCppServerCommand,
 	getLlamaServerBaseUrl,
 	getLlamaServerHealthUrl,
+	computeGpuLayers,
+	shouldUseBundledVulkan,
 	LOCOPILOT_LLAMA_SERVER_PORT,
 	LlamaBackend,
 	type LlamaServerTuning,
 	type FlashAttentionMode,
 	type KvCacheType
 } from './locopilotLlamaCppServer.js';
+import { readGgufLayerCount } from './locopilotGgufMetadata.js';
+import { ILoCoPilotSystemInfoService, type ISystemHardwareInfo } from '../../../../platform/locopilotSystemInfo/common/locopilotSystemInfo.js';
 import { dirname } from '../../../../base/common/path.js';
 import { isWindows, isMacintosh } from '../../../../base/common/platform.js';
 import {
@@ -150,6 +155,10 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 	private readonly _suppressCrashNotice = new Set<string>();
 	/** Cache of on-disk weight sizes (bytes) keyed by modelId, so the eviction budget doesn't re-stat on every switch. */
 	private readonly _modelSizeCache = new Map<string, number>();
+	/** Cached hardware probe (CPU cores / GPU VRAM); hardware doesn't change during a session. */
+	private _hardwareInfo: Promise<ISystemHardwareInfo | undefined> | undefined;
+	/** Cache of GGUF transformer-layer counts keyed by resolved model file path (for partial GPU offload). */
+	private readonly _layerCountCache = new Map<string, number | undefined>();
 
 	constructor(
 		@ICustomLanguageModelsService private readonly customLanguageModelsService: ICustomLanguageModelsService,
@@ -206,6 +215,36 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 				}
 			}
 		});
+		// Power-user override for the bundled local engine (auto/cpu/gpu). The choice is normally automatic
+		// (see _resolveServerLaunch); this command is the supported way to force it without the settings UI.
+		registerAction2(class extends Action2 {
+			constructor() {
+				super({
+					id: 'locopilot.selectLocalEngine',
+					title: { value: 'Select Local Model Engine (CPU/GPU)', original: 'Select Local Model Engine (CPU/GPU)' },
+					category: { value: 'LoCoPilot', original: 'LoCoPilot' },
+					f1: true,
+				});
+			}
+			async run(accessor: ServicesAccessor): Promise<void> {
+				const quickInput = accessor.get(IQuickInputService);
+				const current = self.configurationService.getValue<string>(ChatConfiguration.LocopilotLlamaCppEngine) ?? 'auto';
+				const mark = (id: string) => id === current ? ' (current)' : '';
+				const items: (IQuickPickItem & { id: 'auto' | 'cpu' | 'gpu' })[] = [
+					{ id: 'auto', label: `Auto${mark('auto')}`, description: 'Use the GPU when a capable one is detected, otherwise CPU (recommended)' },
+					{ id: 'cpu', label: `CPU${mark('cpu')}`, description: 'Always run on the CPU' },
+					{ id: 'gpu', label: `GPU (Vulkan)${mark('gpu')}`, description: 'Force the bundled GPU engine, even on integrated graphics' },
+				];
+				const picked = await quickInput.pick(items, {
+					placeHolder: isMacintosh
+						? 'Local model engine - note: macOS always uses Metal, so this has no effect here'
+						: 'Choose the engine for local GGUF models (applies on the next model start)',
+				});
+				if (picked && picked.id !== current) {
+					await self.configurationService.updateValue(ChatConfiguration.LocopilotLlamaCppEngine, picked.id);
+				}
+			}
+		});
 	}
 
 	/**
@@ -230,6 +269,86 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 	 */
 	getBackendPriority(): LlamaBackend[] {
 		return detectLlamaBackend(this._hasCustomServerPath());
+	}
+
+	/**
+	 * Hardware-aware backend choice for an actual launch. Starts from the static recommendation
+	 * ({@link getBackend}) and, only when that is the generic discrete-GPU pick `cuda` (custom build on a
+	 * non-Mac), refines it from the detected GPU vendor: NVIDIA -> `cuda`, AMD/Intel -> `vulkan`. This avoids
+	 * launching a CUDA build against an AMD/Intel GPU (which would fail), without ever forcing a GPU backend
+	 * onto the bundled CPU-only binaries (those still resolve to `cpu`/`metal` and are returned unchanged).
+	 */
+	private async _resolveBackendForLaunch(): Promise<LlamaBackend> {
+		const top = this.getBackend();
+		if (top !== 'cuda') {
+			return top; // metal / cpu are not GPU-vendor dependent
+		}
+		const hw = await this._getHardwareInfo();
+		const gpus = hw?.gpus ?? [];
+		if (gpus.some(g => g.vendor === 'nvidia')) {
+			return 'cuda';
+		}
+		if (gpus.some(g => g.vendor === 'amd' || g.vendor === 'intel')) {
+			this._log('[LoCoPilot Runner] Detected AMD/Intel GPU; preferring Vulkan backend over CUDA.');
+			return 'vulkan';
+		}
+		return top; // unknown vendor -> keep the static recommendation
+	}
+
+	/** True when a path on disk points at an existing file (best-effort; false on any error). */
+	private async _isExistingFile(fsPath: string): Promise<boolean> {
+		try {
+			return (await this.fileService.stat(URI.file(fsPath))).isFile;
+		} catch {
+			return false;
+		}
+	}
+
+	/**
+	 * Resolves the llama-server binary AND the backend to launch with together, since they are coupled
+	 * (the bundled Vulkan binary must run with the Vulkan backend, the CPU binary with CPU, etc.).
+	 *
+	 * Priority:
+	 *  1. User-configured custom build -> honor it, backend from the GPU-vendor-aware resolver.
+	 *  2. Apple Silicon -> the bundled Metal binary (current behavior).
+	 *  3. Windows/Linux: pick the bundled CPU or **Vulkan** (GPU) binary per the `engine` setting:
+	 *     'auto' (default) uses Vulkan when the GPU is worth it ({@link shouldUseBundledVulkan}) and the
+	 *     binary shipped; 'gpu' forces Vulkan whenever the binary shipped; 'cpu' forces the CPU binary.
+	 *     VRAM-aware partial offload then applies automatically on the Vulkan path.
+	 *  4. CPU fallback (then conventional install paths).
+	 */
+	private async _resolveServerLaunch(): Promise<{ serverPath: string | undefined; backend: LlamaBackend }> {
+		// 1. Custom build path set by the user wins (may be a CUDA/Vulkan build). The `engine` setting is
+		//    about the *bundled* engines, so it does not apply here.
+		if (this._hasCustomServerPath()) {
+			return { serverPath: await this.resolveServerPath(), backend: await this._resolveBackendForLaunch() };
+		}
+
+		// 2. Apple Silicon: the bundled binary is a Metal build. The `engine` setting (cpu/gpu) is a
+		//    Windows/Linux concept, so it does not apply on macOS.
+		if (this.getBackend() === 'metal') {
+			return { serverPath: await this.resolveServerPath(), backend: 'metal' };
+		}
+
+		// 3. Windows/Linux: choose CPU vs bundled Vulkan, honoring the user's engine preference.
+		const engine = this.configurationService.getValue<'auto' | 'cpu' | 'gpu'>(ChatConfiguration.LocopilotLlamaCppEngine) ?? 'auto';
+		if (engine !== 'cpu') {
+			const hw = await this._getHardwareInfo();
+			// 'gpu' forces Vulkan regardless of how capable the GPU looks; 'auto' gates on shouldUseBundledVulkan.
+			const wantVulkan = engine === 'gpu' || (!!hw && shouldUseBundledVulkan(hw.gpus));
+			if (wantVulkan) {
+				const vulkanPath = getBundledLlamaServerPath(this._appRoot, 'vulkan');
+				if (vulkanPath && await this._isExistingFile(vulkanPath)) {
+					const detected = hw?.gpus.map(g => g.name).join(', ') || 'unknown GPU';
+					this._log(`[LoCoPilot Runner] Using bundled Vulkan engine (engine=${engine}, GPU: ${detected}).`);
+					return { serverPath: vulkanPath, backend: 'vulkan' };
+				}
+				this._log(`[LoCoPilot Runner] Vulkan engine requested (engine=${engine}) but not bundled in this build; falling back to CPU.`);
+			}
+		}
+
+		// 4. CPU fallback (bundled CPU binary, then conventional install locations).
+		return { serverPath: await this.resolveServerPath(), backend: 'cpu' };
 	}
 
 	/**
@@ -556,12 +675,84 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 			multiTokenPrediction: perModelMtp !== undefined ? perModelMtp : globalMtp,
 			mtpArgs: cfg.getValue<string>(ChatConfiguration.LocopilotLlamaCppMtpArgs),
 			cacheReuse: cfg.getValue<number>(ChatConfiguration.LocopilotLlamaCppCacheReuse),
+			draftModelPath: cfg.getValue<string>(ChatConfiguration.LocopilotLlamaCppDraftModelPath),
+			draftGpuLayers: cfg.getValue<number>(ChatConfiguration.LocopilotLlamaCppDraftGpuLayers),
+			parallelSlots: cfg.getValue<number>(ChatConfiguration.LocopilotLlamaCppParallel),
+			continuousBatching: cfg.getValue<boolean>(ChatConfiguration.LocopilotLlamaCppContinuousBatching),
 			threads: cfg.getValue<number>(ChatConfiguration.LocopilotLlamaCppThreads),
 			batchSize: cfg.getValue<number>(ChatConfiguration.LocopilotLlamaCppBatchSize),
 			ubatchSize: cfg.getValue<number>(ChatConfiguration.LocopilotLlamaCppUbatchSize),
 			mlock: cfg.getValue<boolean>(ChatConfiguration.LocopilotLlamaCppMlock),
 			extraArgs: cfg.getValue<string>(ChatConfiguration.LocopilotLlamaCppExtraArgs),
 		};
+	}
+
+	/**
+	 * Probes (once, cached) the host hardware - CPU core counts and GPU VRAM - via the shared-process
+	 * system-info service. Returns undefined on web or when the service is unavailable, so callers degrade
+	 * gracefully to llama.cpp's own auto-detection.
+	 */
+	private _getHardwareInfo(): Promise<ISystemHardwareInfo | undefined> {
+		if (!this._hardwareInfo) {
+			this._hardwareInfo = this.instantiationService.invokeFunction(async (accessor) => {
+				try {
+					return await accessor.get(ILoCoPilotSystemInfoService).getHardwareInfo();
+				} catch {
+					return undefined; // service not registered (web) or probe failed
+				}
+			});
+		}
+		return this._hardwareInfo;
+	}
+
+	/** Reads (and caches) the GGUF transformer-layer count for a resolved model file path. */
+	private async _getLayerCount(modelPath: string): Promise<number | undefined> {
+		if (this._layerCountCache.has(modelPath)) {
+			return this._layerCountCache.get(modelPath);
+		}
+		const count = await readGgufLayerCount(this.fileService, modelPath);
+		this._layerCountCache.set(modelPath, count);
+		return count;
+	}
+
+	/**
+	 * Augments the base (settings-derived) tuning with hardware-aware values that the user hasn't pinned:
+	 *  - `--threads`: defaults to the machine's physical (performance) core count, which is generally faster
+	 *    than llama.cpp's hyperthread-counting auto-detect on hybrid CPUs. Skipped if the user set threads.
+	 *  - `--n-gpu-layers`: on discrete-GPU backends (CUDA/Vulkan) whose VRAM we know, offloads only as many
+	 *    layers as fit when the model is larger than VRAM, instead of an all-or-nothing full offload that
+	 *    would OOM the GPU. Skipped if the user pinned gpuLayers or the model fits.
+	 *
+	 * All steps are best-effort: any missing data leaves the base tuning untouched.
+	 */
+	private async _augmentTuningWithHardware(modelPath: string, backend: LlamaBackend, base: LlamaServerTuning): Promise<LlamaServerTuning> {
+		const hw = await this._getHardwareInfo();
+		if (!hw) {
+			return base;
+		}
+		const tuning: LlamaServerTuning = { ...base };
+
+		// Thread auto-tuning: only when the user left it on auto (0/unset).
+		if ((!tuning.threads || tuning.threads <= 0) && hw.physicalCoreCount > 0) {
+			tuning.threads = hw.physicalCoreCount;
+			this._log(`[LoCoPilot Runner] Auto-set --threads to ${hw.physicalCoreCount} (physical cores).`);
+		}
+
+		// Partial GPU offload: only when the user left gpuLayers unset and we're on a discrete-GPU backend.
+		if (tuning.gpuLayers === undefined && (backend === 'cuda' || backend === 'vulkan')) {
+			const nvidia = hw.gpus.find(g => g.vendor === 'nvidia' && g.totalVramBytes > 0);
+			if (nvidia) {
+				const modelBytes = await this._weightBytesOnDisk(modelPath);
+				const layerCount = await this._getLayerCount(modelPath);
+				const layers = computeGpuLayers({ backend, modelBytes, layerCount, vramBytes: nvidia.totalVramBytes });
+				if (layers !== undefined) {
+					tuning.gpuLayers = layers;
+					this._log(`[LoCoPilot Runner] Model (${Math.round(modelBytes / 1e9)}GB) exceeds VRAM budget on ${nvidia.name} (${Math.round(nvidia.totalVramBytes / 1e9)}GB); offloading ${layers}/${layerCount} layers to GPU, rest on CPU.`);
+				}
+			}
+		}
+
+		return tuning;
 	}
 
 	/**
@@ -853,7 +1044,7 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 			}
 		}
 
-		const serverPath = await this.resolveServerPath();
+		const { serverPath, backend } = await this._resolveServerLaunch();
 		if (!serverPath) {
 			this.notificationService.prompt(
 				Severity.Error,
@@ -877,10 +1068,10 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 		}
 
 		const modelPath = await this.resolveModelFilePath(model.localPath);
-		const backend = getRecommendedBackend(this._hasCustomServerPath());
 
 		const port = await this.findAvailablePort(LOCOPILOT_LLAMA_SERVER_PORT);
-		const { command, args } = getLlamaCppServerCommand(modelPath, backend, serverPath, port, this._getLlamaTuning(model));
+		const tuning = await this._augmentTuningWithHardware(modelPath, backend, this._getLlamaTuning(model));
+		const { command, args } = getLlamaCppServerCommand(modelPath, backend, serverPath, port, tuning);
 		this._log(`[LoCoPilot Runner] Starting llama.cpp server for model ${modelId} on port ${port} with backend: ${backend}`);
 
 		// Launch the binary DIRECTLY as the terminal's process (executable + args[]), NOT by typing a
@@ -891,7 +1082,8 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 		const launchEnv = this._serverLaunchEnv(serverPath);
 		const cmdLineForLog = [command, ...args].join(' ');
 		this._log(`[LoCoPilot Runner] Executing: ${cmdLineForLog}`);
-		this._log(`[LoCoPilot Runner] Using llama-server: ${serverPath} (bundled = ${serverPath === getBundledLlamaServerPath(this._appRoot)}).`);
+		const isBundled = serverPath === getBundledLlamaServerPath(this._appRoot) || serverPath === getBundledLlamaServerPath(this._appRoot, 'vulkan');
+		this._log(`[LoCoPilot Runner] Using llama-server: ${serverPath} (bundled = ${isBundled}).`);
 
 		this._beginStarting(modelId);
 		try {

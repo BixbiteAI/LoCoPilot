@@ -35,8 +35,9 @@ const REPO = 'ggml-org/llama.cpp';
 
 // Asset selection per <platform>-<arch>. `asset` is matched as a substring against the release's
 // asset names so it survives the embedded build number (e.g. "llama-b9624-bin-macos-x64.tar.gz").
-// Default backend choices: Metal (mac), CPU on Windows/Linux (most compatible; GPU offload still
-// works via Vulkan/CUDA when the user has it - but a CPU build always runs). Override per your needs.
+// Default backend choices: Metal (mac), CPU on Windows/Linux (most compatible; a CPU build always runs).
+// On Windows/Linux we ALSO fetch an optional Vulkan (GPU) build into resources/bin/<target>-vulkan/; the
+// runner uses it automatically when it detects a capable GPU and falls back to the CPU build otherwise.
 const TARGETS = {
 	'darwin-arm64': { asset: 'bin-macos-arm64', bin: 'llama-server' },
 	'darwin-x64': { asset: 'bin-macos-x64', bin: 'llama-server' },
@@ -45,6 +46,14 @@ const TARGETS = {
 	'linux-x64': { asset: 'bin-ubuntu-x64', bin: 'llama-server' },
 	// Linux arm64 has no official prebuilt asset at time of writing; build it yourself and drop the
 	// binary + libs into resources/bin/linux-arm64/ manually, or add a tag below once available.
+
+	// Optional GPU (Vulkan) builds, fetched into resources/bin/<platform>-<arch>-vulkan/. Vulkan is the
+	// universal GPU backend (NVIDIA/AMD/Intel) and is self-contained (needs only the user's GPU driver -
+	// no CUDA runtime DLLs to bundle). The runner picks the Vulkan binary at runtime when it detects a
+	// capable GPU, and falls back to the CPU build otherwise. macOS uses Metal (the CPU/base build), so
+	// there is no Vulkan variant there.
+	'win32-x64-vulkan': { asset: 'bin-win-vulkan-x64', bin: 'llama-server.exe' },
+	'linux-x64-vulkan': { asset: 'bin-ubuntu-vulkan-x64', bin: 'llama-server' },
 };
 
 const root = join(dirname(fileURLToPath(import.meta.url)), '..');
@@ -159,8 +168,8 @@ async function copyDirFlat(srcDir, destDir) {
 	}
 }
 
-async function main() {
-	const target = process.argv[2] || currentTarget();
+// Fetches and installs a single target (e.g. "win32-x64" or "win32-x64-vulkan") into resources/bin/<target>/.
+async function fetchTarget(target) {
 	const spec = TARGETS[target];
 	if (!spec) {
 		throw new Error(`No llama.cpp asset mapping for target "${target}". Known targets:\n  ${Object.keys(TARGETS).join('\n  ')}`);
@@ -198,6 +207,23 @@ async function main() {
 		process.stdout.write(`\nllama.cpp ready for ${target} in resources/bin/${target}/ (tag ${tag})\n`);
 	} finally {
 		await rm(work, { recursive: true, force: true });
+	}
+}
+
+async function main() {
+	const target = process.argv[2] || currentTarget();
+	await fetchTarget(target);
+
+	// When fetching a base target that has an optional GPU (Vulkan) variant, fetch that too so the
+	// packaged app can offload to a GPU with zero setup. Best-effort: a missing/renamed Vulkan asset
+	// must not fail the (required) base build. Skip when the caller already asked for a "-vulkan" target.
+	if (!target.endsWith('-vulkan') && TARGETS[`${target}-vulkan`]) {
+		try {
+			await fetchTarget(`${target}-vulkan`);
+		} catch (err) {
+			process.stdout.write(`\n[warning] Optional Vulkan engine for ${target} was not fetched: ${err.message}\n`);
+			process.stdout.write(`The app will still ship the CPU engine. Re-run with LLAMA_BUILD set to a tag that has the Vulkan asset to retry.\n`);
+		}
 	}
 }
 

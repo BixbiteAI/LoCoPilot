@@ -46,6 +46,8 @@ export enum ChatConfiguration {
 	WebSearchApiKey = 'chat.webSearch.apiKey',
 	/** Advanced override for the llama-server binary. Empty (default) = use the bundled engine shipped in the app (resources/bin/<platform>-<arch>), then conventional install paths, then PATH. Set to a custom build path only if needed. */
 	LocopilotLlamaCppServerPath = 'locopilot.llamaCpp.serverPath',
+	/** Which bundled engine to run local GGUF models with: 'auto' (default; GPU when a capable one is detected, else CPU), 'cpu' (force CPU), or 'gpu' (force the bundled Vulkan GPU engine). */
+	LocopilotLlamaCppEngine = 'locopilot.llamaCpp.engine',
 	/** Advanced override for the Python interpreter running `python -m mlx_lm.server` (Apple Silicon MLX). Empty (default) = use the bundled self-contained Python with mlx-lm (resources/mlx/darwin-arm64), then `python3` on PATH. */
 	LocopilotMlxPythonPath = 'locopilot.mlx.pythonPath',
 	/** Context window (`-c`) for llama-server. Smaller = smaller KV cache, faster prefill, less memory. */
@@ -60,6 +62,14 @@ export enum ChatConfiguration {
 	LocopilotLlamaCppMtpArgs = 'locopilot.llamaCpp.mtpArgs',
 	/** Min chunk size to reuse from the KV cache via shifting (`--cache-reuse`). 0 disables. */
 	LocopilotLlamaCppCacheReuse = 'locopilot.llamaCpp.cacheReuse',
+	/** Path to a separate small GGUF draft model for speculative decoding (`--model-draft`). Empty = off. */
+	LocopilotLlamaCppDraftModelPath = 'locopilot.llamaCpp.draftModelPath',
+	/** GPU layers to offload for the draft model (`--gpu-layers-draft`). 0 = none. */
+	LocopilotLlamaCppDraftGpuLayers = 'locopilot.llamaCpp.draftGpuLayers',
+	/** Parallel request slots (`--parallel`). 0/1 = single slot (build default). */
+	LocopilotLlamaCppParallel = 'locopilot.llamaCpp.parallel',
+	/** Continuous batching (`-cb`) when serving parallel slots. */
+	LocopilotLlamaCppContinuousBatching = 'locopilot.llamaCpp.continuousBatching',
 	/** CPU threads for generation (`--threads`). 0 = auto-detect. */
 	LocopilotLlamaCppThreads = 'locopilot.llamaCpp.threads',
 	/** Logical batch size (`--batch-size`). 0 = build default. */

@@ -621,6 +621,17 @@ configurationRegistry.registerConfiguration({
 			description: nls.localize('locopilot.llamaCpp.serverPath.description', "Advanced override for the llama-server binary. LoCoPilot ships a bundled llama.cpp engine, so this is normally left empty. Set it only to point at your own build (full path to the binary, e.g. /path/to/llama-server or C:\\llama.cpp\\build\\bin\\llama-server.exe, or the directory that contains it)."),
 			default: '',
 		},
+		[ChatConfiguration.LocopilotLlamaCppEngine]: {
+			type: 'string',
+			enum: ['auto', 'cpu', 'gpu'],
+			enumDescriptions: [
+				nls.localize('locopilot.llamaCpp.engine.auto', "Automatic (default): use the bundled GPU (Vulkan) engine when a capable GPU is detected (discrete NVIDIA/AMD, or a dedicated GPU with enough VRAM), otherwise the CPU engine. On Apple Silicon this is always the Metal engine."),
+				nls.localize('locopilot.llamaCpp.engine.cpu', "Force the CPU engine. Most compatible; use this if the GPU engine misbehaves on your machine."),
+				nls.localize('locopilot.llamaCpp.engine.gpu', "Force the bundled GPU (Vulkan) engine, even on integrated GPUs that automatic mode would skip. Requires a GPU with up-to-date drivers; falls back to CPU if the GPU engine was not bundled in this build. No effect on Apple Silicon (always Metal)."),
+			],
+			markdownDescription: nls.localize('locopilot.llamaCpp.engine.description', "Which bundled engine to run local GGUF models with. `auto` picks the GPU (Vulkan) engine when a capable GPU is detected and the CPU engine otherwise. Set `cpu` to always run on the CPU, or `gpu` to force the GPU engine (useful for a capable integrated GPU that `auto` conservatively skips). Ignored when `#locopilot.llamaCpp.serverPath#` points at your own build, and on Apple Silicon (which always uses Metal)."),
+			default: 'auto',
+		},
 		[ChatConfiguration.LocopilotMlxPythonPath]: {
 			type: 'string',
 			description: nls.localize('locopilot.mlx.pythonPath.description', "Advanced override for the Python interpreter used to run `python -m mlx_lm.server` (local Hugging Face MLX models, Apple Silicon). LoCoPilot ships a bundled self-contained Python with mlx-lm pre-installed, so this is normally left empty. Set it only to use your own interpreter (e.g. /path/to/.venv/bin/python3)."),
@@ -645,14 +656,15 @@ configurationRegistry.registerConfiguration({
 		},
 		[ChatConfiguration.LocopilotLlamaCppKvCacheType]: {
 			type: 'string',
-			enum: ['f16', 'q8_0', 'q4_0'],
+			enum: ['auto', 'f16', 'q8_0', 'q4_0'],
 			enumDescriptions: [
-				nls.localize('locopilot.llamaCpp.kv.f16', "Full-precision KV cache (default, always safe)."),
+				nls.localize('locopilot.llamaCpp.kv.auto', "Automatic (default): full-precision f16 for small context windows, 8-bit q8_0 once the context reaches 32K (where the KV cache dominates memory and q8_0's quality loss is negligible)."),
+				nls.localize('locopilot.llamaCpp.kv.f16', "Full-precision KV cache (always safe)."),
 				nls.localize('locopilot.llamaCpp.kv.q8_0', "8-bit KV cache: ~half the memory, slightly faster. Requires Flash Attention (auto-enabled)."),
 				nls.localize('locopilot.llamaCpp.kv.q4_0', "4-bit KV cache: smallest memory, fastest. May slightly reduce quality. Requires Flash Attention (auto-enabled)."),
 			],
-			markdownDescription: nls.localize('locopilot.llamaCpp.kvCacheType.description', "KV cache quantization (`--cache-type-k/v`) for the local llama.cpp server. Quantizing shrinks the cache so more context fits on the GPU. When set to `q8_0`/`q4_0`, Flash Attention is auto-enabled (required), so this never fails to start."),
-			default: 'f16',
+			markdownDescription: nls.localize('locopilot.llamaCpp.kvCacheType.description', "KV cache quantization (`--cache-type-k/v`) for the local llama.cpp server. Quantizing shrinks the cache so more context fits on the GPU. `auto` keeps full precision for small windows and switches to `q8_0` at large context (32K+). When quantized, Flash Attention is auto-enabled (required), so this never fails to start."),
+			default: 'auto',
 		},
 		[ChatConfiguration.LocopilotLlamaCppMtp]: {
 			type: 'boolean',
@@ -669,6 +681,28 @@ configurationRegistry.registerConfiguration({
 			minimum: 0,
 			markdownDescription: nls.localize('locopilot.llamaCpp.cacheReuse.description', "Minimum chunk size to reuse from the KV cache via shifting (`--cache-reuse`) on the local llama.cpp server. Lets repeated prompt prefixes (like the system prompt resent on every agent turn) skip reprocessing, which noticeably speeds up multi-turn/tool conversations. Set to `0` to disable."),
 			default: 256,
+		},
+		[ChatConfiguration.LocopilotLlamaCppDraftModelPath]: {
+			type: 'string',
+			markdownDescription: nls.localize('locopilot.llamaCpp.draftModelPath.description', "Path to a separate, smaller GGUF model used for **speculative decoding** (`--model-draft`) on the local llama.cpp server. The small draft model proposes tokens that the main model verifies in one pass, typically giving 1.5-2.5x faster generation when they agree. Pick a much smaller model from the same family (e.g. a 0.5B-1B draft for a 7B+ target). Leave empty to disable. Ignored when `#locopilot.llamaCpp.multiTokenPrediction#` is on (that uses the model's own embedded draft head)."),
+			default: '',
+		},
+		[ChatConfiguration.LocopilotLlamaCppDraftGpuLayers]: {
+			type: 'number',
+			minimum: 0,
+			markdownDescription: nls.localize('locopilot.llamaCpp.draftGpuLayers.description', "GPU layers to offload for the speculative-decoding draft model (`--gpu-layers-draft`). `0` keeps the draft model on the CPU. Only used when `#locopilot.llamaCpp.draftModelPath#` is set."),
+			default: 0,
+		},
+		[ChatConfiguration.LocopilotLlamaCppParallel]: {
+			type: 'number',
+			minimum: 0,
+			markdownDescription: nls.localize('locopilot.llamaCpp.parallel.description', "Number of parallel request slots (`--parallel`) for the local llama.cpp server. Values above 1 let the server handle several requests at once (e.g. chat alongside inline completions) by splitting the KV cache into that many slots, at the cost of less context per slot. `0` or `1` uses a single slot (build default)."),
+			default: 0,
+		},
+		[ChatConfiguration.LocopilotLlamaCppContinuousBatching]: {
+			type: 'boolean',
+			markdownDescription: nls.localize('locopilot.llamaCpp.continuousBatching.description', "Enable continuous batching (`-cb`) on the local llama.cpp server so concurrent requests are interleaved for higher throughput. Only has an effect when `#locopilot.llamaCpp.parallel#` is greater than 1. Recent llama.cpp builds enable this by default."),
+			default: false,
 		},
 		[ChatConfiguration.LocopilotLlamaCppThreads]: {
 			type: 'number',

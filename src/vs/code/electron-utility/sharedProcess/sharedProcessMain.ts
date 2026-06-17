@@ -24,6 +24,8 @@ import { IEmbeddingComputeService } from '../../../platform/embeddings/common/em
 import { EmbeddingComputeService } from '../../../platform/embeddings/node/embeddingComputeService.js';
 import { ILoCoPilotGitService } from '../../../platform/locopilotGit/common/locopilotGit.js';
 import { LoCoPilotGitService } from '../../../platform/locopilotGit/node/locopilotGitService.js';
+import { ILoCoPilotSystemInfoService } from '../../../platform/locopilotSystemInfo/common/locopilotSystemInfo.js';
+import { LoCoPilotSystemInfoService } from '../../../platform/locopilotSystemInfo/node/locopilotSystemInfoService.js';
 import { IConfigurationService } from '../../../platform/configuration/common/configuration.js';
 import { ConfigurationService } from '../../../platform/configuration/common/configurationService.js';
 import { IDiagnosticsService } from '../../../platform/diagnostics/common/diagnostics.js';
@@ -302,6 +304,9 @@ class SharedProcessMain extends Disposable implements IClientConnectionFilter {
 		// LoCoPilot git execution (status/diff for the chat agent)
 		services.set(ILoCoPilotGitService, new SyncDescriptor(LoCoPilotGitService, undefined, false /* proxied to other processes */));
 
+		// LoCoPilot system hardware probing (CPU cores / GPU VRAM for local-model tuning)
+		services.set(ILoCoPilotSystemInfoService, new SyncDescriptor(LoCoPilotSystemInfoService, undefined, false /* proxied to other processes */));
+
 		// V8 Inspect profiler
 		services.set(IV8InspectProfilingService, new SyncDescriptor(V8InspectProfilingService, undefined, false /* proxied to other processes */));
 
@@ -444,6 +449,10 @@ class SharedProcessMain extends Disposable implements IClientConnectionFilter {
 		// LoCoPilot git
 		const gitChannel = ProxyChannel.fromService(accessor.get(ILoCoPilotGitService), this._store);
 		this.server.registerChannel('locopilotGit', gitChannel);
+
+		// LoCoPilot system info
+		const systemInfoChannel = ProxyChannel.fromService(accessor.get(ILoCoPilotSystemInfoService), this._store);
+		this.server.registerChannel('locopilotSystemInfo', systemInfoChannel);
 
 		// Profiling
 		const profilingChannel = ProxyChannel.fromService(accessor.get(IV8InspectProfilingService), this._store);

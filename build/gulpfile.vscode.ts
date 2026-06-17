@@ -289,11 +289,13 @@ function packageTask(platform: string, arch: string, sourceFolderName: string, d
 
 		const profiles = gulp.src('resources/profiles/**', { base: '.', dot: true });
 		const embeddingModel = gulp.src('resources/embeddings/**', { base: '.', dot: true });
-		// Bundle only the llama.cpp binary matching THIS build's platform/arch (fetched into
+		// Bundle the llama.cpp binaries matching THIS build's platform/arch (fetched into
 		// resources/bin/<platform>-<arch>/ by scripts/fetch-llama-binaries.mjs). Shipped under
-		// <appRoot>/resources/bin/<platform>-<arch>/ so local GGUF models run with zero setup.
-		// allowEmpty so builds without a fetched binary (e.g. linux-armhf) still package.
-		const llamaBinaries = gulp.src(`resources/bin/${platform}-${arch}/**`, { base: '.', dot: true, allowEmpty: true });
+		// <appRoot>/resources/bin/<platform>-<arch>/ so local GGUF models run with zero setup. The trailing
+		// `*` also captures the optional GPU build in resources/bin/<platform>-<arch>-vulkan/ (Windows/Linux),
+		// which the runner uses when a capable GPU is detected. allowEmpty so builds without a fetched binary
+		// (e.g. linux-armhf, or a build that skipped the Vulkan fetch) still package.
+		const llamaBinaries = gulp.src(`resources/bin/${platform}-${arch}*/**`, { base: '.', dot: true, allowEmpty: true });
 		// Bundle the self-contained MLX Python runtime (mlx-lm pre-installed) ONLY in the macOS arm64
 		// package - MLX is Apple Silicon only. Fetched by scripts/fetch-mlx-runtime.mjs into
 		// resources/mlx/darwin-arm64/. allowEmpty so non-mac builds (and mac builds that skip the fetch)

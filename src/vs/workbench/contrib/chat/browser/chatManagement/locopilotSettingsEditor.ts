@@ -55,6 +55,10 @@ import { ILoCoPilotLocalModelRunner } from '../locopilotLocalModelRunner.js';
 import { ITimerService } from '../../../../services/timer/browser/timerService.js';
 import { isAppleSiliconMac } from '../locopilotMlxServer.js';
 import { findCatalogEntry, getCatalogSuitability, ModelSuitability } from '../locopilotModelCatalog.js';
+// [engine-ui] Only needed by the commented-out engine dropdown in renderAgentSettings; uncomment to restore.
+// import { isMacintosh } from '../../../../../base/common/platform.js';
+// import { IConfigurationService } from '../../../../../platform/configuration/common/configuration.js';
+// import { ChatConfiguration } from '../../common/constants.js';
 
 const $ = DOM.$;
 
@@ -234,6 +238,7 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 	} | undefined;
 	private maxIterationsInput!: InputBox;
 	private autoRunCommandsInSandboxToggle!: Toggle;
+	// [engine-ui] private engineSelectBox!: SelectBox;
 	/** Phase 3: per-workspace ("this project only") agent instructions. */
 	private workspaceInstructionsTextarea!: HTMLTextAreaElement;
 	private agentSettingsService!: ILoCoPilotAgentSettingsService;
@@ -271,6 +276,7 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 		@ILoCoPilotProjectMemoryService private readonly projectMemoryService: ILoCoPilotProjectMemoryService,
 		@IClipboardService private readonly clipboardService: IClipboardService,
 		@ITimerService private readonly timerService: ITimerService,
+		// [engine-ui] @IConfigurationService private readonly configurationService: IConfigurationService,
 	) {
 		super(LoCoPilotSettingsEditor.ID, group, telemetryService, themeService, storageService);
 		this.agentSettingsService = agentSettingsService;
@@ -1516,11 +1522,37 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 		DOM.append(autoRunWrap, this.autoRunCommandsInSandboxToggle.domNode);
 		this._register(this.autoRunCommandsInSandboxToggle.onChange(() => this.updateAgentSettingsDirtyIndicators()));
 
-		// Note: both local engines ship bundled inside the app, so there are no paths to configure:
-		//  - llama.cpp (GGUF)        -> resources/bin/<platform>-<arch>
-		//  - MLX runtime (mac arm64) -> resources/mlx/darwin-arm64 (self-contained Python + mlx-lm)
-		// Power users can still override via the hidden settings locopilot.llamaCpp.serverPath and
-		// locopilot.mlx.pythonPath (e.g. to point at a custom build or their own Python).
+		// [engine-ui] The local-model engine (auto/cpu/gpu) is decided automatically (see
+		// LoCoPilotLocalModelRunner._resolveServerLaunch). The override is intentionally NOT shown in this
+		// panel - power users can still change it via the "LoCoPilot: Select Local Model Engine" command or
+		// the `locopilot.llamaCpp.engine` setting. To restore an inline dropdown here, uncomment this block
+		// and the lines tagged [engine-ui] above (imports, field, constructor param).
+		//
+		// if (!isMacintosh) {
+		// 	const engineOptions: ISelectOptionItem[] = [
+		// 		{ text: localize('locopilotSettings.engine.auto', 'Auto (recommended)'), description: localize('locopilotSettings.engine.auto.desc', 'GPU when a capable one is detected, otherwise CPU') },
+		// 		{ text: localize('locopilotSettings.engine.cpu', 'CPU'), description: localize('locopilotSettings.engine.cpu.desc', 'Always use the CPU engine') },
+		// 		{ text: localize('locopilotSettings.engine.gpu', 'GPU (Vulkan)'), description: localize('locopilotSettings.engine.gpu.desc', 'Force the GPU engine even on integrated graphics') },
+		// 	];
+		// 	const engineValues = ['auto', 'cpu', 'gpu'] as const;
+		// 	const currentEngine = this.configurationService.getValue<string>(ChatConfiguration.LocopilotLlamaCppEngine) ?? 'auto';
+		// 	const engineIndex = Math.max(0, engineValues.indexOf(currentEngine as typeof engineValues[number]));
+		//
+		// 	const engineRow = DOM.append(execCard, $('.agent-setting-row'));
+		// 	const engineText = DOM.append(engineRow, $('.agent-setting-text'));
+		// 	const engineLabel = DOM.append(engineText, $('label.locopilot-setting-label'));
+		// 	engineLabel.textContent = localize('locopilotSettings.engine', 'Local model engine');
+		// 	const engineDesc = DOM.append(engineText, $('.agent-setting-description'));
+		// 	engineDesc.textContent = localize('locopilotSettings.engineDescription', 'Which engine runs local GGUF models. Auto uses the GPU when a capable one is detected and falls back to CPU. Force GPU to enable Vulkan on an integrated GPU that auto skips.');
+		// 	const engineControl = DOM.append(engineRow, $('.agent-setting-control'));
+		// 	const engineSelectContainer = DOM.append(engineControl, $('div'));
+		// 	this.engineSelectBox = this._register(new SelectBox(engineOptions, engineIndex, this.contextViewService, locopilotSettingsSelectBoxStyles));
+		// 	this.engineSelectBox.render(engineSelectContainer);
+		// 	this._register(this.engineSelectBox.onDidSelect(e => {
+		// 		const val = engineValues[e.index] ?? 'auto';
+		// 		this.configurationService.updateValue(ChatConfiguration.LocopilotLlamaCppEngine, val);
+		// 	}));
+		// }
 
 		// --- Card: System Prompts -------------------------------------------
 		const promptCard = DOM.append(container, $('.agent-setting-card'));
