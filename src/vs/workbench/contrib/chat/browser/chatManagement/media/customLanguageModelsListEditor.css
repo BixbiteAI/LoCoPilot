@@ -366,6 +366,46 @@
 	cursor: default;
 }
 
+/* "Running" status shown right after the model name once the server is ready. No box/shade - just a pulsing dot plus its label, inline with the name, tinted with the theme accent color. */
+.model-running-indicator {
+	display: inline-flex;
+	align-items: center;
+	gap: 4px;
+	margin-left: 8px;
+	font-size: 11px;
+	line-height: 16px;
+	vertical-align: text-bottom;
+	color: #3fb950;
+	cursor: default;
+}
+
+/* Force the dot icon to take the indicator's color instead of the default icon-foreground (grey), so the dot matches the "Running" label color exactly. */
+.model-running-indicator .codicon {
+	font-size: 12px;
+	color: inherit;
+}
+
+.model-running-label {
+	white-space: nowrap;
+	color: inherit;
+}
+
+.model-running-dot {
+	display: inline-flex;
+	align-items: center;
+	color: #3fb950;
+	animation: model-running-pulse 1.6s ease-in-out infinite;
+}
+
+.model-running-dot .codicon {
+	color: #3fb950 !important;
+}
+
+@keyframes model-running-pulse {
+	0%, 100% { opacity: 1; }
+	50% { opacity: 0.35; }
+}
+
 .model-item-row2 .model-details {
 	flex: 1;
 	min-width: 0;

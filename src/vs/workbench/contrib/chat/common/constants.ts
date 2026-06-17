@@ -78,6 +78,16 @@ export enum ChatConfiguration {
 	LocopilotLocalAutoStartServer = 'locopilot.local.autoStartServer',
 	/** Keep only one local model loaded: stop the previously active local server when switching models. */
 	LocopilotLocalSingleActiveModel = 'locopilot.local.singleActiveModel',
+	/** Eagerly start a local model's server the moment it is selected in the model picker (hides cold start). */
+	LocopilotLocalPrewarmOnSelect = 'locopilot.local.prewarmOnSelect',
+	/** Minutes a local model server may sit idle before it is unloaded to free RAM (0 = never unload). */
+	LocopilotLocalKeepAliveMinutes = 'locopilot.local.keepAliveMinutes',
+	/** Max number of local model servers kept resident at once; least-recently-used ones are evicted (LRU). */
+	LocopilotLocalMaxResidentModels = 'locopilot.local.maxResidentModels',
+	/** Fraction of total system RAM the resident local models may collectively occupy before LRU eviction kicks in. */
+	LocopilotLocalMemoryBudgetFraction = 'locopilot.local.memoryBudgetFraction',
+	/** Hard floor (in GB) of free system RAM to preserve; loading a model that would breach it evicts LRU first. */
+	LocopilotLocalMinFreeMemoryGB = 'locopilot.local.minFreeMemoryGB',
 	/** Whether to show tool call parameters and results in the chat UI. */
 	LocopilotShowToolDetails = 'locopilot.chat.showToolDetails',
 }

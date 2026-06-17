@@ -715,8 +715,38 @@ configurationRegistry.registerConfiguration({
 		},
 		[ChatConfiguration.LocopilotLocalSingleActiveModel]: {
 			type: 'boolean',
-			markdownDescription: nls.localize('locopilot.local.singleActiveModel.description', "Keep only one local model loaded at a time. When you auto-start a local model, the previously running local server is stopped first to free up CPU and memory. Turn off to keep multiple local servers running at once."),
+			markdownDescription: nls.localize('locopilot.local.singleActiveModel.description', "Keep only one local model loaded at a time. When on, switching models stops the previous local server immediately, forcing a full reload if you switch back. Leave off (default) to keep recently-used models warm under `#locopilot.local.maxResidentModels#` and `#locopilot.local.keepAliveMinutes#`, so switching back is instant."),
+			default: false,
+		},
+		[ChatConfiguration.LocopilotLocalPrewarmOnSelect]: {
+			type: 'boolean',
+			markdownDescription: nls.localize('locopilot.local.prewarmOnSelect.description', "Start a local model's server as soon as you pick it in the model dropdown, instead of waiting for your first message. The model loads into memory while you type, so the first response no longer pays the cold-start delay."),
 			default: true,
+		},
+		[ChatConfiguration.LocopilotLocalKeepAliveMinutes]: {
+			type: 'number',
+			minimum: 0,
+			markdownDescription: nls.localize('locopilot.local.keepAliveMinutes.description', "How long (in minutes) a local model server stays loaded after its last request before it is unloaded to free memory. Keeping it resident lets you switch back to a recent model with no reload. Set to `0` to never auto-unload."),
+			default: 30,
+		},
+		[ChatConfiguration.LocopilotLocalMaxResidentModels]: {
+			type: 'number',
+			minimum: 1,
+			markdownDescription: nls.localize('locopilot.local.maxResidentModels.description', "Maximum number of local model servers kept loaded in memory at the same time. When you exceed this, the least-recently-used model is unloaded (LRU). Higher values make switching between models instant at the cost of more RAM. Acts as a hard upper bound; the actual number may be lower when `#locopilot.local.memoryBudgetFraction#` would be exceeded. Ignored when `#locopilot.local.singleActiveModel#` is on (which forces 1)."),
+			default: 2,
+		},
+		[ChatConfiguration.LocopilotLocalMemoryBudgetFraction]: {
+			type: 'number',
+			minimum: 0.1,
+			maximum: 0.95,
+			markdownDescription: nls.localize('locopilot.local.memoryBudgetFraction.description', "Fraction of total system RAM that all resident local models may collectively occupy. Before loading a model, least-recently-used models are unloaded until the estimated total fits within this fraction (and `#locopilot.local.minFreeMemoryGB#` is respected). Keeps switching fast without driving the machine into swap. Only applied on Apple Silicon and CPU backends, where weights live in system RAM; discrete-GPU backends fall back to the `#locopilot.local.maxResidentModels#` count."),
+			default: 0.7,
+		},
+		[ChatConfiguration.LocopilotLocalMinFreeMemoryGB]: {
+			type: 'number',
+			minimum: 0,
+			markdownDescription: nls.localize('locopilot.local.minFreeMemoryGB.description', "Hard floor (in GB) of free system RAM to preserve. If loading a local model would leave less than this much memory free, least-recently-used models are unloaded first. A safety net against out-of-memory and swapping even when `#locopilot.local.memoryBudgetFraction#` would otherwise allow the load."),
+			default: 2,
 		},
 		[ChatConfiguration.LocopilotShowToolDetails]: {
 			type: 'boolean',

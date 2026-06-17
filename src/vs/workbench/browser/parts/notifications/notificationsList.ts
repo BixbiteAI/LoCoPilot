@@ -82,7 +82,14 @@ export class NotificationsList extends Disposable {
 				setRowLineHeight: false,
 				horizontalScrolling: false,
 				overrideStyles: {
-					listBackground: NOTIFICATIONS_BACKGROUND
+					listBackground: NOTIFICATIONS_BACKGROUND,
+					// Keep clicking/focusing a notification from tinting the row (e.g. dark teal
+					// selection) - reuse the notification background so there is no color change.
+					listFocusBackground: NOTIFICATIONS_BACKGROUND,
+					listActiveSelectionBackground: NOTIFICATIONS_BACKGROUND,
+					listInactiveFocusBackground: NOTIFICATIONS_BACKGROUND,
+					listInactiveSelectionBackground: NOTIFICATIONS_BACKGROUND,
+					listHoverBackground: NOTIFICATIONS_BACKGROUND
 				},
 				accessibilityProvider: this.instantiationService.createInstance(NotificationAccessibilityProvider, options)
 			}

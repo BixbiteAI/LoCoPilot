@@ -1084,6 +1084,9 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 			bestIcon.appendChild(renderIcon(Codicon.pass));
 			bestIcon.title = localize('customLanguageModels.bestForYou.tooltip', 'Recommended: sized for your system memory.');
 		}
+		// Live running indicator: a pulsing green dot when the model's server is up, or a spinner while it
+		// is starting/loading its weights. Driven by the runner's phase; the list re-renders on state change.
+		this._renderRunningIndicator(model.id, nameLabel);
 		const actionsContainer = DOM.append(row1, $('.model-actions'));
 		const runSlot = DOM.append(actionsContainer, $('.model-actions-run-slot'));
 		const downloadingHFOrOllama = model.isDownloading && (model.provider === 'huggingface' || isOllama);
@@ -1304,6 +1307,25 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 				: localize('customLanguageModels.savedTo', 'Saved to: {0}', model.localPath);
 			pathLabel.title = model.localPath || '';
 		}
+	}
+
+	/**
+	 * Renders a small "Running" indicator (pulsing dot + label, in the theme accent color) next to the model
+	 * name once its server is ready. The starting/loading phases are intentionally left to the server-controls
+	 * spinner so we don't show two loaders. Re-rendered by onDidServerStateChange.
+	 */
+	private _renderRunningIndicator(modelId: string, nameLabel: HTMLElement): void {
+		// Only show this for a fully-ready server. While starting/loading, the server controls already show a
+		// spinner; a failed launch shows "Failed to start" + Retry there too. No second indicator in either case.
+		if (this.serverStartErrors.has(modelId) || this.localModelRunner.getServerPhase(modelId) !== 'ready') {
+			return;
+		}
+		const badge = DOM.append(nameLabel, $('span.model-running-indicator.model-running-ready'));
+		const dot = DOM.append(badge, $('span.model-running-dot'));
+		dot.appendChild(renderIcon(Codicon.circleFilled));
+		const text = DOM.append(badge, $('span.model-running-label'));
+		text.textContent = localize('customLanguageModels.serverRunning', 'Running');
+		badge.title = localize('customLanguageModels.serverRunningTooltip', 'This model is loaded and ready to answer requests.');
 	}
 
 	/**

@@ -6,7 +6,7 @@
 /* eslint-disable @typescript-eslint/no-explicit-any, curly */
 /* eslint-disable local/code-no-in-operator */
 
-import { AsyncIterableSource } from '../../../../base/common/async.js';
+import { AsyncIterableSource, timeout } from '../../../../base/common/async.js';
 import { encodeBase64, streamToBuffer } from '../../../../base/common/buffer.js';
 import { createMarkdownCommandLink } from '../../../../base/common/htmlContent.js';
 import { CancellationToken } from '../../../../base/common/cancellation.js';
@@ -21,6 +21,7 @@ import { ChatConfiguration, ChatAgentLocation } from '../common/constants.js';
 import { DEFAULT_PICKER_MODEL_REPO_ID } from './locopilotModelCatalog.js';
 import { ILoCoPilotFileLog } from './locopilotFileLog.js';
 import { INotificationService } from '../../../../platform/notification/common/notification.js';
+import { IProgressService, ProgressLocation } from '../../../../platform/progress/common/progress.js';
 import { ICustomLanguageModelsService, ICustomLanguageModel, getCustomModelListLabel, deriveTokenLimits, defaultContextWindow, TOOL_FAILURE_DISABLE_THRESHOLD } from '../common/customLanguageModelsService.js';
 import { IChatMessage, ILanguageModelChatInfoOptions, ILanguageModelChatMetadataAndIdentifier, ILanguageModelChatProvider, ILanguageModelChatResponse, ILanguageModelsService, IChatResponsePart, ChatMessageRole } from '../common/languageModels.js';
 import { IWorkbenchContribution } from '../../../common/contributions.js';
@@ -54,6 +55,7 @@ export class LoCoPilotLanguageModelProvider extends Disposable implements ILangu
 		@ILoCoPilotLocalModelRunner private readonly localModelRunner: ILoCoPilotLocalModelRunner,
 		@IConfigurationService private readonly configurationService: IConfigurationService,
 		@INotificationService private readonly notificationService: INotificationService,
+		@IProgressService private readonly progressService: IProgressService,
 	) {
 		super();
 		this._log('[LoCoPilot] Initializing Language Model Provider');
@@ -756,6 +758,37 @@ export class LoCoPilotLanguageModelProvider extends Disposable implements ILangu
 		return response.res.statusCode ?? 0;
 	}
 
+	/**
+	 * Runs `start` (the server launch + readiness wait) under a Window progress indicator that reads
+	 * "Loading <model>… <phase>", so a cold start looks like the model loading rather than a slow response.
+	 * The message is refreshed from the runner's live load phase/progress while the weights load. Only used
+	 * when the server was not already running.
+	 */
+	private async _withModelLoadingProgress(model: ICustomLanguageModel, token: CancellationToken, start: (token: CancellationToken) => Promise<string | undefined>): Promise<string | undefined> {
+		const label = model.displayName || model.modelName;
+		return this.progressService.withProgress<string | undefined>(
+			{ location: ProgressLocation.Window, title: `Loading ${label}…`, type: 'loading' },
+			async progress => {
+				let done = false;
+				// Poll the runner's phase/progress and reflect it in the indicator until the start resolves.
+				(async () => {
+					while (!done && !token.isCancellationRequested) {
+						const phase = this.localModelRunner.getServerPhase(model.id);
+						const detail = this.localModelRunner.getLoadProgress(model.id)
+							?? (phase === 'starting' ? 'starting engine…' : phase === 'loading' ? 'loading into memory…' : '');
+						progress.report({ message: detail ? `Loading ${label} - ${detail}` : `Loading ${label}...` });
+						await timeout(700);
+					}
+				})();
+				try {
+					return await start(token);
+				} finally {
+					done = true;
+				}
+			}
+		);
+	}
+
 	private async _callLocalModel(model: ICustomLanguageModel, messages: IChatMessage[], options: { [name: string]: unknown }, stream: AsyncIterableSource<IChatResponsePart | IChatResponsePart[]>, token: CancellationToken): Promise<any> {
 		this._log(`[LoCoPilot Provider] Calling local model: ${model.modelName}`);
 		if (!model.localPath) {
@@ -763,11 +796,17 @@ export class LoCoPilotLanguageModelProvider extends Disposable implements ILangu
 			throw new Error(`The model "${model.modelName}" is not downloaded yet. Add it in LoCoPilot Settings with provider HuggingFace and wait for the download to complete.`);
 		}
 		let baseUrl = this.localModelRunner.getServerBaseUrl(model.id);
-		if (!baseUrl && this.configurationService.getValue<boolean>(ChatConfiguration.LocopilotLocalAutoStartServer) !== false) {
-			// Auto-start-on-use (Ollama-like): launch this model's server, stop the previously active one,
-			// and wait until it is ready, so the user can just pick the model and send without a manual step.
+		const autoStart = this.configurationService.getValue<boolean>(ChatConfiguration.LocopilotLocalAutoStartServer) !== false;
+		if (!baseUrl && autoStart) {
+			// Auto-start-on-use (Ollama-like): launch this model's server and wait until it is ready, so the
+			// user can just pick the model and send without a manual step. Because the server has to load the
+			// weights into memory first, show a distinct "loading" indicator (instead of the normal working
+			// spinner) so the wait reads as model start-up, not slow generation.
 			this._log(`[LoCoPilot Provider] Auto-starting local server for ${model.modelName}.`);
-			baseUrl = await this.localModelRunner.ensureServerForModel(model.id, token);
+			baseUrl = await this._withModelLoadingProgress(model, token, t => this.localModelRunner.ensureServerForModel(model.id, t));
+		} else if (baseUrl && autoStart) {
+			// Already running: route through ensure to refresh the keep-alive idle timer (cheap no-op start).
+			baseUrl = await this.localModelRunner.ensureServerForModel(model.id, token) ?? baseUrl;
 		}
 		if (!baseUrl) {
 			throw new Error(this._getLocalLlamaServerNotRunningMessage(model.modelName, model.displayName));
@@ -921,11 +960,10 @@ export class LoCoPilotLanguageModelProvider extends Disposable implements ILangu
 	 * Reasoning streams as `delta.reasoning_content`, `delta.reasoning`, or `delta.thinking` depending on the server.
 	 */
 	private async _callOllamaModel(model: ICustomLanguageModel, messages: IChatMessage[], options: { [name: string]: unknown }, stream: AsyncIterableSource<IChatResponsePart | IChatResponsePart[]>, token: CancellationToken): Promise<any> {
-		// Switching to Ollama: free any running llama.cpp/MLX server so two local engines don't compete
-		// for RAM/CPU. Ollama then manages its own model memory via its daemon (keepAlive setting).
-		if (this.configurationService.getValue<boolean>(ChatConfiguration.LocopilotLocalSingleActiveModel) !== false) {
-			this.localModelRunner.stopManagedServers();
-		}
+		// Switching to Ollama: free any running llama.cpp/MLX server so the two local engines don't compete
+		// for RAM/CPU. Ollama then manages its own model memory via its daemon (keepAlive setting). This is a
+		// cross-engine handoff, so it applies regardless of the (llama/mlx-only) resident-model budget.
+		this.localModelRunner.stopManagedServers();
 		const baseUrl = (model.localPath || 'http://localhost:11434').replace(/\/$/, '');
 		const mappedMessages = messages.flatMap(m => this._mapMessageToOpenAI(m));
 		const isLocalModel = model.provider === 'huggingface' || model.provider === 'localhost' || model.provider === 'ollama';

@@ -39,6 +39,7 @@ import {
 	shouldUseMlxServerForHfModel,
 } from './locopilotMlxServer.js';
 import { IPathService } from '../../../services/path/common/pathService.js';
+import { ILifecycleService, LifecyclePhase } from '../../../services/lifecycle/common/lifecycle.js';
 import { ITerminalService, ITerminalInstance } from '../../terminal/browser/terminal.js';
 import { Event, Emitter } from '../../../../base/common/event.js';
 import { INotificationService, Severity } from '../../../../platform/notification/common/notification.js';
@@ -52,12 +53,30 @@ import { timeout } from '../../../../base/common/async.js';
 
 export const ILoCoPilotLocalModelRunner = createDecorator<ILoCoPilotLocalModelRunner>('locopilotLocalModelRunner');
 
+/**
+ * Lifecycle phase of a local model server:
+ *  - 'starting': process is being launched (no port bound yet).
+ *  - 'loading' : process is up but still reading weights into RAM/VRAM (endpoint not 200 yet).
+ *  - 'ready'   : the OpenAI endpoint answered 200; safe to send requests.
+ */
+export type LocalServerPhase = 'starting' | 'loading' | 'ready';
+
 export interface ILoCoPilotLocalModelRunner {
 	readonly _serviceBrand: undefined;
 	readonly onDidServerStateChange: Event<string>;
 	readonly onDidLogUpdate: Event<string>;
 	/** Fired when a server launch fails. Payload contains modelId and a human-readable reason. */
 	readonly onDidServerStartFailed: Event<{ modelId: string; message: string }>;
+	/** Current load phase for a model whose server we are starting/running, or undefined when not managed. */
+	getServerPhase(modelId: string): LocalServerPhase | undefined;
+	/** Latest human-readable load-progress line (parsed from llama.cpp output), if any. */
+	getLoadProgress(modelId: string): string | undefined;
+	/**
+	 * Eagerly start (warm up) a model's server in the background, without waiting. No-op when the model
+	 * is already running/starting, is not a startable local model, or prewarm-on-select is disabled.
+	 * Used to hide the cold start behind the user's typing time when they pick a model.
+	 */
+	prewarmModel(modelId: string): void;
 	getBackend(): LlamaBackend;
 	getBackendPriority(): LlamaBackend[];
 	getServerBaseUrl(modelId: string): string | undefined;
@@ -65,8 +84,9 @@ export interface ILoCoPilotLocalModelRunner {
 	startServerInTerminal(modelId: string): Promise<void>;
 	/**
 	 * Ensures a local server for the model is running and ready to answer chat requests.
-	 * If not running, starts it (stopping the previously active local server first when
-	 * `singleActiveModel` is on) and waits until the OpenAI-compatible endpoint responds.
+	 * If not running, starts it (evicting the least-recently-used server first when the resident-model
+	 * budget is reached) and waits until the OpenAI-compatible endpoint responds. Reusing a running
+	 * server also refreshes its keep-alive idle timer.
 	 * Returns the server base URL when ready, or undefined if it could not be started.
 	 */
 	ensureServerForModel(modelId: string, token?: CancellationToken): Promise<string | undefined>;
@@ -100,11 +120,36 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 
 	/** Models whose server launch is in progress (sent to terminal but not yet confirmed running/failed). */
 	private startingServers = new Set<string>();
-	private runningServers = new Map<string, { port: number; terminal: ITerminalInstance; kind: 'llama' | 'mlx'; logs: string[] }>();
+	/**
+	 * In-flight launch promises keyed by modelId. Set synchronously at the start of a launch so concurrent
+	 * callers (e.g. startup pre-warm racing the model-picker's select pre-warm) share one launch instead of
+	 * each spawning a server on the same port - the classic "exit code 1" double-start at startup.
+	 */
+	private readonly _startInFlight = new Map<string, Promise<void>>();
+	/** Ports picked by an in-flight launch but not yet bound; reserved so concurrent launches don't reuse them. */
+	private readonly _reservedPorts = new Set<number>();
+	private runningServers = new Map<string, {
+		port: number;
+		terminal: ITerminalInstance;
+		kind: 'llama' | 'mlx';
+		logs: string[];
+		/** Epoch ms of the last request/use; drives least-recently-used eviction and the idle timer. */
+		lastUsedAt: number;
+		/** True once the OpenAI endpoint answered 200 (phase 'ready'); false while still loading weights. */
+		ready: boolean;
+		/** Pending idle-unload timer; cleared/reset on each use. */
+		idleTimer?: ReturnType<typeof setTimeout>;
+		/** Latest parsed load-progress line shown in the loading UI. */
+		loadProgress?: string;
+	}>();
 	/** Models we are intentionally stopping, so the process-exit handler doesn't report a stop as a crash. */
 	private readonly _intentionalStops = new Set<string>();
 	/** Models whose server process exited before it ever became ready (so readiness polling can bail early). */
 	private readonly _crashedBeforeReady = new Set<string>();
+	/** Models whose next crash should be logged but NOT surfaced as a notification (e.g. a pre-warm attempt that will be retried). */
+	private readonly _suppressCrashNotice = new Set<string>();
+	/** Cache of on-disk weight sizes (bytes) keyed by modelId, so the eviction budget doesn't re-stat on every switch. */
+	private readonly _modelSizeCache = new Map<string, number>();
 
 	constructor(
 		@ICustomLanguageModelsService private readonly customLanguageModelsService: ICustomLanguageModelsService,
@@ -120,9 +165,12 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 		@IInstantiationService private readonly instantiationService: IInstantiationService,
 		@IRequestService private readonly requestService: IRequestService,
 		@IEnvironmentService private readonly environmentService: IEnvironmentService,
+		@ILifecycleService private readonly lifecycleService: ILifecycleService,
 	) {
 		super();
 		this._registerCommands();
+		// Make sure idle timers and child processes are torn down when the service is disposed.
+		this._register({ dispose: () => this.stopManagedServers() });
 	}
 
 	private _registerCommands(): void {
@@ -144,6 +192,17 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 			async run(accessor: ServicesAccessor, modelId?: string): Promise<void> {
 				if (modelId) {
 					await self.runOllamaModelInTerminal(modelId);
+				}
+			}
+		});
+		// Eager pre-warm hook fired from the chat model picker when a model is selected.
+		registerAction2(class extends Action2 {
+			constructor() {
+				super({ id: 'locopilot.prewarmModel', title: { value: 'Pre-warm Local Model', original: 'Pre-warm Local Model' } });
+			}
+			async run(accessor: ServicesAccessor, modelId?: string): Promise<void> {
+				if (modelId) {
+					self.prewarmModel(modelId);
 				}
 			}
 		});
@@ -198,15 +257,208 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 		return this.runningServers.get(modelId)?.logs ?? [];
 	}
 
+	getServerPhase(modelId: string): LocalServerPhase | undefined {
+		const running = this.runningServers.get(modelId);
+		if (running) {
+			return running.ready ? 'ready' : 'loading';
+		}
+		return this.startingServers.has(modelId) ? 'starting' : undefined;
+	}
+
+	getLoadProgress(modelId: string): string | undefined {
+		return this.runningServers.get(modelId)?.loadProgress;
+	}
+
 	stopServer(modelId: string): void {
 		const running = this.runningServers.get(modelId);
 		if (running) {
+			if (running.idleTimer) {
+				clearTimeout(running.idleTimer);
+			}
 			this._intentionalStops.add(modelId); // mark so onExit treats this as a clean stop, not a crash
 			running.terminal.dispose();
 			this.runningServers.delete(modelId);
 			this._onDidServerStateChange.fire(modelId);
 			this._log(`[LoCoPilot Runner] Stopped server for model ${modelId}`);
 		}
+	}
+
+	/**
+	 * Records that a model was just used: bumps its LRU timestamp and (re)arms the idle-unload timer.
+	 * Called on every request path so a model in active use is never evicted.
+	 */
+	private _touch(modelId: string): void {
+		const running = this.runningServers.get(modelId);
+		if (!running) {
+			return;
+		}
+		running.lastUsedAt = Date.now();
+		this._armIdleTimer(modelId);
+	}
+
+	/**
+	 * (Re)arms the idle-unload timer for a model. After `keepAliveMinutes` of no use the server is
+	 * stopped to free RAM (Ollama-style keep-alive). A value of 0 disables auto-unload.
+	 */
+	private _armIdleTimer(modelId: string): void {
+		const running = this.runningServers.get(modelId);
+		if (!running) {
+			return;
+		}
+		if (running.idleTimer) {
+			clearTimeout(running.idleTimer);
+			running.idleTimer = undefined;
+		}
+		const minutes = this.configurationService.getValue<number>(ChatConfiguration.LocopilotLocalKeepAliveMinutes);
+		const ms = (typeof minutes === 'number' && minutes > 0) ? minutes * 60_000 : 0;
+		if (ms <= 0) {
+			return; // never auto-unload
+		}
+		running.idleTimer = setTimeout(() => {
+			const still = this.runningServers.get(modelId);
+			if (still && Date.now() - still.lastUsedAt >= ms) {
+				this._log(`[LoCoPilot Runner] Unloading idle model ${modelId} after ${minutes} min of inactivity.`);
+				this.stopServer(modelId);
+			}
+		}, ms);
+	}
+
+	/**
+	 * Maximum number of local servers to keep resident at once. `singleActiveModel` (off by default) forces 1
+	 * for users who opt into the old single-model behavior; otherwise the `maxResidentModels` budget (default 2) applies.
+	 */
+	private _maxResidentModels(): number {
+		const singleActive = this.configurationService.getValue<boolean>(ChatConfiguration.LocopilotLocalSingleActiveModel) !== false;
+		if (singleActive) {
+			return 1;
+		}
+		const configured = this.configurationService.getValue<number>(ChatConfiguration.LocopilotLocalMaxResidentModels);
+		return (typeof configured === 'number' && configured >= 1) ? Math.floor(configured) : 2;
+	}
+
+	/**
+	 * Enforces the resident-model budget before starting `keepModelId`: while making room would exceed the
+	 * limit, evicts the least-recently-used *other* server. This replaces the old "stop everything on switch"
+	 * behavior so switching back to a recently-used model is instant (no reload) while RAM stays bounded.
+	 *
+	 * Two budgets are combined (an "other" is evicted, oldest first, while ANY is violated):
+	 *  1. The {@link _maxResidentModels} count (hard upper bound, always applied).
+	 *  2. A memory budget (Apple Silicon / CPU backends only, where weights live in system RAM): the estimated
+	 *     resident footprint of all loaded models must fit within `memoryBudgetFraction` of total RAM AND must
+	 *     not drive free RAM below the `minFreeMemoryGB` floor. Discrete-GPU backends (CUDA/Vulkan) keep weights
+	 *     in VRAM, which we can't reliably size from here, so they rely on the count budget alone.
+	 *
+	 * Always keeps at least the incoming model's slot free; never evicts `keepModelId`.
+	 */
+	private async _enforceResidentBudget(keepModelId: string): Promise<void> {
+		const max = this._maxResidentModels();
+		// We are about to add keepModelId, so the others may occupy at most max-1 slots.
+		const evictable = () => Array.from(this.runningServers.entries())
+			.filter(([id]) => id !== keepModelId)
+			.sort((a, b) => a[1].lastUsedAt - b[1].lastUsedAt); // oldest first
+
+		// --- Memory budget inputs (best-effort; absent on web or when stats are unavailable) ---
+		const memInfo = this._useMemoryBudget() ? await this._getSystemMemory() : undefined;
+		let cap = Number.POSITIVE_INFINITY;     // max total resident bytes allowed
+		let floor = 0;                          // min free bytes to preserve
+		let newCost = 0;                        // estimated footprint of the model we are about to load
+		const otherCost = new Map<string, number>(); // estimated footprint of each currently-running model
+		if (memInfo) {
+			const fraction = this.configurationService.getValue<number>(ChatConfiguration.LocopilotLocalMemoryBudgetFraction);
+			const minFreeGb = this.configurationService.getValue<number>(ChatConfiguration.LocopilotLocalMinFreeMemoryGB);
+			cap = (typeof fraction === 'number' && fraction > 0 ? fraction : 0.7) * memInfo.totalmem;
+			floor = (typeof minFreeGb === 'number' && minFreeGb > 0 ? minFreeGb : 0) * 1024 * 1024 * 1024;
+			newCost = await this._estimateModelCost(keepModelId);
+			for (const [id] of this.runningServers) {
+				if (id !== keepModelId) {
+					otherCost.set(id, await this._estimateModelCost(id));
+				}
+			}
+		}
+
+		let freedBytes = 0; // memory reclaimed by evictions so far (added back to the free estimate)
+		const memoryViolated = (others: [string, unknown][]): boolean => {
+			if (!memInfo) {
+				return false;
+			}
+			const residentOther = others.reduce((sum, [id]) => sum + (otherCost.get(id) ?? 0), 0);
+			const totalAfter = residentOther + newCost;
+			const freeAfter = memInfo.freemem + freedBytes - newCost;
+			return totalAfter > cap || freeAfter < floor;
+		};
+
+		let others = evictable();
+		// Keep evicting the LRU "other" while either budget is exceeded, but never evict the last remaining
+		// slot we need for keepModelId (loop naturally stops when others is empty).
+		while (others.length > 0 && (others.length > Math.max(0, max - 1) || memoryViolated(others))) {
+			const [lruId] = others[0];
+			const reason = others.length > Math.max(0, max - 1) ? `count budget (${max})` : 'memory budget';
+			this._log(`[LoCoPilot Runner] Resident ${reason} reached; evicting LRU model ${lruId}.`);
+			freedBytes += otherCost.get(lruId) ?? 0;
+			this.stopServer(lruId);
+			others = evictable();
+		}
+	}
+
+	/**
+	 * True when the memory-aware budget should be consulted: only on backends that keep weights in system RAM
+	 * (Metal on Apple Silicon, or CPU). CUDA/Vulkan keep weights in VRAM, which we can't size reliably here, so
+	 * those fall back to the count budget alone.
+	 */
+	private _useMemoryBudget(): boolean {
+		const backend = this.getBackend();
+		return backend === 'metal' || backend === 'cpu';
+	}
+
+	/** Reads total/free system RAM via the native host. Returns undefined on web or if the query fails. */
+	private async _getSystemMemory(): Promise<{ totalmem: number; freemem: number } | undefined> {
+		try {
+			return await this.instantiationService.invokeFunction(async (accessor) => {
+				const native = accessor.get(INativeHostService);
+				const stats = await native.getOSStatistics();
+				return { totalmem: stats.totalmem, freemem: stats.freemem };
+			});
+		} catch {
+			return undefined; // no native host (web), or stats unavailable -> skip the memory budget
+		}
+	}
+
+	/**
+	 * Estimates a model's resident memory footprint in bytes: the on-disk weight size plus a 20% allowance for
+	 * the KV cache and runtime overhead. Sizes are cached per model since the weights don't change at runtime.
+	 * Returns 0 when the size can't be determined (e.g. Ollama models, whose weights we don't manage on disk).
+	 */
+	private async _estimateModelCost(modelId: string): Promise<number> {
+		const cached = this._modelSizeCache.get(modelId);
+		if (cached !== undefined) {
+			return Math.round(cached * 1.2);
+		}
+		const model = this.customLanguageModelsService.getCustomModels().find(m => m.id === modelId);
+		if (!model || !model.localPath || model.provider === 'ollama') {
+			this._modelSizeCache.set(modelId, 0);
+			return 0;
+		}
+		const bytes = await this._weightBytesOnDisk(model.localPath);
+		this._modelSizeCache.set(modelId, bytes);
+		return Math.round(bytes * 1.2);
+	}
+
+	/** Sums the on-disk size of a model's weights: the .gguf file, or every file in an MLX/sharded directory. */
+	private async _weightBytesOnDisk(localPath: string): Promise<number> {
+		try {
+			const uri = URI.file(localPath);
+			const stat = await this.fileService.stat(uri);
+			if (stat.isFile) {
+				return stat.size ?? 0;
+			}
+			if (stat.isDirectory) {
+				const resolved = await this.fileService.resolve(uri, { resolveMetadata: true });
+				return (resolved.children ?? []).reduce((sum, c) => sum + (c.isFile ? (c.size ?? 0) : 0), 0);
+			}
+		} catch {
+			// path missing / unreadable -> treat as unknown (0), so it never blocks a load
+		}
+		return 0;
 	}
 
 	stopManagedServers(exceptModelId?: string): void {
@@ -255,7 +507,10 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 	 * and shows an actionable notification so the user isn't left staring at a stuck "running" state.
 	 */
 	private _reportServerCrash(modelId: string, modelName: string, serverPath: string, exitCode: number | undefined, logs: string[]): void {
-		const tail = logs.slice(-12).join('\n');
+		// Use a generous tail for both the diagnostic log and the heuristics below: the real fatal line is
+		// often the very last thing the engine prints, and a short 12-line window can scroll it off behind
+		// startup banners (device_info, system_info, tokenizer warnings, etc.).
+		const tail = logs.slice(-60).join('\n');
 		const lower = tail.toLowerCase();
 		const code = exitCode ?? 'unknown';
 		this._log(`[LoCoPilot Runner] llama-server for "${modelName}" exited before serving (exit ${code}). Last output:\n${tail}`);
@@ -314,12 +569,18 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 	 * request so GPU kernels are compiled and the cache is primed before the user's first message.
 	 * Fire-and-forget; all failures are swallowed (the server may simply still be loading).
 	 */
-	private async _warmUpLlamaServer(port: number, modelName: string): Promise<void> {
+	private async _warmUpLlamaServer(modelId: string, port: number, modelName: string): Promise<void> {
 		const healthUrl = getLlamaServerHealthUrl(port);
 		const token = CancellationToken.None;
 		// Poll readiness for up to ~2 minutes (large models can take a while to load).
 		let ready = false;
 		for (let attempt = 0; attempt < 120; attempt++) {
+			// Stop immediately if the server crashed or was stopped/evicted - otherwise we'd keep hitting a
+			// dead port with ERR_CONNECTION_REFUSED for the full 2 minutes.
+			if (this._crashedBeforeReady.has(modelId) || !this.runningServers.has(modelId)) {
+				this._log(`[LoCoPilot Runner] Warm-up aborted for ${modelId}: server is no longer running.`);
+				return;
+			}
 			try {
 				const res = await this.requestService.request({ type: 'GET', url: healthUrl }, token);
 				const status = res.res.statusCode ?? 0;
@@ -483,20 +744,40 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 
 	private async findAvailablePort(startPort: number): Promise<number> {
 		let port = startPort;
-		const usedPorts = new Set(Array.from(this.runningServers.values()).map(s => s.port));
+		// Seed from both running servers AND ports already reserved by in-flight launches, then reserve our
+		// pick *synchronously* (before the async probe). This prevents two concurrent launches - e.g. two
+		// different models warming at startup or during a rapid switch - from both choosing the default port
+		// and colliding (the second process fails to bind and exits 1).
+		const usedPorts = new Set<number>([
+			...Array.from(this.runningServers.values()).map(s => s.port),
+			...this._reservedPorts,
+		]);
 		while (usedPorts.has(port)) {
 			port++;
 		}
+		this._reservedPorts.add(port);
 		// On desktop, ask the main process to pick a 127.0.0.1 port that is not already bound (e.g. leftover mlx/llama).
 		return this.instantiationService.invokeFunction((accessor) => {
 			try {
 				const native = accessor.get(INativeHostService);
-				return native.findFreePort(port, 40, 5000, 1).then(free => (free !== 0 ? free : port));
+				return native.findFreePort(port, 40, 5000, 1).then(free => {
+					const chosen = free !== 0 ? free : port;
+					if (chosen !== port) {
+						this._reservedPorts.delete(port);
+						this._reservedPorts.add(chosen);
+					}
+					return chosen;
+				});
 			} catch {
 				// No native host (e.g. web): keep session-local heuristic only.
 				return Promise.resolve(port);
 			}
 		});
+	}
+
+	/** Releases a port reserved by {@link findAvailablePort} once the server is tracked (or its launch failed). */
+	private _releaseReservedPort(port: number): void {
+		this._reservedPorts.delete(port);
 	}
 
 	/** Mark a model as starting and notify the UI immediately so it can show a spinner. */
@@ -517,18 +798,43 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 	/**
 	 * Starts the llama.cpp server for the given model in a new terminal.
 	 * Uses recommended backend (GPU/Metal/CPU). The server runs until the terminal is closed.
+	 *
+	 * Concurrent callers for the same model share a single launch (see {@link _startInFlight}) so two
+	 * pre-warm triggers cannot spawn duplicate servers on the same port.
 	 */
-	async startServerInTerminal(modelId: string): Promise<void> {
+	startServerInTerminal(modelId: string): Promise<void> {
 		if (this.runningServers.has(modelId)) {
 			this._log(`[LoCoPilot Runner] Server for model ${modelId} is already running.`);
-			return;
+			return Promise.resolve();
 		}
+		const inFlight = this._startInFlight.get(modelId);
+		if (inFlight) {
+			this._log(`[LoCoPilot Runner] Launch already in progress for model ${modelId}; reusing it.`);
+			return inFlight;
+		}
+		const launch = this._doStartServerInTerminal(modelId).finally(() => {
+			this._startInFlight.delete(modelId);
+		});
+		this._startInFlight.set(modelId, launch);
+		return launch;
+	}
 
+	private async _doStartServerInTerminal(modelId: string): Promise<void> {
 		const model = this.customLanguageModelsService.getCustomModels().find(m => m.id === modelId);
 		if (!model || !model.localPath) {
 			this._log(`[LoCoPilot Runner] Model ${modelId} not found or has no local path.`);
 			return;
 		}
+
+		// Wait until the workbench has finished restoring before spawning. During early startup VS Code
+		// revives/restores persistent terminals; a terminal we create before that restoration runs gets
+		// torn down with the pty (SIGHUP), which is the "exit 1 right after the server started listening"
+		// crash seen when a model is pre-warmed on reload. The Restored phase guarantees terminal
+		// restoration has completed, so freshly-created terminals are stable. (No-op once already restored,
+		// e.g. for a manual launch from the model picker.)
+		await this.lifecycleService.when(LifecyclePhase.Restored);
+		// Also wait until the terminal/pty backend is actually connected before spawning.
+		await this.terminalService.whenConnected;
 
 		if (model.provider === 'huggingface' && isAppleSiliconMac()) {
 			const hasGguf = await this.pathResolvesToGguf(model.localPath);
@@ -598,6 +904,13 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 					// Keep the terminal open if the process exits/crashes so the real error (e.g. a missing
 					// dependency) stays visible instead of the window vanishing.
 					waitOnExit: true,
+					// Do NOT persist this terminal across window reloads. Persistent terminals are kept alive by
+					// the pty host on reload, which orphans the old llama-server process - it keeps holding the
+					// GPU/Metal memory (and the port). The next startup pre-warm then launches a fresh server
+					// while the orphan is still resident, so the new process dies mid-load ("fitting params to
+					// device memory" -> exit 1). Transient terminals are torn down cleanly on reload, so each
+					// window starts from a clean slate and the pre-warmed model loads reliably.
+					isTransient: true,
 				}
 			});
 
@@ -610,6 +923,21 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 				if (logs.length > LoCoPilotLocalModelRunner.MAX_LOG_LINES) {
 					logs.splice(0, logs.length - LoCoPilotLocalModelRunner.MAX_LOG_LINES);
 				}
+				const rec = this.runningServers.get(modelId);
+				if (rec) {
+					const progress = this._parseLoadProgress(line);
+					if (progress) {
+						rec.loadProgress = progress;
+					}
+					// llama.cpp prints this once the HTTP endpoint is up and the model is loaded. Use it to flip
+					// the phase to 'ready' even for launches that don't go through ensureServerForModel (e.g. the
+					// manual Retry path), so the running indicator turns green promptly.
+					if (!rec.ready && /server is listening|HTTP server listening|all slots are idle|model loaded/i.test(line)) {
+						rec.ready = true;
+						rec.loadProgress = undefined;
+						this._onDidServerStateChange.fire(modelId);
+					}
+				}
 				this._onDidLogUpdate.fire(modelId);
 			}));
 
@@ -619,6 +947,7 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 			// unsupported CPU, etc.) so nothing ever bound the port. Surface a concrete message instead.
 			this._register(terminal.onExit(code => {
 				const exitCode = typeof code === 'number' ? code : undefined;
+				this._releaseReservedPort(port); // the process is gone; free its port reservation
 				const wasIntentional = this._intentionalStops.delete(modelId);
 				if (this.runningServers.has(modelId)) {
 					this.runningServers.delete(modelId);
@@ -629,23 +958,42 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 					return;
 				}
 				this._crashedBeforeReady.add(modelId);
-				this._reportServerCrash(modelId, model.modelName, serverPath, exitCode, logs);
+				// A pre-warm attempt that will be retried suppresses its notification so a self-healing
+				// startup race doesn't flash a scary "failed to start" toast; the crash is still logged.
+				if (this._suppressCrashNotice.delete(modelId)) {
+					const tail = logs.slice(-60).join('\n');
+					this._log(`[LoCoPilot Runner] Pre-warm attempt for "${model.modelName}" exited (exit ${exitCode ?? 'n/a'}); will retry. Last output:\n${tail}`);
+				} else {
+					this._reportServerCrash(modelId, model.modelName, serverPath, exitCode, logs);
+				}
 			}));
 
 			// Wait for the server process to initialise before switching the UI to running state.
 			await timeout(5000);
 
+			// If the process already died during this window (onExit set _crashedBeforeReady and reported it),
+			// do NOT flip to "running" or start warm-up. Doing so was the cause of the endless /health retry
+			// against a dead server and the list showing a crashed model as running.
+			if (this._crashedBeforeReady.has(modelId)) {
+				this._releaseReservedPort(port);
+				this.startingServers.delete(modelId);
+				this._log(`[LoCoPilot Runner] Not marking ${modelId} as running - it crashed during startup.`);
+				return;
+			}
+
 			this.startingServers.delete(modelId); // running state replaces starting state
-			this.runningServers.set(modelId, { port, terminal, kind: 'llama', logs });
+			this.runningServers.set(modelId, { port, terminal, kind: 'llama', logs, lastUsedAt: Date.now(), ready: false });
+			this._releaseReservedPort(port); // now tracked via runningServers; reservation no longer needed
 			this._onDidServerStateChange.fire(modelId);
 
 			// Warm up in the background so the first real message has no kernel-JIT / cache lag.
 			if (this.configurationService.getValue<boolean>(ChatConfiguration.LocopilotLlamaCppWarmup) !== false) {
-				this._warmUpLlamaServer(port, model.modelName);
+				this._warmUpLlamaServer(modelId, port, model.modelName);
 			}
 
 			this._log(`[LoCoPilot Runner] Terminal started with: ${cmdLineForLog}`);
 		} catch (e) {
+			this._releaseReservedPort(port);
 			this._log(`[LoCoPilot Runner] Failed to start terminal: ${e}`);
 			this._endStarting(modelId, `Failed to start llama-server terminal: ${e}`);
 			throw e;
@@ -654,21 +1002,20 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 
 	/**
 	 * Auto-start-on-use entry point. Reuses startServerInTerminal (which picks llama.cpp or mlx-lm),
-	 * but first frees memory by stopping the previously active local server when singleActiveModel is on,
-	 * then waits until the server's OpenAI endpoint actually responds so the caller can send immediately.
+	 * but first frees memory by evicting the least-recently-used server when the resident-model budget is
+	 * reached, then waits until the server's OpenAI endpoint actually responds so the caller can send immediately.
 	 */
 	async ensureServerForModel(modelId: string, token: CancellationToken = CancellationToken.None): Promise<string | undefined> {
-		// Already running - reuse as-is.
+		// Already running - reuse as-is, and refresh its LRU/idle state so it isn't evicted while in use.
 		const existing = this.getServerBaseUrl(modelId);
 		if (existing) {
+			this._touch(modelId);
 			return existing;
 		}
 
-		// Single active model: stop any other running local servers so we don't pile models into RAM/CPU.
-		const singleActive = this.configurationService.getValue<boolean>(ChatConfiguration.LocopilotLocalSingleActiveModel) !== false;
-		if (singleActive) {
-			this.stopManagedServers(modelId);
-		}
+		// Free RAM under an LRU budget instead of killing every other server: a recently-used model stays
+		// warm so switching back to it is instant. singleActiveModel forces the budget to 1 (old behavior).
+		await this._enforceResidentBudget(modelId);
 
 		// Launch (no-op if another caller already kicked it off; startServerInTerminal guards on runningServers).
 		await this.startServerInTerminal(modelId);
@@ -680,7 +1027,89 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 		}
 
 		const ready = await this._waitForServerReady(baseUrl, token, modelId);
-		return ready ? baseUrl : undefined;
+		if (!ready) {
+			return undefined;
+		}
+		// Mark ready (phase -> 'ready') and start the idle keep-alive timer.
+		const rec = this.runningServers.get(modelId);
+		if (rec) {
+			rec.ready = true;
+			rec.loadProgress = undefined;
+		}
+		this._touch(modelId);
+		this._onDidServerStateChange.fire(modelId);
+		return baseUrl;
+	}
+
+	prewarmModel(modelId: string): void {
+		if (this.configurationService.getValue<boolean>(ChatConfiguration.LocopilotLocalPrewarmOnSelect) === false) {
+			return;
+		}
+		// Nothing to do if it's already up or mid-launch.
+		if (this.runningServers.has(modelId) || this.startingServers.has(modelId)) {
+			if (this.runningServers.has(modelId)) {
+				this._touch(modelId); // selecting a warm model should reset its idle timer
+			}
+			return;
+		}
+		const model = this.customLanguageModelsService.getCustomModels().find(m => m.id === modelId);
+		// Only pre-warm models we actually launch a managed server for (GGUF/MLX). Ollama/localhost/cloud
+		// manage their own lifecycle, so there is nothing to warm here.
+		if (!model || !model.localPath || (model.provider !== 'huggingface' && model.provider !== 'localhost')) {
+			return;
+		}
+		this._log(`[LoCoPilot Runner] Pre-warming model ${modelId} in the background.`);
+		// Fire-and-forget: the user's typing overlaps the weight load. Swallow errors (the eventual real
+		// request will surface any failure with full context).
+		this._prewarmWithRetry(modelId).catch(e => this._log(`[LoCoPilot Runner] Pre-warm for ${modelId} failed (ignored): ${e}`));
+	}
+
+	/**
+	 * Pre-warm launch with one automatic retry. A pre-warm fired right at window startup races the rest of
+	 * startup (notably the in-process embedder, which also spins up the GPU/Metal backend); under that
+	 * transient contention the engine occasionally aborts mid-load (clean exit 1) even though the very same
+	 * command starts fine a moment later - which is exactly why a manual start from the model picker always
+	 * works. Rather than surface a scary "failed to start" notification for a self-healing race, we wait for
+	 * startup to settle and try once more. The real request path still reports a genuine, persistent failure.
+	 */
+	private async _prewarmWithRetry(modelId: string): Promise<void> {
+		// First attempt is silent on crash - we retry, so don't alarm the user with a notification yet.
+		this._suppressCrashNotice.add(modelId);
+		const baseUrl = await this.ensureServerForModel(modelId);
+		this._suppressCrashNotice.delete(modelId);
+		// Success, or it failed for a real reason already surfaced by ensureServerForModel (missing binary,
+		// unsupported MLX, ...) - in which case it isn't flagged as a startup crash, so don't retry.
+		if (baseUrl || !this._crashedBeforeReady.has(modelId)) {
+			return;
+		}
+		this._log(`[LoCoPilot Runner] Pre-warm for ${modelId} crashed during startup; retrying once after a short delay.`);
+		this._crashedBeforeReady.delete(modelId);
+		await timeout(4000); // let the embedder / other startup GPU work finish before the second attempt
+		if (this.runningServers.has(modelId) || this.startingServers.has(modelId)) {
+			return; // a real request (or another trigger) already (re)started it in the meantime
+		}
+		// Second attempt is NOT suppressed: if it still crashes, surface the real failure to the user.
+		await this.ensureServerForModel(modelId);
+	}
+
+	/**
+	 * Extracts a short, human-friendly load-progress hint from a llama.cpp/mlx server log line, or
+	 * undefined when the line carries no progress signal. Used by the loading UI while weights load.
+	 */
+	private _parseLoadProgress(line: string): string | undefined {
+		const l = line.trim();
+		// llama.cpp prints an explicit load progress percentage, e.g. "load: ... 42.00 %".
+		const pct = l.match(/(\d{1,3}(?:\.\d+)?)\s*%/);
+		if (pct && /load|tensor|model|buffer/i.test(l)) {
+			return `Loading weights… ${Math.round(parseFloat(pct[1]))}%`;
+		}
+		if (/load_tensors|loading model|llama_model_loader/i.test(l)) {
+			return 'Loading weights…';
+		}
+		if (/warming up|warmup/i.test(l)) {
+			return 'Warming up…';
+		}
+		return undefined;
 	}
 
 	/**
@@ -732,6 +1161,9 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 			const terminal = await this.terminalService.createTerminal({
 				config: {
 					name: `MLX - ${model.modelName}`,
+					// Transient so the process is torn down on window reload instead of being orphaned by the
+					// pty host (see the llama-server launch for the full rationale).
+					isTransient: true,
 				}
 			});
 			await new Promise<void>(resolve => setTimeout(resolve, 400));
@@ -741,7 +1173,8 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 
 			const logs: string[] = [];
 			this.startingServers.delete(modelId);
-			this.runningServers.set(modelId, { port, terminal, kind: 'mlx', logs });
+			this.runningServers.set(modelId, { port, terminal, kind: 'mlx', logs, lastUsedAt: Date.now(), ready: false });
+			this._releaseReservedPort(port); // now tracked via runningServers; reservation no longer needed
 			this._onDidServerStateChange.fire(modelId);
 
 			this._register(terminal.onLineData(line => {
@@ -753,6 +1186,7 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 			}));
 
 			this._register(terminal.onDisposed(() => {
+				this._releaseReservedPort(port);
 				if (this.runningServers.has(modelId)) {
 					this.runningServers.delete(modelId);
 					this._onDidServerStateChange.fire(modelId);
@@ -760,6 +1194,7 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 				}
 			}));
 		} catch (e) {
+			this._releaseReservedPort(port);
 			this._log(`[LoCoPilot Runner] Failed to start MLX terminal: ${e}`);
 			const usingBundled = pythonCmd === getBundledMlxPython(this._appRoot);
 			const failMsg = usingBundled
@@ -797,6 +1232,8 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 			const terminal = await this.terminalService.createTerminal({
 				config: {
 					name: `Ollama - ${model.modelName}`,
+					// Transient so it doesn't get revived/orphaned across window reloads (see llama-server).
+					isTransient: true,
 				}
 			});
 			await new Promise<void>(resolve => setTimeout(resolve, 400));
@@ -807,7 +1244,7 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 			const logs: string[] = [];
 			this.startingServers.delete(modelId);
 			// For Ollama, we don't manage the port, it's always the baseUrl port, but we track the terminal
-			this.runningServers.set(modelId, { port: 11434, terminal, kind: 'llama', logs });
+			this.runningServers.set(modelId, { port: 11434, terminal, kind: 'llama', logs, lastUsedAt: Date.now(), ready: true });
 			this._onDidServerStateChange.fire(modelId);
 
 			this._register(terminal.onLineData(line => {

@@ -65,6 +65,7 @@ import { IKeybindingService } from '../../../../../../platform/keybinding/common
 import { ILabelService } from '../../../../../../platform/label/common/label.js';
 import { WorkbenchList } from '../../../../../../platform/list/browser/listService.js';
 import { ILogService } from '../../../../../../platform/log/common/log.js';
+import { ICommandService } from '../../../../../../platform/commands/common/commands.js';
 import { ObservableMemento, observableMemento } from '../../../../../../platform/observable/common/observableMemento.js';
 import { bindContextKey } from '../../../../../../platform/observable/common/platformObservableUtils.js';
 import { IStorageService, StorageScope, StorageTarget } from '../../../../../../platform/storage/common/storage.js';
@@ -479,6 +480,7 @@ export class ChatInputPart extends Disposable implements IHistoryNavigationWidge
 		@IChatContextService private readonly chatContextService: IChatContextService,
 		@IAgentSessionsService private readonly agentSessionsService: IAgentSessionsService,
 		@IWorkspaceContextService private readonly workspaceContextService: IWorkspaceContextService,
+		@ICommandService private readonly commandService: ICommandService,
 	) {
 		super();
 
@@ -681,7 +683,8 @@ export class ChatInputPart extends Disposable implements IHistoryNavigationWidge
 			if (model) {
 				// Only restore the model if it wasn't the default at the time of storing or it is now the default
 				if (!persistedAsDefault || model.metadata.isDefaultForLocation[this.location]) {
-					this.setCurrentLanguageModel(model);
+					// This is the user's resolved persisted selection - pre-warm it so it's ready at startup.
+					this.setCurrentLanguageModel(model, true /* prewarm resolved selection */);
 					this.checkModelSupported();
 				}
 			} else {
@@ -693,7 +696,8 @@ export class ChatInputPart extends Disposable implements IHistoryNavigationWidge
 						// Only restore the model if it wasn't the default at the time of storing or it is now the default
 						if (!persistedAsDefault || persistedModel.isDefaultForLocation[this.location]) {
 							if (persistedModel.isUserSelectable) {
-								this.setCurrentLanguageModel({ metadata: persistedModel, identifier: persistedSelection });
+								// Resolved persisted selection (arrived asynchronously) - pre-warm it.
+								this.setCurrentLanguageModel({ metadata: persistedModel, identifier: persistedSelection }, true /* prewarm resolved selection */);
 								this.checkModelSupported();
 							}
 						}
@@ -722,7 +726,7 @@ export class ChatInputPart extends Disposable implements IHistoryNavigationWidge
 		const models = this.getModels();
 		const model = models.find(m => m.metadata.vendor === modelMetadata.vendor && m.metadata.id === modelMetadata.id && m.metadata.family === modelMetadata.family);
 		if (model) {
-			this.setCurrentLanguageModel(model);
+			this.setCurrentLanguageModel(model, true /* userInitiated */);
 		}
 	}
 
@@ -730,7 +734,7 @@ export class ChatInputPart extends Disposable implements IHistoryNavigationWidge
 		const models = this.getModels();
 		const model = models.find(m => ILanguageModelChatMetadata.matchesQualifiedName(qualifiedModelName, m.metadata));
 		if (model) {
-			this.setCurrentLanguageModel(model);
+			this.setCurrentLanguageModel(model, true /* userInitiated */);
 			return true;
 		}
 		this.logService.warn(`[chat] Model "${qualifiedModelName}" not found. Use format "<name> (<vendor>)", e.g. "GPT-4o (copilot)".`);
@@ -742,7 +746,7 @@ export class ChatInputPart extends Disposable implements IHistoryNavigationWidge
 		if (models.length > 0) {
 			const currentIndex = models.findIndex(model => model.identifier === this._currentLanguageModel.get()?.identifier);
 			const nextIndex = (currentIndex + 1) % models.length;
-			this.setCurrentLanguageModel(models[nextIndex]);
+			this.setCurrentLanguageModel(models[nextIndex], true /* userInitiated */);
 		}
 	}
 
@@ -955,8 +959,18 @@ export class ChatInputPart extends Disposable implements IHistoryNavigationWidge
 		this._isSyncingToOrFromInputModel = false;
 	}
 
-	public setCurrentLanguageModel(model: ILanguageModelChatMetadataAndIdentifier) {
+	public setCurrentLanguageModel(model: ILanguageModelChatMetadataAndIdentifier, prewarmSelection = false) {
 		this._currentLanguageModel.set(model, undefined);
+
+		// Eagerly pre-warm LoCoPilot local models so they load into memory before the first message and the
+		// cold start is hidden. Fired for a genuine user pick AND for the user's resolved persisted selection
+		// at startup - but NOT for the transient default the picker sets before that selection resolves, so we
+		// don't warm a model the user didn't choose. The runner waits for the terminal backend to be connected
+		// before spawning, so the startup launch no longer gets torn down. Best-effort, fire-and-forget.
+		if (prewarmSelection && model.metadata.vendor === 'locopilot') {
+			this.commandService.executeCommand('locopilot.prewarmModel', model.metadata.id)
+				.catch(err => this.logService.trace(`[chat] prewarm hint failed: ${err}`));
+		}
 
 		if (this.cachedWidth) {
 			// For quick chat and editor chat, relayout because the input may need to shrink to accomodate the model name
@@ -1928,7 +1942,7 @@ export class ChatInputPart extends Disposable implements IHistoryNavigationWidge
 						currentModel: this._currentLanguageModel,
 						setModel: (model: ILanguageModelChatMetadataAndIdentifier) => {
 							this._waitForPersistedLanguageModel.clear();
-							this.setCurrentLanguageModel(model);
+							this.setCurrentLanguageModel(model, true /* userInitiated */);
 							this.renderAttachedContext();
 						},
 						getModels: () => this.getModels()
