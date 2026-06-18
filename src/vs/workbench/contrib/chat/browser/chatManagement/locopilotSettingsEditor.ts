@@ -95,6 +95,31 @@ const LOCAL_PROVIDERS_ADD: ISelectOptionItem[] = [
 
 export const locopilotSettingsSashBorder = registerColor('locopilotSettings.sashBorder', PANEL_BORDER, localize('locopilotSettingsSashBorder', "The color of the LoCoPilot Settings editor splitview sash border."));
 
+/**
+ * Parse a model's parameter count (in billions) from its label, e.g. "Qwen3.5 0.8B" -> 0.8,
+ * "Mistral Small 24B" -> 24, "Gemma 4 26B-A4B MoE" -> 26 (total params), "Gemma 4 E4B" -> 4.
+ * Returns undefined when the name carries no recognizable "<n>B" parameter hint.
+ */
+function parseModelParamsB(name: string | undefined): number | undefined {
+	if (!name) {
+		return undefined;
+	}
+	// First "<number>B" token where B is not part of a longer word (so "GB"/"Bytes" etc. don't match).
+	const match = /(\d+(?:\.\d+)?)\s*B(?![a-z])/i.exec(name);
+	if (!match) {
+		return undefined;
+	}
+	const value = parseFloat(match[1]);
+	return Number.isFinite(value) && value > 0 ? value : undefined;
+}
+
+/** Format a parameter count for display: 24 -> "24B", 0.8 -> "0.8B". */
+function formatParamsB(params: number): string {
+	const rounded = Math.round(params * 10) / 10;
+	const text = Number.isInteger(rounded) ? String(rounded) : rounded.toFixed(1);
+	return `${text}B`;
+}
+
 interface SectionItem {
 	id: string;
 	label: string;
@@ -178,6 +203,8 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 	private modelBestFilter: 'all' | 'best' = 'all';
 	private modelToolsFilter: boolean = false;
 	private modelMtpFilter: boolean = false;
+	/** Parameter-count range filter (billions). Undefined means "all sizes" - no constraint applied. */
+	private modelParamsFilter: { min: number; max: number } | undefined = undefined;
 
 	// Add Language Model form
 	/** Cloud / Local segmented control buttons (index 0 = Cloud, 1 = Local). */
@@ -1006,6 +1033,9 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 			);
 		}
 
+		// Parameters range slider, rendered on its own row below the dropdown filters.
+		this.renderParamsRangeFilter(stickyTop, allModels);
+
 		// makeToggleFilter(
 		// 	localize('customLanguageModels.filter.toolsLabel', 'Tools'),
 		// 	this.modelToolsFilter,
@@ -1042,6 +1072,11 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 			if (this.modelBestFilter === 'best' && this.modelSuitability(m) !== 'best') { return false; }
 			if (this.modelToolsFilter && !m.useNativeTools) { return false; }
 			if (this.modelMtpFilter && !m.mtp) { return false; }
+			// Parameter-count filter: only constrains models whose name carries a "<n>B" hint; others always pass.
+			if (this.modelParamsFilter) {
+				const params = parseModelParamsB(getCustomModelListLabel(m));
+				if (params !== undefined && (params < this.modelParamsFilter.min || params > this.modelParamsFilter.max)) { return false; }
+			}
 			if (!q) { return true; }
 			const label = getCustomModelListLabel(m).toLowerCase();
 			return label.includes(q) || (m.provider || '').toLowerCase().includes(q) || (m.modelName || '').toLowerCase().includes(q) || (m.type || '').toLowerCase().includes(q);
@@ -1065,7 +1100,7 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 			if (ra !== rb) { return ra - rb; }
 			return sortAZ(a, b);
 		});
-		const hasActiveFilter = this.modelTypeFilter !== 'all' || this.modelStatusFilter !== 'all' || this.modelVisibilityFilter !== 'all' || this.modelBestFilter !== 'all' || this.modelToolsFilter || this.modelMtpFilter;
+		const hasActiveFilter = this.modelTypeFilter !== 'all' || this.modelStatusFilter !== 'all' || this.modelVisibilityFilter !== 'all' || this.modelBestFilter !== 'all' || this.modelToolsFilter || this.modelMtpFilter || !!this.modelParamsFilter;
 
 		const listContainer = DOM.append(this.listModelsContainer, $('.models-list-container'));
 		if (sortedModels.length === 0) {
@@ -1979,7 +2014,120 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 		this.loadAgentPanelFromPersisted();
 	}
 
-	/** Clear any active search text / filters so the My Models list opens fresh each visit. */
+	/**
+	 * Render the "Parameters" range slider below the dropdown filters. A custom two-handle slider (real
+	 * pointer dragging - native overlapping range inputs don't drag reliably in Electron) bounded by the
+	 * smallest/largest parameter count among the models, rounded out to "nice" endpoints (e.g. 0.6B/34.8B
+	 * -> 0.5B/64B). Handles default to the full extent ("All sizes"); dragging filters the list on release.
+	 * Hidden when fewer than two distinct parameter counts exist (nothing to range over).
+	 */
+	private renderParamsRangeFilter(stickyTop: HTMLElement, allModels: ICustomLanguageModel[]): void {
+		let dataMin: number | undefined;
+		let dataMax: number | undefined;
+		for (const m of allModels) {
+			const params = parseModelParamsB(getCustomModelListLabel(m));
+			if (params === undefined) { continue; }
+			dataMin = dataMin === undefined ? params : Math.min(dataMin, params);
+			dataMax = dataMax === undefined ? params : Math.max(dataMax, params);
+		}
+		if (dataMin === undefined || dataMax === undefined || dataMin >= dataMax) {
+			// Nothing to range over - drop any stale filter so the list isn't silently constrained.
+			this.modelParamsFilter = undefined;
+			return;
+		}
+
+		// Round the rail out to clean power-of-two-ish endpoints so the scale reads nicely (0.5B ... 64B).
+		const LADDER = [0.5, 1, 2, 4, 8, 16, 32, 64, 128, 256, 512];
+		const railMin = [...LADDER].reverse().find(v => v <= dataMin!) ?? dataMin;
+		const railMax = LADDER.find(v => v >= dataMax!) ?? dataMax;
+		const range = railMax - railMin || 1;
+
+		// Clamp any active filter to the current rail (model set may have changed since it was set).
+		const clamp = (v: number) => Math.max(railMin, Math.min(v, railMax));
+		const state = this.modelParamsFilter
+			? { min: clamp(this.modelParamsFilter.min), max: clamp(this.modelParamsFilter.max) }
+			: { min: railMin, max: railMax };
+
+		const fieldset = DOM.append(stickyTop, $('fieldset.models-filter.models-params-filter'));
+		const legend = DOM.append(fieldset, $('legend.models-filter-label'));
+		legend.textContent = localize('customLanguageModels.filter.paramsLabel', 'Parameters');
+
+		const slider = DOM.append(fieldset, $('.models-params-slider'));
+		DOM.append(slider, $('.models-params-rail'));
+		const fill = DOM.append(slider, $('.models-params-fill'));
+		const minHandle = DOM.append(slider, $('.models-params-handle.models-params-handle-min'));
+		const maxHandle = DOM.append(slider, $('.models-params-handle.models-params-handle-max'));
+		minHandle.tabIndex = 0;
+		maxHandle.tabIndex = 0;
+		minHandle.setAttribute('role', 'slider');
+		maxHandle.setAttribute('role', 'slider');
+		minHandle.setAttribute('aria-label', localize('customLanguageModels.filter.minParams', 'Minimum parameters'));
+		maxHandle.setAttribute('aria-label', localize('customLanguageModels.filter.maxParams', 'Maximum parameters'));
+
+		const scale = DOM.append(fieldset, $('.models-params-scale'));
+		const minLabel = DOM.append(scale, $('span.models-params-minlabel'));
+		const maxLabel = DOM.append(scale, $('span.models-params-maxlabel'));
+
+		const pct = (v: number) => ((v - railMin) / range) * 100;
+		const layout = () => {
+			minHandle.style.left = `${pct(state.min)}%`;
+			maxHandle.style.left = `${pct(state.max)}%`;
+			fill.style.left = `${pct(state.min)}%`;
+			fill.style.width = `${Math.max(0, pct(state.max) - pct(state.min))}%`;
+			// At the extremes the bucket is open-ended ("< 0.5B" / "> 64B") - everything below/above is shown.
+			minLabel.textContent = state.min <= railMin ? `< ${formatParamsB(railMin)}` : formatParamsB(state.min);
+			maxLabel.textContent = state.max >= railMax ? `> ${formatParamsB(railMax)}` : formatParamsB(state.max);
+			minHandle.setAttribute('aria-valuenow', String(state.min));
+			maxHandle.setAttribute('aria-valuenow', String(state.max));
+		};
+
+		const commit = () => {
+			this.modelParamsFilter = (state.min <= railMin && state.max >= railMax) ? undefined : { min: state.min, max: state.max };
+			this.renderListModels();
+		};
+
+		const valueAt = (clientX: number): number => {
+			const rect = slider.getBoundingClientRect();
+			const ratio = rect.width > 0 ? (clientX - rect.left) / rect.width : 0;
+			const v = railMin + Math.max(0, Math.min(1, ratio)) * range;
+			return Math.round(v * 10) / 10; // snap to 0.1B
+		};
+
+		const startDrag = (which: 'min' | 'max', downEvent: PointerEvent) => {
+			downEvent.preventDefault();
+			(which === 'min' ? minHandle : maxHandle).focus();
+			const win = DOM.getWindow(slider);
+			const moveDisposable = DOM.addDisposableListener(win, DOM.EventType.POINTER_MOVE, (e: PointerEvent) => {
+				const v = valueAt(e.clientX);
+				if (which === 'min') { state.min = Math.min(v, state.max); }
+				else { state.max = Math.max(v, state.min); }
+				layout();
+			});
+			const upDisposable = DOM.addDisposableListener(win, DOM.EventType.POINTER_UP, () => {
+				moveDisposable.dispose();
+				upDisposable.dispose();
+				commit();
+			});
+		};
+		this._register(DOM.addDisposableListener(minHandle, DOM.EventType.POINTER_DOWN, (e: PointerEvent) => startDrag('min', e)));
+		this._register(DOM.addDisposableListener(maxHandle, DOM.EventType.POINTER_DOWN, (e: PointerEvent) => startDrag('max', e)));
+
+		// Keyboard: arrow keys nudge the focused handle by one snap step.
+		const onKey = (which: 'min' | 'max', e: KeyboardEvent) => {
+			const delta = e.key === 'ArrowLeft' || e.key === 'ArrowDown' ? -0.1 : (e.key === 'ArrowRight' || e.key === 'ArrowUp' ? 0.1 : 0);
+			if (delta === 0) { return; }
+			e.preventDefault();
+			if (which === 'min') { state.min = Math.max(railMin, Math.min(clamp(Math.round((state.min + delta) * 10) / 10), state.max)); }
+			else { state.max = Math.min(railMax, Math.max(clamp(Math.round((state.max + delta) * 10) / 10), state.min)); }
+			layout();
+			commit();
+		};
+		this._register(DOM.addDisposableListener(minHandle, DOM.EventType.KEY_DOWN, (e: KeyboardEvent) => onKey('min', e)));
+		this._register(DOM.addDisposableListener(maxHandle, DOM.EventType.KEY_DOWN, (e: KeyboardEvent) => onKey('max', e)));
+
+		layout();
+	}
+
 	private resetModelFilters(): void {
 		this.modelSearchQuery = '';
 		this.modelTypeFilter = 'all';
@@ -1988,6 +2136,7 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 		this.modelBestFilter = 'all';
 		this.modelToolsFilter = false;
 		this.modelMtpFilter = false;
+		this.modelParamsFilter = undefined;
 	}
 
 	/**

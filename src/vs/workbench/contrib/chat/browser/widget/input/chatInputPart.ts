@@ -2124,6 +2124,10 @@ export class ChatInputPart extends Disposable implements IHistoryNavigationWidge
 		this._register(inputResizeObserver.observe(this.container));
 	}
 
+	// Average tokens per word for typical English/code output. Used to convert
+	// the stream tracker's word-based stats into an estimated token count/rate.
+	private static readonly WORDS_TO_TOKENS = 1.4;
+
 	public setRequestInProgress(inProgress: boolean, getStats?: () => { lastWordCount: number; impliedWordLoadRate: number; thinkingWordCount?: number } | undefined): void {
 		if (!this._timerBar) {
 			return;
@@ -2156,12 +2160,20 @@ export class ChatInputPart extends Disposable implements IHistoryNavigationWidge
 					const elapsedMs = Date.now() - this._timerStartTime!;
 					const elapsed = Math.floor(elapsedMs / 1000);
 					const stats = getStats?.();
-					const outputTokens = stats?.lastWordCount ?? 0;
-					const thinkingTokens = stats?.thinkingWordCount ?? 0;
+					// The underlying stats are word counts. Convert to an estimated token
+					// count using an average words->tokens ratio (~1.4 tokens per word for
+					// typical English/code output). This is an estimate, not an exact count.
+					const outputWords = stats?.lastWordCount ?? 0;
+					const thinkingWords = stats?.thinkingWordCount ?? 0;
+					const totalWords = outputWords + thinkingWords;
+					const outputTokens = Math.round(outputWords * ChatInputPart.WORDS_TO_TOKENS);
+					const thinkingTokens = Math.round(thinkingWords * ChatInputPart.WORDS_TO_TOKENS);
 					const totalTokens = outputTokens + thinkingTokens;
-					// Compute rate from total tokens (output + thinking) over elapsed time
-					const elapsedSec = elapsedMs / 1000;
-					const rate = totalTokens > 0 && elapsedSec > 1 ? Math.round(totalTokens / elapsedSec) : 0;
+					// Use the stream tracker's implied load rate (words/sec) which ignores
+					// pauses for tool calls, latency and thinking gaps, rather than dividing
+					// by total wall-clock elapsed time. Convert that rate to tokens/sec.
+					const wordRate = stats?.impliedWordLoadRate ?? 0;
+					const rate = wordRate > 0 ? Math.round(wordRate * ChatInputPart.WORDS_TO_TOKENS) : 0;
 
 					timeEl.textContent = `${elapsed}s`;
 
@@ -2169,10 +2181,10 @@ export class ChatInputPart extends Disposable implements IHistoryNavigationWidge
 					sep1.style.display = hasTok ? '' : 'none';
 					tokEl.style.display = hasTok ? '' : 'none';
 					if (hasTok) {
-						tokEl.textContent = `${totalTokens} tokens`;
+						tokEl.textContent = `~${totalTokens} tokens`;
 						tokEl.title = thinkingTokens > 0
-							? `${outputTokens} output + ${thinkingTokens} thinking`
-							: '';
+							? `~${outputTokens} output + ~${thinkingTokens} thinking (estimated from ${totalWords} words)`
+							: `Estimated from ${totalWords} words`;
 					}
 
 					const hasRate = rate > 0;

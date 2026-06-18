@@ -188,6 +188,73 @@
 	outline-offset: 1px;
 }
 
+/* Parameters range slider - custom two-handle slider on its own row below the dropdown filters. */
+.models-params-filter {
+	display: block;
+	width: 100%;
+	margin-top: 12px;
+}
+
+.models-params-slider {
+	position: relative;
+	width: 100%;
+	height: 16px;
+	margin-top: 10px;
+}
+
+.models-params-rail {
+	position: absolute;
+	top: 50%;
+	left: 0;
+	right: 0;
+	height: 4px;
+	transform: translateY(-50%);
+	border-radius: 4px;
+	background-color: var(--vscode-scrollbarSlider-background);
+}
+
+.models-params-fill {
+	position: absolute;
+	top: 50%;
+	height: 4px;
+	transform: translateY(-50%);
+	border-radius: 4px;
+	background-color: var(--vscode-progressBar-background);
+}
+
+.models-params-handle {
+	position: absolute;
+	top: 50%;
+	width: 14px;
+	height: 14px;
+	transform: translate(-50%, -50%);
+	border-radius: 50%;
+	background-color: var(--vscode-foreground);
+	border: 2px solid var(--vscode-editor-background);
+	box-shadow: 0 0 0 1px var(--vscode-contrastBorder, rgba(0, 0, 0, 0.35));
+	cursor: grab;
+	touch-action: none;
+}
+
+.models-params-handle:active {
+	cursor: grabbing;
+}
+
+.models-params-handle:focus-visible {
+	outline: 1px solid var(--vscode-focusBorder);
+	outline-offset: 2px;
+}
+
+.models-params-scale {
+	display: flex;
+	justify-content: space-between;
+	width: 100%;
+	margin-top: 8px;
+	font-size: 11px;
+	color: var(--vscode-descriptionForeground);
+	font-variant-numeric: tabular-nums;
+}
+
 /* Section headers (sticky below the title+search+filters bar).
  * The pin offset is measured at render time (--models-section-header-top) because the bar height
  * changes when the filter dropdowns wrap; falls back to 114px before the variable is set. */
