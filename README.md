@@ -39,7 +39,20 @@ LoCoPilot by **Bixbite AI** brings AI pair programming to your desktop. Use loca
 
 ## Quick Start
 
-**Runs locally in minutes.** Prerequisites: [Node.js](https://nodejs.org/) (LTS), npm.
+**Runs locally in minutes.**
+
+### Prerequisites
+
+| Requirement | Details |
+| ----------- | ------- |
+| **Node.js v22** | v22.21.1 recommended (see `.nvmrc`). Install via [nvm](https://github.com/nvm-sh/nvm) or [nodejs.org](https://nodejs.org/). |
+| **npm** | Comes with Node.js. |
+| **Python 3** | Required for native module compilation. |
+| **Git** | For cloning the repo. |
+| **macOS/Linux** | Xcode Command Line Tools: `xcode-select --install` |
+| **Windows** | [Build Tools for Visual Studio](https://visualstudio.microsoft.com/visual-cpp-build-tools/) (for native module compilation via node-gyp) |
+
+> **Tip (nvm users):** run `nvm use` inside the repo to automatically switch to the correct Node version.
 
 ```bash
 git clone https://github.com/BixbiteAI/LoCoPilot.git
