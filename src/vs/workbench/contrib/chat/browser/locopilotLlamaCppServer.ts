@@ -373,9 +373,14 @@ export function getLlamaCppServerCommand(modelPath: string, backend: LlamaBacken
 
 	// Parallel request slots + continuous batching: serve concurrent requests (e.g. chat alongside inline
 	// completions) by splitting the KV cache into N slots and interleaving their decode steps.
-	if (tuning.parallelSlots && tuning.parallelSlots > 1) {
-		args.push('--parallel', String(Math.floor(tuning.parallelSlots)));
-		if (tuning.continuousBatching) {
+	// We emit `--parallel` for any explicit value >= 1 (including 1). This matters: without the flag,
+	// llama.cpp's own "auto" picks 4 slots and splits the KV cache four ways, which can overflow the
+	// context on long prompts. `0` means "let llama.cpp auto-detect" (no flag). Continuous batching only
+	// helps with more than one slot.
+	if (tuning.parallelSlots && tuning.parallelSlots >= 1) {
+		const slots = Math.floor(tuning.parallelSlots);
+		args.push('--parallel', String(slots));
+		if (slots > 1 && tuning.continuousBatching) {
 			args.push('-cb');
 		}
 	}

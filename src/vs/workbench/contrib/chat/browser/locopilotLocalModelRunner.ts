@@ -674,8 +674,12 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 		const cfg = this.configurationService;
 		const perModelMtp = model?.mtp;
 		const globalMtp = cfg.getValue<boolean>(ChatConfiguration.LocopilotLlamaCppMtp);
+		// Context window is per-model first (the model's own contextWindow, set or auto-derived from the
+		// GGUF), then the global setting, which itself defaults to DEFAULT_LLAMA_CONTEXT_SIZE. This way a
+		// long-context model gets a matching `-c` instead of every model sharing one global window.
+		const perModelContext = model?.contextWindow && model.contextWindow > 0 ? model.contextWindow : undefined;
 		return {
-			contextSize: cfg.getValue<number>(ChatConfiguration.LocopilotLlamaCppContextSize),
+			contextSize: perModelContext ?? cfg.getValue<number>(ChatConfiguration.LocopilotLlamaCppContextSize),
 			flashAttention: cfg.getValue<FlashAttentionMode>(ChatConfiguration.LocopilotLlamaCppFlashAttention),
 			kvCacheType: cfg.getValue<KvCacheType>(ChatConfiguration.LocopilotLlamaCppKvCacheType),
 			multiTokenPrediction: perModelMtp !== undefined ? perModelMtp : globalMtp,

@@ -155,8 +155,16 @@ suite('LoCoPilot llama.cpp server', () => {
 			assert.ok(args.includes('-cb'));
 		});
 
-		test('parallel slots <= 1 emit nothing', () => {
+		test('parallelSlots = 1 emits --parallel 1 but no -cb', () => {
+			// Explicit single slot must pass --parallel 1; otherwise llama.cpp auto-picks several slots
+			// and splits the KV cache, which can overflow context on long prompts. -cb only helps with > 1.
 			const { args } = getLlamaCppServerCommand('/m.gguf', 'metal', undefined, 1234, { parallelSlots: 1, continuousBatching: true });
+			assert.strictEqual(argValue(args, '--parallel'), '1');
+			assert.strictEqual(args.indexOf('-cb'), -1);
+		});
+
+		test('parallelSlots = 0 emits nothing (llama.cpp auto)', () => {
+			const { args } = getLlamaCppServerCommand('/m.gguf', 'metal', undefined, 1234, { parallelSlots: 0, continuousBatching: true });
 			assert.strictEqual(args.indexOf('--parallel'), -1);
 			assert.strictEqual(args.indexOf('-cb'), -1);
 		});

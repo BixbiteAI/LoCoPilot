@@ -696,8 +696,8 @@ configurationRegistry.registerConfiguration({
 		[ChatConfiguration.LocopilotLlamaCppParallel]: {
 			type: 'number',
 			minimum: 0,
-			markdownDescription: nls.localize('locopilot.llamaCpp.parallel.description', "Number of parallel request slots (`--parallel`) for the local llama.cpp server. Values above 1 let the server handle several requests at once (e.g. chat alongside inline completions) by splitting the KV cache into that many slots, at the cost of less context per slot. `0` or `1` uses a single slot (build default)."),
-			default: 0,
+			markdownDescription: nls.localize('locopilot.llamaCpp.parallel.description', "Number of parallel request slots (`--parallel`) for the local llama.cpp server. Values above 1 let the server handle several requests at once (e.g. chat alongside inline completions) by splitting the KV cache into that many slots, at the cost of less context per slot. `1` (default) uses a single slot so each request gets the full context window - recommended for single-user local use. `0` lets llama.cpp auto-detect (which may pick several slots)."),
+			default: 1,
 		},
 		[ChatConfiguration.LocopilotLlamaCppContinuousBatching]: {
 			type: 'boolean',
