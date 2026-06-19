@@ -2128,6 +2128,22 @@ export class ChatInputPart extends Disposable implements IHistoryNavigationWidge
 	// the stream tracker's word-based stats into an estimated token count/rate.
 	private static readonly WORDS_TO_TOKENS = 1.4;
 
+	// Format an elapsed duration (in whole seconds) into a compact human-readable
+	// string, e.g. 45 -> "45s", 112 -> "1m 52s", 3725 -> "1h 2m 5s".
+	private static formatElapsed(totalSeconds: number): string {
+		if (totalSeconds < 60) {
+			return `${totalSeconds}s`;
+		}
+		const hours = Math.floor(totalSeconds / 3600);
+		const minutes = Math.floor((totalSeconds % 3600) / 60);
+		const seconds = totalSeconds % 60;
+		const parts: string[] = [];
+		if (hours > 0) { parts.push(`${hours}h`); }
+		parts.push(`${minutes}m`);
+		parts.push(`${seconds}s`);
+		return parts.join(' ');
+	}
+
 	public setRequestInProgress(inProgress: boolean, getStats?: () => { lastWordCount: number; impliedWordLoadRate: number; thinkingWordCount?: number } | undefined): void {
 		if (!this._timerBar) {
 			return;
@@ -2175,7 +2191,7 @@ export class ChatInputPart extends Disposable implements IHistoryNavigationWidge
 					const wordRate = stats?.impliedWordLoadRate ?? 0;
 					const rate = wordRate > 0 ? Math.round(wordRate * ChatInputPart.WORDS_TO_TOKENS) : 0;
 
-					timeEl.textContent = `${elapsed}s`;
+					timeEl.textContent = ChatInputPart.formatElapsed(elapsed);
 
 					const hasTok = totalTokens > 0;
 					sep1.style.display = hasTok ? '' : 'none';

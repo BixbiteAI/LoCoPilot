@@ -132,6 +132,11 @@ suite('LoCoPilot llama.cpp server', () => {
 			assert.strictEqual(argValue(args, '--n-gpu-layers'), '11');
 		});
 
+		test('gpu backend without override omits --n-gpu-layers (lets llama.cpp auto-fit)', () => {
+			const { args } = getLlamaCppServerCommand('/m.gguf', 'metal', undefined, 1234, {});
+			assert.strictEqual(args.indexOf('--n-gpu-layers'), -1, 'no flag -> llama.cpp auto-fits / full offload on Metal');
+		});
+
 		test('separate draft model adds --model-draft (when MTP off)', () => {
 			const { args } = getLlamaCppServerCommand('/m.gguf', 'metal', undefined, 1234, { draftModelPath: '/draft.gguf', draftGpuLayers: 99 });
 			assert.strictEqual(argValue(args, '--model-draft'), '/draft.gguf');

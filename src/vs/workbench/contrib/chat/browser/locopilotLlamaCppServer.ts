@@ -335,9 +335,18 @@ export function getLlamaCppServerCommand(modelPath: string, backend: LlamaBacken
 		'-fa', flashAttention,
 	];
 
-	// GPU offload: CPU backend forces 0; GPU backends offload everything (or an explicit override).
-	const gpuLayers = backend === 'cpu' ? 0 : (tuning.gpuLayers !== undefined ? tuning.gpuLayers : 999);
-	args.push('--n-gpu-layers', String(gpuLayers));
+	// GPU offload:
+	//  - CPU backend       -> explicit 0 (forcing the flag onto a CPU-only binary would break startup).
+	//  - explicit override -> use exactly that many layers (from tuning / computeGpuLayers partial split).
+	//  - GPU, no override   -> omit the flag entirely so llama.cpp auto-fits to free device memory. On
+	//    Apple Silicon (Metal, unified memory) the whole model still fits, so this auto-offloads everything;
+	//    on a discrete GPU it offloads as many layers as fit instead of OOM-ing on a forced full offload.
+	//    Omitting also silences llama.cpp's "n_gpu_layers already set by user to 999, abort" fit warning.
+	if (backend === 'cpu') {
+		args.push('--n-gpu-layers', '0');
+	} else if (tuning.gpuLayers !== undefined) {
+		args.push('--n-gpu-layers', String(tuning.gpuLayers));
+	}
 
 	// KV cache quantization shrinks the cache (more context on-GPU, faster). f16 = default (no flag needed).
 	if (kvCacheType !== 'f16') {
