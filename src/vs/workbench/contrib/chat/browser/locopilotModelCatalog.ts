@@ -98,20 +98,11 @@ export const LOCOPILOT_DEFAULT_CATALOG: readonly ICatalogModel[] = [
 		tier: '8 GB',
 		contextWindow: 131072,
 	},
-	{
-		catalogId: 'gemma4-e4b-mlx',
-		displayName: 'Gemma 4 E4B (MLX)',
-		vendor: 'Google',
-		blurb: 'Same edge-class Gemma 4 tuned for Apple Silicon via MLX.',
-		repoId: 'unsloth/gemma-4-E4B-it-UD-MLX-4bit',
-		format: 'mlx',
-		engine: 'mlx',
-		approxSizeBytes: Math.round(2.8 * GB),
-		minRamGB: 8,
-		tier: '8 GB',
-		requiresAppleSilicon: true,
-		contextWindow: 131072,
-	},
+	// NOTE: No MLX twin for Gemma 4 E4B. It is a multimodal checkpoint (vision/audio towers, weights
+	// prefixed `language_model.*`), which the text-only MLX engine (mlx-lm) cannot load - it errors with
+	// "Received N parameters not in model" and the server hangs. The GGUF build above runs fine on
+	// llama.cpp (text), so Apple Silicon users get Gemma 4 E4B via that entry. Re-add an MLX twin only
+	// once a text-only MLX build (or mlx-vlm support) is available.
 	{
 		catalogId: 'gemma4-12b-gguf',
 		displayName: 'Gemma 4 12B',
@@ -166,20 +157,9 @@ export const LOCOPILOT_DEFAULT_CATALOG: readonly ICatalogModel[] = [
 		tier: '32 GB+',
 		contextWindow: 262144,
 	},
-	{
-		catalogId: 'qwen36-27b-mlx',
-		displayName: 'Qwen3.6 27B (MLX)',
-		vendor: 'Alibaba (Qwen)',
-		blurb: 'Same Qwen3.6 27B dense coder tuned for Apple Silicon via MLX.',
-		repoId: 'unsloth/Qwen3.6-27B-UD-MLX-4bit',
-		format: 'mlx',
-		engine: 'mlx',
-		approxSizeBytes: Math.round(15 * GB),
-		minRamGB: 32,
-		tier: '32 GB+',
-		requiresAppleSilicon: true,
-		contextWindow: 262144,
-	},
+	// NOTE: No MLX twin for Qwen3.6 27B - the MLX build (unsloth/Qwen3.6-27B-UD-MLX-4bit) is a multimodal
+	// (image-text-to-text) checkpoint, which the text-only MLX engine (mlx-lm) cannot load. The GGUF build
+	// above runs on llama.cpp instead.
 	{
 		catalogId: 'qwen36-35b-a3b-gguf',
 		displayName: 'Qwen3.6 35B-A3B MoE',
@@ -193,20 +173,8 @@ export const LOCOPILOT_DEFAULT_CATALOG: readonly ICatalogModel[] = [
 		tier: '32 GB+',
 		contextWindow: 262144,
 	},
-	{
-		catalogId: 'qwen36-35b-a3b-mlx',
-		displayName: 'Qwen3.6 35B-A3B MoE (MLX)',
-		vendor: 'Alibaba (Qwen)',
-		blurb: 'Same fast Qwen3.6 MoE tuned for Apple Silicon via MLX.',
-		repoId: 'unsloth/Qwen3.6-35B-A3B-UD-MLX-4bit',
-		format: 'mlx',
-		engine: 'mlx',
-		approxSizeBytes: Math.round(19 * GB),
-		minRamGB: 32,
-		tier: '32 GB+',
-		requiresAppleSilicon: true,
-		contextWindow: 262144,
-	},
+	// NOTE: No MLX twin for Qwen3.6 35B-A3B - the MLX build (unsloth/Qwen3.6-35B-A3B-UD-MLX-4bit) is a
+	// multimodal (image-text-to-text) checkpoint that mlx-lm cannot load. Use the GGUF build above.
 
 	// ---- Qwen 3.5 MTP (Alibaba) - GGUF builds with Multi-Token Prediction heads (llama.cpp --spec-type mtp) ----
 	{
@@ -309,21 +277,8 @@ export const LOCOPILOT_DEFAULT_CATALOG: readonly ICatalogModel[] = [
 		defaultHidden: true,
 		contextWindow: 262144,
 	},
-	{
-		catalogId: 'diffusiongemma-26b-a4b-mlx',
-		displayName: 'DiffusionGemma 26B-A4B (MLX)',
-		vendor: 'Google',
-		blurb: 'DiffusionGemma 26B-A4B tuned for Apple Silicon via MLX; experimental.',
-		repoId: 'mlx-community/diffusiongemma-26B-A4B-it-4bit',
-		format: 'mlx',
-		engine: 'mlx',
-		approxSizeBytes: Math.round(15 * GB),
-		minRamGB: 32,
-		tier: '32 GB+',
-		requiresAppleSilicon: true,
-		defaultHidden: true,
-		contextWindow: 262144,
-	},
+	// NOTE: No MLX twin for DiffusionGemma - it is a diffusion (non-autoregressive) model that mlx-lm
+	// cannot run. The experimental GGUF build above is the only entry.
 
 	// ---- Qwen 3.6 MTP (Alibaba) - MTP heads for speculative decoding, hidden until tested ----
 	{
@@ -565,7 +520,6 @@ const DEFAULT_VISIBLE_CATALOG_IDS: ReadonlySet<string> = new Set([
 	'qwen35-9b-mtp-gguf',
 	'qwen36-35b-a3b-gguf',
 	'gemma4-e4b-gguf',
-	'gemma4-e4b-mlx',
 ]);
 
 /**

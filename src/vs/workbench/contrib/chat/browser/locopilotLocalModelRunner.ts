@@ -85,6 +85,13 @@ export interface ILoCoPilotLocalModelRunner {
 	getBackend(): LlamaBackend;
 	getBackendPriority(): LlamaBackend[];
 	getServerBaseUrl(modelId: string): string | undefined;
+	/**
+	 * The model id the running server was loaded with (the `--model` value). Chat requests should send
+	 * this as their `model` field instead of the catalog/HF name, because MLX (mlx_lm.server) tries to
+	 * load a different model when the request id doesn't match what it booted with. Undefined when the
+	 * server isn't running or the engine ignores the field (llama.cpp).
+	 */
+	getServedModelId(modelId: string): string | undefined;
 	getServerLogs(modelId: string): string[];
 	startServerInTerminal(modelId: string): Promise<void>;
 	/**
@@ -137,6 +144,14 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 		port: number;
 		terminal: ITerminalInstance;
 		kind: 'llama' | 'mlx';
+		/**
+		 * The model identifier the server was actually loaded with (the value passed to `--model`).
+		 * For MLX this is the on-disk model directory; mlx_lm.server is per-request model-aware and will
+		 * try to (re)load a *different* model if a chat request's `model` field doesn't match this, which
+		 * silently stalls the request. Chat requests must send this id, not the HF repo name. Undefined
+		 * for engines (llama.cpp) that ignore the request's `model` field.
+		 */
+		servedModelId?: string;
 		logs: string[];
 		/** Epoch ms of the last request/use; drives least-recently-used eviction and the idle timer. */
 		lastUsedAt: number;
@@ -362,6 +377,10 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 				: getLlamaServerBaseUrl(running.port);
 		}
 		return undefined;
+	}
+
+	getServedModelId(modelId: string): string | undefined {
+		return this.runningServers.get(modelId)?.servedModelId;
 	}
 
 	isServerRunning(modelId: string): boolean {
@@ -625,33 +644,20 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 	 * C++ Redistributable, and on Linux a missing system library - then logs it, fires the failure event,
 	 * and shows an actionable notification so the user isn't left staring at a stuck "running" state.
 	 */
-	private _reportServerCrash(modelId: string, modelName: string, serverPath: string, exitCode: number | undefined, logs: string[]): void {
-		// Use a generous tail for both the diagnostic log and the heuristics below: the real fatal line is
-		// often the very last thing the engine prints, and a short 12-line window can scroll it off behind
-		// startup banners (device_info, system_info, tokenizer warnings, etc.).
+	private async _reportServerCrash(modelId: string, modelName: string, exitCode: number | undefined, logs: string[]): Promise<void> {
+		// Use a generous tail: the real fatal line is often the very last thing the engine prints, and a short
+		// window can scroll it off behind startup banners (device_info, system_info, tokenizer warnings, etc.).
 		const tail = logs.slice(-60).join('\n');
-		const lower = tail.toLowerCase();
 		const code = exitCode ?? 'unknown';
 		this._log(`[LoCoPilot Runner] llama-server for "${modelName}" exited before serving (exit ${code}). Last output:\n${tail}`);
 
-		let message = `The local model engine for "${modelName}" failed to start (exit code ${code}).`;
 		const actions: { label: string; run: () => void }[] = [];
 
-		if (isWindows) {
-			// Missing-DLL crashes on Windows manifest as exit 0xC0000135 (-1073741515)/0xC000007B, or a
-			// "vcruntime140.dll/msvcp140.dll was not found" dialog. The llama.cpp Windows builds link
-			// dynamically against the MSVC runtime, which isn't bundled.
-			const looksLikeMissingRuntime = exitCode === -1073741515 || exitCode === -1073741701
-				|| lower.includes('vcruntime') || lower.includes('msvcp140') || lower.includes('0xc0000135') || lower.includes('0xc000007b');
-			if (looksLikeMissingRuntime || exitCode !== 0) {
-				message += ' This usually means the Microsoft Visual C++ Redistributable (x64) is not installed - the bundled engine needs it. Install it, then try again.';
-				actions.push({ label: 'Get VC++ Redistributable', run: () => this.openerService.open('https://aka.ms/vs/17/release/vc_redist.x64.exe') });
-			}
-		} else if (isMacintosh) {
-			message += ' The bundled engine could not load its libraries. Try reinstalling LoCoPilot, or point "locopilot.llamaCpp.serverPath" at your own llama.cpp build.';
-		} else {
-			message += ' The bundled engine could not load a required system library. Check the server terminal output for the missing library name.';
-		}
+		// Keep the user-facing wording friendly and free of internal details (engine names, settings keys,
+		// file paths). The full diagnostic output is always written to the logs above and reachable via the
+		// "Show Logs" action below; the toast just needs to say it failed and that retrying / contacting
+		// support is the next step.
+		const message = `Couldn't start the local model "${modelName}". Please try again - if it keeps happening, restart LoCoPilot or contact LoCoPilot support.`;
 
 		actions.push({ label: 'Show Logs', run: () => this.commandService.executeCommand('workbench.action.toggleDevTools') });
 
@@ -818,6 +824,9 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 	/**
 	 * Resolves the path to use for llama-server. Priority:
 	 *   1. User override (locopilot.llamaCpp.serverPath) - for remote/custom builds. Advanced; unset by default.
+	 *      Only honored when it still points at an existing binary; a configured-but-missing path (e.g. the
+	 *      user deleted their own llama.cpp build) is ignored so we transparently fall back to the bundled
+	 *      engine instead of trying to exec a dead path and crashing on startup.
 	 *   2. Bundled binary shipped inside the app (resources/bin/<platform>-<arch>/llama-server) - the
 	 *      zero-setup default that ships with every package via scripts/fetch-llama-binaries.mjs.
 	 *   3. Conventional install locations (~/llama.cpp/build/bin, Homebrew, etc.).
@@ -826,7 +835,10 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 	private async resolveServerPath(): Promise<string | undefined> {
 		const configured = this.configurationService.getValue<string>(ChatConfiguration.LocopilotLlamaCppServerPath)?.trim();
 		if (configured) {
-			return configured;
+			if (await this._isExistingFile(configured)) {
+				return configured;
+			}
+			this._log(`[LoCoPilot Runner] Configured llama.cpp server path does not exist; falling back to the bundled engine: ${configured}`);
 		}
 		// Prefer the binary we ship inside the installer - no user setup required.
 		const bundled = getBundledLlamaServerPath(this._appRoot);
@@ -1156,7 +1168,7 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 					const tail = logs.slice(-60).join('\n');
 					this._log(`[LoCoPilot Runner] Pre-warm attempt for "${model.modelName}" exited (exit ${exitCode ?? 'n/a'}); will retry. Last output:\n${tail}`);
 				} else {
-					this._reportServerCrash(modelId, model.modelName, serverPath, exitCode, logs);
+					void this._reportServerCrash(modelId, model.modelName, exitCode, logs);
 				}
 			}));
 
@@ -1335,6 +1347,30 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 	}
 
 	/**
+	 * Inspects a single line of mlx_lm.server output for a fatal model-load failure and, if found, returns
+	 * a human-readable explanation; otherwise undefined. mlx_lm prints a Python traceback to stderr when the
+	 * worker thread can't load the weights. The most common case for users is picking an MLX repo that is a
+	 * *multimodal* model (Gemma 3n / "E4B", Qwen-VL, etc.): mlx-lm is text-only and rejects the extra
+	 * vision/audio weights with "Received N parameters not in model", which needs mlx-vlm instead.
+	 */
+	private _mlxLoadFailureReason(line: string, modelName: string): string | undefined {
+		const l = line.toLowerCase();
+		// Multimodal / architecture-mismatch: weights mlx-lm's text loader doesn't recognize.
+		if (l.includes('parameters not in model') || l.includes('language_model.model') || l.includes('vision_tower') || l.includes('audio_tower')) {
+			return `The MLX model "${modelName}" looks like a multimodal model, which the text-only MLX engine (mlx-lm) cannot run. Use a text MLX build (its weights load cleanly), or a GGUF build with llama.cpp instead.`;
+		}
+		// Unsupported architecture in this mlx-lm version.
+		if (l.includes('model type') && l.includes('not supported') || l.includes('no module named') && l.includes('mlx_lm.models')) {
+			return `The MLX model "${modelName}" uses an architecture this version of mlx-lm does not support. Update the bundled MLX runtime, or use a GGUF build with llama.cpp instead.`;
+		}
+		// Generic load-time errors (out of memory, corrupt/incomplete download, safetensors errors).
+		if (l.includes('safetensorerror') || l.includes('metal::malloc') || (l.includes('error') && l.includes('safetensors'))) {
+			return `The MLX model "${modelName}" failed to load (possibly a corrupt or incomplete download, or out of memory). Try re-downloading it, or use a smaller model.`;
+		}
+		return undefined;
+	}
+
+	/**
 	 * Starts `mlx_lm.server` for downloaded Hugging Face MLX weights (Apple Silicon only).
 	 */
 	private async _startMlxServerInTerminal(modelId: string, model: ICustomLanguageModel & { localPath: string }): Promise<void> {
@@ -1365,7 +1401,7 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 
 			const logs: string[] = [];
 			this.startingServers.delete(modelId);
-			this.runningServers.set(modelId, { port, terminal, kind: 'mlx', logs, lastUsedAt: Date.now(), ready: false });
+			this.runningServers.set(modelId, { port, terminal, kind: 'mlx', servedModelId: modelDir, logs, lastUsedAt: Date.now(), ready: false });
 			this._releaseReservedPort(port); // now tracked via runningServers; reservation no longer needed
 			this._onDidServerStateChange.fire(modelId);
 
@@ -1375,6 +1411,26 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 					logs.splice(0, logs.length - LoCoPilotLocalModelRunner.MAX_LOG_LINES);
 				}
 				this._onDidLogUpdate.fire(modelId);
+
+				// mlx_lm loads the weights on a background worker thread; if that load throws (e.g. an
+				// unsupported / multimodal architecture), the worker thread dies but the HTTP thread stays
+				// up and keeps answering GET /v1/models with 200. So our readiness probe passes, the model
+				// shows "ready", yet every chat request enqueues and blocks forever with no error - an
+				// infinite spinner. Detect the load failure from the server's own traceback and surface it
+				// as a real error instead of hanging. Only act before the model has served anything.
+				const current = this.runningServers.get(modelId);
+				if (current && !current.ready && !this._crashedBeforeReady.has(modelId)) {
+					const reason = this._mlxLoadFailureReason(line, model.modelName);
+					if (reason) {
+						this._crashedBeforeReady.add(modelId);
+						this._log(`[LoCoPilot Runner] MLX model "${model.modelName}" failed to load: ${line}`);
+						this.stopServer(modelId);
+						this._endStarting(modelId, reason);
+						if (!this._suppressCrashNotice.has(modelId)) {
+							this.notificationService.notify({ severity: Severity.Error, message: reason });
+						}
+					}
+				}
 			}));
 
 			this._register(terminal.onDisposed(() => {
