@@ -284,6 +284,13 @@ export class ChatInputPart extends Disposable implements IHistoryNavigationWidge
 	private _timerBar: HTMLElement | undefined;
 	private _timerIntervalId: number | undefined;
 	private _timerStartTime: number | undefined;
+	// Total time (ms) the request has spent paused waiting for human approval. This is
+	// subtracted from the wall-clock elapsed so the displayed "total time taken" reflects
+	// model time only, and is not reset across approval pauses within the same request.
+	private _timerPausedAccumMs: number = 0;
+	// When the request is currently paused awaiting approval, the timestamp the pause began;
+	// undefined while actively generating.
+	private _timerPauseStartedAt: number | undefined;
 
 	readonly height = observableValue<number>(this, 0);
 
@@ -2164,13 +2171,26 @@ export class ChatInputPart extends Disposable implements IHistoryNavigationWidge
 		return `${thousands.toFixed(1).replace(/\.0$/, '')}k`;
 	}
 
-	public setRequestInProgress(inProgress: boolean, getStats?: () => { lastWordCount: number; impliedWordLoadRate: number; thinkingWordCount?: number } | undefined): void {
+	public setRequestInProgress(inProgress: boolean, getStats?: () => { lastWordCount: number; impliedWordLoadRate: number; thinkingWordCount?: number } | undefined, paused?: boolean): void {
 		if (!this._timerBar) {
 			return;
 		}
 		if (inProgress) {
+			// Track approval pauses: while paused, accumulate the wait time so it can be
+			// subtracted from the displayed elapsed (and the timer is not reset). The request
+			// is considered the same request across approval pauses.
+			if (paused) {
+				if (this._timerPauseStartedAt === undefined) {
+					this._timerPauseStartedAt = Date.now();
+				}
+			} else if (this._timerPauseStartedAt !== undefined) {
+				this._timerPausedAccumMs += Date.now() - this._timerPauseStartedAt;
+				this._timerPauseStartedAt = undefined;
+			}
 			if (this._timerIntervalId === undefined) {
 				this._timerStartTime = Date.now();
+				this._timerPausedAccumMs = 0;
+				this._timerPauseStartedAt = paused ? Date.now() : undefined;
 
 				// Build the logo loader element (created once, reused each tick)
 				const logoLoader = this._buildLogoLoader(14);
@@ -2193,8 +2213,17 @@ export class ChatInputPart extends Disposable implements IHistoryNavigationWidge
 
 				const update = () => {
 					if (!this._timerBar) { return; }
-					const elapsedMs = Date.now() - this._timerStartTime!;
-					const elapsed = Math.floor(elapsedMs / 1000);
+					const now = Date.now();
+					// Exclude time spent waiting for human approval. An ongoing pause is added
+					// to the already-accumulated paused time so the clock visibly freezes while
+					// waiting, then resumes from where it left off.
+					let pausedMs = this._timerPausedAccumMs;
+					if (this._timerPauseStartedAt !== undefined) {
+						pausedMs += now - this._timerPauseStartedAt;
+					}
+					const elapsedMs = now - this._timerStartTime! - pausedMs;
+					const elapsed = Math.max(0, Math.floor(elapsedMs / 1000));
+					const isPaused = this._timerPauseStartedAt !== undefined;
 					const stats = getStats?.();
 					// The underlying stats are word counts. Convert to an estimated token
 					// count using an average words->tokens ratio (~1.4 tokens per word for
@@ -2227,7 +2256,9 @@ export class ChatInputPart extends Disposable implements IHistoryNavigationWidge
 							: `Estimated from ${totalWords} words`;
 					}
 
-					const hasRate = rate > 0;
+					// While paused awaiting approval nothing is generating, so a stale rate would
+					// be misleading - hide it until generation resumes.
+					const hasRate = rate > 0 && !isPaused;
 					sep2.style.display = hasRate ? '' : 'none';
 					rateEl.style.display = hasRate ? '' : 'none';
 					if (hasRate) {
@@ -2250,6 +2281,8 @@ export class ChatInputPart extends Disposable implements IHistoryNavigationWidge
 				dom.getWindow(this._timerBar).clearInterval(this._timerIntervalId);
 				this._timerIntervalId = undefined;
 				this._timerStartTime = undefined;
+				this._timerPausedAccumMs = 0;
+				this._timerPauseStartedAt = undefined;
 			}
 			this._timerBar.style.display = 'none';
 			dom.clearNode(this._timerBar);
