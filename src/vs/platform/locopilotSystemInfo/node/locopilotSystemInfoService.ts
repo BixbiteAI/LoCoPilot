@@ -139,35 +139,73 @@ export class LoCoPilotSystemInfoService implements ILoCoPilotSystemInfoService {
 			gpus.push({ vendor: 'apple', name: 'Apple Silicon GPU', totalVramBytes: 0, freeVramBytes: 0 });
 		}
 
-		// Generic vendor sniff (no VRAM) on non-NVIDIA discrete GPUs, so the runner at least knows one exists.
+		// AMD/Intel discrete GPUs: sniff the vendor and, where possible, the dedicated VRAM so the runner can
+		// size partial/MoE offload for them too (not just NVIDIA).
 		if (gpus.length === 0) {
-			const vendor = await this._detectOtherGpuVendor();
-			if (vendor) {
-				gpus.push({ vendor, name: `${vendor} GPU`, totalVramBytes: 0, freeVramBytes: 0 });
+			const other = await this._detectOtherGpu();
+			if (other) {
+				gpus.push({ vendor: other.vendor, name: other.name ?? `${other.vendor} GPU`, totalVramBytes: other.totalVramBytes, freeVramBytes: 0 });
 			}
 		}
 
 		return gpus;
 	}
 
-	/** Sniffs for an AMD/Intel GPU on Linux/Windows when nvidia-smi found nothing. Name/VRAM not resolved. */
-	private async _detectOtherGpuVendor(): Promise<GpuVendor | undefined> {
+	/**
+	 * Detects an AMD/Intel GPU on Linux/Windows when nvidia-smi found nothing, including total VRAM when the
+	 * platform exposes it (AMD ROCm `rocm-smi`, Linux DRM sysfs, or Windows WMI `AdapterRAM`). VRAM is `0`
+	 * when it can't be resolved - the runner then treats the GPU as present-but-unsized.
+	 */
+	private async _detectOtherGpu(): Promise<{ vendor: GpuVendor; name?: string; totalVramBytes: number } | undefined> {
 		const plat = platform();
 		try {
 			if (plat === 'linux') {
 				const out = await tryExec('sh', ['-c', 'lspci 2>/dev/null | grep -i vga']);
 				const l = out.toLowerCase();
-				if (l.includes('amd') || l.includes('radeon')) { return 'amd'; }
-				if (l.includes('intel')) { return 'intel'; }
+				let vendor: GpuVendor | undefined;
+				if (l.includes('amd') || l.includes('radeon')) { vendor = 'amd'; }
+				else if (l.includes('intel')) { vendor = 'intel'; }
+				if (!vendor) { return undefined; }
+				return { vendor, totalVramBytes: await this._detectLinuxGpuVram(vendor) };
 			} else if (plat === 'win32') {
-				const out = (await tryExec('wmic', ['path', 'win32_VideoController', 'get', 'Name', '/value'])).toLowerCase();
-				if (out.includes('amd') || out.includes('radeon')) { return 'amd'; }
-				if (out.includes('nvidia')) { return 'nvidia'; }
-				if (out.includes('intel')) { return 'intel'; }
+				// Query both Name and AdapterRAM (bytes, 32-bit so capped at ~4GB) per controller.
+				const out = await tryExec('wmic', ['path', 'win32_VideoController', 'get', 'Name,AdapterRAM', '/format:list']);
+				const lower = out.toLowerCase();
+				let vendor: GpuVendor | undefined;
+				if (lower.includes('amd') || lower.includes('radeon')) { vendor = 'amd'; }
+				else if (lower.includes('nvidia')) { vendor = 'nvidia'; }
+				else if (lower.includes('intel')) { vendor = 'intel'; }
+				if (!vendor) { return undefined; }
+				let vram = 0;
+				for (const m of out.matchAll(/AdapterRAM=(\d+)/gi)) {
+					vram = Math.max(vram, parseInt(m[1], 10) || 0);
+				}
+				return { vendor, totalVramBytes: vram };
 			}
 		} catch {
 			// ignore
 		}
 		return undefined;
+	}
+
+	/**
+	 * Best-effort dedicated VRAM (bytes) for an AMD/Intel GPU on Linux. Tries AMD's `rocm-smi` first, then the
+	 * generic DRM sysfs `mem_info_vram_total` node. Returns 0 when neither is available (integrated GPUs, or
+	 * no permission), which the runner reads as "size unknown".
+	 */
+	private async _detectLinuxGpuVram(vendor: GpuVendor): Promise<number> {
+		if (vendor === 'amd') {
+			const smi = await tryExec('rocm-smi', ['--showmeminfo', 'vram', '--csv']);
+			// Look for the largest integer that plausibly represents a VRAM byte count.
+			let best = 0;
+			for (const m of smi.matchAll(/(\d{9,})/g)) {
+				best = Math.max(best, parseInt(m[1], 10) || 0);
+			}
+			if (best > 0) { return best; }
+		}
+		// Generic DRM sysfs node (AMD/Intel): value is in bytes.
+		const sysfs = await tryExec('sh', ['-c', 'cat /sys/class/drm/card*/device/mem_info_vram_total 2>/dev/null | sort -rn | head -1']);
+		const bytes = parseInt(sysfs.trim(), 10);
+		return Number.isFinite(bytes) && bytes > 0 ? bytes : 0;
 	}
 }

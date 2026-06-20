@@ -221,7 +221,7 @@ export class CustomLanguageModelsService extends Disposable implements ICustomLa
 			this.models = this.models.map(m => ({
 				...m,
 				hidden: m.hidden ?? false,
-				useNativeTools: m.useNativeTools ?? false,
+				useNativeTools: m.useNativeTools ?? true,
 				mtp: m.mtp ?? false,
 				contextWindow: m.contextWindow ?? m.maxInputTokens ?? defaultContextWindow(m.type === 'local'),
 				ollamaPullComplete: m.provider === 'ollama' ? (m.ollamaPullComplete ?? true) : m.ollamaPullComplete,

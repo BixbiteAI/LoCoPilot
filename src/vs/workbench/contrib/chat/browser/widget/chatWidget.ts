@@ -1795,7 +1795,16 @@ export class ChatWidget extends Disposable implements IChatWidget {
 						}
 					}
 				}
-				return timings ? { ...timings, thinkingWordCount } : undefined;
+				if (timings) {
+					return { ...timings, thinkingWordCount };
+				}
+				// During the pure-reasoning phase no output text has streamed yet, so
+				// `contentUpdateTimings` is undefined. Still surface thinking tokens so the
+				// counter isn't blank while the model is only reasoning.
+				if (thinkingWordCount > 0) {
+					return { lastWordCount: 0, impliedWordLoadRate: 0, thinkingWordCount };
+				}
+				return undefined;
 			});
 
 			// Update the editor's placeholder text when it changes in the view model

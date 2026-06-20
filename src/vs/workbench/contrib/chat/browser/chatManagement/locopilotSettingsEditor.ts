@@ -628,8 +628,8 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 		useNativeToolsLabel.textContent = localize('addCustomModel.useNativeTools', 'Tools');
 		const useNativeToolsToggleContainer = DOM.append(this.addFormUseNativeToolsContainer, $('.form-input-container.agent-setting-switch-wrap'));
 		this.addFormUseNativeToolsToggle = this._register(new Toggle({
-			title: localize('addCustomModel.useNativeToolsDescription', 'When on, use the model\'s native tool calling capability. When off, tools are injected into the system prompt. Default: off.'),
-			isChecked: false,
+			title: localize('addCustomModel.useNativeToolsDescription', 'When on, use the model\'s native tool calling capability. When off, tools are injected into the system prompt. Default: on.'),
+			isChecked: true,
 			...defaultToggleStyles
 		}));
 		DOM.append(useNativeToolsToggleContainer, this.addFormUseNativeToolsToggle.domNode);

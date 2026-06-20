@@ -732,6 +732,27 @@ configurationRegistry.registerConfiguration({
 			markdownDescription: nls.localize('locopilot.llamaCpp.mlock.description', "Lock model weights into RAM (`--mlock`) so they are never paged out. Can speed up inference but may fail to start without sufficient memory or locked-memory privileges, so it is off by default."),
 			default: false,
 		},
+		[ChatConfiguration.LocopilotLlamaCppCpuMoeLayers]: {
+			type: 'number',
+			minimum: -1,
+			markdownDescription: nls.localize('locopilot.llamaCpp.cpuMoeLayers.description', "Mixture-of-Experts (MoE) expert offload (`--n-cpu-moe`) for the local llama.cpp server. Keeps the expert tensors of N transformer blocks in system RAM while attention stays on the GPU, so a large MoE model (e.g. a 35B-A3B) can run on a small GPU at near-full speed. `-1` (default) is **automatic**: LoCoPilot detects MoE models from their metadata and offloads only as many blocks as needed to fit your GPU/Metal memory. `0` disables offload (force full GPU). A positive value offloads exactly that many blocks. No effect on dense (non-MoE) models."),
+			default: -1,
+		},
+		[ChatConfiguration.LocopilotLlamaCppPromptLookup]: {
+			type: 'boolean',
+			markdownDescription: nls.localize('locopilot.llamaCpp.promptLookup.description', "Enable prompt-lookup / n-gram speculative decoding on the local llama.cpp server. Drafts tokens by matching n-grams already in the context (no separate draft model), which speeds up highly repetitive generation like code edits. **Build-specific and opt-in**: the flags in `#locopilot.llamaCpp.promptLookupArgs#` are appended and may not be supported by every llama.cpp build (older builds can fail to start). Off by default."),
+			default: false,
+		},
+		[ChatConfiguration.LocopilotLlamaCppPromptLookupArgs]: {
+			type: 'string',
+			markdownDescription: nls.localize('locopilot.llamaCpp.promptLookupArgs.description', "Flags appended when `#locopilot.llamaCpp.promptLookup#` is on. Build-specific; the default is `--spec-type ngram-cache`. Run `llama-server -h` to see your build's supported speculative options and adjust this if needed."),
+			default: '--spec-type ngram-cache',
+		},
+		[ChatConfiguration.LocopilotLlamaCppSlotSavePath]: {
+			type: 'string',
+			markdownDescription: nls.localize('locopilot.llamaCpp.slotSavePath.description', "Directory where the local llama.cpp server persists per-slot KV cache to disk (`--slot-save-path`). When set, a previously-processed prompt prefix (like the agent system prompt) can be restored across restarts instead of being re-processed, so the first turn after a relaunch is fast. The directory must exist. Leave empty to disable."),
+			default: '',
+		},
 		[ChatConfiguration.LocopilotLlamaCppExtraArgs]: {
 			type: 'string',
 			markdownDescription: nls.localize('locopilot.llamaCpp.extraArgs.description', "Extra command-line arguments appended verbatim to the local `llama-server` command (advanced). Example: `--threads 8 --batch-size 2048`. Invalid flags for your build may prevent the server from starting."),

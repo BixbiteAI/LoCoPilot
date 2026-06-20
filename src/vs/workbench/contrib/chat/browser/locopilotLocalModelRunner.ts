@@ -23,6 +23,8 @@ import {
 	getLlamaServerBaseUrl,
 	getLlamaServerHealthUrl,
 	computeGpuLayers,
+	computeCpuMoeLayers,
+	clampContextSize,
 	shouldUseBundledVulkan,
 	LOCOPILOT_LLAMA_SERVER_PORT,
 	LlamaBackend,
@@ -30,7 +32,7 @@ import {
 	type FlashAttentionMode,
 	type KvCacheType
 } from './locopilotLlamaCppServer.js';
-import { readGgufLayerCount } from './locopilotGgufMetadata.js';
+import { readGgufModelInfo, isMoeModelInfo, type IGgufModelInfo } from './locopilotGgufMetadata.js';
 import { ILoCoPilotSystemInfoService, type ISystemHardwareInfo } from '../../../../platform/locopilotSystemInfo/common/locopilotSystemInfo.js';
 import { dirname } from '../../../../base/common/path.js';
 import { isWindows, isMacintosh } from '../../../../base/common/platform.js';
@@ -172,8 +174,8 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 	private readonly _modelSizeCache = new Map<string, number>();
 	/** Cached hardware probe (CPU cores / GPU VRAM); hardware doesn't change during a session. */
 	private _hardwareInfo: Promise<ISystemHardwareInfo | undefined> | undefined;
-	/** Cache of GGUF transformer-layer counts keyed by resolved model file path (for partial GPU offload). */
-	private readonly _layerCountCache = new Map<string, number | undefined>();
+	/** Cache of GGUF model info (layer count, expert count, context length) keyed by resolved model file path. */
+	private readonly _modelInfoCache = new Map<string, IGgufModelInfo>();
 
 	constructor(
 		@ICustomLanguageModelsService private readonly customLanguageModelsService: ICustomLanguageModelsService,
@@ -692,6 +694,15 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 			threads: cfg.getValue<number>(ChatConfiguration.LocopilotLlamaCppThreads),
 			batchSize: cfg.getValue<number>(ChatConfiguration.LocopilotLlamaCppBatchSize),
 			ubatchSize: cfg.getValue<number>(ChatConfiguration.LocopilotLlamaCppUbatchSize),
+			// MoE offload: a negative value means "auto" (left undefined so _augmentTuningWithHardware sizes it
+			// from the GGUF expert count + memory budget); 0 or more is an explicit user override.
+			cpuMoeLayers: (() => {
+				const v = cfg.getValue<number>(ChatConfiguration.LocopilotLlamaCppCpuMoeLayers);
+				return typeof v === 'number' && v >= 0 ? Math.floor(v) : undefined;
+			})(),
+			promptLookup: cfg.getValue<boolean>(ChatConfiguration.LocopilotLlamaCppPromptLookup),
+			promptLookupArgs: cfg.getValue<string>(ChatConfiguration.LocopilotLlamaCppPromptLookupArgs),
+			slotSavePath: cfg.getValue<string>(ChatConfiguration.LocopilotLlamaCppSlotSavePath),
 			mlock: cfg.getValue<boolean>(ChatConfiguration.LocopilotLlamaCppMlock),
 			extraArgs: cfg.getValue<string>(ChatConfiguration.LocopilotLlamaCppExtraArgs),
 		};
@@ -715,23 +726,45 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 		return this._hardwareInfo;
 	}
 
-	/** Reads (and caches) the GGUF transformer-layer count for a resolved model file path. */
-	private async _getLayerCount(modelPath: string): Promise<number | undefined> {
-		if (this._layerCountCache.has(modelPath)) {
-			return this._layerCountCache.get(modelPath);
+	/** Reads (and caches) GGUF model info (layer/expert count, context length) for a resolved file path. */
+	private async _getModelInfo(modelPath: string): Promise<IGgufModelInfo> {
+		const cached = this._modelInfoCache.get(modelPath);
+		if (cached) {
+			return cached;
 		}
-		const count = await readGgufLayerCount(this.fileService, modelPath);
-		this._layerCountCache.set(modelPath, count);
-		return count;
+		const info = await readGgufModelInfo(this.fileService, modelPath);
+		this._modelInfoCache.set(modelPath, info);
+		return info;
+	}
+
+	/**
+	 * Memory budget (bytes) the weights may use on a given backend, or undefined when unknown:
+	 *  - discrete GPU (cuda/vulkan): the largest detected dedicated VRAM pool (any vendor).
+	 *  - metal (Apple Silicon): total system RAM (unified memory shared with the CPU).
+	 *  - cpu: undefined (the resident-budget/eviction path handles RAM pressure instead).
+	 */
+	private async _memoryBudgetBytes(backend: LlamaBackend, hw: ISystemHardwareInfo): Promise<number | undefined> {
+		if (backend === 'cuda' || backend === 'vulkan') {
+			const vram = hw.gpus.map(g => g.totalVramBytes).filter(v => v > 0);
+			return vram.length ? Math.max(...vram) : undefined;
+		}
+		if (backend === 'metal') {
+			const mem = await this._getSystemMemory();
+			return mem?.totalmem;
+		}
+		return undefined;
 	}
 
 	/**
 	 * Augments the base (settings-derived) tuning with hardware-aware values that the user hasn't pinned:
-	 *  - `--threads`: defaults to the machine's physical (performance) core count, which is generally faster
-	 *    than llama.cpp's hyperthread-counting auto-detect on hybrid CPUs. Skipped if the user set threads.
-	 *  - `--n-gpu-layers`: on discrete-GPU backends (CUDA/Vulkan) whose VRAM we know, offloads only as many
-	 *    layers as fit when the model is larger than VRAM, instead of an all-or-nothing full offload that
-	 *    would OOM the GPU. Skipped if the user pinned gpuLayers or the model fits.
+	 *  - `--threads`: defaults to the machine's physical (performance) core count (faster than llama.cpp's
+	 *    hyperthread-counting auto-detect on hybrid CPUs). Skipped if the user set threads.
+	 *  - `--n-cpu-moe`: for Mixture-of-Experts models larger than the memory budget, offloads expert tensors
+	 *    of as many blocks as needed to system RAM so the model fits a small GPU at near-full speed (#1).
+	 *  - `--n-gpu-layers`: for *dense* models larger than VRAM on a discrete GPU, offloads only the layers
+	 *    that fit instead of an all-or-nothing full offload that would OOM the GPU.
+	 *  - context clamp: caps `-c` to the model's trained window and to what the KV-cache budget can hold (#5).
+	 *  - `-b`/`-ub`: sensible prefill batch defaults on GPU backends for faster time-to-first-token (#7).
 	 *
 	 * All steps are best-effort: any missing data leaves the base tuning untouched.
 	 */
@@ -748,17 +781,54 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 			this._log(`[LoCoPilot Runner] Auto-set --threads to ${hw.physicalCoreCount} (physical cores).`);
 		}
 
-		// Partial GPU offload: only when the user left gpuLayers unset and we're on a discrete-GPU backend.
-		if (tuning.gpuLayers === undefined && (backend === 'cuda' || backend === 'vulkan')) {
-			const nvidia = hw.gpus.find(g => g.vendor === 'nvidia' && g.totalVramBytes > 0);
-			if (nvidia) {
-				const modelBytes = await this._weightBytesOnDisk(modelPath);
-				const layerCount = await this._getLayerCount(modelPath);
-				const layers = computeGpuLayers({ backend, modelBytes, layerCount, vramBytes: nvidia.totalVramBytes });
+		const info = await this._getModelInfo(modelPath);
+		const budget = await this._memoryBudgetBytes(backend, hw);
+
+		// #1 MoE expert offload vs dense partial GPU offload. These are mutually exclusive: a MoE model uses
+		// --n-cpu-moe (keep attention on GPU, experts on CPU); a dense model uses --n-gpu-layers.
+		if (backend !== 'cpu' && budget && budget > 0) {
+			const modelBytes = await this._weightBytesOnDisk(modelPath);
+			if (isMoeModelInfo(info) && tuning.cpuMoeLayers === undefined) {
+				const moe = computeCpuMoeLayers({ backend, modelBytes, layerCount: info.layerCount, expertCount: info.expertCount, memoryBudgetBytes: budget });
+				if (moe !== undefined) {
+					tuning.cpuMoeLayers = moe;
+					this._log(`[LoCoPilot Runner] MoE model (${Math.round(modelBytes / 1e9)}GB, ${info.expertCount} experts) exceeds the ${Math.round(budget / 1e9)}GB budget; offloading experts of ${moe}/${info.layerCount} blocks to CPU (--n-cpu-moe).`);
+				}
+			} else if (!isMoeModelInfo(info) && tuning.gpuLayers === undefined && (backend === 'cuda' || backend === 'vulkan')) {
+				const layers = computeGpuLayers({ backend, modelBytes, layerCount: info.layerCount, vramBytes: budget });
 				if (layers !== undefined) {
 					tuning.gpuLayers = layers;
-					this._log(`[LoCoPilot Runner] Model (${Math.round(modelBytes / 1e9)}GB) exceeds VRAM budget on ${nvidia.name} (${Math.round(nvidia.totalVramBytes / 1e9)}GB); offloading ${layers}/${layerCount} layers to GPU, rest on CPU.`);
+					this._log(`[LoCoPilot Runner] Dense model (${Math.round(modelBytes / 1e9)}GB) exceeds the ${Math.round(budget / 1e9)}GB VRAM budget; offloading ${layers}/${info.layerCount} layers to GPU, rest on CPU.`);
 				}
+			}
+		}
+
+		// #5 Context clamp: never request more than the model supports, nor more than the KV budget can hold.
+		// Use ~25% of the memory budget as the KV-cache allowance (weights take the rest).
+		if (tuning.contextSize && tuning.contextSize > 0) {
+			const clamped = clampContextSize({
+				requestedContext: tuning.contextSize,
+				modelContextLength: info.contextLength,
+				kvBudgetBytes: budget ? budget * 0.25 : undefined,
+				layerCount: info.layerCount,
+			});
+			if (clamped < tuning.contextSize) {
+				this._log(`[LoCoPilot Runner] Clamped context ${tuning.contextSize} -> ${clamped} to fit the model/memory budget.`);
+				tuning.contextSize = clamped;
+			}
+		}
+
+		// #7 Prefill batch tuning on GPU backends: a larger *physical* batch (ubatch) processes the prompt in
+		// bigger chunks, which meaningfully cuts time-to-first-token on a GPU. We raise ubatch from the build
+		// default (512) to 1024 - a safe bump the GPU memory comfortably absorbs, and the offload logic above
+		// already keeps the model within budget. CPU is left alone (large batches don't help and cost RAM).
+		// Only applied when the user hasn't pinned these.
+		if (backend === 'cuda' || backend === 'vulkan' || backend === 'metal') {
+			if (!tuning.batchSize || tuning.batchSize <= 0) {
+				tuning.batchSize = 2048;
+			}
+			if (!tuning.ubatchSize || tuning.ubatchSize <= 0) {
+				tuning.ubatchSize = 1024;
 			}
 		}
 
@@ -1326,8 +1396,11 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 	 */
 	private async _waitForServerReady(baseUrl: string, token: CancellationToken, modelId?: string): Promise<boolean> {
 		const url = `${baseUrl}/models`;
-		// Large models can take a while to load; poll for up to ~2 minutes.
-		for (let attempt = 0; attempt < 120; attempt++) {
+		// Large models on a cold cache can take several minutes to load into memory; poll for up to ~5
+		// minutes. We only give up early when the process actually crashes (checked below), so the wait is
+		// bounded by real readiness, not an arbitrary short timeout that surfaced a false "could not start".
+		const maxAttempts = 300;
+		for (let attempt = 0; attempt < maxAttempts; attempt++) {
 			if (token.isCancellationRequested) {
 				return false;
 			}

@@ -191,19 +191,55 @@ class GgufCursor {
  * Reads the transformer block (layer) count from a GGUF model file, or `undefined` if it can't be
  * determined (not a GGUF file, parse error, or the key is absent). The relevant key is
  * `<architecture>.block_count`, e.g. `llama.block_count`, `qwen2.block_count`.
+ *
+ * Thin wrapper over {@link readGgufModelInfo} kept for existing callers that only need the layer count.
  */
 export async function readGgufLayerCount(fileService: IFileService, filePath: string): Promise<number | undefined> {
+	return (await readGgufModelInfo(fileService, filePath)).layerCount;
+}
+
+/**
+ * Architecture-level facts we extract from a GGUF header in a single pass. All fields are optional:
+ * any that can't be determined (older header, missing key, parse error) come back `undefined` and the
+ * caller falls back to llama.cpp's own defaults.
+ */
+export interface IGgufModelInfo {
+	/** `<arch>.block_count` - transformer layer count, for partial GPU offload (`--n-gpu-layers`). */
+	readonly layerCount: number | undefined;
+	/**
+	 * `<arch>.expert_count` - number of routed experts. Present and > 0 only for Mixture-of-Experts
+	 * models (e.g. Qwen3 A3B, Gemma MoE). Drives the decision to offload expert tensors to CPU
+	 * (`--n-cpu-moe`), which lets a large MoE model run on a small GPU at near-full speed.
+	 */
+	readonly expertCount: number | undefined;
+	/** `<arch>.context_length` - the model's trained context window, used to cap our `-c` to RAM budget. */
+	readonly contextLength: number | undefined;
+}
+
+/** True when the GGUF metadata indicates a Mixture-of-Experts model (has routed experts). */
+export function isMoeModelInfo(info: IGgufModelInfo): boolean {
+	return (info.expertCount ?? 0) > 0;
+}
+
+/**
+ * Single-pass GGUF header read returning {@link IGgufModelInfo}. Stops as soon as all three keys are
+ * found (or the metadata block ends). Only the header is read - never the multi-GB tensor data.
+ */
+export async function readGgufModelInfo(fileService: IFileService, filePath: string): Promise<IGgufModelInfo> {
+	let layerCount: number | undefined;
+	let expertCount: number | undefined;
+	let contextLength: number | undefined;
 	try {
 		const uri = URI.file(filePath);
 		const cursor = new GgufCursor(fileService, uri);
 
 		const magic = await cursor.u32();
 		if (magic !== GGUF_MAGIC) {
-			return undefined; // not a GGUF file
+			return { layerCount, expertCount, contextLength }; // not a GGUF file
 		}
 		const version = await cursor.u32();
 		if (version < 2) {
-			return undefined; // v1 used uint32 length prefixes; not worth supporting
+			return { layerCount, expertCount, contextLength }; // v1 used uint32 length prefixes; not supported
 		}
 		await cursor.u64(); // tensor_count (unused)
 		const kvCount = await cursor.u64();
@@ -211,18 +247,27 @@ export async function readGgufLayerCount(fileService: IFileService, filePath: st
 		for (let i = 0; i < kvCount; i++) {
 			const key = await cursor.str();
 			const valueType = await cursor.u32() as GgufType;
-			if (key.endsWith('.block_count')) {
-				// Layer counts are stored as UINT32 in practice, but accept any scalar for robustness.
-				if (scalarSize(valueType) !== undefined) {
-					const n = await cursor.scalar(valueType);
-					return Number.isFinite(n) && n > 0 ? Math.floor(n) : undefined;
-				}
-				return undefined;
+			// Scalar numeric keys we care about; everything else is skipped without decoding.
+			const isScalar = scalarSize(valueType) !== undefined;
+			if (isScalar && key.endsWith('.block_count')) {
+				const n = await cursor.scalar(valueType);
+				layerCount = Number.isFinite(n) && n > 0 ? Math.floor(n) : undefined;
+			} else if (isScalar && key.endsWith('.expert_count')) {
+				const n = await cursor.scalar(valueType);
+				expertCount = Number.isFinite(n) && n >= 0 ? Math.floor(n) : undefined;
+			} else if (isScalar && key.endsWith('.context_length')) {
+				const n = await cursor.scalar(valueType);
+				contextLength = Number.isFinite(n) && n > 0 ? Math.floor(n) : undefined;
+			} else {
+				await cursor.skipValue(valueType);
 			}
-			await cursor.skipValue(valueType);
+			// Early-out once we have everything; the rest of the header (tokenizer vocab) is large.
+			if (layerCount !== undefined && expertCount !== undefined && contextLength !== undefined) {
+				break;
+			}
 		}
-		return undefined; // key not present
 	} catch {
-		return undefined; // any failure -> caller falls back to full offload
+		// any failure -> return whatever we gathered (callers treat undefined as "use defaults")
 	}
+	return { layerCount, expertCount, contextLength };
 }

@@ -95,7 +95,7 @@ import { IChatResponseViewModel } from '../../../common/model/chatViewModel.js';
 import { IChatAgentService } from '../../../common/participants/chatAgents.js';
 import { ILanguageModelToolsService } from '../../../common/tools/languageModelToolsService.js';
 import { ChatHistoryNavigator } from '../../../common/widget/chatWidgetHistoryService.js';
-import { ChatSessionPrimaryPickerAction, ChatSubmitAction, IChatExecuteActionContext, OpenDelegationPickerAction, OpenModelPickerAction, OpenModePickerAction, OpenSessionTargetPickerAction, OpenWorkspacePickerAction } from '../../actions/chatExecuteActions.js';
+import { ChatSessionPrimaryPickerAction, ChatSubmitAction, IChatExecuteActionContext, OpenDelegationPickerAction, OpenModelPickerAction, OpenModePickerAction, OpenReasoningEffortPickerAction, OpenSessionTargetPickerAction, OpenWorkspacePickerAction } from '../../actions/chatExecuteActions.js';
 import { AgentSessionProviders, getAgentSessionProvider } from '../../agentSessions/agentSessions.js';
 import { IAgentSessionsService } from '../../agentSessions/agentSessionsService.js';
 import { ChatAttachmentModel } from '../../attachments/chatAttachmentModel.js';
@@ -120,6 +120,7 @@ import { ChatSelectedTools } from './chatSelectedTools.js';
 import { DelegationSessionPickerActionItem } from './delegationSessionPickerActionItem.js';
 import { IModelPickerDelegate, ModelPickerActionItem } from './modelPickerActionItem.js';
 import { IModePickerDelegate, ModePickerActionItem } from './modePickerActionItem.js';
+import { ReasoningEffortPickerActionItem } from './reasoningEffortPickerActionItem.js';
 import { SessionTypePickerActionItem } from './sessionTargetPickerActionItem.js';
 import { WorkspacePickerActionItem } from './workspacePickerActionItem.js';
 
@@ -329,6 +330,7 @@ export class ChatInputPart extends Disposable implements IHistoryNavigationWidge
 	private agentSessionTypeKey: IContextKey<string>;
 	private chatSessionHasCustomAgentTarget: IContextKey<boolean>;
 	private modelWidget: ModelPickerActionItem | undefined;
+	private reasoningEffortWidget: ReasoningEffortPickerActionItem | undefined;
 	private modeWidget: ModePickerActionItem | undefined;
 	private sessionTargetWidget: SessionTypePickerActionItem | undefined;
 	private delegationWidget: DelegationSessionPickerActionItem | undefined;
@@ -758,6 +760,10 @@ export class ChatInputPart extends Disposable implements IHistoryNavigationWidge
 
 	public openModePicker(): void {
 		this.modeWidget?.show();
+	}
+
+	public openReasoningEffortPicker(): void {
+		this.reasoningEffortWidget?.show();
 	}
 
 	public openSessionTargetPicker(): void {
@@ -1950,6 +1956,8 @@ export class ChatInputPart extends Disposable implements IHistoryNavigationWidge
 						getModels: () => this.getModels()
 					};
 					return this.modelWidget = this.instantiationService.createInstance(ModelPickerActionItem, action, undefined, itemDelegate, pickerOptions);
+				} else if (action.id === OpenReasoningEffortPickerAction.ID && action instanceof MenuItemAction) {
+					return this.reasoningEffortWidget = this.instantiationService.createInstance(ReasoningEffortPickerActionItem, action, pickerOptions);
 				} else if (action.id === OpenModePickerAction.ID && action instanceof MenuItemAction) {
 					const delegate: IModePickerDelegate = {
 						currentMode: this._currentModeObservable,
@@ -2144,6 +2152,18 @@ export class ChatInputPart extends Disposable implements IHistoryNavigationWidge
 		return parts.join(' ');
 	}
 
+	// Format a token count compactly: exact below 1000, otherwise abbreviated with a
+	// 'k' suffix (e.g. 1300 -> "1.3k", 24700 -> "24.7k") to stay readable in the
+	// compact status bar.
+	private static formatTokenCount(count: number): string {
+		if (count < 1000) {
+			return `${count}`;
+		}
+		const thousands = count / 1000;
+		// One decimal place, but drop a trailing ".0" (e.g. 2000 -> "2k", not "2.0k").
+		return `${thousands.toFixed(1).replace(/\.0$/, '')}k`;
+	}
+
 	public setRequestInProgress(inProgress: boolean, getStats?: () => { lastWordCount: number; impliedWordLoadRate: number; thinkingWordCount?: number } | undefined): void {
 		if (!this._timerBar) {
 			return;
@@ -2188,6 +2208,10 @@ export class ChatInputPart extends Disposable implements IHistoryNavigationWidge
 					// Use the stream tracker's implied load rate (words/sec) which ignores
 					// pauses for tool calls, latency and thinking gaps, rather than dividing
 					// by total wall-clock elapsed time. Convert that rate to tokens/sec.
+					// Only show a rate when the stream tracker has a genuine generation rate
+					// (active generation). A wall-clock fallback over total elapsed time would
+					// include reasoning/tool/latency gaps and report a misleadingly low rate,
+					// so during those gaps we hide the rate rather than show a wrong number.
 					const wordRate = stats?.impliedWordLoadRate ?? 0;
 					const rate = wordRate > 0 ? Math.round(wordRate * ChatInputPart.WORDS_TO_TOKENS) : 0;
 
@@ -2197,7 +2221,7 @@ export class ChatInputPart extends Disposable implements IHistoryNavigationWidge
 					sep1.style.display = hasTok ? '' : 'none';
 					tokEl.style.display = hasTok ? '' : 'none';
 					if (hasTok) {
-						tokEl.textContent = `~${totalTokens} tokens`;
+						tokEl.textContent = `~${ChatInputPart.formatTokenCount(totalTokens)} tokens`;
 						tokEl.title = thinkingTokens > 0
 							? `~${outputTokens} output + ~${thinkingTokens} thinking (estimated from ${totalWords} words)`
 							: `Estimated from ${totalWords} words`;

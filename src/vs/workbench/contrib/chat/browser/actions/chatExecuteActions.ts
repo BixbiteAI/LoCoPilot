@@ -429,6 +429,43 @@ export class OpenModelPickerAction extends Action2 {
 		}
 	}
 }
+export class OpenReasoningEffortPickerAction extends Action2 {
+	static readonly ID = 'workbench.action.chat.openReasoningEffortPicker';
+
+	constructor() {
+		super({
+			id: OpenReasoningEffortPickerAction.ID,
+			title: localize2('interactive.openReasoningEffortPicker.label', "Open Reasoning Effort Picker"),
+			tooltip: localize('setReasoningEffort', "Set how much the model thinks before answering"),
+			category: CHAT_CATEGORY,
+			f1: false,
+			precondition: ChatContextKeys.enabled,
+			menu: {
+				id: MenuId.ChatInput,
+				order: 4,
+				group: 'navigation',
+				when:
+					ContextKeyExpr.and(
+						ChatContextKeys.lockedToCodingAgent.negate(),
+						ContextKeyExpr.or(
+							ContextKeyExpr.equals(ChatContextKeys.location.key, ChatAgentLocation.Chat),
+							ContextKeyExpr.equals(ChatContextKeys.location.key, ChatAgentLocation.EditorInline),
+							ContextKeyExpr.equals(ChatContextKeys.location.key, ChatAgentLocation.Notebook),
+							ContextKeyExpr.equals(ChatContextKeys.location.key, ChatAgentLocation.Terminal))
+					)
+			}
+		});
+	}
+
+	override async run(accessor: ServicesAccessor, ...args: unknown[]): Promise<void> {
+		const widgetService = accessor.get(IChatWidgetService);
+		const widget = widgetService.lastFocusedWidget;
+		if (widget) {
+			await widgetService.reveal(widget);
+			widget.input.openReasoningEffortPicker();
+		}
+	}
+}
 export class OpenModePickerAction extends Action2 {
 	static readonly ID = 'workbench.action.chat.openModePicker';
 
@@ -910,6 +947,7 @@ export function registerChatExecuteActions() {
 	registerAction2(ToggleChatModeAction);
 	registerAction2(SwitchToNextModelAction);
 	registerAction2(OpenModelPickerAction);
+	registerAction2(OpenReasoningEffortPickerAction);
 	registerAction2(OpenModePickerAction);
 	registerAction2(OpenSessionTargetPickerAction);
 	registerAction2(OpenDelegationPickerAction);

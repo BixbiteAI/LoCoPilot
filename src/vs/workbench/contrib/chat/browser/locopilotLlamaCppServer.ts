@@ -198,6 +198,48 @@ export function resolveKvCacheType(kvCacheType: KvCacheType, contextSize: number
 	return contextSize >= KV_AUTO_QUANT_CONTEXT_THRESHOLD ? 'q8_0' : 'f16';
 }
 
+/** Inputs for {@link clampContextSize}; all optional except the requested size. */
+export interface ContextClampInputs {
+	/** Context the caller wants (from per-model setting or the global default). */
+	requestedContext: number;
+	/** The model's trained context window from GGUF (`<arch>.context_length`); we never exceed it. */
+	modelContextLength?: number;
+	/** Bytes of memory the KV cache may use (a slice of the free RAM/VRAM budget). */
+	kvBudgetBytes?: number;
+	/** Transformer block count, used to size the KV cache. */
+	layerCount?: number;
+	/** Bytes per token *per layer* for the KV cache at f16 (k+v). Defaults to a conservative 160KB/1k est. */
+	kvBytesPerTokenPerLayer?: number;
+}
+
+/** Smallest context we will ever clamp down to, so a tiny budget can't make the model unusable. */
+export const MIN_CLAMPED_CONTEXT = 4096;
+
+/**
+ * Clamps the requested context window to (a) the model's trained maximum and (b) what the KV-cache memory
+ * budget can hold, rounded down to a multiple of 1024 and floored at {@link MIN_CLAMPED_CONTEXT}. Returns
+ * the requested size unchanged when no constraint applies or inputs are missing. This stops a long-context
+ * model from allocating a huge KV cache and OOM-ing / paging on a low-memory machine.
+ */
+export function clampContextSize(inputs: ContextClampInputs): number {
+	let ctx = Math.floor(inputs.requestedContext > 0 ? inputs.requestedContext : DEFAULT_LLAMA_CONTEXT_SIZE);
+	if (inputs.modelContextLength && inputs.modelContextLength > 0) {
+		ctx = Math.min(ctx, inputs.modelContextLength);
+	}
+	if (inputs.kvBudgetBytes && inputs.kvBudgetBytes > 0 && inputs.layerCount && inputs.layerCount > 0) {
+		const perTokenPerLayer = inputs.kvBytesPerTokenPerLayer && inputs.kvBytesPerTokenPerLayer > 0
+			? inputs.kvBytesPerTokenPerLayer
+			: 160; // ~160 B/token/layer at f16 for a typical 7B-class model; conservative.
+		const maxTokens = Math.floor(inputs.kvBudgetBytes / (perTokenPerLayer * inputs.layerCount));
+		if (maxTokens > 0) {
+			ctx = Math.min(ctx, maxTokens);
+		}
+	}
+	// Round down to a 1024 multiple and never go below the floor.
+	ctx = Math.floor(ctx / 1024) * 1024;
+	return Math.max(MIN_CLAMPED_CONTEXT, ctx);
+}
+
 /**
  * Performance tuning options for the llama.cpp server.
  * All optional; every value is chosen so that an unsupported system falls back gracefully
@@ -236,6 +278,29 @@ export interface LlamaServerTuning {
 	draftModelPath?: string;
 	/** GPU layers to offload for the draft model (`--gpu-layers-draft`). Emitted only when > 0. */
 	draftGpuLayers?: number;
+	/**
+	 * MoE expert-tensor CPU offload (`--n-cpu-moe N`): keep the first N transformer blocks' expert FFN
+	 * tensors in system RAM while attention/dense weights stay on the GPU. For Mixture-of-Experts models
+	 * (only a few experts are active per token) this lets a large model fit a small GPU at near-full speed.
+	 * Emitted only when > 0; meaningless on dense models (they have no expert tensors). See
+	 * {@link computeCpuMoeLayers} for the fit heuristic.
+	 */
+	cpuMoeLayers?: number;
+	/**
+	 * Prompt-lookup / n-gram speculative decoding (build-specific, OPT-IN, default off). Drafts tokens by
+	 * matching n-grams already present in the context - no separate draft model - which is a large win on
+	 * highly repetitive generation (code edits). When on, appends {@link promptLookupArgs} verbatim. The
+	 * exact flag names vary by llama.cpp build, so the args are configurable and this never turns on by itself.
+	 */
+	promptLookup?: boolean;
+	/** Flags appended when {@link promptLookup} is on. Build-specific; defaults to `--spec-type ngram-cache`. */
+	promptLookupArgs?: string;
+	/**
+	 * Directory for persisting per-slot KV cache to disk (`--slot-save-path`). Lets the server restore a
+	 * previously-processed prompt prefix (e.g. the agent system prompt) across restarts instead of
+	 * re-prefilling it, so the first turn after a relaunch is fast. Emitted only when non-empty.
+	 */
+	slotSavePath?: string;
 	/**
 	 * Number of parallel request slots (`--parallel`). >1 lets the server handle several requests at once
 	 * (e.g. chat + inline completions) by splitting the KV cache into that many slots. Emitted only when > 0.
@@ -308,6 +373,59 @@ export function computeGpuLayers(inputs: GpuLayerInputs): number | undefined {
 	return Math.max(0, Math.min(layerCount, fit));
 }
 
+/** Inputs for {@link computeCpuMoeLayers}. Byte counts are absolute; layerCount is the model's blocks. */
+export interface CpuMoeInputs {
+	backend: LlamaBackend;
+	/** On-disk weight size in bytes. */
+	modelBytes: number;
+	/** Transformer block count from GGUF metadata, or undefined when unknown. */
+	layerCount: number | undefined;
+	/** Number of routed experts (`<arch>.expert_count`); MoE only. <= 1 / undefined means "not MoE". */
+	expertCount: number | undefined;
+	/** Dedicated VRAM in bytes for discrete GPUs (CUDA/Vulkan), or total RAM for Metal unified memory. */
+	memoryBudgetBytes: number | undefined;
+	/** Fraction of the budget the model may use before we start offloading experts. Defaults to 0.9. */
+	budgetFraction?: number;
+}
+
+/**
+ * Decides how many transformer blocks should have their expert (FFN) tensors offloaded to CPU
+ * (`--n-cpu-moe N`) so a Mixture-of-Experts model fits the available GPU/Metal memory budget:
+ *  - `undefined` -> don't pass the flag (not MoE, model already fits, or we lack the data to size it).
+ *  - a number N  -> offload the experts of N blocks to CPU; the rest (attention + remaining experts)
+ *    stay on the GPU. Because only a few experts are active per token, this keeps decode near GPU speed
+ *    while the bulk of the weights live in cheap system RAM.
+ *
+ * The expert tensors dominate a MoE model's size, so we approximate the over-budget amount as a number
+ * of *whole blocks* to move to CPU (slightly conservative, which is the safe direction for fitting).
+ * Applies to CUDA/Vulkan (VRAM-limited) and Metal (unified-memory-limited) alike; CPU backend never needs it.
+ */
+export function computeCpuMoeLayers(inputs: CpuMoeInputs): number | undefined {
+	const { backend, modelBytes, layerCount, expertCount, memoryBudgetBytes } = inputs;
+	if (backend === 'cpu') {
+		return undefined; // everything is already on CPU
+	}
+	if (!expertCount || expertCount <= 1) {
+		return undefined; // dense model -> no expert tensors to offload
+	}
+	if (!layerCount || layerCount <= 0 || modelBytes <= 0 || !memoryBudgetBytes || memoryBudgetBytes <= 0) {
+		return undefined; // not enough info -> let full offload / partial GPU-layer logic handle it
+	}
+	const fraction = inputs.budgetFraction && inputs.budgetFraction > 0 ? inputs.budgetFraction : 0.9;
+	const budget = memoryBudgetBytes * fraction;
+	if (modelBytes <= budget) {
+		return undefined; // fits as-is -> no expert offload needed
+	}
+	const overBytes = modelBytes - budget;
+	const perLayerBytes = modelBytes / layerCount;
+	if (perLayerBytes <= 0) {
+		return undefined;
+	}
+	// Move enough whole blocks' experts to CPU to cover the overflow (round up to be safe).
+	const layersToOffload = Math.ceil(overBytes / perLayerBytes);
+	return Math.max(1, Math.min(layerCount, layersToOffload));
+}
+
 /**
  * Builds the llama.cpp server command and args for the given model path and backend.
  * serverPath: optional path from settings (locopilot.llamaCpp.serverPath). Empty = use binary from PATH.
@@ -369,6 +487,24 @@ export function getLlamaCppServerCommand(modelPath: string, backend: LlamaBacken
 		if (tuning.draftGpuLayers !== undefined && tuning.draftGpuLayers > 0) {
 			args.push('--gpu-layers-draft', String(Math.floor(tuning.draftGpuLayers)));
 		}
+	}
+
+	// MoE expert offload: keep N blocks' expert FFN tensors in system RAM while attention stays on the GPU.
+	// Only meaningful for Mixture-of-Experts models; the runner sizes this from GGUF expert_count + memory.
+	if (tuning.cpuMoeLayers && tuning.cpuMoeLayers > 0) {
+		args.push('--n-cpu-moe', String(Math.floor(tuning.cpuMoeLayers)));
+	}
+
+	// Prompt-lookup / n-gram speculative decoding (build-specific, opt-in). No separate model; drafts from
+	// the context itself. Flags are configurable because their names differ across llama.cpp builds.
+	if (tuning.promptLookup) {
+		const lookupArgs = (tuning.promptLookupArgs && tuning.promptLookupArgs.trim()) ? tuning.promptLookupArgs.trim() : '--spec-type ngram-cache';
+		args.push(...lookupArgs.split(/\s+/));
+	}
+
+	// Persist per-slot KV cache to disk so a previously-processed prompt prefix survives restarts.
+	if (tuning.slotSavePath && tuning.slotSavePath.trim()) {
+		args.push('--slot-save-path', tuning.slotSavePath.trim());
 	}
 
 	// Parallel request slots + continuous batching: serve concurrent requests (e.g. chat alongside inline

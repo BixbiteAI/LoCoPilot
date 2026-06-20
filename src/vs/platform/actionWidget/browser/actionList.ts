@@ -52,6 +52,11 @@ export interface IActionListItem<T> {
 	readonly group?: { kind?: unknown; icon?: ThemeIcon; title: string };
 	readonly disabled?: boolean;
 	readonly label?: string;
+	/**
+	 * Optional key used to order this item in the A-Z sort instead of {@link label}.
+	 * Lets a picker impose an explicit order (e.g. High/Medium/Low) without renaming the visible label.
+	 */
+	readonly sortText?: string;
 	readonly description?: string;
 	/**
 	 * Optional hover configuration shown when focusing/hovering over the item.
@@ -414,8 +419,10 @@ export class ActionList<T> extends Disposable {
 		// Only sort action items; leave headers and separators in place
 		return [...items].sort((a, b) => {
 			if (a.kind !== ActionListItemKind.Action || b.kind !== ActionListItemKind.Action) { return 0; }
-			if (!a.label || !b.label) { return 0; }
-			return a.label.localeCompare(b.label, undefined, { sensitivity: 'base' });
+			const aKey = a.sortText ?? a.label;
+			const bKey = b.sortText ?? b.label;
+			if (!aKey || !bKey) { return 0; }
+			return aKey.localeCompare(bKey, undefined, { sensitivity: 'base' });
 		});
 	}
 

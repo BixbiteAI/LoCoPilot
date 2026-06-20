@@ -80,6 +80,14 @@ export enum ChatConfiguration {
 	LocopilotLlamaCppWarmup = 'locopilot.llamaCpp.warmup',
 	/** Lock model weights in RAM (`--mlock`) to avoid paging. Opt-in: can fail without privileges/RAM. */
 	LocopilotLlamaCppMlock = 'locopilot.llamaCpp.mlock',
+	/** MoE expert CPU offload (`--n-cpu-moe`). -1 = auto (size from VRAM/RAM), 0 = off, N = offload N blocks. */
+	LocopilotLlamaCppCpuMoeLayers = 'locopilot.llamaCpp.cpuMoeLayers',
+	/** Prompt-lookup / n-gram speculative decoding (build-specific, opt-in). */
+	LocopilotLlamaCppPromptLookup = 'locopilot.llamaCpp.promptLookup',
+	/** Flags appended when promptLookup is on (build-specific). */
+	LocopilotLlamaCppPromptLookupArgs = 'locopilot.llamaCpp.promptLookupArgs',
+	/** Directory for persisting per-slot KV cache to disk (`--slot-save-path`). Empty = disabled. */
+	LocopilotLlamaCppSlotSavePath = 'locopilot.llamaCpp.slotSavePath',
 	/** Extra raw args appended to the llama-server command line (power users). */
 	LocopilotLlamaCppExtraArgs = 'locopilot.llamaCpp.extraArgs',
 	/** How long Ollama keeps a model loaded in memory (`ollama run --keepalive`). Reduces cold starts. */
