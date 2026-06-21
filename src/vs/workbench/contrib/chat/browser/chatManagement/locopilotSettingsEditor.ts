@@ -196,6 +196,12 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 	private listModelsContainer!: HTMLElement;
 	private agentSettingsPanel!: HTMLElement;
 	private modelSearchQuery: string = '';
+	/**
+	 * Model to pin at the very top of the list (above running models) - set when the user clicks a
+	 * "Download" link in the chat panel so the just-started download is the first thing they see,
+	 * without filtering the list down to a single search result. Cleared by {@link resetModelFilters}.
+	 */
+	private pinnedModelId: string | undefined = undefined;
 	private modelTypeFilter: 'all' | 'local' | 'cloud' = 'all';
 	private modelStatusFilter: 'all' | 'downloaded' | 'not-downloaded' = 'all';
 	private modelVisibilityFilter: 'all' | 'shown' | 'hidden' = 'all';
@@ -1089,12 +1095,19 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 		const isRunning = (m: ICustomLanguageModel): boolean =>
 			this.localModelRunner.isServerRunning(m.id) || this.localModelRunner.isServerStarting(m.id);
 
-		// One flat, A-Z sorted list with currently running/starting models pinned at the very top.
+		// One flat, A-Z sorted list. Order of precedence from the top:
+		//   1. the pinned model (set when the user clicks a chat-panel "Download" link), so the
+		//      just-started download is the first row they see;
+		//   2. currently running/starting models;
+		//   3. everything else, A-Z.
 		// (Visibility and "Best for you" are applied as filters in matchesFilters rather than as
 		// separate sections, so there are no sticky section titles anymore - hidden models stay in
 		// place, just dimmed via the .hidden row class.)
 		const matched = allModels.filter(matchesFilters);
 		const sortedModels = matched.sort((a, b) => {
+			const pa = a.id === this.pinnedModelId ? 0 : 1;
+			const pb = b.id === this.pinnedModelId ? 0 : 1;
+			if (pa !== pb) { return pa - pb; }
 			const ra = isRunning(a) ? 0 : 1;
 			const rb = isRunning(b) ? 0 : 1;
 			if (ra !== rb) { return ra - rb; }
@@ -2130,6 +2143,7 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 
 	private resetModelFilters(): void {
 		this.modelSearchQuery = '';
+		this.pinnedModelId = undefined;
 		this.modelTypeFilter = 'all';
 		this.modelStatusFilter = 'all';
 		this.modelVisibilityFilter = 'all';
@@ -2235,10 +2249,11 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 			const focusedModel = this.customLanguageModelsService.getCustomModels().find(m => m.id === focusModelId);
 			if (focusedModel) {
 				// Clear any pre-existing filters so the focused model can't be hidden by a
-				// stale type/status/visibility filter, then apply our own focus search.
+				// stale type/status/visibility filter. We pin it to the top of the list rather than
+				// filtering down to a search result, so the user sees the downloading model first
+				// while still being able to scroll through running and other models below.
 				this.resetModelFilters();
-				// Filter the list to show only this model; user can clear the search to see all
-				this.modelSearchQuery = getCustomModelListLabel(focusedModel);
+				this.pinnedModelId = focusModelId;
 				this.renderListModels();
 				// Scroll the tile into view and briefly highlight it
 				// eslint-disable-next-line no-restricted-syntax
