@@ -18,6 +18,8 @@ export interface IActionWidgetDropdownAction extends IAction {
 	category?: { label: string; order: number; showHeader?: boolean };
 	icon?: ThemeIcon;
 	description?: string;
+	/** Optional key to order this item in the dropdown's A-Z sort instead of its visible label. */
+	sortText?: string;
 	/**
 	 * Optional flyout hover configuration shown when focusing/hovering over the action.
 	 */
@@ -115,6 +117,7 @@ export class ActionWidgetDropdown extends BaseDropdown {
 					disabled: !action.enabled,
 					hideIcon: false,
 					label: action.label,
+					sortText: action.sortText,
 					keybinding: this._options.showItemKeybindings ? this.keybindingService.lookupKeybinding(action.id) : undefined,
 				});
 			}

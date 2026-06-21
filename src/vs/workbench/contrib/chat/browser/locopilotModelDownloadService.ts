@@ -20,6 +20,8 @@ import { IEnvironmentService } from '../../../../platform/environment/common/env
 import { ICustomLanguageModelsService, ICustomLanguageModel, MIN_CONTEXT_WINDOW, MAX_CONTEXT_WINDOW, getCustomModelListLabel } from '../common/customLanguageModelsService.js';
 import { ILoCoPilotFileLog } from './locopilotFileLog.js';
 import { ILoCoPilotOllamaService } from './locopilotOllamaService.js';
+import { ILoCoPilotSystemInfoService } from '../../../../platform/locopilotSystemInfo/common/locopilotSystemInfo.js';
+import { INativeHostService } from '../../../../platform/native/common/native.js';
 import { registerAction2, Action2 } from '../../../../platform/actions/common/actions.js';
 import { ServicesAccessor } from '../../../../platform/instantiation/common/instantiation.js';
 import { IWorkbenchContribution } from '../../../common/contributions.js';
@@ -43,6 +45,57 @@ interface HFTreeItem {
 	path: string;
 	type: 'file' | 'dir';
 	size?: number;
+}
+
+/**
+ * Quality ranking of GGUF quantizations, best first. Used by {@link pickBestGgufForBudget} to choose the
+ * *highest-quality* quant that still fits the machine's memory budget. Roughly tracks bits-per-weight, so
+ * a bigger/fatter quant always outranks a smaller one. Anything unrecognised scores lowest.
+ */
+const GGUF_QUANT_QUALITY = [
+	'F16', 'BF16', 'Q8_0', 'Q6_K', 'Q5_K_M', 'Q5_K_S', 'Q5_0', 'Q4_K_M', 'Q4_K_S', 'Q4_1', 'Q4_0',
+	'IQ4_XS', 'IQ4_NL', 'Q3_K_L', 'Q3_K_M', 'Q3_K_S', 'IQ3_M', 'IQ3_S', 'IQ3_XXS', 'Q2_K', 'IQ2_M', 'IQ2_XS', 'IQ2_XXS'
+];
+
+/** Quality score for a GGUF filename: higher = better quality. Unknown quants score 0 (lowest). */
+export function quantQualityScore(filename: string): number {
+	const upper = filename.toUpperCase();
+	// Longer tokens (e.g. Q4_K_M) must be matched before their prefixes (Q4_0), so iterate best->worst and
+	// return on the first containment; the array order already encodes quality.
+	for (let i = 0; i < GGUF_QUANT_QUALITY.length; i++) {
+		if (upper.includes(GGUF_QUANT_QUALITY[i])) {
+			return GGUF_QUANT_QUALITY.length - i;
+		}
+	}
+	return 0;
+}
+
+/**
+ * Picks the GGUF file to download given the machine's memory budget: the **highest-quality quant whose file
+ * fits** `budgetBytes` (after a safety fraction), and when none fit, the **smallest** file so the model can
+ * at least run. Returns undefined when there are no GGUF files or no sizes are known (caller falls back to
+ * the static priority pick). `files` are {path,size}; entries without a size are treated as unknown and only
+ * used as a last-resort smallest pick.
+ */
+export function pickBestGgufForBudget(files: readonly { path: string; size?: number }[], budgetBytes: number): string | undefined {
+	const gguf = files.filter(f => f.path.toLowerCase().endsWith('.gguf'));
+	if (gguf.length === 0) {
+		return undefined;
+	}
+	const sized = gguf.filter(f => typeof f.size === 'number' && f.size! > 0) as { path: string; size: number }[];
+	if (sized.length === 0 || budgetBytes <= 0) {
+		return undefined; // no sizes -> let the static picker decide
+	}
+	const usable = budgetBytes * 0.7; // leave headroom for the KV cache, runtime, and the OS
+	const fitting = sized.filter(f => f.size <= usable);
+	if (fitting.length > 0) {
+		// Highest quality among those that fit; on a tie, the larger file (more bits) wins.
+		fitting.sort((a, b) => (quantQualityScore(b.path) - quantQualityScore(a.path)) || (b.size - a.size));
+		return fitting[0].path;
+	}
+	// Nothing fits -> smallest file so the model is at least runnable (with paging / partial offload).
+	sized.sort((a, b) => a.size - b.size);
+	return sized[0].path;
 }
 
 /** Model format priority list. */
@@ -168,6 +221,8 @@ export class LoCoPilotModelDownloadService extends Disposable implements IWorkbe
 		@INotificationService private readonly notificationService: INotificationService,
 		@ICommandService private readonly commandService: ICommandService,
 		@ILoCoPilotOllamaService private readonly ollamaService: ILoCoPilotOllamaService,
+		@ILoCoPilotSystemInfoService private readonly systemInfoService: ILoCoPilotSystemInfoService,
+		@INativeHostService private readonly nativeHostService: INativeHostService,
 	) {
 		super();
 		this._registerCommands();
@@ -283,7 +338,31 @@ export class LoCoPilotModelDownloadService extends Disposable implements IWorkbe
 		}
 	}
 
-	private async listRepoFiles(repoId: string, token: string | undefined, cancel: CancellationToken): Promise<string[]> {
+	/**
+	 * The memory budget (bytes) used to size-select a GGUF quant at download time: the larger of the machine's
+	 * total system RAM and its biggest detected GPU VRAM pool. RAM is included because GGUF weights can live in
+	 * system RAM (CPU/Metal backends, or partial/MoE offload), so a model that fits RAM is still runnable even
+	 * without enough VRAM. Returns 0 when neither figure is available (caller then skips the downgrade).
+	 */
+	private async _memoryBudgetForDownload(): Promise<number> {
+		let ram = 0;
+		let vram = 0;
+		try {
+			const stats = await this.nativeHostService.getOSStatistics();
+			ram = stats.totalmem ?? 0;
+		} catch { /* ignore */ }
+		try {
+			const hw = await this.systemInfoService.getHardwareInfo();
+			vram = hw.gpus.reduce((max, g) => Math.max(max, g.totalVramBytes), 0);
+		} catch { /* ignore */ }
+		return Math.max(ram, vram);
+	}
+
+	/**
+	 * Lists every file path in a HuggingFace repo. When `sizesOut` is provided, it is filled with each file's
+	 * byte size (when the API reports one), keyed by the same full path, so callers can size-select quants.
+	 */
+	private async listRepoFiles(repoId: string, token: string | undefined, cancel: CancellationToken, sizesOut?: Map<string, number>): Promise<string[]> {
 		const out: string[] = [];
 		const queue: string[] = [''];
 		// Use path segment encoding so "org/repo" becomes "org/repo" in path (HF expects slash in path)
@@ -306,6 +385,9 @@ export class LoCoPilotModelDownloadService extends Disposable implements IWorkbe
 				const fullPath = path ? `${path}/${item.path}` : item.path;
 				if (item.type === 'file') {
 					out.push(fullPath);
+					if (sizesOut && typeof item.size === 'number' && item.size > 0) {
+						sizesOut.set(fullPath, item.size);
+					}
 				} else if (item.type === 'dir') {
 					queue.push(fullPath);
 				}
@@ -509,8 +591,26 @@ export class LoCoPilotModelDownloadService extends Disposable implements IWorkbe
 		try {
 			await this.customLanguageModelsService.updateCustomModel(modelId, { isDownloading: true, downloadProgress: 0 });
 
-			const allPaths = await this.listRepoFiles(repoId, token, cancel);
-			const toDownload = filterPathsByFormat(allPaths, format);
+			const sizes = new Map<string, number>();
+			const allPaths = await this.listRepoFiles(repoId, token, cancel, sizes);
+			let toDownload = filterPathsByFormat(allPaths, format);
+
+			// #4 Hardware-aware quant selection: when the chosen GGUF quant is too big for this machine's memory
+			// budget, fall back to the highest-quality quant that *does* fit (or the smallest if none do). Only
+			// ever downgrades - a quant that already fits is left untouched - so explicit choices are respected.
+			if (toDownload.length === 1 && toDownload[0].toLowerCase().endsWith('.gguf')) {
+				const budget = await this._memoryBudgetForDownload();
+				const chosen = toDownload[0];
+				const chosenSize = sizes.get(chosen) ?? 0;
+				if (budget > 0 && chosenSize > budget * 0.7) {
+					const files = allPaths.map(p => ({ path: p, size: sizes.get(p) }));
+					const better = pickBestGgufForBudget(files, budget);
+					if (better && better !== chosen) {
+						this._log(`[LoCoPilot Download] ${chosen} (${Math.round(chosenSize / 1e9)}GB) exceeds the ~${Math.round(budget / 1e9)}GB memory budget; downloading ${better} instead (hardware-aware quant).`);
+						toDownload = [better];
+					}
+				}
+			}
 
 			if (toDownload.length === 0) {
 				throw new Error(localize('locopilot.download.error.formatUnavailable', 'Model format "{0}" is not available in repository "{1}".', format || 'any', repoId));

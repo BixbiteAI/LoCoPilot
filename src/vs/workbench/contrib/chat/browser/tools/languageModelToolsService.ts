@@ -447,8 +447,10 @@ export class LanguageModelToolsService extends Disposable implements ILanguageMo
 				prepareTimeWatch.stop();
 
 				let autoConfirmed = await this.shouldAutoConfirm(tool.data.id, tool.data.runsInWorkspace, tool.data.source, dto.parameters, dto.context?.sessionResource);
-				// LoCoPilot: when "Auto run commands in sandbox" is on, allow terminal commands without asking
-				if (!autoConfirmed && preparedInvocation?.toolSpecificData?.kind === 'terminal' && this._agentSettingsService.getAutoRunCommandsInSandbox()) {
+				// LoCoPilot: when the "Auto approve agent tool calls" setting is on, run any tool
+				// (terminal, MCP, built-in, etc.) without asking. Previously this only covered
+				// terminal commands, so MCP tool calls still prompted regardless of the toggle.
+				if (!autoConfirmed && this._agentSettingsService.getAutoRunCommandsInSandbox()) {
 					autoConfirmed = { type: ToolConfirmKind.Setting, id: 'locopilot.autoRunCommandsInSandbox' };
 				}
 
@@ -521,7 +523,12 @@ export class LanguageModelToolsService extends Disposable implements ILanguageMo
 			this.ensureToolDetails(dto, toolResult, tool.data);
 
 			if (toolInvocation?.didExecuteTool(toolResult).type === IChatToolInvocation.StateKind.WaitingForPostApproval) {
-				const autoConfirmedPost = await this.shouldAutoConfirmPostExecution(tool.data.id, tool.data.runsInWorkspace, tool.data.source, dto.parameters, dto.context?.sessionResource);
+				let autoConfirmedPost = await this.shouldAutoConfirmPostExecution(tool.data.id, tool.data.runsInWorkspace, tool.data.source, dto.parameters, dto.context?.sessionResource);
+				// LoCoPilot: when "Auto approve agent tool calls" is on, also send the tool
+				// results straight to the agent without the second (post-execution) prompt.
+				if (!autoConfirmedPost && this._agentSettingsService.getAutoRunCommandsInSandbox()) {
+					autoConfirmedPost = { type: ToolConfirmKind.Setting, id: 'locopilot.autoRunCommandsInSandbox' };
+				}
 				if (autoConfirmedPost) {
 					IChatToolInvocation.confirmWith(toolInvocation, autoConfirmedPost);
 				}

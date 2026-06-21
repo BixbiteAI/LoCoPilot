@@ -95,7 +95,7 @@ import { IChatResponseViewModel } from '../../../common/model/chatViewModel.js';
 import { IChatAgentService } from '../../../common/participants/chatAgents.js';
 import { ILanguageModelToolsService } from '../../../common/tools/languageModelToolsService.js';
 import { ChatHistoryNavigator } from '../../../common/widget/chatWidgetHistoryService.js';
-import { ChatSessionPrimaryPickerAction, ChatSubmitAction, IChatExecuteActionContext, OpenDelegationPickerAction, OpenModelPickerAction, OpenModePickerAction, OpenSessionTargetPickerAction, OpenWorkspacePickerAction } from '../../actions/chatExecuteActions.js';
+import { ChatSessionPrimaryPickerAction, ChatSubmitAction, IChatExecuteActionContext, OpenDelegationPickerAction, OpenModelPickerAction, OpenModePickerAction, OpenReasoningEffortPickerAction, OpenSessionTargetPickerAction, OpenWorkspacePickerAction } from '../../actions/chatExecuteActions.js';
 import { AgentSessionProviders, getAgentSessionProvider } from '../../agentSessions/agentSessions.js';
 import { IAgentSessionsService } from '../../agentSessions/agentSessionsService.js';
 import { ChatAttachmentModel } from '../../attachments/chatAttachmentModel.js';
@@ -120,6 +120,7 @@ import { ChatSelectedTools } from './chatSelectedTools.js';
 import { DelegationSessionPickerActionItem } from './delegationSessionPickerActionItem.js';
 import { IModelPickerDelegate, ModelPickerActionItem } from './modelPickerActionItem.js';
 import { IModePickerDelegate, ModePickerActionItem } from './modePickerActionItem.js';
+import { ReasoningEffortPickerActionItem } from './reasoningEffortPickerActionItem.js';
 import { SessionTypePickerActionItem } from './sessionTargetPickerActionItem.js';
 import { WorkspacePickerActionItem } from './workspacePickerActionItem.js';
 
@@ -283,6 +284,13 @@ export class ChatInputPart extends Disposable implements IHistoryNavigationWidge
 	private _timerBar: HTMLElement | undefined;
 	private _timerIntervalId: number | undefined;
 	private _timerStartTime: number | undefined;
+	// Total time (ms) the request has spent paused waiting for human approval. This is
+	// subtracted from the wall-clock elapsed so the displayed "total time taken" reflects
+	// model time only, and is not reset across approval pauses within the same request.
+	private _timerPausedAccumMs: number = 0;
+	// When the request is currently paused awaiting approval, the timestamp the pause began;
+	// undefined while actively generating.
+	private _timerPauseStartedAt: number | undefined;
 
 	readonly height = observableValue<number>(this, 0);
 
@@ -329,6 +337,7 @@ export class ChatInputPart extends Disposable implements IHistoryNavigationWidge
 	private agentSessionTypeKey: IContextKey<string>;
 	private chatSessionHasCustomAgentTarget: IContextKey<boolean>;
 	private modelWidget: ModelPickerActionItem | undefined;
+	private reasoningEffortWidget: ReasoningEffortPickerActionItem | undefined;
 	private modeWidget: ModePickerActionItem | undefined;
 	private sessionTargetWidget: SessionTypePickerActionItem | undefined;
 	private delegationWidget: DelegationSessionPickerActionItem | undefined;
@@ -758,6 +767,10 @@ export class ChatInputPart extends Disposable implements IHistoryNavigationWidge
 
 	public openModePicker(): void {
 		this.modeWidget?.show();
+	}
+
+	public openReasoningEffortPicker(): void {
+		this.reasoningEffortWidget?.show();
 	}
 
 	public openSessionTargetPicker(): void {
@@ -1950,6 +1963,8 @@ export class ChatInputPart extends Disposable implements IHistoryNavigationWidge
 						getModels: () => this.getModels()
 					};
 					return this.modelWidget = this.instantiationService.createInstance(ModelPickerActionItem, action, undefined, itemDelegate, pickerOptions);
+				} else if (action.id === OpenReasoningEffortPickerAction.ID && action instanceof MenuItemAction) {
+					return this.reasoningEffortWidget = this.instantiationService.createInstance(ReasoningEffortPickerActionItem, action, pickerOptions);
 				} else if (action.id === OpenModePickerAction.ID && action instanceof MenuItemAction) {
 					const delegate: IModePickerDelegate = {
 						currentMode: this._currentModeObservable,
@@ -2144,13 +2159,38 @@ export class ChatInputPart extends Disposable implements IHistoryNavigationWidge
 		return parts.join(' ');
 	}
 
-	public setRequestInProgress(inProgress: boolean, getStats?: () => { lastWordCount: number; impliedWordLoadRate: number; thinkingWordCount?: number } | undefined): void {
+	// Format a token count compactly: exact below 1000, otherwise abbreviated with a
+	// 'k' suffix (e.g. 1300 -> "1.3k", 24700 -> "24.7k") to stay readable in the
+	// compact status bar.
+	private static formatTokenCount(count: number): string {
+		if (count < 1000) {
+			return `${count}`;
+		}
+		const thousands = count / 1000;
+		// One decimal place, but drop a trailing ".0" (e.g. 2000 -> "2k", not "2.0k").
+		return `${thousands.toFixed(1).replace(/\.0$/, '')}k`;
+	}
+
+	public setRequestInProgress(inProgress: boolean, getStats?: () => { lastWordCount: number; impliedWordLoadRate: number; thinkingWordCount?: number } | undefined, paused?: boolean): void {
 		if (!this._timerBar) {
 			return;
 		}
 		if (inProgress) {
+			// Track approval pauses: while paused, accumulate the wait time so it can be
+			// subtracted from the displayed elapsed (and the timer is not reset). The request
+			// is considered the same request across approval pauses.
+			if (paused) {
+				if (this._timerPauseStartedAt === undefined) {
+					this._timerPauseStartedAt = Date.now();
+				}
+			} else if (this._timerPauseStartedAt !== undefined) {
+				this._timerPausedAccumMs += Date.now() - this._timerPauseStartedAt;
+				this._timerPauseStartedAt = undefined;
+			}
 			if (this._timerIntervalId === undefined) {
 				this._timerStartTime = Date.now();
+				this._timerPausedAccumMs = 0;
+				this._timerPauseStartedAt = paused ? Date.now() : undefined;
 
 				// Build the logo loader element (created once, reused each tick)
 				const logoLoader = this._buildLogoLoader(14);
@@ -2173,8 +2213,17 @@ export class ChatInputPart extends Disposable implements IHistoryNavigationWidge
 
 				const update = () => {
 					if (!this._timerBar) { return; }
-					const elapsedMs = Date.now() - this._timerStartTime!;
-					const elapsed = Math.floor(elapsedMs / 1000);
+					const now = Date.now();
+					// Exclude time spent waiting for human approval. An ongoing pause is added
+					// to the already-accumulated paused time so the clock visibly freezes while
+					// waiting, then resumes from where it left off.
+					let pausedMs = this._timerPausedAccumMs;
+					if (this._timerPauseStartedAt !== undefined) {
+						pausedMs += now - this._timerPauseStartedAt;
+					}
+					const elapsedMs = now - this._timerStartTime! - pausedMs;
+					const elapsed = Math.max(0, Math.floor(elapsedMs / 1000));
+					const isPaused = this._timerPauseStartedAt !== undefined;
 					const stats = getStats?.();
 					// The underlying stats are word counts. Convert to an estimated token
 					// count using an average words->tokens ratio (~1.4 tokens per word for
@@ -2188,6 +2237,10 @@ export class ChatInputPart extends Disposable implements IHistoryNavigationWidge
 					// Use the stream tracker's implied load rate (words/sec) which ignores
 					// pauses for tool calls, latency and thinking gaps, rather than dividing
 					// by total wall-clock elapsed time. Convert that rate to tokens/sec.
+					// Only show a rate when the stream tracker has a genuine generation rate
+					// (active generation). A wall-clock fallback over total elapsed time would
+					// include reasoning/tool/latency gaps and report a misleadingly low rate,
+					// so during those gaps we hide the rate rather than show a wrong number.
 					const wordRate = stats?.impliedWordLoadRate ?? 0;
 					const rate = wordRate > 0 ? Math.round(wordRate * ChatInputPart.WORDS_TO_TOKENS) : 0;
 
@@ -2197,13 +2250,15 @@ export class ChatInputPart extends Disposable implements IHistoryNavigationWidge
 					sep1.style.display = hasTok ? '' : 'none';
 					tokEl.style.display = hasTok ? '' : 'none';
 					if (hasTok) {
-						tokEl.textContent = `~${totalTokens} tokens`;
+						tokEl.textContent = `~${ChatInputPart.formatTokenCount(totalTokens)} tokens`;
 						tokEl.title = thinkingTokens > 0
 							? `~${outputTokens} output + ~${thinkingTokens} thinking (estimated from ${totalWords} words)`
 							: `Estimated from ${totalWords} words`;
 					}
 
-					const hasRate = rate > 0;
+					// While paused awaiting approval nothing is generating, so a stale rate would
+					// be misleading - hide it until generation resumes.
+					const hasRate = rate > 0 && !isPaused;
 					sep2.style.display = hasRate ? '' : 'none';
 					rateEl.style.display = hasRate ? '' : 'none';
 					if (hasRate) {
@@ -2226,6 +2281,8 @@ export class ChatInputPart extends Disposable implements IHistoryNavigationWidge
 				dom.getWindow(this._timerBar).clearInterval(this._timerIntervalId);
 				this._timerIntervalId = undefined;
 				this._timerStartTime = undefined;
+				this._timerPausedAccumMs = 0;
+				this._timerPauseStartedAt = undefined;
 			}
 			this._timerBar.style.display = 'none';
 			dom.clearNode(this._timerBar);

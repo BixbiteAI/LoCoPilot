@@ -628,8 +628,8 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 		useNativeToolsLabel.textContent = localize('addCustomModel.useNativeTools', 'Tools');
 		const useNativeToolsToggleContainer = DOM.append(this.addFormUseNativeToolsContainer, $('.form-input-container.agent-setting-switch-wrap'));
 		this.addFormUseNativeToolsToggle = this._register(new Toggle({
-			title: localize('addCustomModel.useNativeToolsDescription', 'When on, use the model\'s native tool calling capability. When off, tools are injected into the system prompt. Default: off.'),
-			isChecked: false,
+			title: localize('addCustomModel.useNativeToolsDescription', 'When on, use the model\'s native tool calling capability. When off, tools are injected into the system prompt. Default: on.'),
+			isChecked: true,
 			...defaultToggleStyles
 		}));
 		DOM.append(useNativeToolsToggleContainer, this.addFormUseNativeToolsToggle.domNode);
@@ -1550,13 +1550,13 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 		const autoRunRow = DOM.append(execCard, $('.agent-setting-row'));
 		const autoRunText = DOM.append(autoRunRow, $('.agent-setting-text'));
 		const autoRunLabel = DOM.append(autoRunText, $('label.locopilot-setting-label'));
-		autoRunLabel.textContent = localize('locopilotSettings.autoApproveTerminalCommands', "Auto approve terminal commands");
+		autoRunLabel.textContent = localize('locopilotSettings.autoApproveTerminalCommands', "Auto approve agent tool calls");
 		const autoRunDesc = DOM.append(autoRunText, $('.agent-setting-description.agent-setting-description-warning'));
 		DOM.append(autoRunDesc, renderIcon(Codicon.warning));
-		DOM.append(autoRunDesc, $('span', undefined, localize('locopilotSettings.autoApproveTerminalCommandsHint', "Runs terminal commands without asking. Off by default.")));
+		DOM.append(autoRunDesc, $('span', undefined, localize('locopilotSettings.autoApproveTerminalCommandsHint', "Runs terminal commands and MCP/tool calls without asking. Off by default.")));
 		const autoRunWrap = DOM.append(autoRunRow, $('.agent-setting-control.agent-setting-toggle-wrap.agent-setting-switch-wrap'));
 		this.autoRunCommandsInSandboxToggle = this._register(new Toggle({
-			title: localize('locopilotSettings.autoApproveTerminalCommandsDescription', "When on, terminal commands from the LLM agent run without asking for permission. Commands are allowed in sandbox. Default: off."),
+			title: localize('locopilotSettings.autoApproveTerminalCommandsDescription', "When on, the LLM agent runs all tool calls - terminal commands, MCP tools and built-in tools - and sends their results back without asking for permission. Default: off."),
 			isChecked: this.agentSettingsService.getAutoRunCommandsInSandbox(),
 			...defaultToggleStyles
 		}));

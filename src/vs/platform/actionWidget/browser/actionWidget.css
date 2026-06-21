@@ -137,7 +137,18 @@
 }
 
 .action-widget .monaco-list-row.action .title {
-	flex: 1;
+	flex: 1 1 auto;
+	min-width: 0;
+	white-space: nowrap;
+	overflow: hidden;
+	text-overflow: ellipsis;
+}
+
+/* Keep Local/Cloud label and the hover toolbar (show/hide) pinned to the right */
+/* at their natural size; only the model name (.title) truncates with an ellipsis. */
+.action-widget .monaco-list-row.action .description,
+.action-widget .monaco-list-row.action .action-list-item-toolbar {
+	flex: 0 0 auto;
 	white-space: nowrap;
 }
 

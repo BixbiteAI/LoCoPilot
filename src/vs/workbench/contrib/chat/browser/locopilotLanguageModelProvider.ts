@@ -22,6 +22,8 @@ import { DEFAULT_PICKER_MODEL_REPO_ID } from './locopilotModelCatalog.js';
 import { ILoCoPilotFileLog } from './locopilotFileLog.js';
 import { INotificationService } from '../../../../platform/notification/common/notification.js';
 import { IProgressService, ProgressLocation } from '../../../../platform/progress/common/progress.js';
+import { IStorageService } from '../../../../platform/storage/common/storage.js';
+import { getReasoningEffort, reasoningBudgetTokens, ReasoningEffort } from '../common/locopilotReasoningEffort.js';
 import { ICustomLanguageModelsService, ICustomLanguageModel, getCustomModelListLabel, deriveTokenLimits, defaultContextWindow, TOOL_FAILURE_DISABLE_THRESHOLD } from '../common/customLanguageModelsService.js';
 import { IChatMessage, ILanguageModelChatInfoOptions, ILanguageModelChatMetadataAndIdentifier, ILanguageModelChatProvider, ILanguageModelChatResponse, ILanguageModelsService, IChatResponsePart, ChatMessageRole } from '../common/languageModels.js';
 import { IWorkbenchContribution } from '../../../common/contributions.js';
@@ -56,6 +58,7 @@ export class LoCoPilotLanguageModelProvider extends Disposable implements ILangu
 		@IConfigurationService private readonly configurationService: IConfigurationService,
 		@INotificationService private readonly notificationService: INotificationService,
 		@IProgressService private readonly progressService: IProgressService,
+		@IStorageService private readonly storageService: IStorageService,
 	) {
 		super();
 		this._log('[LoCoPilot] Initializing Language Model Provider');
@@ -161,6 +164,31 @@ export class LoCoPilotLanguageModelProvider extends Disposable implements ILangu
 			arguments: [{ section: LOCOPILOT_SETTINGS_SECTION_LIST_MODELS }],
 		});
 		return `**${label}** could not be started. ${openModels} to view its logs or start it manually.`;
+	}
+
+	/**
+	 * Shown when the server is up but still loading its weights when the request arrives (the readiness
+	 * wait timed out, yet the process is alive and not crashed). This is a transient "wait a moment"
+	 * state, not a failure, so we must NOT show the alarming "could not be started" message here - large
+	 * models can take a while to load into memory on the first start, after which it works fine.
+	 */
+	private _getLocalModelStillLoadingMessage(modelName: string, displayName?: string): string {
+		const label = displayName?.trim() || modelName;
+		return `**${label}** is still loading into memory - large models can take a little while on the first start. Please wait a few seconds and send your message again.`;
+	}
+
+	/**
+	 * Picks the right message when a local server isn't usable yet: a still-loading server (process alive,
+	 * phase 'loading'/'starting') gets the friendly "wait a moment" message; only a genuinely
+	 * crashed/unstarted server gets the "could not be started" message. This keeps the user from seeing a
+	 * scary failure when the model simply hasn't finished loading.
+	 */
+	private _getLocalServerUnavailableMessage(model: ICustomLanguageModel): string {
+		const phase = this.localModelRunner.getServerPhase(model.id);
+		if (phase === 'loading' || phase === 'starting') {
+			return this._getLocalModelStillLoadingMessage(model.modelName, model.displayName);
+		}
+		return this._getLocalLlamaServerNotRunningMessage(model.modelName, model.displayName);
 	}
 
 	/**
@@ -336,6 +364,60 @@ export class LoCoPilotLanguageModelProvider extends Disposable implements ILangu
 		}
 	}
 
+	/** Current user-selected reasoning effort (Off/Low/Medium/High) from the chat input picker. */
+	private _reasoningEffort(): ReasoningEffort {
+		return getReasoningEffort(this.storageService);
+	}
+
+	/** Emit a reasoning/"thinking" delta to the stream. Reasoning is always shown when the model produces it. */
+	private _emitThinking(stream: AsyncIterableSource<IChatResponsePart | IChatResponsePart[]>, value: string): void {
+		stream.emitOne({ type: 'thinking', value });
+	}
+
+	/** Heuristic: does this OpenAI cloud model name belong to a reasoning-capable family? */
+	private _openAiIsReasoningModel(name: string): boolean {
+		return /(^|[^a-z])o[134](\b|-)|gpt-5|gpt-oss|reason|think|deepseek-r|qwen3/i.test(name);
+	}
+
+	/**
+	 * Apply reasoning effort to an OpenAI-style request body via the `reasoning_effort` field.
+	 * `local` servers (llama.cpp/mlx/ollama/localhost) tolerate the field and gate thinking on it, so we
+	 * always pass the level there; for OpenAI cloud we only attach it to reasoning-capable models so a
+	 * non-reasoning model (e.g. gpt-4o) isn't rejected by the default 'low'. `off` omits the field.
+	 */
+	private _applyOpenAiReasoningEffort(body: any, modelName: string, local: boolean): void {
+		const effort = this._reasoningEffort();
+		// Local servers (llama.cpp/mlx/ollama/localhost) tolerate the field and gate thinking on it.
+		// Cloud OpenAI: only attach to reasoning-capable models so a non-reasoning model isn't rejected.
+		if (local || this._openAiIsReasoningModel(modelName)) {
+			body.reasoning_effort = effort;
+		}
+	}
+
+	/** Apply reasoning effort to an Anthropic request body (extended thinking via `budget_tokens`). */
+	private _applyAnthropicReasoningEffort(body: any, modelName: string, maxOutputTokens: number): void {
+		const effort = this._reasoningEffort();
+		// Only Claude 3.7 / 4.x families support extended thinking; skip older models so we don't 400 by default.
+		if (!/3-7|3\.7|sonnet-4|opus-4|haiku-4|-4-|-4-\d/i.test(modelName)) {
+			return;
+		}
+		// Anthropic requires budget_tokens >= 1024 and strictly less than max_tokens; temperature must be unset.
+		const budget = Math.max(1024, Math.min(reasoningBudgetTokens(effort), Math.max(1024, maxOutputTokens - 1024)));
+		body.thinking = { type: 'enabled', budget_tokens: budget };
+		delete body.temperature;
+	}
+
+	/** Apply reasoning effort to a Gemini request body (`generationConfig.thinkingConfig.thinkingBudget`). */
+	private _applyGoogleReasoningEffort(body: any, modelName: string): void {
+		const effort = this._reasoningEffort();
+		// Thinking budget is a 2.5+/3 feature; older Gemini models reject thinkingConfig.
+		if (!/2\.5|2-5|gemini-3|gemini-2\.5/i.test(modelName)) {
+			return;
+		}
+		body.generationConfig = body.generationConfig ?? {};
+		body.generationConfig.thinkingConfig = { thinkingBudget: reasoningBudgetTokens(effort) };
+	}
+
 	private async _callOpenAI(model: ICustomLanguageModel, messages: IChatMessage[], options: { [name: string]: unknown }, stream: AsyncIterableSource<IChatResponsePart | IChatResponsePart[]>, token: CancellationToken, opts?: { url?: string; modelName?: string; providerLabel?: string; disableTools?: boolean }): Promise<any> {
 		const url = opts?.url ?? 'https://api.openai.com/v1/chat/completions';
 		const requestModelName = opts?.modelName ?? model.modelName;
@@ -363,6 +445,7 @@ export class LoCoPilotLanguageModelProvider extends Disposable implements ILangu
 			temperature: 0.3,
 			max_tokens: maxOutputTokens
 		};
+		this._applyOpenAiReasoningEffort(body, requestModelName, isLocalModel);
 
 		// Add tools if provided (unless caller disabled them, e.g. HF model without function-calling support)
 		if (!opts?.disableTools && options.tools && Array.isArray(options.tools) && options.tools.length > 0) {
@@ -416,7 +499,7 @@ export class LoCoPilotLanguageModelProvider extends Disposable implements ILangu
 								}
 								const openAiReasoning = this._reasoningTextFromOpenAiDelta(choice?.delta);
 								if (openAiReasoning) {
-									stream.emitOne({ type: 'thinking', value: openAiReasoning });
+									this._emitThinking(stream, openAiReasoning);
 								}
 								// Accumulate tool call deltas by index (id, function.name, function.arguments stream separately)
 								if (choice?.delta?.tool_calls) {
@@ -488,6 +571,7 @@ export class LoCoPilotLanguageModelProvider extends Disposable implements ILangu
 			stream: true,
 			max_tokens: maxOutputTokens
 		};
+		this._applyAnthropicReasoningEffort(body, model.modelName, maxOutputTokens);
 
 		if (systemMessage) {
 			body.system = systemMessage.content.map(p => p.type === 'text' ? p.value : '').join('');
@@ -538,7 +622,7 @@ export class LoCoPilotLanguageModelProvider extends Disposable implements ILangu
 										stream.emitOne({ type: 'text', value: delta.text });
 									} else if (delta?.type === 'thinking_delta' && typeof delta.thinking === 'string') {
 										this._log(`[LoCoPilot Provider] Anthropic thinking delta: ${delta.thinking}`);
-										stream.emitOne({ type: 'thinking', value: delta.thinking });
+										this._emitThinking(stream, delta.thinking);
 									} else if (delta?.type === 'input_json_delta' && typeof delta.partial_json === 'string') {
 										inputJsonAccum += delta.partial_json;
 									}
@@ -612,6 +696,7 @@ export class LoCoPilotLanguageModelProvider extends Disposable implements ILangu
 				maxOutputTokens
 			}
 		};
+		this._applyGoogleReasoningEffort(body, model.modelName);
 
 		if (systemMessage) {
 			const systemParts = systemMessage.content.filter(p => p.type === 'text').map(p => ({ text: (p as { type: 'text'; value: string }).value }));
@@ -680,7 +765,7 @@ export class LoCoPilotLanguageModelProvider extends Disposable implements ILangu
 											stream.emitOne({ type: 'text', value: part.text });
 										} else if (part.thought) {
 											this._log(`[LoCoPilot Provider] Google thought: ${part.thought}`);
-											stream.emitOne({ type: 'thinking', value: part.thought });
+											this._emitThinking(stream, part.thought);
 										} else if (part.functionCall) {
 											// Handle tool calls. Capture thoughtSignature for Gemini 3 so we can resend it in the next turn.
 											const thoughtSig = part.thoughtSignature ?? part.thought_signature;
@@ -809,7 +894,7 @@ export class LoCoPilotLanguageModelProvider extends Disposable implements ILangu
 			baseUrl = await this.localModelRunner.ensureServerForModel(model.id, token) ?? baseUrl;
 		}
 		if (!baseUrl) {
-			throw new Error(this._getLocalLlamaServerNotRunningMessage(model.modelName, model.displayName));
+			throw new Error(this._getLocalServerUnavailableMessage(model));
 		}
 		const url = `${baseUrl}/chat/completions`;
 		const mappedMessages = messages.flatMap(m => this._mapMessageToOpenAI(m));
@@ -828,8 +913,9 @@ export class LoCoPilotLanguageModelProvider extends Disposable implements ILangu
 			temperature: 0.3,
 			max_tokens: maxOutputTokens
 		};
+		this._applyOpenAiReasoningEffort(body, servedModelId, true /* local */);
 
-		// Add tools if provided. 
+		// Add tools if provided.
 		// Fallback logic: if the request is too large for the local context (4096), 
 		// we try to send it without tools to reduce the prompt size.
 		if (options.tools && Array.isArray(options.tools) && options.tools.length > 0) {
@@ -901,7 +987,7 @@ export class LoCoPilotLanguageModelProvider extends Disposable implements ILangu
 				const localReasoning = this._reasoningTextFromOpenAiDelta(choice?.delta);
 				if (localReasoning) {
 					this._log(`[LoCoPilot Provider] Reasoning delta: ${localReasoning.substring(0, 200)}${localReasoning.length > 200 ? '...' : ''}`);
-					stream.emitOne({ type: 'thinking', value: localReasoning });
+					this._emitThinking(stream, localReasoning);
 				}
 				if (choice?.delta?.content) {
 					stream.emitOne({ type: 'text', value: choice.delta.content });
@@ -931,7 +1017,7 @@ export class LoCoPilotLanguageModelProvider extends Disposable implements ILangu
 
 			if (status !== 200) {
 				const msg = status === 404 || status === 502 || status === 503
-					? this._getLocalLlamaServerNotRunningMessage(model.modelName, model.displayName)
+					? this._getLocalServerUnavailableMessage(model)
 					: `Local model "${model.modelName}" request failed (${status}).`;
 				throw new Error(msg);
 			}
@@ -954,7 +1040,7 @@ export class LoCoPilotLanguageModelProvider extends Disposable implements ILangu
 			}
 			const isConnectionRefused = /ECONNREFUSED|ERR_CONNECTION_REFUSED|net::ERR_CONNECTION_REFUSED|fetch failed|Failed to fetch/i.test(errMsg);
 			const msg = isConnectionRefused
-				? this._getLocalLlamaServerNotRunningMessage(model.modelName, model.displayName)
+				? this._getLocalServerUnavailableMessage(model)
 				: `Local model "${model.modelName}" error: ${errMsg}`;
 			throw new Error(msg);
 		}
@@ -1027,9 +1113,9 @@ export class LoCoPilotLanguageModelProvider extends Disposable implements ILangu
 			stream: true,
 			temperature: 0.3,
 			max_tokens: maxOutputTokens,
-			// Ollama: enable thinking on compatible models (qwen3, etc.); omit or use "none" to disable
-			reasoning_effort: 'medium',
 		};
+		// Ollama: enable thinking on compatible models (qwen3, etc.) per the user's effort setting; 'off' omits it.
+		this._applyOpenAiReasoningEffort(body, model.modelName, true /* local */);
 
 		if (filteredTools && filteredTools.length > 0 && model.useNativeTools) {
 			body.tools = filteredTools;
@@ -1050,7 +1136,7 @@ export class LoCoPilotLanguageModelProvider extends Disposable implements ILangu
 				}
 				const reasoningDelta = this._reasoningTextFromOpenAiDelta(delta);
 				if (reasoningDelta) {
-					stream.emitOne({ type: 'thinking', value: reasoningDelta });
+					this._emitThinking(stream, reasoningDelta);
 				}
 				if (delta?.tool_calls) {
 					for (const tc of delta.tool_calls) {
@@ -1126,6 +1212,7 @@ export class LoCoPilotLanguageModelProvider extends Disposable implements ILangu
 			temperature: 0.3,
 			max_tokens: maxOutputTokens
 		};
+		this._applyOpenAiReasoningEffort(body, openAiModel, true /* local */);
 
 		// Add tools if provided
 		if (options.tools && Array.isArray(options.tools) && options.tools.length > 0) {
@@ -1196,7 +1283,7 @@ export class LoCoPilotLanguageModelProvider extends Disposable implements ILangu
 				const localReasoning = this._reasoningTextFromOpenAiDelta(choice?.delta);
 				if (localReasoning) {
 					this._log(`[LoCoPilot Provider] Reasoning delta: ${localReasoning.substring(0, 200)}${localReasoning.length > 200 ? '...' : ''}`);
-					stream.emitOne({ type: 'thinking', value: localReasoning });
+					this._emitThinking(stream, localReasoning);
 				}
 				if (choice?.delta?.content) {
 					stream.emitOne({ type: 'text', value: choice.delta.content });

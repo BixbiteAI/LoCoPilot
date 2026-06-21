@@ -1783,7 +1783,12 @@ export class ChatWidget extends Disposable implements IChatWidget {
 			const inProgress = this.viewModel.model.requestInProgress.get();
 			this.requestInProgress.set(inProgress);
 			const vm = this.viewModel;
-			this.inputPart.setRequestInProgress(inProgress, () => {
+			// A request that is paused waiting for human approval reports `inProgress === false`,
+			// but it is still the same request. Keep the timer running (paused) across the wait
+			// so the displayed total time is continuous rather than resetting after each approval.
+			const needsInput = !!this.viewModel.model.requestNeedsInput.get();
+			const timerActive = inProgress || needsInput;
+			this.inputPart.setRequestInProgress(timerActive, () => {
 				const last = vm.getItems().findLast(item => isResponseVM(item)) as { response?: { value: ReadonlyArray<{ kind: string; value?: string | string[] }> }; contentUpdateTimings?: { lastWordCount: number; impliedWordLoadRate: number } } | undefined;
 				const timings = last?.contentUpdateTimings;
 				let thinkingWordCount = 0;
@@ -1795,8 +1800,17 @@ export class ChatWidget extends Disposable implements IChatWidget {
 						}
 					}
 				}
-				return timings ? { ...timings, thinkingWordCount } : undefined;
-			});
+				if (timings) {
+					return { ...timings, thinkingWordCount };
+				}
+				// During the pure-reasoning phase no output text has streamed yet, so
+				// `contentUpdateTimings` is undefined. Still surface thinking tokens so the
+				// counter isn't blank while the model is only reasoning.
+				if (thinkingWordCount > 0) {
+					return { lastWordCount: 0, impliedWordLoadRate: 0, thinkingWordCount };
+				}
+				return undefined;
+			}, needsInput);
 
 			// Update the editor's placeholder text when it changes in the view model
 			if (events?.some(e => e?.kind === 'changePlaceholder')) {

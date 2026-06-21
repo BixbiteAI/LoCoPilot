@@ -7,12 +7,15 @@ import assert from 'assert';
 import { ensureNoDisposablesAreLeakedInTestSuite } from '../../../../../base/test/common/utils.js';
 import {
 	computeGpuLayers,
+	computeCpuMoeLayers,
+	clampContextSize,
 	getBundledLlamaServerPath,
 	getLlamaCppServerCommand,
 	resolveKvCacheType,
 	shouldUseBundledVulkan,
 	KV_AUTO_QUANT_CONTEXT_THRESHOLD,
 	VULKAN_MIN_DEDICATED_VRAM_BYTES,
+	MIN_CLAMPED_CONTEXT,
 	type GpuLike,
 } from '../../browser/locopilotLlamaCppServer.js';
 
@@ -66,6 +69,64 @@ suite('LoCoPilot llama.cpp server', () => {
 		test('tiny VRAM -> 0 layers', () => {
 			const n = computeGpuLayers({ backend: 'vulkan', modelBytes: 40 * GB, layerCount: 64, vramBytes: 1 * GB });
 			assert.strictEqual(n, 1); // 0.9GB budget / 0.625GB per layer = 1
+		});
+	});
+
+	suite('computeCpuMoeLayers', () => {
+		const GB = 1024 * 1024 * 1024;
+
+		test('dense model (no experts) -> undefined', () => {
+			assert.strictEqual(computeCpuMoeLayers({ backend: 'cuda', modelBytes: 40 * GB, layerCount: 64, expertCount: undefined, memoryBudgetBytes: 8 * GB }), undefined);
+			assert.strictEqual(computeCpuMoeLayers({ backend: 'cuda', modelBytes: 40 * GB, layerCount: 64, expertCount: 1, memoryBudgetBytes: 8 * GB }), undefined);
+		});
+
+		test('cpu backend -> undefined (already on CPU)', () => {
+			assert.strictEqual(computeCpuMoeLayers({ backend: 'cpu', modelBytes: 40 * GB, layerCount: 64, expertCount: 128, memoryBudgetBytes: 8 * GB }), undefined);
+		});
+
+		test('MoE model that fits the budget -> undefined (no offload)', () => {
+			assert.strictEqual(computeCpuMoeLayers({ backend: 'metal', modelBytes: 6 * GB, layerCount: 48, expertCount: 128, memoryBudgetBytes: 16 * GB }), undefined);
+		});
+
+		test('MoE model over budget -> offload enough whole blocks', () => {
+			// 20GB model, 48 layers => ~0.4167GB/layer. 8GB * 0.9 = 7.2GB budget; over by 12.8GB => ceil(30.7) = 31.
+			const n = computeCpuMoeLayers({ backend: 'cuda', modelBytes: 20 * GB, layerCount: 48, expertCount: 128, memoryBudgetBytes: 8 * GB });
+			assert.strictEqual(n, 31);
+		});
+
+		test('result clamped to [1, layerCount]', () => {
+			const n = computeCpuMoeLayers({ backend: 'vulkan', modelBytes: 200 * GB, layerCount: 32, expertCount: 64, memoryBudgetBytes: 2 * GB });
+			assert.strictEqual(n, 32);
+		});
+	});
+
+	suite('clampContextSize', () => {
+		test('no constraints -> requested (rounded to 1024)', () => {
+			assert.strictEqual(clampContextSize({ requestedContext: 16384 }), 16384);
+		});
+
+		test('caps to the model trained window', () => {
+			assert.strictEqual(clampContextSize({ requestedContext: 131072, modelContextLength: 32768 }), 32768);
+		});
+
+		test('caps to the KV memory budget', () => {
+			// 1GB KV budget / (160 B/tok/layer * 32 layers) = ~204k tokens -> not binding here.
+			// Tight: 64MB budget / (160*32) = ~13107 -> rounded down to 12288.
+			const ctx = clampContextSize({ requestedContext: 32768, kvBudgetBytes: 64 * 1024 * 1024, layerCount: 32 });
+			assert.strictEqual(ctx, 12288);
+		});
+
+		test('never below the floor', () => {
+			// ~2000 tokens fit -> rounds to 1024 -> floored up to MIN_CLAMPED_CONTEXT.
+			const ctx = clampContextSize({ requestedContext: 32768, kvBudgetBytes: 2000 * 160 * 80, layerCount: 80 });
+			assert.strictEqual(ctx, MIN_CLAMPED_CONTEXT);
+		});
+
+		test('emits --n-cpu-moe and --slot-save-path when tuned', () => {
+			const { args } = getLlamaCppServerCommand('/m.gguf', 'metal', undefined, 38452, { cpuMoeLayers: 12, slotSavePath: '/tmp/kv', promptLookup: true });
+			assert.strictEqual(argValue(args, '--n-cpu-moe'), '12');
+			assert.strictEqual(argValue(args, '--slot-save-path'), '/tmp/kv');
+			assert.ok(args.includes('--spec-type') && args.includes('ngram-cache'));
 		});
 	});
 
