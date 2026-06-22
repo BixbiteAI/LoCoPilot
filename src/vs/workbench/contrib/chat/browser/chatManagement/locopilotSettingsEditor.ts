@@ -24,10 +24,7 @@ import {
 } from './locopilotSettingsEditorInput.js';
 import { Button } from '../../../../../base/browser/ui/button/button.js';
 import { localize } from '../../../../../nls.js';
-import { Orientation, Sizing, SplitView } from '../../../../../base/browser/ui/splitview/splitview.js';
-import { IListVirtualDelegate } from '../../../../../base/browser/ui/list/list.js';
-import { WorkbenchList } from '../../../../../platform/list/browser/listService.js';
-import { Event, Emitter } from '../../../../../base/common/event.js';
+import { Emitter } from '../../../../../base/common/event.js';
 import { Disposable } from '../../../../../base/common/lifecycle.js';
 import { Dimension } from '../../../../../base/browser/dom.js';
 import { registerColor, foreground, listActiveSelectionBackground, listActiveSelectionForeground } from '../../../../../platform/theme/common/colorRegistry.js';
@@ -186,8 +183,8 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 	static readonly ID: string = 'workbench.editor.locopilotSettings';
 
 	private container: HTMLElement | undefined;
-	private splitView: SplitView<number> | undefined;
-	private sectionsList: WorkbenchList<SectionItem> | undefined;
+	private tabBar: HTMLElement | undefined;
+	private tabButtons = new Map<string, HTMLElement>();
 	private headerContainer!: HTMLElement;
 	private contentsContainer!: HTMLElement;
 
@@ -345,54 +342,12 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 
 		this.renderHeader(this.container);
 
-		const splitViewContainer = DOM.append(this.container, $('.split-view-container'));
+		this.renderTabs(this.container);
 
-		const sidebarView = DOM.append(splitViewContainer, $('.sidebar-view'));
-		const sidebarContainer = DOM.append(sidebarView, $('.sidebar-container'));
-
-		const contentsView = DOM.append(splitViewContainer, $('.contents-view'));
+		const contentsView = DOM.append(this.container, $('.contents-view'));
 		this.contentsContainer = DOM.append(contentsView, $('.contents-container'));
 
-		this.splitView = new SplitView(splitViewContainer, {
-			orientation: Orientation.HORIZONTAL,
-			proportionalLayout: true
-		});
-
-		this.renderSidebar(sidebarContainer);
 		this.renderContents(this.contentsContainer);
-
-		this.splitView.addView({
-			onDidChange: Event.None,
-			element: sidebarView,
-			minimumSize: 210,
-			maximumSize: 360,
-			layout: (width, _, height) => {
-				sidebarContainer.style.width = `${width}px`;
-				if (this.sectionsList && height !== undefined) {
-					this.sectionsList.layout(height, width);
-				}
-			}
-		}, 250, undefined, true);
-
-		this.splitView.addView({
-			onDidChange: Event.None,
-			element: contentsView,
-			minimumSize: 400,
-			maximumSize: Number.POSITIVE_INFINITY,
-			layout: (width, _, height) => {
-				contentsView.style.width = `${width}px`;
-				if (height !== undefined) {
-					this.layoutContents(width, height);
-				}
-			}
-		}, Sizing.Distribute, undefined, true);
-
-		this.updateStyles();
-	}
-
-	override updateStyles(): void {
-		const borderColor = this.theme.getColor(locopilotSettingsSashBorder)!;
-		this.splitView?.style({ separatorBorder: borderColor });
 	}
 
 	private renderHeader(parent: HTMLElement): void {
@@ -405,60 +360,66 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 		title.textContent = localize('locopilotSettings.title', "LoCoPilot Settings");
 	}
 
-	private renderSidebar(parent: HTMLElement): void {
+	private renderTabs(parent: HTMLElement): void {
 		this.sections = [
 			{ id: LOCOPILOT_SETTINGS_SECTION_ADD_MODEL, label: localize('locopilotSettings.addModel', "Add Model"), icon: Codicon.add, description: localize('locopilotSettings.addModel.desc', "Connect a new local model") },
 			{ id: LOCOPILOT_SETTINGS_SECTION_LIST_MODELS, label: localize('locopilotSettings.myModels', "My Models"), icon: Codicon.layers, description: localize('locopilotSettings.myModels.desc', "Manage installed models") },
 			{ id: LOCOPILOT_SETTINGS_SECTION_AGENT_SETTINGS, label: localize('locopilotSettings.agentSettings', "Agent Settings"), icon: Codicon.settingsGear, description: localize('locopilotSettings.agentSettings.desc', "Prompts & behavior") },
 		];
 
-		const delegate = new SectionItemDelegate();
-		const renderer = new SectionItemRenderer();
+		this.tabBar = DOM.append(parent, $('.locopilot-settings-tabs'));
+		this.tabBar.setAttribute('role', 'tablist');
+		this.tabBar.setAttribute('aria-label', localize('locopilotSettingsSectionsAriaLabel', "LoCoPilot Settings Sections"));
 
-		this.sectionsList = this._register(this.instantiationService.createInstance(
-			WorkbenchList<SectionItem>,
-			'LoCoPilotSettingsSections',
-			parent,
-			delegate,
-			[renderer],
-			{
-				multipleSelectionSupport: false,
-				setRowLineHeight: false,
-				horizontalScrolling: false,
-				accessibilityProvider: {
-					getAriaLabel(element: SectionItem) {
-						return element.label;
-					},
-					getWidgetAriaLabel() {
-						return localize('locopilotSettingsSectionsAriaLabel', "LoCoPilot Settings Sections");
-					}
-				},
-				openOnSingleClick: true,
-				identityProvider: {
-					getId(element: SectionItem) {
-						return element.id;
-					}
-				}
+		this.tabButtons.clear();
+		for (const section of this.sections) {
+			const tab = DOM.append(this.tabBar, $('button.locopilot-settings-tab'));
+			tab.setAttribute('role', 'tab');
+			tab.setAttribute('aria-label', section.label);
+			tab.title = section.description ?? section.label;
+
+			const icon = DOM.append(tab, $('.locopilot-settings-tab-icon'));
+			icon.appendChild(renderIcon(section.icon));
+			const text = DOM.append(tab, $('.locopilot-settings-tab-text'));
+			const label = DOM.append(text, $('.locopilot-settings-tab-label'));
+			label.textContent = section.label;
+			if (section.description) {
+				const description = DOM.append(text, $('.locopilot-settings-tab-description'));
+				description.textContent = section.description;
 			}
-		));
 
-		this.sectionsList.splice(0, this.sectionsList.length, this.sections);
-		this.sectionsList.setSelection([0]);
+			this._register(DOM.addDisposableListener(tab, 'click', () => this.selectTab(section.id)));
+			this.tabButtons.set(section.id, tab);
+		}
 
-		this._register(this.sectionsList.onDidChangeSelection(e => {
-			if (e.elements.length > 0) {
-				const previousSection = this.selectedSection;
-				const newSection = e.elements[0].id;
-				this.selectedSection = newSection;
-				if (newSection === LOCOPILOT_SETTINGS_SECTION_ADD_MODEL && previousSection !== LOCOPILOT_SETTINGS_SECTION_ADD_MODEL) {
-					this.resetAddModelFormToDefaults();
-				}
-				if (newSection === LOCOPILOT_SETTINGS_SECTION_LIST_MODELS && previousSection !== LOCOPILOT_SETTINGS_SECTION_LIST_MODELS) {
-					this.resetModelFilters();
-				}
-				this.renderSelectedSection();
-			}
-		}));
+		this.updateTabSelection();
+	}
+
+	/** User clicked a tab: run the section's reset hooks (matching the old sidebar behavior) and switch. */
+	private selectTab(newSection: string): void {
+		const previousSection = this.selectedSection;
+		if (newSection === previousSection) {
+			return;
+		}
+		this.selectedSection = newSection;
+		if (newSection === LOCOPILOT_SETTINGS_SECTION_ADD_MODEL && previousSection !== LOCOPILOT_SETTINGS_SECTION_ADD_MODEL) {
+			this.resetAddModelFormToDefaults();
+		}
+		if (newSection === LOCOPILOT_SETTINGS_SECTION_LIST_MODELS && previousSection !== LOCOPILOT_SETTINGS_SECTION_LIST_MODELS) {
+			this.resetModelFilters();
+		}
+		this.updateTabSelection();
+		this.renderSelectedSection();
+	}
+
+	/** Reflect this.selectedSection onto the tab buttons' active state. */
+	private updateTabSelection(): void {
+		for (const [id, tab] of this.tabButtons) {
+			const active = id === this.selectedSection;
+			tab.classList.toggle('active', active);
+			tab.setAttribute('aria-selected', active ? 'true' : 'false');
+			tab.tabIndex = active ? 0 : -1;
+		}
 	}
 
 	private renderContents(parent: HTMLElement): void {
@@ -888,11 +849,7 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 				this.commandService.executeCommand('locopilot.downloadModel', addedModel.id);
 				// Switch to Language Models list so user sees the model tile with download progress
 				this.selectedSection = LOCOPILOT_SETTINGS_SECTION_LIST_MODELS;
-				const listIdx = this.sections.findIndex(s => s.id === LOCOPILOT_SETTINGS_SECTION_LIST_MODELS);
-				if (listIdx >= 0 && this.sectionsList) {
-					this.sectionsList.setSelection([listIdx]);
-					this.sectionsList.setFocus([listIdx]);
-				}
+				this.updateTabSelection();
 				this.renderSelectedSection();
 				const infoMsg = providerValue === 'ollama'
 					? localize('addCustomModel.ollamaPullStarted', 'Ollama pull started')
@@ -2211,10 +2168,6 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 		}
 	}
 
-	private layoutContents(_width: number, _height: number): void {
-		// Add and list panels use CSS layout
-	}
-
 	override async setInput(input: LoCoPilotSettingsEditorInput, options: IEditorOptions | undefined, context: IEditorOpenContext, token: CancellationToken): Promise<void> {
 		await super.setInput(input, options, context, token);
 		this.switchToSection(input.initialSection, input.focusModelId);
@@ -2238,11 +2191,7 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 			if (section === LOCOPILOT_SETTINGS_SECTION_LIST_MODELS && previousSection !== LOCOPILOT_SETTINGS_SECTION_LIST_MODELS) {
 				this.resetModelFilters();
 			}
-			const idx = this.sections.findIndex(s => s.id === section);
-			if (idx >= 0 && this.sectionsList) {
-				this.sectionsList.setSelection([idx]);
-				this.sectionsList.setFocus([idx]);
-			}
+			this.updateTabSelection();
 			this.renderSelectedSection();
 		}
 		if (focusModelId) {
@@ -2272,53 +2221,12 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 
 	override layout(dimension: Dimension): void {
 		this.dimension = dimension;
-		if (this.container && this.splitView) {
-			const headerHeight = this.headerContainer?.offsetHeight || 0;
-			const splitViewHeight = dimension.height - headerHeight;
-			this.splitView.layout(this.container.clientWidth, splitViewHeight);
-			this.splitView.el.style.height = `${splitViewHeight}px`;
-		}
+		// Layout is driven by flexbox CSS; nothing imperative to do here.
 	}
 
 	override focus(): void {
 		super.focus();
-		this.sectionsList?.domFocus();
+		this.tabButtons.get(this.selectedSection)?.focus();
 	}
 }
 
-class SectionItemDelegate implements IListVirtualDelegate<SectionItem> {
-	getHeight(element: SectionItem) {
-		return 48;
-	}
-	getTemplateId() { return 'locopilotSectionItem'; }
-}
-
-interface ISectionItemTemplateData {
-	readonly icon: HTMLElement;
-	readonly label: HTMLElement;
-	readonly description: HTMLElement;
-}
-
-class SectionItemRenderer {
-	readonly templateId = 'locopilotSectionItem';
-
-	renderTemplate(container: HTMLElement): ISectionItemTemplateData {
-		container.classList.add('section-list-item');
-		const icon = DOM.append(container, $('.section-list-item-icon'));
-		const text = DOM.append(container, $('.section-list-item-text'));
-		const label = DOM.append(text, $('.section-list-item-label'));
-		const description = DOM.append(text, $('.section-list-item-description'));
-		return { icon, label, description };
-	}
-
-	renderElement(element: SectionItem, index: number, templateData: ISectionItemTemplateData): void {
-		DOM.clearNode(templateData.icon);
-		templateData.icon.appendChild(renderIcon(element.icon));
-		templateData.label.textContent = element.label;
-		templateData.description.textContent = element.description ?? '';
-		templateData.description.style.display = element.description ? '' : 'none';
-	}
-
-	disposeTemplate(templateData: ISectionItemTemplateData): void {
-	}
-}

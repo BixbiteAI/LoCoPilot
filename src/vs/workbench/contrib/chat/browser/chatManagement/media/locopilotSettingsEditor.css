@@ -20,49 +20,120 @@
 	flex-shrink: 0;
 }
 
-.locopilot-settings-editor .split-view-container {
+/*
+ * Header-style tab row: sits directly under the title, switches the content below.
+ * Each tab carries the same icon-chip + label + description treatment the old left
+ * side panel used, laid out horizontally. Colors are all theme tokens so it reads
+ * correctly in dark, light, and high-contrast themes.
+ */
+.locopilot-settings-editor .locopilot-settings-tabs {
+	display: flex;
+	align-items: stretch;
+	gap: 8px;
+	flex-shrink: 0;
+	padding: 10px 23px 12px 23px;
+	border-bottom: 1px solid var(--vscode-settings-headerBorder, var(--vscode-panel-border));
+	overflow-x: auto;
+}
+
+.locopilot-settings-editor .locopilot-settings-tab {
+	display: flex;
+	align-items: center;
+	gap: 11px;
+	padding: 8px 14px;
+	border: 1px solid transparent;
+	border-radius: 9px;
+	background: transparent;
+	color: var(--vscode-foreground);
+	font-family: inherit;
+	text-align: left;
+	cursor: pointer;
+	white-space: nowrap;
+	-webkit-appearance: none;
+	appearance: none;
+	transition: background-color 0.12s ease, border-color 0.12s ease, box-shadow 0.12s ease;
+}
+
+/* Icon chip: soft rounded square, matches the old sidebar item icon. */
+.locopilot-settings-editor .locopilot-settings-tab-icon {
+	display: flex;
+	align-items: center;
+	justify-content: center;
+	width: 30px;
+	height: 30px;
+	min-width: 30px;
+	border-radius: 8px;
+	background: var(--vscode-toolbar-hoverBackground, rgba(127, 127, 127, 0.12));
+	color: var(--vscode-foreground);
+	opacity: 0.85;
+	transition: background-color 0.12s ease, color 0.12s ease, opacity 0.12s ease;
+}
+
+.locopilot-settings-editor .locopilot-settings-tab-icon .codicon {
+	font-size: 16px;
+}
+
+.locopilot-settings-editor .locopilot-settings-tab-text {
+	display: flex;
+	flex-direction: column;
+	gap: 1px;
+	min-width: 0;
+}
+
+.locopilot-settings-editor .locopilot-settings-tab-label {
+	font-size: 13px;
+	font-weight: 600;
+	line-height: 1.3;
+	color: var(--vscode-foreground);
+}
+
+.locopilot-settings-editor .locopilot-settings-tab-description {
+	font-size: 11px;
+	line-height: 1.3;
+	color: var(--vscode-descriptionForeground);
+	white-space: nowrap;
+}
+
+/* Hover: subtle filled background + brighter chip (only on inactive tabs). */
+.locopilot-settings-editor .locopilot-settings-tab:hover:not(.active) {
+	background: var(--vscode-list-hoverBackground);
+}
+
+.locopilot-settings-editor .locopilot-settings-tab:hover .locopilot-settings-tab-icon {
+	opacity: 1;
+}
+
+.locopilot-settings-editor .locopilot-settings-tab:focus-visible {
+	outline: none;
+	border-color: var(--vscode-focusBorder);
+}
+
+/* Active: accent-tinted chip, accent-tinted card, bold label - the open tab reads clearly. */
+.locopilot-settings-editor .locopilot-settings-tab.active {
+	background: var(--vscode-list-activeSelectionBackground, var(--vscode-list-inactiveSelectionBackground));
+	border-color: var(--vscode-focusBorder);
+}
+
+.locopilot-settings-editor .locopilot-settings-tab.active .locopilot-settings-tab-icon {
+	background: var(--vscode-inputOption-activeBackground, var(--vscode-button-background));
+	color: var(--vscode-inputOption-activeForeground, var(--vscode-button-foreground));
+	opacity: 1;
+}
+
+.locopilot-settings-editor .locopilot-settings-tab.active .locopilot-settings-tab-label {
+	font-weight: 700;
+	color: var(--vscode-list-activeSelectionForeground, var(--vscode-foreground));
+}
+
+.locopilot-settings-editor .locopilot-settings-tab.active .locopilot-settings-tab-description {
+	color: var(--vscode-list-activeSelectionForeground, var(--vscode-descriptionForeground));
+	opacity: 0.8;
+}
+
+.locopilot-settings-editor .contents-view {
 	flex: 1;
 	min-height: 0;
-	position: relative;
-}
-
-.locopilot-settings-editor .sidebar-view,
-.locopilot-settings-editor .contents-view {
-	height: 100%;
 	overflow: hidden;
-}
-
-/* Section nav pane: soft corners (selection/focus still use theme colors) */
-.locopilot-settings-editor .sidebar-view {
-	border-radius: 6px;
-	outline: none;
-}
-
-.locopilot-settings-editor .sidebar-view:focus,
-.locopilot-settings-editor .sidebar-view:focus-within {
-	outline: none;
-}
-
-.locopilot-settings-editor .sidebar-container .monaco-list .monaco-list-row {
-	border-radius: 6px;
-}
-
-/* No focus outline/border on rows (default theme draws a blue/accent ring) */
-.locopilot-settings-editor .sidebar-container .monaco-list .monaco-list-row.focused {
-	outline: none !important;
-}
-
-.locopilot-settings-editor .sidebar-container .monaco-list:focus {
-	outline: none !important;
-}
-
-/*
- * Workbench (style.css) draws a full-list focus ring via ::before on .monaco-list:focus
- * when the list has no row keyboard focus - theme color on all sides. Hide it here; row
- * selection/focus styling still comes from .monaco-list-row.focused.
- */
-.monaco-workbench .locopilot-settings-editor .sidebar-container .monaco-list:not(.element-focused):not(:active):focus:before {
-	display: none !important;
 }
 
 .locopilot-settings-editor .contents-container {
@@ -70,97 +141,6 @@
 	overflow-y: auto;
 	overflow-x: hidden;
 	padding-bottom: 24px;
-}
-
-.locopilot-settings-editor .sidebar-container {
-	padding-left: 8px;
-	padding-top: 15px;
-	height: 100%;
-	overflow: hidden;
-	box-sizing: border-box;
-}
-
-.locopilot-settings-editor .sidebar-container .monaco-list-row {
-	padding: 3px 6px 3px 0;
-	box-sizing: border-box;
-}
-
-.locopilot-settings-editor .sidebar-container .section-list-item {
-	height: 100%;
-	padding: 0 10px;
-	display: flex;
-	align-items: center;
-	gap: 11px;
-	border-radius: 8px;
-	box-sizing: border-box;
-}
-
-.locopilot-settings-editor .sidebar-container .section-list-item-icon {
-	display: flex;
-	align-items: center;
-	justify-content: center;
-	width: 28px;
-	height: 28px;
-	min-width: 28px;
-	border-radius: 7px;
-	background: var(--vscode-toolbar-hoverBackground, rgba(127, 127, 127, 0.12));
-	color: var(--vscode-foreground);
-	opacity: 0.85;
-	transition: background-color 0.12s ease, color 0.12s ease, opacity 0.12s ease;
-}
-
-.locopilot-settings-editor .sidebar-container .section-list-item-icon .codicon {
-	font-size: 15px;
-}
-
-.locopilot-settings-editor .sidebar-container .section-list-item-text {
-	display: flex;
-	flex-direction: column;
-	gap: 1px;
-	min-width: 0;
-	overflow: hidden;
-}
-
-.locopilot-settings-editor .sidebar-container .section-list-item-label {
-	font-size: 13px;
-	font-weight: 600;
-	line-height: 1.3;
-	overflow: hidden;
-	text-overflow: ellipsis;
-	white-space: nowrap;
-}
-
-.locopilot-settings-editor .sidebar-container .section-list-item-description {
-	font-size: 11px;
-	line-height: 1.3;
-	/* Inherit the row color so the subtitle follows monaco's selection foreground
-		(readable on both the dark focused-teal and light inactive-teal backgrounds). */
-	color: inherit;
-	opacity: 0.75;
-	overflow: hidden;
-	text-overflow: ellipsis;
-	white-space: nowrap;
-}
-
-/* Hover: subtle rounded highlight on the inner item (rows themselves have transparent bg) */
-.locopilot-settings-editor .sidebar-container .monaco-list-row:hover .section-list-item {
-	background: var(--vscode-list-hoverBackground);
-}
-
-.locopilot-settings-editor .sidebar-container .monaco-list-row:hover .section-list-item-icon {
-	opacity: 1;
-}
-
-/* Selected: accent-tinted icon chip so the active tab reads clearly */
-.locopilot-settings-editor .sidebar-container .monaco-list-row.selected .section-list-item-icon,
-.locopilot-settings-editor .sidebar-container .monaco-list:focus .monaco-list-row.selected .section-list-item-icon {
-	background: var(--vscode-inputOption-activeBackground, var(--vscode-button-background));
-	color: var(--vscode-inputOption-activeForeground, var(--vscode-button-foreground));
-	opacity: 1;
-}
-
-.locopilot-settings-editor .sidebar-container .monaco-list-row.selected .section-list-item-label {
-	font-weight: 700;
 }
 
 .locopilot-settings-editor .header-title-container {
