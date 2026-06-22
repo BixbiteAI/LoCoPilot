@@ -41,17 +41,19 @@
 	align-items: center;
 	gap: 11px;
 	padding: 8px 14px;
-	border: 1px solid transparent;
+	/* Resting state reads as a clickable chip: faint surface + border so inactive tabs look selectable, without competing with the active one. */
+	border: 1px solid var(--vscode-checkbox-border, var(--vscode-widget-border, rgba(127, 127, 127, 0.35)));
 	border-radius: 9px;
-	background: transparent;
+	background: var(--vscode-toolbar-hoverBackground, rgba(127, 127, 127, 0.08));
 	color: var(--vscode-foreground);
+	opacity: 0.82;
 	font-family: inherit;
 	text-align: left;
 	cursor: pointer;
 	white-space: nowrap;
 	-webkit-appearance: none;
 	appearance: none;
-	transition: background-color 0.12s ease, border-color 0.12s ease, box-shadow 0.12s ease;
+	transition: background-color 0.12s ease, border-color 0.12s ease, opacity 0.12s ease, box-shadow 0.12s ease;
 }
 
 /* Icon chip: soft rounded square, matches the old sidebar item icon. */
@@ -94,9 +96,11 @@
 	white-space: nowrap;
 }
 
-/* Hover: subtle filled background + brighter chip (only on inactive tabs). */
+/* Hover: lift the chip - brighter fill, full opacity, accent-tinted border. */
 .locopilot-settings-editor .locopilot-settings-tab:hover:not(.active) {
 	background: var(--vscode-list-hoverBackground);
+	border-color: var(--vscode-focusBorder);
+	opacity: 1;
 }
 
 .locopilot-settings-editor .locopilot-settings-tab:hover .locopilot-settings-tab-icon {
@@ -112,6 +116,7 @@
 .locopilot-settings-editor .locopilot-settings-tab.active {
 	background: var(--vscode-list-activeSelectionBackground, var(--vscode-list-inactiveSelectionBackground));
 	border-color: var(--vscode-focusBorder);
+	opacity: 1;
 }
 
 .locopilot-settings-editor .locopilot-settings-tab.active .locopilot-settings-tab-icon {
