@@ -22,17 +22,21 @@ import { ChatInputPickerActionViewItem, IChatInputPickerOptions } from './chatIn
 
 function effortDescription(effort: ReasoningEffort): string {
 	switch (effort) {
-		case 'low': return localize('chat.effortPicker.low.desc', "A little thinking before answering - fastest");
-		case 'medium': return localize('chat.effortPicker.medium.desc', "Balanced thinking");
-		case 'high': return localize('chat.effortPicker.high.desc', "Maximum thinking - slowest, most thorough");
+		case 'off': return localize('chat.effortPicker.off.desc', "No thinking - answers immediately, fastest");
+		case 'low': return localize('chat.effortPicker.low.desc', "A little thinking before answering");
+		case 'medium': return localize('chat.effortPicker.medium.desc', "Balanced thinking and speed");
+		case 'high': return localize('chat.effortPicker.high.desc', "Lots of thinking - slower");
+		case 'max': return localize('chat.effortPicker.max.desc', "Unlimited thinking - slowest, most thorough");
 	}
 }
 
 function effortIcon(effort: ReasoningEffort): ThemeIcon {
 	switch (effort) {
+		case 'off': return Codicon.circleSlash;
 		case 'low': return Codicon.circleOutline;
 		case 'medium': return Codicon.circleFilled;
-		case 'high': return Codicon.lightbulbSparkleAutofix;
+		case 'high': return Codicon.lightbulb;
+		case 'max': return Codicon.lightbulbSparkleAutofix;
 	}
 }
 
@@ -49,8 +53,8 @@ function effortActionsProvider(storageService: IStorageService): IActionWidgetDr
 				class: undefined,
 				icon: effortIcon(effort),
 				sortText: String(index),
-				// No `description` - it renders right-aligned and overflows the narrow picker. Keep the
-				// explanation in the tooltip (hover) and rely on the icon + label for the row itself.
+				// Keep rows compact: icon + label only. The full explanation lives in the tooltip (hover) so
+				// the dropdown stays narrow and the label is never squeezed by a long right-aligned description.
 				tooltip: effortDescription(effort),
 				label: reasoningEffortLabel(effort),
 				hover: undefined,

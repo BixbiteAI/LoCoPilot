@@ -32,7 +32,7 @@ import {
 	type FlashAttentionMode,
 	type KvCacheType
 } from './locopilotLlamaCppServer.js';
-import { readGgufModelInfo, isMoeModelInfo, type IGgufModelInfo } from './locopilotGgufMetadata.js';
+import { readGgufModelInfo, isMoeModelInfo, kvBytesPerTokenPerLayer, type IGgufModelInfo } from './locopilotGgufMetadata.js';
 import { ILoCoPilotSystemInfoService, type ISystemHardwareInfo } from '../../../../platform/locopilotSystemInfo/common/locopilotSystemInfo.js';
 import { dirname } from '../../../../base/common/path.js';
 import { isWindows, isMacintosh } from '../../../../base/common/platform.js';
@@ -806,14 +806,20 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 		// #5 Context clamp: never request more than the model supports, nor more than the KV budget can hold.
 		// Use ~25% of the memory budget as the KV-cache allowance (weights take the rest).
 		if (tuning.contextSize && tuning.contextSize > 0) {
+			// Estimate KV bytes/token/layer from the model's attention geometry (f16 - conservative, since
+			// large windows actually run q8_0 which is ~half). Falls back to clampContextSize's own default
+			// when the GGUF lacks the attention keys. Without this the default under-estimates KV by ~25x and
+			// a 256K-trained model would never get clamped on a 16GB machine.
+			const perTokenPerLayer = kvBytesPerTokenPerLayer(info, 2);
 			const clamped = clampContextSize({
 				requestedContext: tuning.contextSize,
 				modelContextLength: info.contextLength,
 				kvBudgetBytes: budget ? budget * 0.25 : undefined,
 				layerCount: info.layerCount,
+				kvBytesPerTokenPerLayer: perTokenPerLayer,
 			});
 			if (clamped < tuning.contextSize) {
-				this._log(`[LoCoPilot Runner] Clamped context ${tuning.contextSize} -> ${clamped} to fit the model/memory budget.`);
+				this._log(`[LoCoPilot Runner] Clamped context ${tuning.contextSize} -> ${clamped} to fit the model/memory budget (KV ~${perTokenPerLayer ?? 'default'} B/tok/layer).`);
 				tuning.contextSize = clamped;
 			}
 		}

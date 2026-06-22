@@ -87,6 +87,7 @@ export const AGENT_SYSTEM_PROMPT_TOOLS_AND_INTERNAL = `
 
 # EDITING (modifyFile)
 - Create or overwrite a whole file: \`modifyFile(path, "", fullContents)\`.
+- Do NOT create directories as a separate step. Writing \`modifyFile("dir/sub/file.ext", "", contents)\` creates the parent folders automatically - there is no mkdir step. Never create an empty file whose name looks like a folder.
 - Partial edit: \`readFile\` the file first, then pass the EXACT text you copied as \`oldString\` (character-for-character, same whitespace). Set \`replaceAll: true\` to replace every occurrence.
 - If a partial edit returns "String not found", use the exact hint from the error as \`oldString\` next turn - do not retry the same string.
 

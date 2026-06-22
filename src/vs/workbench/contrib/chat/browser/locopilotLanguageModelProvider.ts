@@ -387,22 +387,47 @@ export class LoCoPilotLanguageModelProvider extends Disposable implements ILangu
 	 */
 	private _applyOpenAiReasoningEffort(body: any, modelName: string, local: boolean): void {
 		const effort = this._reasoningEffort();
-		// Local servers (llama.cpp/mlx/ollama/localhost) tolerate the field and gate thinking on it.
-		// Cloud OpenAI: only attach to reasoning-capable models so a non-reasoning model isn't rejected.
-		if (local || this._openAiIsReasoningModel(modelName)) {
-			body.reasoning_effort = effort;
+		if (local) {
+			// llama.cpp reads `reasoning_budget` (NOT `reasoning_effort`): 0 disables thinking, -1 is
+			// unlimited, any positive value caps the thinking tokens. Without this the server defaults to
+			// -1 (logged as `reasoning-budget: activated, budget=2147483647`) and ignores `reasoning_effort`
+			// entirely, so the Low/Medium/High picker had no effect on bundled llama.cpp.
+			body.reasoning_budget = reasoningBudgetTokens(effort);
+			if (effort === 'off') {
+				// Servers that gate thinking on a chat-template flag (qwen3 on llama.cpp/ollama) need this too.
+				body.chat_template_kwargs = { ...(body.chat_template_kwargs ?? {}), enable_thinking: false };
+			} else {
+				// mlx_lm / Ollama gate on the level string; harmless to llama.cpp which ignores it.
+				body.reasoning_effort = effort;
+			}
+			return;
+		}
+		// Cloud OpenAI: only attach to reasoning-capable models so a non-reasoning model isn't rejected,
+		// and map our extra levels onto the {low,medium,high} the API accepts ('off' omits, 'max' -> high).
+		if (this._openAiIsReasoningModel(modelName)) {
+			if (effort === 'off') {
+				return;
+			}
+			body.reasoning_effort = effort === 'max' ? 'high' : effort;
 		}
 	}
 
 	/** Apply reasoning effort to an Anthropic request body (extended thinking via `budget_tokens`). */
 	private _applyAnthropicReasoningEffort(body: any, modelName: string, maxOutputTokens: number): void {
 		const effort = this._reasoningEffort();
+		// 'off' -> no extended thinking; leave the body untouched (and keep temperature available).
+		if (effort === 'off') {
+			return;
+		}
 		// Only Claude 3.7 / 4.x families support extended thinking; skip older models so we don't 400 by default.
 		if (!/3-7|3\.7|sonnet-4|opus-4|haiku-4|-4-|-4-\d/i.test(modelName)) {
 			return;
 		}
 		// Anthropic requires budget_tokens >= 1024 and strictly less than max_tokens; temperature must be unset.
-		const budget = Math.max(1024, Math.min(reasoningBudgetTokens(effort), Math.max(1024, maxOutputTokens - 1024)));
+		// 'max' (-1) means "as much as the output cap allows", so clamp to maxOutputTokens - 1024.
+		const ceiling = Math.max(1024, maxOutputTokens - 1024);
+		const requested = reasoningBudgetTokens(effort);
+		const budget = requested === -1 ? ceiling : Math.max(1024, Math.min(requested, ceiling));
 		body.thinking = { type: 'enabled', budget_tokens: budget };
 		delete body.temperature;
 	}
@@ -415,6 +440,7 @@ export class LoCoPilotLanguageModelProvider extends Disposable implements ILangu
 			return;
 		}
 		body.generationConfig = body.generationConfig ?? {};
+		// Gemini's thinkingBudget natively accepts our sentinels: 0 disables thinking, -1 is dynamic/unlimited.
 		body.generationConfig.thinkingConfig = { thinkingBudget: reasoningBudgetTokens(effort) };
 	}
 

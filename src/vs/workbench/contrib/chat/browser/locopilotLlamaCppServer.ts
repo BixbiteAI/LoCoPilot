@@ -208,7 +208,12 @@ export interface ContextClampInputs {
 	kvBudgetBytes?: number;
 	/** Transformer block count, used to size the KV cache. */
 	layerCount?: number;
-	/** Bytes per token *per layer* for the KV cache at f16 (k+v). Defaults to a conservative 160KB/1k est. */
+	/**
+	 * Bytes per token *per layer* for the KV cache at f16 (k+v). Caller should pass a value derived from the
+	 * model's attention geometry (see `kvBytesPerTokenPerLayer` in locopilotGgufMetadata). Defaults to a
+	 * conservative 4096 (a typical GQA model: 8 kv-heads x 128 dim x 2 [k+v] x 2 bytes) so an unknown model
+	 * still gets clamped rather than over-allocating - erring toward a smaller, safe window.
+	 */
 	kvBytesPerTokenPerLayer?: number;
 }
 
@@ -229,7 +234,7 @@ export function clampContextSize(inputs: ContextClampInputs): number {
 	if (inputs.kvBudgetBytes && inputs.kvBudgetBytes > 0 && inputs.layerCount && inputs.layerCount > 0) {
 		const perTokenPerLayer = inputs.kvBytesPerTokenPerLayer && inputs.kvBytesPerTokenPerLayer > 0
 			? inputs.kvBytesPerTokenPerLayer
-			: 160; // ~160 B/token/layer at f16 for a typical 7B-class model; conservative.
+			: 4096; // f16 k+v for a typical GQA model (8 kv-heads x 128 dim x 2); conservative when unknown.
 		const maxTokens = Math.floor(inputs.kvBudgetBytes / (perTokenPerLayer * inputs.layerCount));
 		if (maxTokens > 0) {
 			ctx = Math.min(ctx, maxTokens);

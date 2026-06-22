@@ -61,12 +61,12 @@ function offsetToRange(content: string, startOffset: number, length: number): IR
 function buildReplaceEdits(content: string, oldString: string, newString: string, replaceAll: boolean): TextEdit[] {
 	const indices: number[] = [];
 	let idx = 0;
-	for (;;) {
+	for (; ;) {
 		const i = content.indexOf(oldString, idx);
-		if (i === -1) break;
+		if (i === -1) { break; }
 		indices.push(i);
 		idx = i + 1;
-		if (!replaceAll) break;
+		if (!replaceAll) { break; }
 	}
 	const sorted = replaceAll ? [...indices].sort((a, b) => b - a) : indices;
 	return sorted.map(start => ({
@@ -112,7 +112,7 @@ export function createModifyFileToolData(): IToolData {
 			'**When oldString is EMPTY ("")**:\n' +
 			'- If file does NOT exist: creates the file with newString as full contents (parent dirs created automatically).\n' +
 			'- If file EXISTS: replaces the entire file with newString.\n\n' +
-			'**When oldString is NON-EMPTY**: Same as surgical replace — oldString must match the file exactly (use readFile first and copy exact text). If multiple matches, use replaceAll: true or make oldString unique. On "String not found", use the exact hint from the error as oldString on the next turn.',
+			'**When oldString is NON-EMPTY**: Same as surgical replace - oldString must match the file exactly (use readFile first and copy exact text). If multiple matches, use replaceAll: true or make oldString unique. On "String not found", use the exact hint from the error as oldString on the next turn.',
 		source: ToolDataSource.Internal,
 		inputSchema: inputSchema,
 		canRequestPreApproval: true,
@@ -168,7 +168,13 @@ export class ModifyFileTool implements IToolImpl {
 	async invoke(invocation: IToolInvocation, countTokens: CountTokensCallback, progress: ToolProgress, token: CancellationToken): Promise<IToolResult> {
 		const params = invocation.parameters as IModifyFileToolParams;
 
-		// In ask mode, do not modify files — tell the agent to provide code content in chat instead
+		// Small/local models frequently omit oldString (or send null) when they just want to create a
+		// file. Treat a missing oldString/newString as "" so those calls behave as create/overwrite
+		// instead of throwing on `.length` and trapping the model in a retry loop.
+		if (typeof params.oldString !== 'string') { params.oldString = ''; }
+		if (typeof params.newString !== 'string') { params.newString = ''; }
+
+		// In ask mode, do not modify files - tell the agent to provide code content in chat instead
 		if (invocation.context) {
 			const model = this.chatService.getSession(invocation.context.sessionResource) as ChatModel | undefined;
 			const lastRequest = model?.getRequests().at(-1);
@@ -212,20 +218,33 @@ export class ModifyFileTool implements IToolImpl {
 
 			// --- File does not exist ---
 			if (!fileExists) {
-				if (isEmptyOld) {
-					progress.report({ message: `Creating file ${params.path}...` });
-					const content = VSBuffer.fromString(params.newString);
-					await this.fileService.createFile(fileUri, content, { overwrite: false });
-					const lineCount = params.newString.split('\n').length;
-					const successResult: IToolResult = { content: [{ kind: 'text', value: `Successfully created file "${params.path}" (${lineCount} lines). Proceed to the next step or goal.` }] };
-					const lintFailure = await this.getLintFailureAfterEdit(fileUri, params.path);
-					if (lintFailure) { return lintFailure; }
-					return successResult;
+				// Forgiving create: when the target doesn't exist there is nothing to replace, so the only
+				// sensible result is a file containing newString - REGARDLESS of whether oldString was
+				// supplied. Weak models often pass the code in newString while leaving a stale/non-empty
+				// oldString (or omit it); previously that returned "File does not exist" on every call and
+				// trapped a perfectly valid "create X" request in a loop. We now just create the file.
+				const lastSegment = params.path.replace(/[\\/]+$/, '').split(/[\\/]/).pop() ?? '';
+				// Common extension-less files that are legitimately created without an extension.
+				const KNOWN_EXTENSIONLESS = new Set(['dockerfile', 'makefile', 'license', 'readme', 'changelog', 'procfile', 'gemfile', 'rakefile', 'caddyfile', 'jenkinsfile', 'vagrantfile', 'authors', 'notice', 'codeowners']);
+				// Only refuse the one genuinely harmful case: an empty, extension-less, unknown name -
+				// that is the "creating a directory as a file" mistake that blocks the real folder.
+				const looksLikeDir = !lastSegment.includes('.')
+					&& params.newString.trim().length === 0
+					&& !KNOWN_EXTENSIONLESS.has(lastSegment.toLowerCase());
+				if (looksLikeDir) {
+					return {
+						content: [{ kind: 'text', value: `Error: Refusing to create empty file "${params.path}" - it has no extension and no content, which looks like an attempt to create a directory. Next: Do NOT create directories. Just write the file you actually want (e.g. "${params.path}/index.html") with its contents - parent folders are created automatically.` }],
+						toolResultError: 'Directory-like empty file refused'
+					};
 				}
-				return {
-					content: [{ kind: 'text', value: `Error: File "${params.path}" does not exist. Next: Use oldString: "" and newString: "<full contents>" to create the file with modifyFile.` }],
-					toolResultError: 'File does not exist'
-				};
+				progress.report({ message: `Creating file ${params.path}...` });
+				const content = VSBuffer.fromString(params.newString);
+				await this.fileService.createFile(fileUri, content, { overwrite: false });
+				const lineCount = params.newString.split('\n').length;
+				const successResult: IToolResult = { content: [{ kind: 'text', value: `Successfully created file "${params.path}" (${lineCount} lines). Proceed to the next step or goal.` }] };
+				const lintFailure = await this.getLintFailureAfterEdit(fileUri, params.path);
+				if (lintFailure) { return lintFailure; }
+				return successResult;
 			}
 
 			// --- File exists ---
@@ -333,6 +352,14 @@ export class ModifyFileTool implements IToolImpl {
 
 		} catch (error) {
 			const errorMessage = error instanceof Error ? error.message : String(error);
+			// Common, recoverable case: a path component the model intended as a folder already exists
+			// as a FILE, so the parent folder can't be created. Give the exact fix instead of a generic hint.
+			if (/exists but is not a directory|not a directory/i.test(errorMessage)) {
+				return {
+					content: [{ kind: 'text', value: `Error modifying file "${params.path}": ${errorMessage}. A parent path component already exists as a FILE, which blocks creating the folder. Next: delete the blocking file with run_in_terminal (e.g. \`rm <blocking-path>\`) then retry, OR write your target file directly - modifyFile creates parent folders automatically, so you never need a separate mkdir step.` }],
+					toolResultError: errorMessage
+				};
+			}
 			return {
 				content: [{ kind: 'text', value: `Error modifying file "${params.path}": ${errorMessage}. Next: Verify path exists (listDirectory/findFiles), ensure file is not locked, or use readFile then modifyFile with exact oldString.` }],
 				toolResultError: errorMessage

@@ -214,6 +214,47 @@ export interface IGgufModelInfo {
 	readonly expertCount: number | undefined;
 	/** `<arch>.context_length` - the model's trained context window, used to cap our `-c` to RAM budget. */
 	readonly contextLength: number | undefined;
+	/**
+	 * `<arch>.attention.head_count_kv` - number of *key/value* attention heads (GQA). Equals the query
+	 * head count for MHA models. Drives the KV-cache-per-token estimate (see {@link kvBytesPerTokenPerLayer}).
+	 */
+	readonly kvHeadCount: number | undefined;
+	/** `<arch>.attention.head_count` - number of *query* heads; fallback to derive head dim from embedding. */
+	readonly headCount: number | undefined;
+	/** `<arch>.embedding_length` - model hidden size; used to derive head dim when key/value lengths absent. */
+	readonly embeddingLength: number | undefined;
+	/** `<arch>.attention.key_length` - per-head key dimension; preferred head dim for the KV estimate. */
+	readonly keyLength: number | undefined;
+	/** `<arch>.attention.value_length` - per-head value dimension; preferred head dim for the KV estimate. */
+	readonly valueLength: number | undefined;
+}
+
+/**
+ * Estimates the KV-cache bytes consumed per token *per transformer layer* at the given bytes-per-element
+ * (2 for f16, ~1 for q8_0), from the model's attention geometry. Returns `undefined` when the geometry
+ * can't be determined, so the caller keeps its conservative default.
+ *
+ * KV per token per layer = (kvHeads * keyDim + kvHeads * valueDim) * bytesPerElem. The key/value lengths
+ * come straight from GGUF when present; otherwise we derive a square head dim as embedding / headCount.
+ */
+export function kvBytesPerTokenPerLayer(info: IGgufModelInfo, bytesPerElem: number = 2): number | undefined {
+	const kvHeads = info.kvHeadCount && info.kvHeadCount > 0
+		? info.kvHeadCount
+		: (info.headCount && info.headCount > 0 ? info.headCount : undefined);
+	if (!kvHeads) {
+		return undefined;
+	}
+	let keyDim = info.keyLength && info.keyLength > 0 ? info.keyLength : undefined;
+	let valueDim = info.valueLength && info.valueLength > 0 ? info.valueLength : undefined;
+	if ((!keyDim || !valueDim) && info.embeddingLength && info.headCount && info.headCount > 0) {
+		const headDim = Math.floor(info.embeddingLength / info.headCount);
+		keyDim = keyDim ?? headDim;
+		valueDim = valueDim ?? headDim;
+	}
+	if (!keyDim || !valueDim) {
+		return undefined;
+	}
+	return (kvHeads * keyDim + kvHeads * valueDim) * bytesPerElem;
 }
 
 /** True when the GGUF metadata indicates a Mixture-of-Experts model (has routed experts). */
@@ -229,17 +270,22 @@ export async function readGgufModelInfo(fileService: IFileService, filePath: str
 	let layerCount: number | undefined;
 	let expertCount: number | undefined;
 	let contextLength: number | undefined;
+	let kvHeadCount: number | undefined;
+	let headCount: number | undefined;
+	let embeddingLength: number | undefined;
+	let keyLength: number | undefined;
+	let valueLength: number | undefined;
 	try {
 		const uri = URI.file(filePath);
 		const cursor = new GgufCursor(fileService, uri);
 
 		const magic = await cursor.u32();
 		if (magic !== GGUF_MAGIC) {
-			return { layerCount, expertCount, contextLength }; // not a GGUF file
+			return { layerCount, expertCount, contextLength, kvHeadCount, headCount, embeddingLength, keyLength, valueLength }; // not a GGUF file
 		}
 		const version = await cursor.u32();
 		if (version < 2) {
-			return { layerCount, expertCount, contextLength }; // v1 used uint32 length prefixes; not supported
+			return { layerCount, expertCount, contextLength, kvHeadCount, headCount, embeddingLength, keyLength, valueLength }; // v1 used uint32 length prefixes; not supported
 		}
 		await cursor.u64(); // tensor_count (unused)
 		const kvCount = await cursor.u64();
@@ -258,16 +304,33 @@ export async function readGgufModelInfo(fileService: IFileService, filePath: str
 			} else if (isScalar && key.endsWith('.context_length')) {
 				const n = await cursor.scalar(valueType);
 				contextLength = Number.isFinite(n) && n > 0 ? Math.floor(n) : undefined;
+			} else if (isScalar && key.endsWith('.attention.head_count_kv')) {
+				const n = await cursor.scalar(valueType);
+				kvHeadCount = Number.isFinite(n) && n > 0 ? Math.floor(n) : undefined;
+			} else if (isScalar && key.endsWith('.attention.head_count')) {
+				const n = await cursor.scalar(valueType);
+				headCount = Number.isFinite(n) && n > 0 ? Math.floor(n) : undefined;
+			} else if (isScalar && key.endsWith('.embedding_length')) {
+				const n = await cursor.scalar(valueType);
+				embeddingLength = Number.isFinite(n) && n > 0 ? Math.floor(n) : undefined;
+			} else if (isScalar && key.endsWith('.attention.key_length')) {
+				const n = await cursor.scalar(valueType);
+				keyLength = Number.isFinite(n) && n > 0 ? Math.floor(n) : undefined;
+			} else if (isScalar && key.endsWith('.attention.value_length')) {
+				const n = await cursor.scalar(valueType);
+				valueLength = Number.isFinite(n) && n > 0 ? Math.floor(n) : undefined;
 			} else {
 				await cursor.skipValue(valueType);
 			}
-			// Early-out once we have everything; the rest of the header (tokenizer vocab) is large.
-			if (layerCount !== undefined && expertCount !== undefined && contextLength !== undefined) {
+			// Early-out once we have the core sizing keys (expert/key/value lengths are optional and not all
+			// models emit them). headCount + embeddingLength let us derive head dim when key/value are absent.
+			if (layerCount !== undefined && contextLength !== undefined && kvHeadCount !== undefined
+				&& headCount !== undefined && embeddingLength !== undefined) {
 				break;
 			}
 		}
 	} catch {
 		// any failure -> return whatever we gathered (callers treat undefined as "use defaults")
 	}
-	return { layerCount, expertCount, contextLength };
+	return { layerCount, expertCount, contextLength, kvHeadCount, headCount, embeddingLength, keyLength, valueLength };
 }

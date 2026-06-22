@@ -30,6 +30,27 @@ const REPEATED_TOOL_CALL_WINDOW = 6;
 const DEFAULT_MAX_ITERATIONS = 25;
 
 /**
+ * Self-correction scaffolding. Small/local models don't reliably form recovery hypotheses from raw
+ * tool errors, and they keep re-trying logically-identical actions with slightly different args
+ * (which the exact-args repeat guard above can't see). These thresholds drive a *semantic* layer:
+ * we classify each error into a signature and escalate HINTS based on how often the same CLASS of
+ * error recurs, regardless of the exact arguments. These hints never halt the agent.
+ */
+/** After the same error CLASS recurs this many times, inject a corrective "change your approach" nudge. */
+const SEMANTIC_ERROR_CORRECTION_THRESHOLD = 2;
+/**
+ * Repeated errors NEVER hard-stop the agent - they only escalate hints. The model is given
+ * progressively stronger guidance and left free to keep trying. The only hard stops are the two
+ * existing safety nets: MAX_ITERATIONS and the exact same-tool+same-args repeat guard
+ * (REPEATED_TOOL_CALL_THRESHOLD). This keeps the agent unblocked, per the "hint, don't halt" rule.
+ */
+/** Consecutive iterations where every tool call errored (no successful edit) before we force a re-orient. */
+const NO_PROGRESS_REORIENT_THRESHOLD = 3;
+
+/** Tool ids that mutate the workspace - a successful call to one of these counts as real progress. */
+const MUTATING_TOOL_IDS = new Set<string>(['modifyFile', 'editFile_internal']);
+
+/**
  * Tool ids that are safe to run concurrently within a single agent turn: read-only inspection
  * tools plus runSubagent (used for read-only parallel research). Edit/mutating tools are
  * deliberately excluded so they run sequentially and never race on the same files.
@@ -60,7 +81,9 @@ export class UnifiedAgent {
 		private readonly locopilotFileLog: ILoCoPilotFileLog,
 		maxIterations: number = DEFAULT_MAX_ITERATIONS
 	) {
-		this.MAX_ITERATIONS = Math.min(100, Math.max(1, maxIterations));
+		// Honor the user's "Max iterations per request" setting, which the settings UI allows up to 500.
+		// (Previously capped at 100 here, silently overriding higher user-chosen values.)
+		this.MAX_ITERATIONS = Math.min(500, Math.max(1, maxIterations));
 		this.contextManager = new ContextManager(
 			this.languageModelsService,
 			(msg, ...args) => this._log(msg, ...args)
@@ -86,6 +109,16 @@ export class UnifiedAgent {
 		let conversationMessages = [...messages];
 		// Track recent tool invocations (toolKey) to detect repeated same tool+args loops
 		const recentToolKeys: string[] = [];
+
+		// --- Self-correction state (the "running model" a strong model would keep in its head) ---
+		// The user's goal, used when we force the model to re-orient after getting stuck.
+		const originalUserGoal = this.extractUserGoal(messages);
+		// How many times each error CLASS (signature) has been seen across the whole run.
+		const errorSignatureCounts = new Map<string, number>();
+		// Count of successful workspace mutations so far (real forward progress).
+		let successfulMutations = 0;
+		// Consecutive iterations that produced an error and zero successful edits (thrash detector).
+		let consecutiveStuckIterations = 0;
 
 		// Get model metadata and available tools
 		const modelMetadata = this.languageModelsService.lookupLanguageModel(modelId);
@@ -270,7 +303,7 @@ export class UnifiedAgent {
 			// original tool-call order so each tool_result lines up with its tool_use id.
 			this._log(`[LoCoPilot] Executing ${toolCalls.length} tool call(s)...`);
 
-			const results: Array<{ toolResult: any; images: IChatMessageImagePart[] }> = new Array(toolCalls.length);
+			const results: Array<Awaited<ReturnType<UnifiedAgent['executeToolCall']>>> = new Array(toolCalls.length);
 			const parallelIndexes: number[] = [];
 			const sequentialIndexes: number[] = [];
 			toolCalls.forEach((tc, i) => {
@@ -298,6 +331,60 @@ export class UnifiedAgent {
 				imagePartsForVision.push(...r.images);
 			}
 
+			// --- Self-correction: classify this round's outcomes and decide whether to coach/stop. ---
+			// This is the "running model" a strong model keeps in its head, made explicit so weak
+			// models inherit it: count real progress, classify repeated error CLASSES (not exact
+			// args), and inject targeted guidance instead of letting the model spin.
+			let progressedThisRound = false;
+			let erroredThisRound = false;
+			const coachingNotes: string[] = [];
+			// First pass: did we make REAL progress (a successful edit) this round? Progress means the
+			// model is not stuck, so we must not punish it for unrelated errors in the same round.
+			for (const r of results) {
+				if (r && MUTATING_TOOL_IDS.has(r.realToolId) && !r.isError) {
+					successfulMutations++;
+					progressedThisRound = true;
+				}
+				if (r && r.isError) { erroredThisRound = true; }
+			}
+
+			if (progressedThisRound) {
+				// Forward progress clears the "stuck" memory: a legitimate multi-file task that hits the
+				// same error CLASS on independent files (e.g. several "string not found") between
+				// successful edits is not stuck. Only an unbroken run of pure-error rounds keeps escalating.
+				errorSignatureCounts.clear();
+				consecutiveStuckIterations = 0;
+			} else if (erroredThisRound) {
+				// Pure-error round: classify each failure by CLASS (not exact args) and HINT. We never hard-stop
+				// here - we just escalate guidance and let the model keep trying. Termination is left to the two
+				// safety nets (MAX_ITERATIONS and the exact same-tool+args repeat guard).
+				for (const r of results) {
+					if (!r || !r.isError) { continue; }
+					const sig = this.errorSignature(r.realToolId, r.errorText);
+					const count = (errorSignatureCounts.get(sig) ?? 0) + 1;
+					errorSignatureCounts.set(sig, count);
+					if (count >= SEMANTIC_ERROR_CORRECTION_THRESHOLD) {
+						// Re-issued each round the failure persists; the note's wording escalates with count.
+						coachingNotes.push(this.buildCorrectionNote(r.realToolId, r.errorText, count));
+					}
+				}
+				// Thrash detector: consecutive pure-error rounds with only first-seen errors (no single class
+				// repeating) still mean the model is circling - nudge a full re-orient against the goal.
+				consecutiveStuckIterations++;
+				if (consecutiveStuckIterations >= NO_PROGRESS_REORIENT_THRESHOLD && coachingNotes.length === 0) {
+					coachingNotes.push(this.buildReorientNote(originalUserGoal, successfulMutations, consecutiveStuckIterations));
+				}
+			} else {
+				// Reads-only round with no errors (normal exploration): not stuck.
+				consecutiveStuckIterations = 0;
+			}
+			// Append guidance as a text part inside the SAME tool-results user message. This keeps the
+			// required assistant(tool_use) -> user(tool_result) pairing intact (no stray messages) while
+			// putting the nudge exactly where the model reads its results.
+			if (coachingNotes.length > 0 && toolResults.length > 0) {
+				toolResults.push({ type: 'text', value: `\n\n\u2500\u2500 SELF-CORRECTION \u2500\u2500\n${coachingNotes.join('\n\n')}` });
+			}
+
 			// Add tool results to conversation
 			if (toolResults.length > 0) {
 				conversationMessages.push({
@@ -305,6 +392,7 @@ export class UnifiedAgent {
 					content: toolResults
 				});
 			}
+
 
 			// Add a user message with image(s) from readFile so the LLM can use vision (tool messages are text-only)
 			if (imagePartsForVision.length > 0) {
@@ -351,7 +439,7 @@ export class UnifiedAgent {
 		request: IChatAgentRequest,
 		token: CancellationToken,
 		idByLlmName: Map<string, string>
-	): Promise<{ toolResult: any; images: IChatMessageImagePart[] }> {
+	): Promise<{ toolResult: any; images: IChatMessageImagePart[]; realToolId: string; isError: boolean; errorText: string }> {
 		const images: IChatMessageImagePart[] = [];
 		// The model calls tools by their sanitized name; map back to the real tool id to invoke.
 		const realToolId = idByLlmName.get(toolCall.name) ?? toolCall.name;
@@ -409,14 +497,25 @@ export class UnifiedAgent {
 				});
 			}
 
+			// A tool can "soft-fail": it returns normally (no throw) but sets toolResultError and an
+			// "Error: ... Next: ..." message. The conversation still shows that text, but for our own
+			// loop-detection we need to know it was a failure, so surface it here.
+			const softError = result.toolResultError;
+			const softErrorText = softError
+				? softError
+				: (resultContent.find(c => typeof c.value === 'string' && c.value.startsWith('Error:'))?.value ?? '');
+
 			return {
 				toolResult: {
 					type: 'tool_result',
 					toolCallId: toolCall.toolCallId,
 					value: resultContent,
-					isError: false
+					isError: !!softError
 				},
-				images
+				images,
+				realToolId,
+				isError: !!softError || softErrorText.length > 0,
+				errorText: softErrorText
 			};
 		} catch (error: any) {
 			this.logService.error(`[LoCoPilot] Tool ${toolCall.name} failed: ${error}`);
@@ -432,9 +531,82 @@ export class UnifiedAgent {
 					}],
 					isError: true
 				},
-				images
+				images,
+				realToolId,
+				isError: true,
+				errorText: `${error?.message || error}`
 			};
 		}
+	}
+
+	/**
+	 * Pull the user's actual request out of the initial messages so we can remind the model of its
+	 * goal when it gets stuck. We take the last user-authored text (the current ask), trimmed.
+	 */
+	private extractUserGoal(messages: IChatMessage[]): string {
+		for (let i = messages.length - 1; i >= 0; i--) {
+			const m = messages[i];
+			if (m.role !== ChatMessageRole.User) { continue; }
+			const text = (Array.isArray(m.content) ? m.content : [m.content])
+				.map((c: any) => (typeof c === 'string' ? c : c?.type === 'text' ? c.value : ''))
+				.join(' ')
+				.trim();
+			if (text) { return text.length > 300 ? text.slice(0, 300) + '…' : text; }
+		}
+		return '';
+	}
+
+	/**
+	 * Reduce a raw error message to a stable "class" so we can tell when the model is hitting the
+	 * SAME underlying problem with different arguments (e.g. the same write error on three paths).
+	 * We strip quoted strings, paths, and numbers - the variable parts - and key by tool id.
+	 */
+	private errorSignature(toolId: string, errorText: string): string {
+		const norm = (errorText || 'error')
+			.toLowerCase()
+			.replace(/["'`][^"'`]*["'`]/g, ' ')   // quoted paths/strings
+			.replace(/[a-z]:\\[^\s)]+/gi, ' ')    // windows-style paths
+			.replace(/\/[^\s)]+/g, ' ')           // unix-style paths
+			.replace(/\d+/g, ' ')                  // line numbers, counts
+			.replace(/\s+/g, ' ')
+			.trim()
+			.slice(0, 80);
+		return `${toolId}::${norm}`;
+	}
+
+	/**
+	 * Targeted "stop and change approach" guidance for a repeated error class. Includes a couple of
+	 * concrete recovery patterns small models otherwise fail to infer (e.g. a path they want as a
+	 * folder is actually a file - delete it first via the terminal).
+	 */
+	private buildCorrectionNote(toolId: string, errorText: string, count: number): string {
+		const lower = (errorText || '').toLowerCase();
+		let specific = '';
+		if (lower.includes('not a directory') || lower.includes('already exists but is not a directory')) {
+			specific = ' ROOT CAUSE: a path you are treating as a folder already exists as a FILE. Do NOT keep retrying writes. Either delete that file first (run_in_terminal with `rm <path>`) and retry, or just write your target file directly (modifyFile with path like `dir/file.ext` creates parent folders automatically - there is no separate mkdir step).';
+		} else if (toolId === 'modifyFile' && lower.includes('string not found')) {
+			specific = ' ROOT CAUSE: your oldString does not match the file. Call readFile to get the exact current text and copy it character-for-character, or use the exact hint from the error - do not guess again.';
+		} else if (lower.includes('no workspace folder')) {
+			specific = ' ROOT CAUSE: no folder is open. Stop retrying; tell the user to open a folder.';
+		}
+		// Escalate the tone the longer the same failure persists - but we never halt; the model stays
+		// free to keep trying until it recovers or hits a safety-net stop (max iterations / exact repeat).
+		const escalation = count >= 4
+			? ` This is attempt ${count} - the current approach is clearly NOT working. ABANDON it entirely and try something fundamentally different (a different tool, fix the underlying state with run_in_terminal, or stop and tell the user exactly what is blocking you).`
+			: '';
+		return `The action \`${toolId}\` has now failed ${count} times with the same kind of error: "${(errorText || '').slice(0, 160)}".${specific}${escalation} Before acting again: in ONE sentence state the root cause, then take a DIFFERENT action that addresses it. Do not repeat a variant of the call that just failed.`;
+	}
+
+	/**
+	 * Force a re-orientation after several unproductive iterations: restate goal, name the blocker,
+	 * pick one different next action. Nudges the todo tool so progress is tracked going forward.
+	 */
+	private buildReorientNote(goal: string, edits: number, stuckCount: number): string {
+		return `No progress in the last ${stuckCount} iterations (errors, no successful edits; ${edits} edit(s) total so far). STOP and re-orient before calling another tool:\n` +
+			`1. Restate the goal in one line${goal ? ` (the user asked: "${goal}")` : ''}.\n` +
+			`2. State the current blocker and its root cause in one line.\n` +
+			`3. Choose ONE concrete next action that is DIFFERENT from what has been failing - e.g. fix filesystem state with run_in_terminal, re-read a file/dir to correct a wrong assumption, or write the target file directly.\n` +
+			`Consider using the todo tool to record what is done vs. remaining so you stop repeating steps.`;
 	}
 
 	/**

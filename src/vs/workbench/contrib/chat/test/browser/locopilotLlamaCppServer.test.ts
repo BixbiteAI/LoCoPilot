@@ -109,16 +109,21 @@ suite('LoCoPilot llama.cpp server', () => {
 			assert.strictEqual(clampContextSize({ requestedContext: 131072, modelContextLength: 32768 }), 32768);
 		});
 
-		test('caps to the KV memory budget', () => {
-			// 1GB KV budget / (160 B/tok/layer * 32 layers) = ~204k tokens -> not binding here.
-			// Tight: 64MB budget / (160*32) = ~13107 -> rounded down to 12288.
-			const ctx = clampContextSize({ requestedContext: 32768, kvBudgetBytes: 64 * 1024 * 1024, layerCount: 32 });
+		test('caps to the KV memory budget (explicit per-token estimate)', () => {
+			// Tight: 64MB budget / (160 B/tok/layer * 32 layers) = ~13107 -> rounded down to 12288.
+			const ctx = clampContextSize({ requestedContext: 32768, kvBudgetBytes: 64 * 1024 * 1024, layerCount: 32, kvBytesPerTokenPerLayer: 160 });
 			assert.strictEqual(ctx, 12288);
+		});
+
+		test('default per-token estimate (4096) clamps a long-context model', () => {
+			// 2GB KV budget / (4096 B/tok/layer * 36 layers) = ~14563 -> rounded down to 14336.
+			const ctx = clampContextSize({ requestedContext: 262144, kvBudgetBytes: 2 * 1024 * 1024 * 1024, layerCount: 36 });
+			assert.strictEqual(ctx, 14336);
 		});
 
 		test('never below the floor', () => {
 			// ~2000 tokens fit -> rounds to 1024 -> floored up to MIN_CLAMPED_CONTEXT.
-			const ctx = clampContextSize({ requestedContext: 32768, kvBudgetBytes: 2000 * 160 * 80, layerCount: 80 });
+			const ctx = clampContextSize({ requestedContext: 32768, kvBudgetBytes: 2000 * 160 * 80, layerCount: 80, kvBytesPerTokenPerLayer: 160 });
 			assert.strictEqual(ctx, MIN_CLAMPED_CONTEXT);
 		});
 
