@@ -2211,6 +2211,21 @@ export class ChatInputPart extends Disposable implements IHistoryNavigationWidge
 				this._timerBar.appendChild(sep2);
 				this._timerBar.appendChild(rateEl);
 
+				// Track output streaming activity across ticks. The stream tracker keeps its
+				// last implied rate between updates, so without this the rate would stick on
+				// screen during tool calls / end-of-turn gaps even though nothing is flowing.
+				// We only show the rate while output words are actively increasing.
+				let lastSeenOutputWords = -1;
+				let lastOutputChangeAt = 0;
+				// Output can arrive in chunks up to ~1s apart, so allow a short grace window
+				// before treating the stream as idle and hiding the rate.
+				const RATE_IDLE_TIMEOUT_MS = 1500;
+				// Reasoning streams continuously (no tool-call pauses), so we also surface a
+				// rate during the thinking phase, computed over the reasoning elapsed time.
+				let lastSeenThinkingWords = -1;
+				let lastThinkingChangeAt = 0;
+				let thinkingStartedAt = 0;
+
 				const update = () => {
 					if (!this._timerBar) { return; }
 					const now = Date.now();
@@ -2244,6 +2259,31 @@ export class ChatInputPart extends Disposable implements IHistoryNavigationWidge
 					const wordRate = stats?.impliedWordLoadRate ?? 0;
 					const rate = wordRate > 0 ? Math.round(wordRate * ChatInputPart.WORDS_TO_TOKENS) : 0;
 
+					// Detect whether output is actively streaming. The implied rate above is
+					// retained by the tracker between updates, so we additionally require that
+					// output words actually changed within the recent grace window before
+					// showing the rate - otherwise it would linger on screen during pauses.
+					if (outputWords !== lastSeenOutputWords) {
+						lastSeenOutputWords = outputWords;
+						lastOutputChangeAt = now;
+					}
+					const isStreaming = lastOutputChangeAt > 0 && (now - lastOutputChangeAt) < RATE_IDLE_TIMEOUT_MS;
+
+					// Track reasoning activity the same way. When output isn't flowing but thinking
+					// tokens are, show a rate derived from the reasoning phase so the figure stays
+					// visible (and honest) while the model reasons.
+					if (thinkingWords > 0 && thinkingStartedAt === 0) {
+						thinkingStartedAt = now;
+					}
+					if (thinkingWords !== lastSeenThinkingWords) {
+						lastSeenThinkingWords = thinkingWords;
+						lastThinkingChangeAt = now;
+					}
+					const isThinkingStreaming = !isStreaming && lastThinkingChangeAt > 0 && (now - lastThinkingChangeAt) < RATE_IDLE_TIMEOUT_MS;
+					const thinkingElapsedMs = thinkingStartedAt > 0 ? now - thinkingStartedAt : 0;
+					const thinkingRate = isThinkingStreaming && thinkingElapsedMs > 0 ? Math.round(thinkingTokens / (thinkingElapsedMs / 1000)) : 0;
+					const effectiveRate = isStreaming ? rate : thinkingRate;
+
 					timeEl.textContent = ChatInputPart.formatElapsed(elapsed);
 
 					const hasTok = totalTokens > 0;
@@ -2258,11 +2298,11 @@ export class ChatInputPart extends Disposable implements IHistoryNavigationWidge
 
 					// While paused awaiting approval nothing is generating, so a stale rate would
 					// be misleading - hide it until generation resumes.
-					const hasRate = rate > 0 && !isPaused;
+					const hasRate = effectiveRate > 0 && !isPaused && (isStreaming || isThinkingStreaming);
 					sep2.style.display = hasRate ? '' : 'none';
 					rateEl.style.display = hasRate ? '' : 'none';
 					if (hasRate) {
-						rateEl.textContent = `${rate} tokens/sec`;
+						rateEl.textContent = `${effectiveRate} tokens/sec`;
 					}
 				};
 
