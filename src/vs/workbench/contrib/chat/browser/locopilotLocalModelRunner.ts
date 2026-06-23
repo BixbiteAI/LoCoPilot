@@ -1067,6 +1067,24 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 		return localPath;
 	}
 
+	/**
+	 * Finds the multimodal projector (`mmproj-*.gguf`) next to the model weights, or undefined when none was
+	 * downloaded (text-only model, or a vision model fetched before projector support existed). The download
+	 * service places it in the same directory as the main GGUF, so we look there. Passed to llama.cpp via
+	 * `--mmproj` to enable image input.
+	 */
+	private async resolveMmprojPath(localPath: string): Promise<string | undefined> {
+		try {
+			const stat = await this.fileService.stat(URI.file(localPath));
+			const modelDir = stat.isDirectory ? localPath : dirname(localPath);
+			const resolved = await this.fileService.resolve(URI.file(modelDir));
+			const match = (resolved.children ?? []).find(c => c.isFile && /^mmproj.*\.gguf$/i.test(c.name));
+			return match?.resource.fsPath;
+		} catch {
+			return undefined;
+		}
+	}
+
 	/** True if the resolved local path is a single GGUF file (Hugging Face layout). */
 	private async pathResolvesToGguf(localPath: string): Promise<boolean> {
 		const p = await this.resolveModelFilePath(localPath);
@@ -1255,6 +1273,15 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 
 		const port = await this.findAvailablePort(LOCOPILOT_LLAMA_SERVER_PORT);
 		const tuning = await this._augmentTuningWithHardware(modelPath, backend, this._getLlamaTuning(model));
+		// Vision: when a projector was downloaded next to the weights, pass it so the server accepts images.
+		// Skipped for models the user marked text-only (no point loading a projector they won't use).
+		if (model.supportsVision !== false) {
+			const mmprojPath = await this.resolveMmprojPath(model.localPath);
+			if (mmprojPath) {
+				tuning.mmprojPath = mmprojPath;
+				this._log(`[LoCoPilot Runner] Vision enabled for ${modelId}: using projector ${mmprojPath}.`);
+			}
+		}
 		const { command, args } = getLlamaCppServerCommand(modelPath, backend, serverPath, port, tuning);
 		this._log(`[LoCoPilot Runner] Starting llama.cpp server for model ${modelId} on port ${port} with backend: ${backend}`);
 

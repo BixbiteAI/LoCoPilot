@@ -324,6 +324,12 @@ export interface LlamaServerTuning {
 	ubatchSize?: number;
 	/** Extra raw args appended verbatim (power users / build-specific flags). */
 	extraArgs?: string;
+	/**
+	 * Path to a multimodal projector GGUF (`--mmproj`). Required for the server to accept image input on
+	 * vision models; without it llama.cpp rejects images. Emitted only when set (i.e. the model ships a
+	 * projector and it was downloaded). Independent of the text weights in `-m`.
+	 */
+	mmprojPath?: string;
 }
 
 /** Inputs for {@link computeGpuLayers}; all byte counts are absolute, layerCount is the model's blocks. */
@@ -457,6 +463,11 @@ export function getLlamaCppServerCommand(modelPath: string, backend: LlamaBacken
 		// Flash Attention: 'auto' enables it where supported and falls back to standard attention otherwise.
 		'-fa', flashAttention,
 	];
+
+	// Multimodal projector: enables image input. Only present for vision models whose projector was downloaded.
+	if (tuning.mmprojPath && tuning.mmprojPath.trim()) {
+		args.push('--mmproj', tuning.mmprojPath.trim());
+	}
 
 	// GPU offload:
 	//  - CPU backend       -> explicit 0 (forcing the flag onto a CPU-only binary would break startup).

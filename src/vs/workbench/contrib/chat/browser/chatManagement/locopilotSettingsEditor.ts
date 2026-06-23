@@ -7,7 +7,6 @@ import './media/locopilotSettingsEditor.css';
 import './media/addCustomModelEditor.css';
 import './media/customLanguageModelsListEditor.css';
 import * as DOM from '../../../../../base/browser/dom.js';
-import { IInstantiationService } from '../../../../../platform/instantiation/common/instantiation.js';
 import { IStorageService } from '../../../../../platform/storage/common/storage.js';
 import { ITelemetryService } from '../../../../../platform/telemetry/common/telemetry.js';
 import { IThemeService } from '../../../../../platform/theme/common/themeService.js';
@@ -37,7 +36,7 @@ import { defaultButtonStyles, getInputBoxStyle, getSelectBoxStyles, defaultToggl
 import { settingsSelectBackground, settingsSelectBorder, settingsSelectForeground, settingsSelectListBorder, settingsTextInputBackground, settingsTextInputBorder, settingsTextInputForeground } from '../../../preferences/common/settingsEditorColorRegistry.js';
 import { Toggle } from '../../../../../base/browser/ui/toggle/toggle.js';
 import { SelectBox, ISelectOptionItem, ISelectData } from '../../../../../base/browser/ui/selectBox/selectBox.js';
-import { ICustomLanguageModelsService, ICustomLanguageModel, getCustomModelListLabel, needsDownloadOrPullRetry, DEFAULT_CONTEXT_WINDOW_CLOUD, DEFAULT_CONTEXT_WINDOW_LOCAL, MIN_CONTEXT_WINDOW, MAX_CONTEXT_WINDOW } from '../../common/customLanguageModelsService.js';
+import { ICustomLanguageModelsService, ICustomLanguageModel, getCustomModelListLabel, customModelSupportsVision, needsDownloadOrPullRetry, DEFAULT_CONTEXT_WINDOW_CLOUD, DEFAULT_CONTEXT_WINDOW_LOCAL, MIN_CONTEXT_WINDOW, MAX_CONTEXT_WINDOW } from '../../common/customLanguageModelsService.js';
 import { IDialogService } from '../../../../../platform/dialogs/common/dialogs.js';
 import { IClipboardService } from '../../../../../platform/clipboard/common/clipboardService.js';
 import { ICommandService } from '../../../../../platform/commands/common/commands.js';
@@ -229,6 +228,8 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 	private addFormUseNativeToolsContainer!: HTMLElement;
 	private addFormMtpToggle!: Toggle;
 	private addFormMtpContainer!: HTMLElement;
+	private addFormVisionToggle!: Toggle;
+	private addFormVisionContainer!: HTMLElement;
 	private addFormHfFastestToggle!: Toggle;
 	private addFormHfFastestContainer!: HTMLElement;
 	private addFormAddButton!: Button;
@@ -300,7 +301,6 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 		@ITelemetryService telemetryService: ITelemetryService,
 		@IThemeService themeService: IThemeService,
 		@IStorageService storageService: IStorageService,
-		@IInstantiationService private readonly instantiationService: IInstantiationService,
 		@ILoCoPilotAgentSettingsService agentSettingsService: ILoCoPilotAgentSettingsService,
 		@IContextViewService private readonly contextViewService: IContextViewService,
 		@ICustomLanguageModelsService customLanguageModelsService: ICustomLanguageModelsService,
@@ -614,6 +614,21 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 		}));
 		DOM.append(mtpToggleContainer, this.addFormMtpToggle.domNode);
 
+		// Vision toggle (local models): whether the model can read image attachments. Shown for local providers
+		// so the user can declare a multimodal model up front. Auto-detection (HF/Ollama) and the runtime
+		// auto-disable can still refine this; the My Models toggle lets it be changed later.
+		this.addFormVisionContainer = DOM.append(card, $('.form-field'));
+		this.addFormVisionContainer.style.display = 'none';
+		const visionLabel = DOM.append(this.addFormVisionContainer, $('label.form-label'));
+		visionLabel.textContent = localize('addCustomModel.vision', 'Vision (image input)');
+		const visionToggleContainer = DOM.append(this.addFormVisionContainer, $('.form-input-container.agent-setting-switch-wrap'));
+		this.addFormVisionToggle = this._register(new Toggle({
+			title: localize('addCustomModel.visionDescription', 'Turn on only for multimodal models that can read images. If the model can\'t actually process an image, vision is turned off automatically. Default: off.'),
+			isChecked: false,
+			...defaultToggleStyles
+		}));
+		DOM.append(visionToggleContainer, this.addFormVisionToggle.domNode);
+
 		// HF cloud routing toggle (shown only for Hugging Face cloud): on = cheapest, off = fastest
 		this.addFormHfFastestContainer = DOM.append(card, $('.form-field'));
 		this.addFormHfFastestContainer.style.display = 'none';
@@ -658,6 +673,7 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 		this.addFormModelFormatInputBox.value = '';
 		this.addFormUseNativeToolsToggle.checked = false;
 		this.addFormMtpToggle.checked = false;
+		this.addFormVisionToggle.checked = false;
 		this.addFormUpdateInputFields();
 	}
 
@@ -701,6 +717,8 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 			// Tools / MTP / context window are auto-derived or overridden from the model list, never on the Add form.
 			if (this.addFormUseNativeToolsContainer) { this.addFormUseNativeToolsContainer.style.display = 'none'; }
 			if (this.addFormMtpContainer) { this.addFormMtpContainer.style.display = 'none'; }
+			// Vision is a cloud-model capability we leave to the provider's own metadata, so hide it for cloud.
+			if (this.addFormVisionContainer) { this.addFormVisionContainer.style.display = 'none'; }
 			if (this.addFormHfFastestContainer) { this.addFormHfFastestContainer.style.display = isHfCloud ? '' : 'none'; }
 			// Reset HF cloud routing toggle to its default (cheapest on) when HF cloud is selected.
 			if (isHfCloud && this.addFormHfFastestToggle) { this.addFormHfFastestToggle.checked = true; }
@@ -723,6 +741,8 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 			if (this.addFormModelFormatContainer) { this.addFormModelFormatContainer.style.display = 'none'; }
 			if (this.addFormUseNativeToolsContainer) { this.addFormUseNativeToolsContainer.style.display = 'none'; }
 			if (this.addFormMtpContainer) { this.addFormMtpContainer.style.display = 'none'; }
+			// Vision toggle is shown for all local providers so the user can declare a multimodal model up front.
+			if (this.addFormVisionContainer) { this.addFormVisionContainer.style.display = ''; }
 			// All local providers (HuggingFace, Ollama, Localhost) default to the smaller local context window.
 			this.addFormContextWindowInput.value = String(LoCoPilotSettingsEditor.LOCAL_DEFAULT_CONTEXT_WINDOW);
 		}
@@ -841,6 +861,9 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 				localhostOpenAiModel: isLocalhost ? localhostServerModelId : undefined,
 				localPath: providerValue === 'ollama' ? ollamaUrl : undefined, // Store Base URL in localPath for Ollama
 				hfFastest: isHfCloud ? !this.addFormHfFastestToggle.checked : undefined,
+				// Vision is collected for local models only (cloud relies on provider metadata). A confirmed
+				// HF/Ollama capability can still refine this after download; the My Models toggle can change it.
+				supportsVision: this.addFormCurrentModelType === 'local' ? this.addFormVisionToggle.checked : undefined,
 			});
 			const listLabel = getCustomModelListLabel(addedModel);
 
@@ -1270,6 +1293,26 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 			DOM.append(mtpWrap, mtpToggle.domNode);
 			this._register(mtpToggle.onChange(async () => {
 				await this.customLanguageModelsService.updateCustomModel(model.id, { mtp: mtpToggle.checked });
+			}));
+		}
+		// Vision toggle: whether this model can read image attachments. Shown for local and HF-cloud models.
+		if (model.type === 'local' || model.provider === 'huggingface-cloud') {
+			const visionDesc = model.visionAutoDisabled
+				? localize('customLanguageModels.visionAutoDisabledDescription', 'Vision was turned off automatically because this model couldn\'t read the last image. Turn it back on to try again.')
+				: localize('customLanguageModels.visionDescription', 'Allow image attachments for this model. Only enable for models that can read images.');
+			const visionContainer = DOM.append(secondarySettingsContainer, $('.model-action-tools-container'));
+			visionContainer.title = visionDesc;
+			const visionIcon = DOM.append(visionContainer, $('span.model-action-tools-icon'));
+			visionIcon.appendChild(renderIcon(Codicon.eye));
+			const visionWrap = DOM.append(visionContainer, $('.model-action-tools.agent-setting-switch-wrap'));
+			const visionToggle = this._register(new Toggle({
+				title: visionDesc,
+				isChecked: customModelSupportsVision(model),
+				...defaultToggleStyles
+			}));
+			DOM.append(visionWrap, visionToggle.domNode);
+			this._register(visionToggle.onChange(async () => {
+				await this.customLanguageModelsService.updateCustomModel(model.id, { supportsVision: visionToggle.checked });
 			}));
 		}
 		// HF cloud routing toggle: on = cheapest, off = fastest. Shown only for HF cloud models.

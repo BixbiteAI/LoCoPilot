@@ -25,7 +25,7 @@ import { INotificationService } from '../../../../platform/notification/common/n
 import { IProgressService, ProgressLocation } from '../../../../platform/progress/common/progress.js';
 import { IStorageService } from '../../../../platform/storage/common/storage.js';
 import { getReasoningEffort, reasoningBudgetTokens, ReasoningEffort } from '../common/locopilotReasoningEffort.js';
-import { ICustomLanguageModelsService, ICustomLanguageModel, getCustomModelListLabel, deriveTokenLimits, defaultContextWindow, TOOL_FAILURE_DISABLE_THRESHOLD } from '../common/customLanguageModelsService.js';
+import { ICustomLanguageModelsService, ICustomLanguageModel, getCustomModelListLabel, deriveTokenLimits, defaultContextWindow, TOOL_FAILURE_DISABLE_THRESHOLD, customModelSupportsVision } from '../common/customLanguageModelsService.js';
 import { IChatMessage, ILanguageModelChatInfoOptions, ILanguageModelChatMetadataAndIdentifier, ILanguageModelChatProvider, ILanguageModelChatResponse, ILanguageModelsService, IChatResponsePart, ChatMessageRole } from '../common/languageModels.js';
 import { IWorkbenchContribution } from '../../../common/contributions.js';
 import { LOCOPILOT_SETTINGS_SECTION_LIST_MODELS } from './chatManagement/locopilotSettingsEditorInput.js';
@@ -244,7 +244,10 @@ export class LoCoPilotLanguageModelProvider extends Disposable implements ILangu
 					isUserSelectable: true,
 					modelPickerCategory: { label: 'Custom Models', order: 100 },
 					capabilities: {
-						vision: true,
+						// Gated per-model: a local GGUF without an mmproj projector can't read images. Once the
+						// server rejects one we set supportsVision=false (autoDisableVision) and the attach button
+						// is disabled for that model on the next turn. Defaults optimistic for cloud/unknown models.
+						vision: customModelSupportsVision(m),
 						toolCalling: true
 					}
 				}
@@ -290,6 +293,62 @@ export class LoCoPilotLanguageModelProvider extends Disposable implements ILangu
 		return /not\s*support|unsupported|isn'?t support|does\s*not\s*support|no endpoints?|cannot|not\s*available|not\s*allowed|invalid|400/.test(m);
 	}
 
+	/**
+	 * True when a request error indicates the server can't accept image input - almost always a local GGUF
+	 * loaded without an mmproj projector (llama.cpp: "image input is not supported - hint: ... mmproj"). Kept
+	 * narrow so ordinary 500s don't strip a genuinely vision-capable model.
+	 */
+	private _isVisionUnsupportedError(errMsg: string): boolean {
+		const m = errMsg.toLowerCase();
+		return /mmproj/.test(m)
+			|| /image input is not supported/.test(m)
+			|| (/image|vision|multimodal/.test(m) && /not\s*support|unsupported|does\s*not\s*support|cannot|no\s+vision/.test(m));
+	}
+
+	/**
+	 * Pulls a human-readable message out of a local server's error body. OpenAI-compatible servers (llama.cpp,
+	 * mlx_lm) return `{"error":{"message":"…"}}`; falls back to a trimmed snippet of plain-text bodies. Returns
+	 * undefined when there's nothing useful, so callers keep the generic status message.
+	 */
+	private _extractServerErrorMessage(body: string): string | undefined {
+		const trimmed = body?.trim();
+		if (!trimmed) {
+			return undefined;
+		}
+		try {
+			const parsed = JSON.parse(trimmed);
+			const msg = parsed?.error?.message ?? parsed?.message ?? (typeof parsed?.error === 'string' ? parsed.error : undefined);
+			if (typeof msg === 'string' && msg.trim()) {
+				return msg.trim().slice(0, 300);
+			}
+		} catch {
+			// Not JSON; fall through to the raw snippet.
+		}
+		return trimmed.slice(0, 300);
+	}
+
+	/** Whether any message carries an image attachment (so a vision-unsupported error is worth a text-only retry). */
+	private _messagesHaveImages(messages: IChatMessage[]): boolean {
+		return messages.some(msg => msg.content.some(part => part.type === 'image_url'));
+	}
+
+	/**
+	 * Returns a copy of `messages` with every image part replaced by a short text placeholder. Used to retry a
+	 * turn against a model that can't read images without dead-ending - the model still sees that an image was
+	 * attached and can ask the user to describe it.
+	 */
+	private _stripImageParts(messages: IChatMessage[]): IChatMessage[] {
+		return messages.map(msg => {
+			if (!msg.content.some(part => part.type === 'image_url')) {
+				return msg;
+			}
+			const content = msg.content.map(part => part.type === 'image_url'
+				? { type: 'text' as const, value: '[An image was attached here, but the selected model cannot read images. Ask the user to describe it if needed.]' }
+				: part);
+			return { ...msg, content };
+		});
+	}
+
 	/** Dispatch a request to the right per-provider implementation. Shared by the first attempt and the tools-disabled retry. */
 	private async _dispatchProvider(model: ICustomLanguageModel, messages: IChatMessage[], options: { [name: string]: unknown }, stream: AsyncIterableSource<IChatResponsePart | IChatResponsePart[]>, token: CancellationToken): Promise<any> {
 		if (model.provider === 'openai') {
@@ -329,6 +388,27 @@ export class LoCoPilotLanguageModelProvider extends Disposable implements ILangu
 			return result;
 		} catch (e) {
 			const errMsg = e && typeof (e as Error).message === 'string' ? (e as Error).message : String(e);
+			// Vision-unsupported handling: the request carried an image but the (local) server has no mmproj
+			// projector, so it rejected the input. Mark the model text-only (gates attach next turn) and retry
+			// this same request with the images replaced by a text placeholder, so the turn isn't dead-ended.
+			if (!this._isCanceledError(errMsg) && this._isVisionUnsupportedError(errMsg) && this._messagesHaveImages(messages)) {
+				try {
+					const wasVision = await this.customLanguageModelsService.autoDisableVision(model.id);
+					this._log(`[LoCoPilot Provider] Image input rejected by "${getCustomModelListLabel(model)}"; retrying as text-only. ${errMsg}`);
+					if (wasVision) {
+						this.notificationService.info(`Image skipped - "${getCustomModelListLabel(model)}" can't read images, so your attachment was sent as a text note. Switch to a vision-capable model to send images.`);
+					}
+					return await this._dispatchProvider({ ...model, supportsVision: false }, this._stripImageParts(messages), options, stream, token);
+				} catch (retryErr) {
+					rejected = true;
+					const retryMsg = retryErr && typeof (retryErr as Error).message === 'string' ? (retryErr as Error).message : String(retryErr);
+					const toThrowRetry = this._isCanceledError(retryMsg) ? new Error(this._getCanceledMessage()) : retryErr;
+					this.logService.error(`LoCoPilot provider error (after vision-disabled retry): ${retryErr}`);
+					this.locopilotFileLog.log(`LoCoPilot provider error (after vision-disabled retry): ${retryErr}`);
+					stream.reject(toThrowRetry);
+					throw toThrowRetry;
+				}
+			}
 			// Tool-shaped failure handling: count it, auto-disable past the threshold, and retry this same
 			// request once WITHOUT tools so the user is not blocked. Tool-rejection errors are raised before
 			// any content streams (e.g. an HTTP 400 at request setup), so retrying into the same stream is safe.
@@ -938,10 +1018,13 @@ export class LoCoPilotLanguageModelProvider extends Disposable implements ILangu
 		headers: Record<string, string>,
 		bodyJson: string,
 		token: CancellationToken,
-		onJson: (json: unknown) => void
+		onJson: (json: unknown) => void,
+		/** When provided, raw response text is accumulated here so the caller can read an error body on a non-200 (SSE responses carry no useful body, but error responses do). */
+		errorSink?: { body: string }
 	): Promise<number> {
 		let buffer = '';
 		const consume = (text: string): void => {
+			if (errorSink) { errorSink.body += text; }
 			buffer += text;
 			const lines = buffer.split('\n');
 			buffer = lines.pop() ?? '';
@@ -1155,21 +1238,28 @@ export class LoCoPilotLanguageModelProvider extends Disposable implements ILangu
 				}
 			};
 
-			let status = await this._fetchSSEStream(url, headers, JSON.stringify(body), token, processChunk);
+			const errorSink = { body: '' };
+			let status = await this._fetchSSEStream(url, headers, JSON.stringify(body), token, processChunk, errorSink);
 
 			// Fallback: If 400 error and tools were provided, retry without tools
 			if (status === 400 && body.tools) {
 				this._log(`[LoCoPilot Provider] Local model request failed with 400, retrying without tools as fallback...`);
 				accumulatedToolCalls.clear();
+				errorSink.body = '';
 				const fallbackBody = { ...body };
 				delete fallbackBody.tools;
-				status = await this._fetchSSEStream(url, headers, JSON.stringify(fallbackBody), token, processChunk);
+				status = await this._fetchSSEStream(url, headers, JSON.stringify(fallbackBody), token, processChunk, errorSink);
 			}
 
 			if (status !== 200) {
+				// Surface a known server message (e.g. llama.cpp's "image input is not supported / mmproj") so the
+				// upstream handler can recognize it and retry text-only; the raw body is never shown to the user.
+				const serverDetail = this._extractServerErrorMessage(errorSink.body);
 				const msg = status === 404 || status === 502 || status === 503
 					? this._getLocalServerUnavailableMessage(model)
-					: `Local model "${model.modelName}" request failed (${status}).`;
+					: serverDetail
+						? `Local model "${model.modelName}" request failed (${status}): ${serverDetail}`
+						: `Local model "${model.modelName}" request failed (${status}).`;
 				throw new Error(msg);
 			}
 
@@ -1535,21 +1625,28 @@ export class LoCoPilotLanguageModelProvider extends Disposable implements ILangu
 				}
 			};
 
-			let status = await this._fetchSSEStream(url, headers, JSON.stringify(body), token, processChunk);
+			const errorSink = { body: '' };
+			let status = await this._fetchSSEStream(url, headers, JSON.stringify(body), token, processChunk, errorSink);
 
 			// Fallback: If 400 error and tools were provided, retry without tools
 			if (status === 400 && body.tools) {
 				this._log(`[LoCoPilot Provider] Localhost model request failed with 400, retrying without tools as fallback...`);
 				accumulatedToolCalls.clear();
+				errorSink.body = '';
 				const fallbackBody = { ...body };
 				delete fallbackBody.tools;
-				status = await this._fetchSSEStream(url, headers, JSON.stringify(fallbackBody), token, processChunk);
+				status = await this._fetchSSEStream(url, headers, JSON.stringify(fallbackBody), token, processChunk, errorSink);
 			}
 
 			if (status !== 200) {
+				// Surface a known server detail (e.g. "image input is not supported / mmproj") so the upstream
+				// handler can recognize a vision-unsupported error and retry text-only; raw body is not shown.
+				const serverDetail = this._extractServerErrorMessage(errorSink.body);
 				const msg = status === 404 || status === 502 || status === 503
 					? `Localhost server not responding at ${url}. Check that the server is running and the URL is correct.`
-					: `Localhost model "${model.name}" request failed (${status}).`;
+					: serverDetail
+						? `Localhost model "${model.name}" request failed (${status}): ${serverDetail}`
+						: `Localhost model "${model.name}" request failed (${status}).`;
 				throw new Error(msg);
 			}
 

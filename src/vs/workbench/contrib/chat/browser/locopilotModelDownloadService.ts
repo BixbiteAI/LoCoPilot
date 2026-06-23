@@ -121,6 +121,26 @@ function pickBestGGUFFile(paths: string[], preferredQuant?: string): string | un
 	return gguf.sort((a, b) => a.length - b.length)[0];
 }
 
+/**
+ * A multimodal projector (`mmproj-*.gguf`) sits alongside the main weights in vision GGUF repos and is what
+ * llama.cpp needs (`--mmproj`) to actually read images. Picks one by precision preference (F16 is the usual
+ * sweet spot: full vision quality at half the size of F32), falling back to BF16, then F32, then any match.
+ * Returns undefined when the repo ships no projector (i.e. the model is text-only).
+ */
+function pickMmprojFile(paths: string[]): string | undefined {
+	const mmproj = paths.filter(p => /(^|\/)mmproj[^/]*\.gguf$/i.test(p));
+	if (mmproj.length === 0) {
+		return undefined;
+	}
+	for (const pref of ['-f16.', '-bf16.', '-f32.']) {
+		const found = mmproj.find(p => p.toLowerCase().includes(pref));
+		if (found) {
+			return found;
+		}
+	}
+	return mmproj[0];
+}
+
 function filterPathsByFormat(paths: string[], format: string): string[] {
 	const f = (format || '').toLowerCase().trim();
 
@@ -194,6 +214,24 @@ function contextWindowFromConfig(cfg: any): number | undefined {
 		if (Number.isInteger(n) && n >= MIN_CONTEXT_WINDOW && n <= MAX_CONTEXT_WINDOW) {
 			return n;
 		}
+	}
+	return undefined;
+}
+
+/**
+ * Detect image (vision) support from a HuggingFace model-info payload. Returns true when the model card's
+ * `pipeline_tag` or `tags` mark it as a multimodal image-text model, otherwise undefined (we never assert
+ * false from HF, since absence of a tag isn't proof a model is text-only). Used to auto-fill `supportsVision`.
+ */
+function detectVisionFromHf(info: any): boolean | undefined {
+	const visionPipelines = new Set(['image-text-to-text', 'visual-question-answering', 'image-to-text', 'multimodal']);
+	const pipeline = typeof info?.pipeline_tag === 'string' ? info.pipeline_tag.toLowerCase() : '';
+	if (visionPipelines.has(pipeline)) {
+		return true;
+	}
+	const tags: string[] = Array.isArray(info?.tags) ? info.tags.map((t: unknown) => String(t).toLowerCase()) : [];
+	if (tags.some(t => visionPipelines.has(t) || t === 'vision' || t === 'vlm' || t === 'image-text-to-text')) {
+		return true;
 	}
 	return undefined;
 }
@@ -616,6 +654,19 @@ export class LoCoPilotModelDownloadService extends Disposable implements IWorkbe
 				throw new Error(localize('locopilot.download.error.formatUnavailable', 'Model format "{0}" is not available in repository "{1}".', format || 'any', repoId));
 			}
 
+			// For vision models, also fetch the multimodal projector (mmproj-*.gguf) so the server can read images.
+			// Only for GGUF (llama.cpp) downloads and only when not explicitly marked text-only; appended after the
+			// quant-selection/budget logic so it never interferes with picking the main weights file.
+			let mmprojRelPath: string | undefined;
+			const isGgufDownload = toDownload.some(p => p.toLowerCase().endsWith('.gguf'));
+			if (model.supportsVision !== false && isGgufDownload) {
+				mmprojRelPath = pickMmprojFile(allPaths);
+				if (mmprojRelPath && !toDownload.includes(mmprojRelPath)) {
+					toDownload = [...toDownload, mmprojRelPath];
+					this._log(`[LoCoPilot Download] Vision model: also downloading projector ${mmprojRelPath} for image input.`);
+				}
+			}
+
 			const baseDir = joinPath(
 				this.environmentService.cacheHome,
 				LoCoPilotModelDownloadService.MODELS_DIR,
@@ -676,10 +727,12 @@ export class LoCoPilotModelDownloadService extends Disposable implements IWorkbe
 					}
 					await this.fileService.writeFile(fileUri, res.stream);
 				}
-				// For single GGUF download, use this file as the main model path for llama.cpp
-				if (total === 1 && relPath.toLowerCase().endsWith('.gguf')) {
+				// For single GGUF download, use this file as the main model path for llama.cpp. The mmproj
+				// projector is also a .gguf but must NOT be treated as the main weights, so skip it here.
+				const isMmproj = relPath === mmprojRelPath;
+				if (!isMmproj && total === 1 && relPath.toLowerCase().endsWith('.gguf')) {
 					mainModelFileUri = fileUri;
-				} else if (relPath.toLowerCase().endsWith('.gguf')) {
+				} else if (!isMmproj && relPath.toLowerCase().endsWith('.gguf')) {
 					mainModelFileUri = mainModelFileUri ?? fileUri;
 				}
 				const pct = Math.round(((i + 1) / total) * 100);
@@ -692,7 +745,9 @@ export class LoCoPilotModelDownloadService extends Disposable implements IWorkbe
 			await this.customLanguageModelsService.updateCustomModel(modelId, {
 				isDownloading: false,
 				downloadProgress: 100,
-				localPath
+				localPath,
+				// A projector on disk is ground truth that this model can read images, so enable vision.
+				...(mmprojRelPath ? { supportsVision: true } : {})
 			});
 			partialInstallDir = undefined;
 			this._log(`[LoCoPilot Download] ${repoId} downloaded to ${localPath}.`);
@@ -752,9 +807,11 @@ export class LoCoPilotModelDownloadService extends Disposable implements IWorkbe
 
 			// 1) Model info: for GGUF repos this carries `gguf.context_length` directly.
 			let contextWindow: number | undefined;
+			let supportsVision: boolean | undefined;
 			const info = await this._getJson(`${HF_API_BASE}/api/models/${repoPath}`, headers, cancel);
 			if (info) {
 				contextWindow = sanitizeContextWindow(info.gguf?.context_length) ?? contextWindowFromConfig(info.config);
+				supportsVision = detectVisionFromHf(info);
 			}
 			// 2) Fall back to config.json (transformers/MLX repos expose max_position_embeddings there).
 			if (contextWindow === undefined) {
@@ -762,11 +819,11 @@ export class LoCoPilotModelDownloadService extends Disposable implements IWorkbe
 				contextWindow = contextWindowFromConfig(cfg);
 			}
 
-			if (format === undefined && contextWindow === undefined) {
+			if (format === undefined && contextWindow === undefined && supportsVision === undefined) {
 				return;
 			}
-			await this.customLanguageModelsService.applyDerivedMetadata(model.id, { format, contextWindow });
-			this._log(`[LoCoPilot Download] Enriched ${repoId} metadata (format=${format ?? 'n/a'}, contextWindow=${contextWindow ?? 'n/a'}).`);
+			await this.customLanguageModelsService.applyDerivedMetadata(model.id, { format, contextWindow, supportsVision });
+			this._log(`[LoCoPilot Download] Enriched ${repoId} metadata (format=${format ?? 'n/a'}, contextWindow=${contextWindow ?? 'n/a'}, vision=${supportsVision ?? 'n/a'}).`);
 		} catch (e) {
 			this._log(`[LoCoPilot Download] Metadata enrichment failed for ${model.modelName} (non-fatal): ${e}`);
 		}
@@ -798,14 +855,15 @@ export class LoCoPilotModelDownloadService extends Disposable implements IWorkbe
 					break;
 				}
 			}
-			// `capabilities` is the ground truth for tool support; if absent we leave the optimistic default on.
+			// `capabilities` is the ground truth for tool/vision support; if absent we leave the optimistic default.
 			const useNativeTools = Array.isArray(info.capabilities) ? info.capabilities.includes('tools') : undefined;
+			const supportsVision = Array.isArray(info.capabilities) ? info.capabilities.includes('vision') : undefined;
 
-			if (contextWindow === undefined && useNativeTools === undefined) {
+			if (contextWindow === undefined && useNativeTools === undefined && supportsVision === undefined) {
 				return;
 			}
-			await this.customLanguageModelsService.applyDerivedMetadata(model.id, { contextWindow, useNativeTools });
-			this._log(`[LoCoPilot Ollama] Enriched ${repoId} metadata (contextWindow=${contextWindow ?? 'n/a'}, tools=${useNativeTools ?? 'n/a'}).`);
+			await this.customLanguageModelsService.applyDerivedMetadata(model.id, { contextWindow, useNativeTools, supportsVision });
+			this._log(`[LoCoPilot Ollama] Enriched ${repoId} metadata (contextWindow=${contextWindow ?? 'n/a'}, tools=${useNativeTools ?? 'n/a'}, vision=${supportsVision ?? 'n/a'}).`);
 		} catch (e) {
 			this._log(`[LoCoPilot Ollama] Metadata enrichment failed for ${model.modelName} (non-fatal): ${e}`);
 		}

@@ -81,11 +81,21 @@ export const MAX_CONTEXT_WINDOW = 2000000;
 export const TOOL_FAILURE_DISABLE_THRESHOLD = 2;
 
 /** Fields that can be auto-derived from HuggingFace/Ollama metadata and that the user may override. */
-export type DerivableModelField = 'contextWindow' | 'format' | 'useNativeTools' | 'mtp';
-const DERIVABLE_FIELDS: readonly DerivableModelField[] = ['contextWindow', 'format', 'useNativeTools', 'mtp'];
+export type DerivableModelField = 'contextWindow' | 'format' | 'useNativeTools' | 'mtp' | 'supportsVision';
+const DERIVABLE_FIELDS: readonly DerivableModelField[] = ['contextWindow', 'format', 'useNativeTools', 'mtp', 'supportsVision'];
 
 export function defaultContextWindow(isLocal: boolean): number {
 	return isLocal ? DEFAULT_CONTEXT_WINDOW_LOCAL : DEFAULT_CONTEXT_WINDOW_CLOUD;
+}
+
+/**
+ * Whether a model should be offered image (vision) input. Optimistic by default - we only know a local GGUF
+ * lacks an mmproj projector once the server rejects an image, at which point {@link ICustomLanguageModelsService.autoDisableVision}
+ * sets `supportsVision=false`. Used to gate the picker's `vision` capability so image attach is disabled for
+ * models known to be text-only.
+ */
+export function customModelSupportsVision(model: ICustomLanguageModel): boolean {
+	return model.supportsVision !== false;
 }
 
 /**
@@ -161,6 +171,15 @@ export interface ICustomLanguageModel {
 	toolsAutoDisabled?: boolean;
 	/** Consecutive tool-shaped request failures; reset on a successful tool-using request. Persisted so the next session skips a doomed first attempt. */
 	toolFailureStreak?: number;
+	/**
+	 * Whether the model can read image attachments (vision/multimodal). For local GGUF this requires an `mmproj`
+	 * projector loaded into llama.cpp. Undefined means "assume yes until proven otherwise"; the runtime sets it
+	 * false ({@link visionAutoDisabled}) the first time the server rejects an image. Surfaced as the picker's
+	 * `vision` capability so image attach is gated for text-only models.
+	 */
+	supportsVision?: boolean;
+	/** True when the runtime auto-disabled vision after the server rejected an image (e.g. "image input is not supported / mmproj"). Distinct from a user setting; surfaced in the UI. */
+	visionAutoDisabled?: boolean;
 }
 
 export interface ICustomLanguageModelsService {
@@ -180,13 +199,15 @@ export interface ICustomLanguageModelsService {
 	 * Apply metadata derived from HuggingFace/Ollama. Only writes fields the user has NOT overridden
 	 * (and never re-enables tools that the runtime auto-disabled). Marks the model as enriched.
 	 */
-	applyDerivedMetadata(id: string, derived: Partial<Pick<ICustomLanguageModel, 'contextWindow' | 'format' | 'useNativeTools'>>): Promise<void>;
+	applyDerivedMetadata(id: string, derived: Partial<Pick<ICustomLanguageModel, 'contextWindow' | 'format' | 'useNativeTools' | 'supportsVision'>>): Promise<void>;
 	/** Record one tool-shaped request failure; returns the new consecutive-failure streak. */
 	recordToolFailure(id: string): Promise<number>;
 	/** Reset the tool-failure streak after a successful tool-using request. */
 	resetToolFailureStreak(id: string): Promise<void>;
 	/** Auto-disable native tool calling after repeated failures (sets toolsAutoDisabled + useNativeTools=false, without marking a user override). */
 	autoDisableTools(id: string): Promise<void>;
+	/** Auto-disable vision after the local server rejected an image (sets supportsVision=false + visionAutoDisabled=true), so image attach is gated next turn. Returns true if it flipped a previously-vision model. */
+	autoDisableVision(id: string): Promise<boolean>;
 }
 
 const STORAGE_KEY = 'customLanguageModels';
@@ -422,6 +443,10 @@ export class CustomLanguageModelsService extends Disposable implements ICustomLa
 				merged.toolsAutoDisabled = false;
 				merged.toolFailureStreak = 0;
 			}
+			// Manually toggling vision clears a prior runtime auto-disable so the user's choice fully takes effect.
+			if (Object.prototype.hasOwnProperty.call(updates, 'supportsVision')) {
+				merged.visionAutoDisabled = false;
+			}
 			this.models[index] = merged;
 			await this.saveModels();
 			this._clearSelectedIfUnavailable();
@@ -447,6 +472,11 @@ export class CustomLanguageModelsService extends Disposable implements ICustomLa
 		// (e.g. Ollama capabilities) flows in here, so it may safely turn tools OFF for unsupported models.
 		if (derived.useNativeTools !== undefined && !ov.useNativeTools && !model.toolsAutoDisabled) {
 			updates.useNativeTools = derived.useNativeTools;
+		}
+		// Vision support derived from a confirmed source (HF pipeline_tag/tags, Ollama capabilities). Like tools,
+		// never override a manual setting or a runtime auto-disable; a confirmed source may turn it OFF or ON.
+		if (derived.supportsVision !== undefined && !ov.supportsVision && !model.visionAutoDisabled) {
+			updates.supportsVision = derived.supportsVision;
 		}
 		this.models[index] = { ...model, ...updates, metadataEnriched: true };
 		await this.saveModels();
@@ -481,6 +511,19 @@ export class CustomLanguageModelsService extends Disposable implements ICustomLa
 		this.models[index] = { ...this.models[index], useNativeTools: false, toolsAutoDisabled: true, toolFailureStreak: 0 };
 		await this.saveModels();
 		this._onDidChangeCustomModels.fire();
+	}
+
+	async autoDisableVision(id: string): Promise<boolean> {
+		const index = this.models.findIndex(m => m.id === id);
+		if (index < 0) {
+			return false;
+		}
+		// Only meaningful (and only worth notifying about) when the model wasn't already known text-only.
+		const wasVision = this.models[index].supportsVision !== false;
+		this.models[index] = { ...this.models[index], supportsVision: false, visionAutoDisabled: true };
+		await this.saveModels();
+		this._onDidChangeCustomModels.fire();
+		return wasVision;
 	}
 
 	async hideCustomModel(id: string, hidden: boolean): Promise<void> {
