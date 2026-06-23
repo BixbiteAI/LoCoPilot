@@ -26,6 +26,8 @@ import {
 	computeCpuMoeLayers,
 	clampContextSize,
 	shouldUseBundledVulkan,
+	DEFAULT_LLAMA_CONTEXT_SIZE,
+	MIN_CLAMPED_CONTEXT,
 	LOCOPILOT_LLAMA_SERVER_PORT,
 	LlamaBackend,
 	type LlamaServerTuning,
@@ -465,7 +467,7 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 
 	/**
 	 * Maximum number of local servers to keep resident at once. `singleActiveModel` (off by default) forces 1
-	 * for users who opt into the old single-model behavior; otherwise the `maxResidentModels` budget (default 2) applies.
+	 * for users who opt into the old single-model behavior; otherwise the `maxResidentModels` budget (default 1) applies.
 	 */
 	private _maxResidentModels(): number {
 		const singleActive = this.configurationService.getValue<boolean>(ChatConfiguration.LocopilotLocalSingleActiveModel) !== false;
@@ -473,7 +475,7 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 			return 1;
 		}
 		const configured = this.configurationService.getValue<number>(ChatConfiguration.LocopilotLocalMaxResidentModels);
-		return (typeof configured === 'number' && configured >= 1) ? Math.floor(configured) : 2;
+		return (typeof configured === 'number' && configured >= 1) ? Math.floor(configured) : 1;
 	}
 
 	/**
@@ -492,6 +494,20 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 	 */
 	private async _enforceResidentBudget(keepModelId: string): Promise<void> {
 		const max = this._maxResidentModels();
+
+		// Cross-engine guard (applied before the count/memory budget, regardless of either): llama.cpp and
+		// mlx-lm both keep weights in the SAME unified memory on Apple Silicon, and our per-model footprint
+		// estimate can't fully capture each engine's runtime cost (KV cache, llama's prompt cache, speculative
+		// draft). Running two different engines at once is the most common path to an out-of-memory abort on a
+		// model switch, so always unload resident servers of a *different* engine kind than the incoming model.
+		const keepKind = await this._intendedServerKind(keepModelId);
+		for (const [id, rec] of Array.from(this.runningServers.entries())) {
+			if (id !== keepModelId && rec.kind !== keepKind) {
+				this._log(`[LoCoPilot Runner] Cross-engine switch: evicting ${rec.kind} server ${id} before starting ${keepKind} model ${keepModelId}.`);
+				this.stopServer(id);
+			}
+		}
+
 		// We are about to add keepModelId, so the others may occupy at most max-1 slots.
 		const evictable = () => Array.from(this.runningServers.entries())
 			.filter(([id]) => id !== keepModelId)
@@ -564,23 +580,69 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 	}
 
 	/**
-	 * Estimates a model's resident memory footprint in bytes: the on-disk weight size plus a 20% allowance for
-	 * the KV cache and runtime overhead. Sizes are cached per model since the weights don't change at runtime.
-	 * Returns 0 when the size can't be determined (e.g. Ollama models, whose weights we don't manage on disk).
+	 * The engine a model will (or does) run under. Reuses the running server's kind when up; otherwise mirrors
+	 * the selection in _doStartServerInTerminal (MLX for Apple-Silicon HF models whose weights look like MLX,
+	 * llama.cpp otherwise) so the budget can reason about a not-yet-started model.
+	 */
+	private async _intendedServerKind(modelId: string): Promise<'llama' | 'mlx'> {
+		const running = this.runningServers.get(modelId);
+		if (running) {
+			return running.kind;
+		}
+		const model = this.customLanguageModelsService.getCustomModels().find(m => m.id === modelId);
+		if (model?.provider === 'huggingface' && model.localPath && isAppleSiliconMac()) {
+			const hasGguf = await this.pathResolvesToGguf(model.localPath);
+			if (shouldUseMlxServerForHfModel(model, hasGguf, true)) {
+				return 'mlx';
+			}
+		}
+		return 'llama';
+	}
+
+	/**
+	 * Estimates a model's *resident* memory footprint in bytes - honestly, not just weights. Adds the runtime
+	 * cost the old `weights * 1.2` heuristic ignored, which is exactly what let two models "fit" on paper and
+	 * then OOM in practice:
+	 *  - KV cache: scales with the context window (a conservative all-layers k+v per-token figure).
+	 *  - llama.cpp prompt cache: the server reserves a sizeable host-RAM prompt cache (`--cache-ram`).
+	 *  - speculative draft: MTP self-draft or a separate draft model roughly adds another weights-worth.
+	 * Weight bytes are cached per model (they don't change); the runtime terms are cheap to recompute.
+	 * Returns 0 when the weight size can't be determined (e.g. Ollama), so an unknown model never blocks a load.
 	 */
 	private async _estimateModelCost(modelId: string): Promise<number> {
-		const cached = this._modelSizeCache.get(modelId);
-		if (cached !== undefined) {
-			return Math.round(cached * 1.2);
-		}
 		const model = this.customLanguageModelsService.getCustomModels().find(m => m.id === modelId);
 		if (!model || !model.localPath || model.provider === 'ollama') {
 			this._modelSizeCache.set(modelId, 0);
 			return 0;
 		}
-		const bytes = await this._weightBytesOnDisk(model.localPath);
-		this._modelSizeCache.set(modelId, bytes);
-		return Math.round(bytes * 1.2);
+		let weightBytes = this._modelSizeCache.get(modelId);
+		if (weightBytes === undefined) {
+			weightBytes = await this._weightBytesOnDisk(model.localPath);
+			this._modelSizeCache.set(modelId, weightBytes);
+		}
+		if (weightBytes === 0) {
+			return 0; // unknown weight size -> don't let the budget block this load
+		}
+
+		const kind = await this._intendedServerKind(modelId);
+		// Context window the engine will actually allocate KV for (clamped like the launch path does).
+		const ctxTokens = Math.max(
+			MIN_CLAMPED_CONTEXT,
+			model.contextWindow && model.contextWindow > 0 ? model.contextWindow : DEFAULT_LLAMA_CONTEXT_SIZE
+		);
+		// ~128 KiB/token covers a typical 7-13B model's f16 k+v across all layers; conservative for the budget.
+		const KV_BYTES_PER_TOKEN = 128 * 1024;
+		const GB = 1024 * 1024 * 1024;
+		let runtime = ctxTokens * KV_BYTES_PER_TOKEN;
+		if (kind === 'llama') {
+			runtime += 2 * GB; // conservative slice of llama.cpp's host-RAM prompt cache (default --cache-ram 8 GiB).
+			const tuning = this._getLlamaTuning(model);
+			const draftActive = !!tuning.multiTokenPrediction || !!(tuning.draftModelPath && tuning.draftModelPath.trim());
+			if (draftActive) {
+				runtime += weightBytes; // self-draft (MTP) or a same-size draft model roughly doubles weights.
+			}
+		}
+		return weightBytes + runtime;
 	}
 
 	/** Sums the on-disk size of a model's weights: the .gguf file, or every file in an MLX/sharded directory. */
@@ -1009,6 +1071,36 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 	private async pathResolvesToGguf(localPath: string): Promise<boolean> {
 		const p = await this.resolveModelFilePath(localPath);
 		return p.toLowerCase().endsWith('.gguf');
+	}
+
+	/**
+	 * Validates that an MLX model path is usable before we spawn the server. Returns a human-readable error
+	 * string when the path is unusable, or undefined when it looks good. Checks: non-empty, exists on disk, and
+	 * the resolved model directory actually contains MLX weights (a config.json plus at least one .safetensors).
+	 */
+	private async _validateMlxModelPath(localPath: string | undefined): Promise<string | undefined> {
+		if (!localPath) {
+			return 'This MLX model has no local path set. Download the model again, then retry.';
+		}
+		let modelDir: string;
+		try {
+			const stat = await this.fileService.stat(URI.file(localPath));
+			modelDir = stat.isDirectory ? localPath : dirname(localPath);
+		} catch {
+			return `The MLX model files were not found at "${localPath}". The download may be incomplete - re-download the model and retry.`;
+		}
+		try {
+			const resolved = await this.fileService.resolve(URI.file(modelDir), { resolveMetadata: true });
+			const names = (resolved.children ?? []).filter(c => c.isFile).map(c => c.name.toLowerCase());
+			const hasConfig = names.includes('config.json');
+			const hasWeights = names.some(n => n.endsWith('.safetensors') || n.endsWith('.npz'));
+			if (!hasConfig || !hasWeights) {
+				return `The folder for this MLX model ("${modelDir}") is missing weight files (config.json and *.safetensors). The download is likely incomplete - re-download the model and retry.`;
+			}
+		} catch {
+			return `The MLX model folder "${modelDir}" could not be read. Re-download the model and retry.`;
+		}
+		return undefined;
 	}
 
 	/** Model root for mlx-lm: directory, or parent when localPath is a file. */
@@ -1457,7 +1549,22 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 	 * Starts `mlx_lm.server` for downloaded Hugging Face MLX weights (Apple Silicon only).
 	 */
 	private async _startMlxServerInTerminal(modelId: string, model: ICustomLanguageModel & { localPath: string }): Promise<void> {
-		const modelDir = await this.getMlxModelRootPath(model.localPath);
+		// Preflight: never spawn mlx_lm.server with a missing/empty model path. Doing so builds `--model ''`,
+		// which makes the server start without weights and then either crash with a Python traceback or hang
+		// (GET /v1/models keeps returning 200 while chat requests block forever). Fail fast with a clear,
+		// actionable message and no wasted subprocess instead.
+		const localPath = model.localPath?.trim();
+		const pathError = await this._validateMlxModelPath(localPath);
+		if (pathError) {
+			this._log(`[LoCoPilot Runner] MLX preflight failed for "${model.modelName}": ${pathError}`);
+			this._endStarting(modelId, pathError);
+			if (!this._suppressCrashNotice.has(modelId)) {
+				this.notificationService.notify({ severity: Severity.Error, message: pathError });
+			}
+			return;
+		}
+
+		const modelDir = await this.getMlxModelRootPath(localPath!);
 		const port = await this.findAvailablePort(LOCOPILOT_MLX_SERVER_PORT);
 		const pythonCmd = await this.resolveMlxPython();
 		const { command, args } = getMlxLmServerCommand(modelDir, port, pythonCmd);

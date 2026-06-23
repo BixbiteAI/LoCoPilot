@@ -11,6 +11,7 @@ import { encodeBase64, streamToBuffer } from '../../../../base/common/buffer.js'
 import { createMarkdownCommandLink } from '../../../../base/common/htmlContent.js';
 import { CancellationToken } from '../../../../base/common/cancellation.js';
 import { Emitter } from '../../../../base/common/event.js';
+import { generateUuid } from '../../../../base/common/uuid.js';
 import { Disposable } from '../../../../base/common/lifecycle.js';
 import { listenStream } from '../../../../base/common/stream.js';
 import { ExtensionIdentifier } from '../../../../platform/extensions/common/extensions.js';
@@ -372,6 +373,101 @@ export class LoCoPilotLanguageModelProvider extends Disposable implements ILangu
 	/** Emit a reasoning/"thinking" delta to the stream. Reasoning is always shown when the model produces it. */
 	private _emitThinking(stream: AsyncIterableSource<IChatResponsePart | IChatResponsePart[]>, value: string): void {
 		stream.emitOne({ type: 'thinking', value });
+	}
+
+	/**
+	 * Regex matching the start of a textual tool call. Smaller / quantized local models frequently emit
+	 * tool calls as plain `content` text (Hermes/Qwen XML `<tool_call>…</tool_call>`, `<function=name>` with
+	 * `<parameter=…>` blocks, or a raw JSON `{"name":…,"arguments":…}` / `{"tool_calls":[…]}`) instead of the
+	 * structured `delta.tool_calls` field. When that happens llama.cpp's `peg-native` parser fails to extract
+	 * the call, it leaks into the visible message, and the agent loop dead-ends. We detect the marker mid-stream
+	 * to stop printing the raw markup, then recover the call at stream end (see _recoverTextToolCalls).
+	 */
+	private static readonly _TEXT_TOOLCALL_MARKER = /<\s*tool_call|<\s*function\s*=|<\s*function_call|<\|\s*tool_call|```\s*tool_call|\{\s*"(?:tool_call|tool_calls)"/i;
+
+	/** Returns the index of the first textual tool-call marker in `text`, or -1 if none. */
+	private _textToolCallMarkerIndex(text: string): number {
+		const m = LoCoPilotLanguageModelProvider._TEXT_TOOLCALL_MARKER.exec(text);
+		return m ? m.index : -1;
+	}
+
+	/**
+	 * Best-effort recovery of tool calls that a local model emitted as plain text instead of structured
+	 * `tool_calls`. Handles the three common malformed shapes. Returns the recovered calls (validated against
+	 * `availableToolNames` when provided) so the agent can execute them on this turn instead of stopping.
+	 */
+	private _recoverTextToolCalls(text: string, availableToolNames?: Set<string>): Array<{ name: string; parameters: Record<string, unknown> }> {
+		const out: Array<{ name: string; parameters: Record<string, unknown> }> = [];
+		const isKnown = (name: string) => !availableToolNames || availableToolNames.size === 0 || availableToolNames.has(name);
+		const pushParsed = (name: string | undefined, rawArgs: unknown) => {
+			if (!name || typeof name !== 'string') { return; }
+			const trimmedName = name.trim();
+			if (!trimmedName || !isKnown(trimmedName)) { return; }
+			let parameters: Record<string, unknown> = {};
+			if (rawArgs && typeof rawArgs === 'object') {
+				parameters = rawArgs as Record<string, unknown>;
+			} else if (typeof rawArgs === 'string' && rawArgs.trim()) {
+				try { parameters = JSON.parse(rawArgs); } catch { parameters = {}; }
+			}
+			out.push({ name: trimmedName, parameters });
+		};
+
+		// 1) Hermes/Qwen XML: <tool_call> {json} </tool_call> OR <tool_call> <function=NAME> <parameter=KEY>VAL</parameter> … </function> </tool_call>
+		const blockRe = /<\s*tool_call\s*>([\s\S]*?)<\s*\/\s*tool_call\s*>/gi;
+		let blockMatch: RegExpExecArray | null;
+		while ((blockMatch = blockRe.exec(text))) {
+			const inner = blockMatch[1].trim();
+			if (!this._recoverFromFunctionTag(inner, pushParsed)) {
+				// Inner is (hopefully) JSON like {"name":"x","arguments":{…}}
+				try {
+					const obj = JSON.parse(inner);
+					pushParsed(obj.name ?? obj.function?.name, obj.arguments ?? obj.parameters ?? obj.function?.arguments);
+				} catch { /* fall through */ }
+			}
+		}
+		if (out.length) { return out; }
+
+		// 2) Bare <function=NAME> … <parameter=KEY>VAL</parameter> … </function> (no surrounding <tool_call>)
+		this._recoverFromFunctionTag(text, pushParsed);
+		if (out.length) { return out; }
+
+		// 3) Raw JSON object: {"tool_calls":[{"function":{"name":…,"arguments":…}}]} or {"name":…,"arguments":…}
+		const jsonStart = text.indexOf('{');
+		if (jsonStart >= 0) {
+			const candidate = text.slice(jsonStart, text.lastIndexOf('}') + 1);
+			try {
+				const obj = JSON.parse(candidate);
+				const calls = Array.isArray(obj.tool_calls) ? obj.tool_calls : (obj.name ? [obj] : []);
+				for (const c of calls) {
+					pushParsed(c.name ?? c.function?.name, c.arguments ?? c.parameters ?? c.function?.arguments);
+				}
+			} catch { /* unrecoverable */ }
+		}
+		return out;
+	}
+
+	/** Parses `<function=NAME> <parameter=KEY>VALUE</parameter> … </function>` shapes out of `text`. Returns true if any matched. */
+	private _recoverFromFunctionTag(text: string, push: (name: string | undefined, args: unknown) => void): boolean {
+		const fnRe = /<\s*function\s*=\s*([^>\s]+)\s*>([\s\S]*?)<\s*\/\s*function\s*>/gi;
+		let matched = false;
+		let fnMatch: RegExpExecArray | null;
+		while ((fnMatch = fnRe.exec(text))) {
+			matched = true;
+			const name = fnMatch[1];
+			const body = fnMatch[2];
+			const params: Record<string, unknown> = {};
+			const paramRe = /<\s*parameter\s*=\s*([^>\s]+)\s*>([\s\S]*?)<\s*\/\s*parameter\s*>/gi;
+			let p: RegExpExecArray | null;
+			while ((p = paramRe.exec(body))) {
+				const key = p[1].trim();
+				let val: unknown = p[2].trim();
+				// Coerce JSON-ish values (numbers, booleans, objects/arrays) so the tool gets proper types.
+				try { val = JSON.parse(p[2].trim()); } catch { /* keep string */ }
+				params[key] = val;
+			}
+			push(name, params);
+		}
+		return matched;
 	}
 
 	/** Heuristic: does this OpenAI cloud model name belong to a reasoning-capable family? */
@@ -1016,6 +1112,12 @@ export class LoCoPilotLanguageModelProvider extends Disposable implements ILangu
 		const headers: Record<string, string> = { 'Content-Type': 'application/json', 'Accept': 'text/event-stream' };
 		try {
 			const accumulatedToolCalls: Map<number, { id?: string; name?: string; args: string }> = new Map();
+			// Full assistant content seen so far. We buffer it so that if a local model emits a tool call as
+			// plain text (instead of structured tool_calls), we can (a) stop printing the raw markup to the UI
+			// the moment we spot a marker, and (b) recover the call at stream end. See _recoverTextToolCalls.
+			let contentBuffer = '';
+			let emittedContentLen = 0;       // how much of contentBuffer we've already streamed to the UI
+			let suppressingToolText = false; // once a textual tool-call marker is seen, stop emitting content
 
 			const processChunk = (json: unknown): void => {
 				const choice = (json as IOpenAiStreamChunk).choices?.[0];
@@ -1025,7 +1127,21 @@ export class LoCoPilotLanguageModelProvider extends Disposable implements ILangu
 					this._emitThinking(stream, localReasoning);
 				}
 				if (choice?.delta?.content) {
-					stream.emitOne({ type: 'text', value: choice.delta.content });
+					contentBuffer += choice.delta.content;
+					if (!suppressingToolText) {
+						const markerIdx = this._textToolCallMarkerIndex(contentBuffer);
+						if (markerIdx >= 0) {
+							// Emit only the clean text before the marker, then suppress the rest of this turn.
+							if (markerIdx > emittedContentLen) {
+								stream.emitOne({ type: 'text', value: contentBuffer.slice(emittedContentLen, markerIdx) });
+							}
+							emittedContentLen = contentBuffer.length;
+							suppressingToolText = true;
+						} else {
+							stream.emitOne({ type: 'text', value: choice.delta.content });
+							emittedContentLen = contentBuffer.length;
+						}
+					}
 				}
 				if (choice?.delta?.tool_calls) {
 					for (const tc of choice.delta.tool_calls) {
@@ -1066,6 +1182,29 @@ export class LoCoPilotLanguageModelProvider extends Disposable implements ILangu
 					} catch {
 						stream.emitOne({ type: 'tool_use', name: acc.name, toolCallId: acc.id, parameters: {} });
 					}
+				}
+			}
+
+			// Fallback for local models that emit tool calls as plain text instead of structured tool_calls.
+			// We suppressed the raw markup from the UI during streaming (suppressingToolText); now try to
+			// recover the call so the agent can run it on this turn rather than dead-ending.
+			if (accumulatedToolCalls.size === 0 && suppressingToolText) {
+				const availableToolNames = new Set<string>(
+					(Array.isArray(body.tools) ? body.tools : [])
+						.map((t: any) => t?.function?.name || t?.name)
+						.filter((n: unknown): n is string => typeof n === 'string')
+				);
+				const recovered = this._recoverTextToolCalls(contentBuffer, availableToolNames);
+				if (recovered.length > 0) {
+					this._log(`[LoCoPilot Provider] Recovered ${recovered.length} text-formatted tool call(s) the model emitted as content.`);
+					for (const call of recovered) {
+						stream.emitOne({ type: 'tool_use', name: call.name, toolCallId: `recovered_${generateUuid()}`, parameters: call.parameters });
+					}
+				} else {
+					// Unrecoverable malformed call: don't print the broken markup. Emit a short corrective hint
+					// instead so the turn isn't empty and the model fixes its format on the next try.
+					this._log(`[LoCoPilot Provider] Suppressed an unparseable text tool call; nudging model to retry.`);
+					stream.emitOne({ type: 'text', value: 'It looks like the tool call was not formatted correctly, so it could not be run. Please retry the tool call using the proper structured tool-calling format.' });
 				}
 			}
 		} catch (e: unknown) {
@@ -1161,13 +1300,31 @@ export class LoCoPilotLanguageModelProvider extends Disposable implements ILangu
 		try {
 			const accumulatedToolCalls: Map<number, { id?: string; name?: string; args: string }> = new Map();
 			let hasEmittedAnything = false;
+			// Buffer content so a text-formatted tool call can be suppressed from the UI and recovered at end.
+			let contentBuffer = '';
+			let emittedContentLen = 0;
+			let suppressingToolText = false;
 
 			const status = await this._fetchSSEStream(url, headers, JSON.stringify(body), token, json => {
 				const choice = (json as IOpenAiStreamChunk).choices?.[0];
 				const delta = choice?.delta;
 				if (delta?.content) {
-					stream.emitOne({ type: 'text', value: delta.content });
-					hasEmittedAnything = true;
+					contentBuffer += delta.content;
+					if (!suppressingToolText) {
+						const markerIdx = this._textToolCallMarkerIndex(contentBuffer);
+						if (markerIdx >= 0) {
+							if (markerIdx > emittedContentLen) {
+								stream.emitOne({ type: 'text', value: contentBuffer.slice(emittedContentLen, markerIdx) });
+								hasEmittedAnything = true;
+							}
+							emittedContentLen = contentBuffer.length;
+							suppressingToolText = true;
+						} else {
+							stream.emitOne({ type: 'text', value: delta.content });
+							emittedContentLen = contentBuffer.length;
+							hasEmittedAnything = true;
+						}
+					}
 				}
 				const reasoningDelta = this._reasoningTextFromOpenAiDelta(delta);
 				if (reasoningDelta) {
@@ -1206,6 +1363,29 @@ export class LoCoPilotLanguageModelProvider extends Disposable implements ILangu
 					} catch (_e) {
 						stream.emitOne({ type: 'tool_use', name: acc.name, toolCallId: acc.id, parameters: {} });
 					}
+				}
+			}
+
+			// Fallback for local models that emit tool calls as plain text instead of structured tool_calls.
+			// We suppressed the raw markup from the UI during streaming (suppressingToolText); now try to
+			// recover the call so the agent can run it on this turn rather than dead-ending.
+			if (accumulatedToolCalls.size === 0 && suppressingToolText) {
+				const availableToolNames = new Set<string>(
+					(Array.isArray(body.tools) ? body.tools : [])
+						.map((t: any) => t?.function?.name || t?.name)
+						.filter((n: unknown): n is string => typeof n === 'string')
+				);
+				const recovered = this._recoverTextToolCalls(contentBuffer, availableToolNames);
+				if (recovered.length > 0) {
+					this._log(`[LoCoPilot Provider] Recovered ${recovered.length} text-formatted tool call(s) the model emitted as content.`);
+					for (const call of recovered) {
+						stream.emitOne({ type: 'tool_use', name: call.name, toolCallId: `recovered_${generateUuid()}`, parameters: call.parameters });
+					}
+				} else {
+					// Unrecoverable malformed call: don't print the broken markup. Emit a short corrective hint
+					// instead so the turn isn't empty and the model fixes its format on the next try.
+					this._log(`[LoCoPilot Provider] Suppressed an unparseable text tool call; nudging model to retry.`);
+					stream.emitOne({ type: 'text', value: 'It looks like the tool call was not formatted correctly, so it could not be run. Please retry the tool call using the proper structured tool-calling format.' });
 				}
 			}
 		} catch (e: unknown) {
@@ -1312,6 +1492,12 @@ export class LoCoPilotLanguageModelProvider extends Disposable implements ILangu
 		const headers: Record<string, string> = { 'Content-Type': 'application/json', 'Accept': 'text/event-stream' };
 		try {
 			const accumulatedToolCalls: Map<number, { id?: string; name?: string; args: string }> = new Map();
+			// Full assistant content seen so far. We buffer it so that if a local model emits a tool call as
+			// plain text (instead of structured tool_calls), we can (a) stop printing the raw markup to the UI
+			// the moment we spot a marker, and (b) recover the call at stream end. See _recoverTextToolCalls.
+			let contentBuffer = '';
+			let emittedContentLen = 0;       // how much of contentBuffer we've already streamed to the UI
+			let suppressingToolText = false; // once a textual tool-call marker is seen, stop emitting content
 
 			const processChunk = (json: unknown): void => {
 				const choice = (json as IOpenAiStreamChunk).choices?.[0];
@@ -1321,7 +1507,21 @@ export class LoCoPilotLanguageModelProvider extends Disposable implements ILangu
 					this._emitThinking(stream, localReasoning);
 				}
 				if (choice?.delta?.content) {
-					stream.emitOne({ type: 'text', value: choice.delta.content });
+					contentBuffer += choice.delta.content;
+					if (!suppressingToolText) {
+						const markerIdx = this._textToolCallMarkerIndex(contentBuffer);
+						if (markerIdx >= 0) {
+							// Emit only the clean text before the marker, then suppress the rest of this turn.
+							if (markerIdx > emittedContentLen) {
+								stream.emitOne({ type: 'text', value: contentBuffer.slice(emittedContentLen, markerIdx) });
+							}
+							emittedContentLen = contentBuffer.length;
+							suppressingToolText = true;
+						} else {
+							stream.emitOne({ type: 'text', value: choice.delta.content });
+							emittedContentLen = contentBuffer.length;
+						}
+					}
 				}
 				if (choice?.delta?.tool_calls) {
 					for (const tc of choice.delta.tool_calls) {
@@ -1362,6 +1562,29 @@ export class LoCoPilotLanguageModelProvider extends Disposable implements ILangu
 					} catch {
 						stream.emitOne({ type: 'tool_use', name: acc.name, toolCallId: acc.id, parameters: {} });
 					}
+				}
+			}
+
+			// Fallback for local models that emit tool calls as plain text instead of structured tool_calls.
+			// We suppressed the raw markup from the UI during streaming (suppressingToolText); now try to
+			// recover the call so the agent can run it on this turn rather than dead-ending.
+			if (accumulatedToolCalls.size === 0 && suppressingToolText) {
+				const availableToolNames = new Set<string>(
+					(Array.isArray(body.tools) ? body.tools : [])
+						.map((t: any) => t?.function?.name || t?.name)
+						.filter((n: unknown): n is string => typeof n === 'string')
+				);
+				const recovered = this._recoverTextToolCalls(contentBuffer, availableToolNames);
+				if (recovered.length > 0) {
+					this._log(`[LoCoPilot Provider] Recovered ${recovered.length} text-formatted tool call(s) the model emitted as content.`);
+					for (const call of recovered) {
+						stream.emitOne({ type: 'tool_use', name: call.name, toolCallId: `recovered_${generateUuid()}`, parameters: call.parameters });
+					}
+				} else {
+					// Unrecoverable malformed call: don't print the broken markup. Emit a short corrective hint
+					// instead so the turn isn't empty and the model fixes its format on the next try.
+					this._log(`[LoCoPilot Provider] Suppressed an unparseable text tool call; nudging model to retry.`);
+					stream.emitOne({ type: 'text', value: 'It looks like the tool call was not formatted correctly, so it could not be run. Please retry the tool call using the proper structured tool-calling format.' });
 				}
 			}
 		} catch (e: unknown) {

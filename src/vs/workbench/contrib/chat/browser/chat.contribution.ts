@@ -787,8 +787,8 @@ configurationRegistry.registerConfiguration({
 		[ChatConfiguration.LocopilotLocalMaxResidentModels]: {
 			type: 'number',
 			minimum: 1,
-			markdownDescription: nls.localize('locopilot.local.maxResidentModels.description', "Maximum number of local model servers kept loaded in memory at the same time. When you exceed this, the least-recently-used model is unloaded (LRU). Higher values make switching between models instant at the cost of more RAM. Acts as a hard upper bound; the actual number may be lower when `#locopilot.local.memoryBudgetFraction#` would be exceeded. Ignored when `#locopilot.local.singleActiveModel#` is on (which forces 1)."),
-			default: 2,
+			markdownDescription: nls.localize('locopilot.local.maxResidentModels.description', "Maximum number of local model servers kept loaded in memory at the same time. When you exceed this, the least-recently-used model is unloaded (LRU). The default of 1 keeps memory usage lowest (switching models triggers a reload); raise it to keep recently-used models warm for instant switching, at the cost of more RAM. Acts as a hard upper bound; the actual number may be lower when `#locopilot.local.memoryBudgetFraction#` would be exceeded. Servers of a different engine (llama.cpp vs MLX) are always unloaded on switch regardless of this value. Ignored when `#locopilot.local.singleActiveModel#` is on (which forces 1)."),
+			default: 1,
 		},
 		[ChatConfiguration.LocopilotLocalMemoryBudgetFraction]: {
 			type: 'number',

@@ -54,8 +54,18 @@ export function getMlxServerBaseUrl(port: number): string {
  */
 export function getMlxLmServerCommand(modelDir: string, port: number, pythonCmd: string): { command: string; args: string[] } {
 	const cmd = pythonCmd.trim() || 'python3';
+	// Fail fast on a blank model path: building `--model ''` makes mlx_lm.server start with no model, which
+	// either errors with a cryptic traceback or hangs serving GET /v1/models while every chat request blocks.
+	// The caller is expected to validate the path first; this is a defensive guard at the command boundary.
+	const dir = modelDir?.trim();
+	if (!dir) {
+		throw new Error('Cannot start MLX server: model path is empty. The model may not be downloaded yet or its localPath is unset.');
+	}
+	if (!(port > 0)) {
+		throw new Error(`Cannot start MLX server: invalid port "${port}".`);
+	}
 	// `python -m mlx_lm server` (mlx-lm >= 0.20): `python -m mlx_lm.server` is deprecated.
-	const args = ['-m', 'mlx_lm', 'server', '--model', modelDir, '--host', '127.0.0.1', '--port', String(port)];
+	const args = ['-m', 'mlx_lm', 'server', '--model', dir, '--host', '127.0.0.1', '--port', String(port)];
 	return { command: cmd, args };
 }
 
