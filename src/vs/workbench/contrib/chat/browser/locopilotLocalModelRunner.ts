@@ -1409,19 +1409,28 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 	 * reached, then waits until the server's OpenAI endpoint actually responds so the caller can send immediately.
 	 */
 	async ensureServerForModel(modelId: string, token: CancellationToken = CancellationToken.None): Promise<string | undefined> {
-		// Already running - reuse as-is, and refresh its LRU/idle state so it isn't evicted while in use.
-		const existing = this.getServerBaseUrl(modelId);
-		if (existing) {
+		// Already running AND ready - reuse as-is, and refresh its LRU/idle state so it isn't evicted while
+		// in use. A record that exists but is not yet ready (weights still loading, e.g. a pre-warm that just
+		// launched) must NOT be returned here: doing so would let the caller fire a request the server rejects
+		// with 503 while it loads. Instead we fall through to _waitForServerReady below so the request waits.
+		const existingRec = this.runningServers.get(modelId);
+		if (existingRec?.ready) {
 			this._touch(modelId);
-			return existing;
+			return this.getServerBaseUrl(modelId);
 		}
 
-		// Free RAM under an LRU budget instead of killing every other server: a recently-used model stays
-		// warm so switching back to it is instant. singleActiveModel forces the budget to 1 (old behavior).
-		await this._enforceResidentBudget(modelId);
+		// Only launch (and enforce the RAM budget) when there is no server record at all. If one already
+		// exists but is mid-load, skip straight to waiting for it to become ready - relaunching would be a
+		// no-op (startServerInTerminal guards on runningServers) and re-budgeting could evict the very model
+		// we are waiting on.
+		if (!existingRec) {
+			// Free RAM under an LRU budget instead of killing every other server: a recently-used model stays
+			// warm so switching back to it is instant. singleActiveModel forces the budget to 1 (old behavior).
+			await this._enforceResidentBudget(modelId);
 
-		// Launch (no-op if another caller already kicked it off; startServerInTerminal guards on runningServers).
-		await this.startServerInTerminal(modelId);
+			// Launch (no-op if another caller already kicked it off; startServerInTerminal guards on runningServers).
+			await this.startServerInTerminal(modelId);
+		}
 
 		const baseUrl = this.getServerBaseUrl(modelId);
 		if (!baseUrl) {
@@ -1476,6 +1485,22 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 	 * startup to settle and try once more. The real request path still reports a genuine, persistent failure.
 	 */
 	private async _prewarmWithRetry(modelId: string): Promise<void> {
+		// Let the window finish coming up before we drop the single heaviest startup operation (loading
+		// multi-GB weights into RAM + spinning up the GPU/Metal backend) on top of it. Waiting for the
+		// Eventually phase (idle, after restoration) plus a short configurable delay keeps that I/O and
+		// GPU spike from stuttering the mouse/UI right as the workbench settles. This runs ONLY on the
+		// pre-warm path, never on a real message send, so it never slows an actual request. For a model
+		// the user picks later in the dropdown, Eventually has long since passed and resolves instantly,
+		// so a mid-session pick still warms promptly (minus the small idle delay).
+		await this.lifecycleService.when(LifecyclePhase.Eventually);
+		const delayMs = this.configurationService.getValue<number>(ChatConfiguration.LocopilotLocalPrewarmStartupDelayMs);
+		if (typeof delayMs === 'number' && delayMs > 0) {
+			await timeout(delayMs);
+			// A real request (or another trigger) may have already started it while we waited.
+			if (this.runningServers.has(modelId) || this.startingServers.has(modelId)) {
+				return;
+			}
+		}
 		// First attempt is silent on crash - we retry, so don't alarm the user with a notification yet.
 		this._suppressCrashNotice.add(modelId);
 		const baseUrl = await this.ensureServerForModel(modelId);

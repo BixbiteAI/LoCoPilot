@@ -1096,15 +1096,19 @@ export class LoCoPilotLanguageModelProvider extends Disposable implements ILangu
 		}
 		let baseUrl = this.localModelRunner.getServerBaseUrl(model.id);
 		const autoStart = this.configurationService.getValue<boolean>(ChatConfiguration.LocopilotLocalAutoStartServer) !== false;
-		if (!baseUrl && autoStart) {
-			// Auto-start-on-use (Ollama-like): launch this model's server and wait until it is ready, so the
-			// user can just pick the model and send without a manual step. Because the server has to load the
-			// weights into memory first, show a distinct "loading" indicator (instead of the normal working
-			// spinner) so the wait reads as model start-up, not slow generation.
-			this._log(`[LoCoPilot Provider] Auto-starting local server for ${model.modelName}.`);
-			baseUrl = await this._withModelLoadingProgress(model, token, t => this.localModelRunner.ensureServerForModel(model.id, t));
-		} else if (baseUrl && autoStart) {
-			// Already running: route through ensure to refresh the keep-alive idle timer (cheap no-op start).
+		// A server can be "present but not ready": a pre-warm (or earlier request) launched it and the weights
+		// are still loading. Sending now would hit the server mid-load and come back 503 "still loading", so we
+		// must treat not-ready exactly like not-started - wait for readiness rather than fire the request.
+		const isReady = this.localModelRunner.getServerPhase(model.id) === 'ready';
+		if (!isReady && autoStart) {
+			// Auto-start-on-use (Ollama-like): launch (or wait for) this model's server until it is ready, so the
+			// user can just pick the model and send without a manual step. The wait happens under the chat's normal
+			// "Working…" spinner (no separate loading indicator) - the request simply takes a bit longer while the
+			// weights load into memory.
+			this._log(`[LoCoPilot Provider] Ensuring local server is ready for ${model.modelName}.`);
+			baseUrl = await this.localModelRunner.ensureServerForModel(model.id, token);
+		} else if (isReady && autoStart) {
+			// Already running and ready: route through ensure to refresh the keep-alive idle timer (cheap no-op).
 			baseUrl = await this.localModelRunner.ensureServerForModel(model.id, token) ?? baseUrl;
 		}
 		if (!baseUrl) {

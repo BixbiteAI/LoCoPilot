@@ -778,6 +778,12 @@ configurationRegistry.registerConfiguration({
 			markdownDescription: nls.localize('locopilot.local.prewarmOnSelect.description', "Start a local model's server as soon as you pick it in the model dropdown, instead of waiting for your first message. The model loads into memory while you type, so the first response no longer pays the cold-start delay."),
 			default: true,
 		},
+		[ChatConfiguration.LocopilotLocalPrewarmStartupDelayMs]: {
+			type: 'number',
+			minimum: 0,
+			markdownDescription: nls.localize('locopilot.local.prewarmStartupDelayMs.description', "Extra delay, in milliseconds, before the pre-warm of your last-selected model launches at app start/restart. The pre-warm always waits until the window has finished loading first; this adds a short additional pause so loading the model's weights (heavy disk and GPU/Metal work) doesn't make the mouse and UI stutter while the window is still settling. Only applies to the startup pre-warm - picking a model later in the dropdown still warms immediately. Set to `0` to disable the extra delay."),
+			default: 4000,
+		},
 		[ChatConfiguration.LocopilotLocalKeepAliveMinutes]: {
 			type: 'number',
 			minimum: 0,

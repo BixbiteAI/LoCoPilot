@@ -1467,7 +1467,7 @@ Preserve: key facts, decisions, code changes, file names and paths, user prefere
 	 * For file attachments: sends path (workspace-relative) and optional line range only - no file content.
 	 * LLM can use readFile(path) or readFile(path, offset, limit) when needed.
 	 */
-	private async convertVariablesToContent(variables: IChatRequestVariableEntry[]): Promise<IChatMessage['content']> {
+	private async convertVariablesToContent(variables: IChatRequestVariableEntry[], includeOpenEditors: boolean = true): Promise<IChatMessage['content']> {
 		const content: IChatMessage['content'] = [];
 		const attachedFileUris = new Set<string>();
 
@@ -1572,8 +1572,10 @@ Preserve: key facts, decisions, code changes, file names and paths, user prefere
 			}
 		}
 
-		// Other open files (max 10) - for images: include actual image content so LLM can see them; for text files: paths only
-		const editors = this.editorService.editors;
+		// Other open files (max 5) - for images: include actual image content so LLM can see them; for text files: paths only.
+		// Only attached for the live request, not when replaying history: the set of open editors reflects the
+		// CURRENT workspace, so injecting it into past turns would rewrite that history with today's open files.
+		const editors = includeOpenEditors ? this.editorService.editors : [];
 		const imageExts = ['png', 'jpg', 'jpeg', 'gif', 'webp', 'bmp', 'tiff'];
 		const maxOpenImages = 3; // avoid huge payloads
 		let openImageCount = 0;
@@ -1605,7 +1607,7 @@ Preserve: key facts, decisions, code changes, file names and paths, user prefere
 					}
 				}
 			}
-			const pathsToShow = otherOpenPaths.slice(0, 10);
+			const pathsToShow = otherOpenPaths.slice(0, 5);
 			if (pathsToShow.length > 0) {
 				content.push({
 					type: 'text',
@@ -1698,7 +1700,9 @@ Focus on making the exact changes requested while preserving code structure and 
 
 			// Add variables/attachments to user message
 			if (h.request.variables?.variables) {
-				const variableContent = await this.convertVariablesToContent([...h.request.variables.variables]);
+				// Past turns: replay only the attachments that belonged to THAT turn. Do not inject the
+				// current open-editors list, which would rewrite history with today's workspace state.
+				const variableContent = await this.convertVariablesToContent([...h.request.variables.variables], false);
 				userContent.push(...variableContent);
 			}
 

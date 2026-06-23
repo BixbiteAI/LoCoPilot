@@ -98,6 +98,8 @@ export enum ChatConfiguration {
 	LocopilotLocalSingleActiveModel = 'locopilot.local.singleActiveModel',
 	/** Eagerly start a local model's server the moment it is selected in the model picker (hides cold start). */
 	LocopilotLocalPrewarmOnSelect = 'locopilot.local.prewarmOnSelect',
+	/** Extra delay (ms) before the startup pre-warm launches, so loading weights doesn't stutter the UI while the window is still settling. */
+	LocopilotLocalPrewarmStartupDelayMs = 'locopilot.local.prewarmStartupDelayMs',
 	/** Minutes a local model server may sit idle before it is unloaded to free RAM (0 = never unload). */
 	LocopilotLocalKeepAliveMinutes = 'locopilot.local.keepAliveMinutes',
 	/** Max number of local model servers kept resident at once; least-recently-used ones are evicted (LRU). */
