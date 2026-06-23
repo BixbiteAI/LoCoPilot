@@ -59,12 +59,12 @@ function offsetToRange(content: string, startOffset: number, length: number): IR
 function buildReplaceEdits(content: string, oldString: string, newString: string, replaceAll: boolean): TextEdit[] {
 	const indices: number[] = [];
 	let idx = 0;
-	for (;;) {
+	for (; ;) {
 		const i = content.indexOf(oldString, idx);
-		if (i === -1) break;
+		if (i === -1) { break; }
 		indices.push(i);
 		idx = i + 1;
-		if (!replaceAll) break;
+		if (!replaceAll) { break; }
 	}
 	// Apply from end to start so positions don't shift
 	const sorted = replaceAll ? [...indices].sort((a, b) => b - a) : indices;
@@ -107,7 +107,7 @@ export function createStringReplaceToolData(): IToolData {
 		icon: ThemeIcon.fromId(Codicon.edit.id),
 		displayName: localize('tool.stringReplace.displayName', 'Edit file by string replacement'),
 		userDescription: localize('tool.stringReplace.userDescription', 'Edit a file by replacing an exact string'),
-		modelDescription: 'Edit EXISTING files by replacing an exact string. Call readFile(path) first and copy the exact text for oldString (character-for-character). If you get "String not found", the error includes "First line of file" — use that exact string for oldString on the next turn (check for typos like extra } or missing space). For new files use createFile.',
+		modelDescription: 'Edit EXISTING files by replacing an exact string. Call readFile(path) first and copy the exact text for oldString (character-for-character). If you get "String not found", the error includes "First line of file" - use that exact string for oldString on the next turn (check for typos like extra } or missing space). For new files use createFile.',
 		source: ToolDataSource.Internal,
 		inputSchema: inputSchema,
 		canRequestPreApproval: true,
@@ -133,7 +133,7 @@ export class StringReplaceTool implements IToolImpl {
 
 	async invoke(invocation: IToolInvocation, countTokens: CountTokensCallback, progress: ToolProgress, token: CancellationToken): Promise<IToolResult> {
 		const params = invocation.parameters as IStringReplaceToolParams;
-		
+
 		try {
 			// Resolve path
 			let fileUri: URI;
@@ -150,7 +150,7 @@ export class StringReplaceTool implements IToolImpl {
 				fileUri = URI.joinPath(workspace.folders[0].uri, params.path);
 			}
 
-			progress.report({ message: `Editing ${params.path}...` });
+			progress.report({ message: `Editing ${params.path}` });
 
 			// Read current file content
 			const fileContent = await this.fileService.readFile(fileUri);
@@ -187,9 +187,9 @@ export class StringReplaceTool implements IToolImpl {
 
 			if (occurrences > 1 && !params.replaceAll) {
 				return {
-					content: [{ 
-						kind: 'text', 
-						value: `Error: Found ${occurrences} occurrences of the string in "${params.path}". Next: Either include more context to make oldString unique (match only once) or set replaceAll=true to replace all ${occurrences} occurrences.` 
+					content: [{
+						kind: 'text',
+						value: `Error: Found ${occurrences} occurrences of the string in "${params.path}". Next: Either include more context to make oldString unique (match only once) or set replaceAll=true to replace all ${occurrences} occurrences.`
 					}],
 					toolResultError: 'Ambiguous match'
 				};
@@ -204,8 +204,8 @@ export class StringReplaceTool implements IToolImpl {
 			const oldLines = params.oldString.split('\n').length;
 			const newLines = params.newString.split('\n').length;
 			const lineDiff = newLines - oldLines;
-			const diffText = lineDiff > 0 ? `+${lineDiff}` : lineDiff < 0 ? `${lineDiff}` : '±0';
-			const successMessage = `Successfully edited "${params.path}"\n- Replaced ${replacementCount} occurrence(s)\n- Lines changed: ${diffText}\n- Old: ${oldLines} lines → New: ${newLines} lines\n\nProceed to the next step or goal.`;
+			const diffText = lineDiff > 0 ? `+${lineDiff}` : lineDiff < 0 ? `${lineDiff}` : '+/-0';
+			const successMessage = `Successfully edited "${params.path}"\n- Replaced ${replacementCount} occurrence(s)\n- Lines changed: ${diffText}\n- Old: ${oldLines} lines -> New: ${newLines} lines\n\nProceed to the next step or goal.`;
 
 			// When there is a chat editing session and this is a regular (non-notebook) file,
 			// report edits through it so the UI shows diff colors, keep/undo, "1 of n"
@@ -244,7 +244,16 @@ export class StringReplaceTool implements IToolImpl {
 	}
 
 	async prepareToolInvocation(context: IToolInvocationPreparationContext, token: CancellationToken): Promise<IPreparedToolInvocation | undefined> {
-		// Return undefined so tool call is shown in UI with input/output; confirmation is handled via canRequestPreApproval when needed
-		return undefined;
+		// Confirmation is handled via canRequestPreApproval when needed. Provide a contextual
+		// message so the UI shows the file name instead of a generic "Editing ...".
+		const path: string | undefined = context.parameters?.path;
+		const name = path ? path.split(/[/\\]/).filter(Boolean).pop() : undefined;
+		if (!name) {
+			return undefined;
+		}
+		return {
+			invocationMessage: localize('stringReplace.invoking', "Editing {0}", name),
+			pastTenseMessage: localize('stringReplace.invoked', "Edited {0}", name),
+		};
 	}
 }

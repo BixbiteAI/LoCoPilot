@@ -63,7 +63,7 @@ export function createReadFileToolData(): IToolData {
 		icon: ThemeIcon.fromId(Codicon.file.id),
 		displayName: localize('tool.readFile.displayName', 'Read file contents'),
 		userDescription: localize('tool.readFile.userDescription', 'Read the contents of a file (raw text for use with edits)'),
-		modelDescription: 'Read file contents from the workspace. Returns RAW file text (no line number prefixes) so you can copy it exactly for modifyFile oldString.\n\n**Ways to call:**\n1. **Complete file**: readFile(path) — returns the full file. Use when you need the entire contents (e.g. small config, full module). Files with more than 1000 lines cannot be read in full; the tool returns an error — use (2) for those.\n2. **Specific lines**: readFile(path, offset, limit) — returns only the requested line range. offset = 1-based start line, limit = max lines to return (capped at 1000 per read). Examples: readFile(path, 1, 200) for first 200 lines; readFile(path, 50, 100) for lines 50–149. Use when you need only a section or when the file is large; grep/readLints can give you line numbers.\n\nUse this tool to: examine file contents before edits; copy exact text for modifyFile oldString; read a specific block when you know the line range. Path can be absolute or relative to workspace root.\n\nHandles: text files (raw content); image files (png, jpg, gif, etc. — returns the image for vision so you can describe or analyze it; max 5MB); binary files (returns "[Binary file]"); missing files (clear error); files >1000 lines without offset/limit (error asking you to use offset and limit).',
+		modelDescription: 'Read file contents from the workspace. Returns RAW file text (no line number prefixes) so you can copy it exactly for modifyFile oldString.\n\n**Ways to call:**\n1. **Complete file**: readFile(path) - returns the full file. Use when you need the entire contents (e.g. small config, full module). Files with more than 1000 lines cannot be read in full; the tool returns an error - use (2) for those.\n2. **Specific lines**: readFile(path, offset, limit) - returns only the requested line range. offset = 1-based start line, limit = max lines to return (capped at 1000 per read). Examples: readFile(path, 1, 200) for first 200 lines; readFile(path, 50, 100) for lines 50-149. Use when you need only a section or when the file is large; grep/readLints can give you line numbers.\n\nUse this tool to: examine file contents before edits; copy exact text for modifyFile oldString; read a specific block when you know the line range. Path can be absolute or relative to workspace root.\n\nHandles: text files (raw content); image files (png, jpg, gif, etc. - returns the image for vision so you can describe or analyze it; max 5MB); binary files (returns "[Binary file]"); missing files (clear error); files >1000 lines without offset/limit (error asking you to use offset and limit).',
 		source: ToolDataSource.Internal,
 		inputSchema: inputSchema,
 		alwaysDisplayInputOutput: true
@@ -85,7 +85,7 @@ export class ReadFileTool implements IToolImpl {
 
 	async invoke(invocation: IToolInvocation, countTokens: CountTokensCallback, progress: ToolProgress, token: CancellationToken): Promise<IToolResult> {
 		const params = invocation.parameters as IReadFileToolParams;
-		
+
 		try {
 			// Resolve path (support both absolute and workspace-relative)
 			let fileUri: URI;
@@ -104,11 +104,11 @@ export class ReadFileTool implements IToolImpl {
 				fileUri = URI.joinPath(workspace.folders[0].uri, params.path);
 			}
 
-			progress.report({ message: `Reading ${params.path}...` });
+			progress.report({ message: `Reading ${params.path}` });
 
 			// Check if file exists
 			const stat = await this.fileService.stat(fileUri);
-			
+
 			// Check if it's a directory
 			if (stat.isDirectory) {
 				return {
@@ -129,7 +129,7 @@ export class ReadFileTool implements IToolImpl {
 				const mimeType = getImageMimeType(ext);
 				return {
 					content: [
-						{ kind: 'text', value: `Image file: ${params.path}. Image attached below for vision — use it to describe or analyze the image.` },
+						{ kind: 'text', value: `Image file: ${params.path}. Image attached below for vision - use it to describe or analyze the image.` },
 						{ kind: 'data', value: { mimeType, data: fileContent.value } }
 					]
 				};
@@ -202,7 +202,16 @@ export class ReadFileTool implements IToolImpl {
 	}
 
 	async prepareToolInvocation(context: IToolInvocationPreparationContext, token: CancellationToken): Promise<IPreparedToolInvocation | undefined> {
-		// Read operations don't need confirmation; return undefined so tool call is shown in UI (with input/output from alwaysDisplayInputOutput)
-		return undefined;
+		// Read operations don't need confirmation. Provide a contextual message (the file name)
+		// so the UI shows e.g. "Reading calculator.py" instead of a generic "Reading ...".
+		const path: string | undefined = context.parameters?.path;
+		const name = path ? path.split(/[/\\]/).filter(Boolean).pop() : undefined;
+		if (!name) {
+			return undefined;
+		}
+		return {
+			invocationMessage: localize('readFile.invoking', "Reading {0}", name),
+			pastTenseMessage: localize('readFile.invoked', "Read {0}", name),
+		};
 	}
 }

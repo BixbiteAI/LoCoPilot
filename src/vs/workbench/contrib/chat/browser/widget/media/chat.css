@@ -141,6 +141,53 @@
 	animation: ellipsis steps(4, end) 1s infinite;
 }
 
+/*
+ * Shimmer/wave loader for the "Working" text. A bright highlight sweeps left→right
+ * across the text via an animated background-position with background-clip: text.
+ * Unlike the `content`-based ellipsis, background-position animates on the animation
+ * timeline and is NOT reset by the reflows that streaming tokens trigger, so it keeps
+ * moving while the response streams.
+ */
+@keyframes chat-working-shimmer {
+	0% {
+		background-position: 150% 0;
+	}
+
+	100% {
+		background-position: -50% 0;
+	}
+}
+
+.interactive-item-container.show-detail-progress .detail,
+.interactive-item-container .progress-container.chat-working-progress .rendered-markdown.progress-step,
+.interactive-item-container .chat-thinking-active .chat-used-context-label .monaco-button-mdlabel {
+	background: linear-gradient(
+		100deg,
+		var(--vscode-disabledForeground) 0%,
+		var(--vscode-disabledForeground) 35%,
+		var(--vscode-foreground) 50%,
+		var(--vscode-disabledForeground) 65%,
+		var(--vscode-disabledForeground) 100%
+	);
+	background-size: 200% 100%;
+	background-clip: text;
+	-webkit-background-clip: text;
+	-webkit-text-fill-color: transparent;
+	color: transparent;
+	animation: chat-working-shimmer 1.6s linear infinite;
+}
+
+@media (prefers-reduced-motion: reduce) {
+	.interactive-item-container.show-detail-progress .detail,
+	.interactive-item-container .progress-container.chat-working-progress .rendered-markdown.progress-step,
+	.interactive-item-container .chat-thinking-active .chat-used-context-label .monaco-button-mdlabel {
+		animation: none;
+		background: none;
+		color: var(--vscode-disabledForeground);
+		-webkit-text-fill-color: currentColor;
+	}
+}
+
 .interactive-item-container .header .avatar-container {
 	display: flex;
 	pointer-events: none;

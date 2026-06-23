@@ -90,7 +90,7 @@ export class GrepTool implements IToolImpl {
 
 	async invoke(invocation: IToolInvocation, countTokens: CountTokensCallback, progress: ToolProgress, token: CancellationToken): Promise<IToolResult> {
 		const params = invocation.parameters as IGrepToolParams;
-		
+
 		try {
 			const workspace = this.workspaceService.getWorkspace();
 			if (workspace.folders.length === 0) {
@@ -100,11 +100,11 @@ export class GrepTool implements IToolImpl {
 				};
 			}
 
-			progress.report({ message: `Searching for "${params.pattern}"...` });
+			progress.report({ message: `Searching for "${params.pattern}"` });
 
 			// Build search query
 			const folderUri = workspace.folders[0].uri;
-			const searchPath = params.path 
+			const searchPath = params.path
 				? (params.path.startsWith('/') ? URI.file(params.path) : URI.joinPath(folderUri, params.path))
 				: folderUri;
 

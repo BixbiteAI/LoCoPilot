@@ -75,7 +75,7 @@ export class FindFilesTool implements IToolImpl {
 
 	async invoke(invocation: IToolInvocation, countTokens: CountTokensCallback, progress: ToolProgress, token: CancellationToken): Promise<IToolResult> {
 		const params = invocation.parameters as IFindFilesToolParams;
-		
+
 		try {
 			const workspace = this.workspaceService.getWorkspace();
 			if (workspace.folders.length === 0) {
@@ -85,11 +85,11 @@ export class FindFilesTool implements IToolImpl {
 				};
 			}
 
-			progress.report({ message: `Finding files matching "${params.pattern}"...` });
+			progress.report({ message: `Finding files matching "${params.pattern}"` });
 
 			// Build search query
 			const folderUri = workspace.folders[0].uri;
-			const searchPath = params.targetDirectory 
+			const searchPath = params.targetDirectory
 				? (params.targetDirectory.startsWith('/') ? URI.file(params.targetDirectory) : URI.joinPath(folderUri, params.targetDirectory))
 				: folderUri;
 
@@ -123,7 +123,7 @@ export class FindFilesTool implements IToolImpl {
 
 			// Format results - sort and display relative paths
 			const results: string[] = [];
-			
+
 			const workspaceRoot = workspace.folders[0].uri.fsPath;
 			for (const result of searchResult.results) {
 				const fileMatch = result as IFileMatch;

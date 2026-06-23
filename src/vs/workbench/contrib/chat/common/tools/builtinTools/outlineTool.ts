@@ -141,7 +141,7 @@ export class OutlineTool implements IToolImpl {
 				fileUri = URI.joinPath(workspace.folders[0].uri, params.path);
 			}
 
-			progress.report({ message: `Outlining ${params.path}...` });
+			progress.report({ message: `Outlining ${params.path}` });
 
 			const stat = await this.fileService.stat(fileUri);
 			if (stat.isDirectory) {

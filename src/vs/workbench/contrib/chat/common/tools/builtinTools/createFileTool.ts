@@ -49,7 +49,7 @@ export function createCreateFileToolData(): IToolData {
 		icon: ThemeIcon.fromId(Codicon.newFile.id),
 		displayName: localize('tool.createFile.displayName', 'Create new file'),
 		userDescription: localize('tool.createFile.userDescription', 'Create a new file with specified contents'),
-		modelDescription: 'Create a NEW file only. Fails if the file already exists — do NOT use createFile to edit or overwrite. For existing files, use stringReplace.\n\nUse this tool to: create new source files, config files, new components, test files. Parent directories are created automatically.\n\nCRITICAL: If the path already exists (e.g. you read it with readFile or got "File already exists"), use stringReplace to edit — never createFile. Check with readFile(path) first if unsure.',
+		modelDescription: 'Create a NEW file only. Fails if the file already exists - do NOT use createFile to edit or overwrite. For existing files, use stringReplace.\n\nUse this tool to: create new source files, config files, new components, test files. Parent directories are created automatically.\n\nCRITICAL: If the path already exists (e.g. you read it with readFile or got "File already exists"), use stringReplace to edit - never createFile. Check with readFile(path) first if unsure.',
 		source: ToolDataSource.Internal,
 		inputSchema: inputSchema,
 		canRequestPreApproval: true,
@@ -71,7 +71,7 @@ export class CreateFileTool implements IToolImpl {
 
 	async invoke(invocation: IToolInvocation, countTokens: CountTokensCallback, progress: ToolProgress, token: CancellationToken): Promise<IToolResult> {
 		const params = invocation.parameters as ICreateFileToolParams;
-		
+
 		try {
 			// Resolve path
 			let fileUri: URI;
@@ -88,7 +88,7 @@ export class CreateFileTool implements IToolImpl {
 				fileUri = URI.joinPath(workspace.folders[0].uri, params.path);
 			}
 
-			progress.report({ message: `Creating file ${params.path}...` });
+			progress.report({ message: `Creating file ${params.path}` });
 
 			// Check if file already exists
 			try {
@@ -109,9 +109,9 @@ export class CreateFileTool implements IToolImpl {
 			const size = content.byteLength;
 
 			return {
-				content: [{ 
-					kind: 'text', 
-					value: `Successfully created file "${params.path}" (${lines} lines, ${size} bytes). Proceed to the next step or goal.` 
+				content: [{
+					kind: 'text',
+					value: `Successfully created file "${params.path}" (${lines} lines, ${size} bytes). Proceed to the next step or goal.`
 				}]
 			};
 
@@ -125,7 +125,16 @@ export class CreateFileTool implements IToolImpl {
 	}
 
 	async prepareToolInvocation(context: IToolInvocationPreparationContext, token: CancellationToken): Promise<IPreparedToolInvocation | undefined> {
-		// Return undefined so tool call is shown in UI with input/output; confirmation is handled via canRequestPreApproval when needed
-		return undefined;
+		// Confirmation is handled via canRequestPreApproval when needed. Provide a contextual
+		// message so the UI shows the file name instead of a generic "Creating ...".
+		const path: string | undefined = context.parameters?.path;
+		const name = path ? path.split(/[/\\]/).filter(Boolean).pop() : undefined;
+		if (!name) {
+			return undefined;
+		}
+		return {
+			invocationMessage: localize('createFile.invoking', "Creating {0}", name),
+			pastTenseMessage: localize('createFile.invoked', "Created {0}", name),
+		};
 	}
 }

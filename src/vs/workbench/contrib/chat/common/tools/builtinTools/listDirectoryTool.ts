@@ -100,7 +100,7 @@ export class ListDirectoryTool implements IToolImpl {
 
 	async invoke(invocation: IToolInvocation, countTokens: CountTokensCallback, progress: ToolProgress, token: CancellationToken): Promise<IToolResult> {
 		const params = invocation.parameters as IListDirectoryToolParams;
-		
+
 		try {
 			// Resolve path (support both absolute and workspace-relative)
 			let dirUri: URI;
@@ -116,17 +116,17 @@ export class ListDirectoryTool implements IToolImpl {
 						toolResultError: 'No workspace folder'
 					};
 				}
-				const basePath = params.targetDirectory === '.' || params.targetDirectory === '' 
-					? '' 
+				const basePath = params.targetDirectory === '.' || params.targetDirectory === ''
+					? ''
 					: params.targetDirectory;
 				dirUri = basePath ? URI.joinPath(workspace.folders[0].uri, basePath) : workspace.folders[0].uri;
 			}
 
-			progress.report({ message: `Listing ${params.targetDirectory}...` });
+			progress.report({ message: `Listing ${params.targetDirectory}` });
 
 			// Check if directory exists
 			const stat = await this.fileService.stat(dirUri);
-			
+
 			if (!stat.isDirectory) {
 				return {
 					content: [{ kind: 'text', value: `Error: "${params.targetDirectory}" is not a directory. Next: Use readFile to read this file, or listDirectory with a parent directory path.` }],
@@ -136,7 +136,7 @@ export class ListDirectoryTool implements IToolImpl {
 
 			// Read directory contents
 			const entries = await this.fileService.resolve(dirUri);
-			
+
 			if (!entries.children || entries.children.length === 0) {
 				return {
 					content: [{ kind: 'text', value: `Directory "${params.targetDirectory}" is empty. Next: Try listing a parent directory, or use findFiles to search for files by pattern.` }]
@@ -151,7 +151,7 @@ export class ListDirectoryTool implements IToolImpl {
 
 			for (const entry of entries.children) {
 				const name = entry.name;
-				
+
 				// Skip hidden files by default
 				if (name.startsWith('.')) {
 					continue;
@@ -198,7 +198,14 @@ export class ListDirectoryTool implements IToolImpl {
 	}
 
 	async prepareToolInvocation(context: IToolInvocationPreparationContext, token: CancellationToken): Promise<IPreparedToolInvocation | undefined> {
-		// Read operations don't need confirmation; return undefined so tool call is shown in UI
-		return undefined;
+		// Read operations don't need confirmation. Provide a contextual message (the directory)
+		// so the UI shows e.g. "Listing src" instead of a generic "Listing ...".
+		const dir: string | undefined = context.parameters?.targetDirectory;
+		const name = dir && dir !== '.' && dir !== '' ? dir.split(/[/\\]/).filter(Boolean).pop() : dir;
+		const label = name && name !== '.' ? name : localize('listDirectory.workspaceRoot', "workspace root");
+		return {
+			invocationMessage: localize('listDirectory.invoking', "Listing {0}", label),
+			pastTenseMessage: localize('listDirectory.invoked', "Listed {0}", label),
+		};
 	}
 }

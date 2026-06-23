@@ -91,6 +91,15 @@ function extractTitleFromThinkingContent(content: string): string | undefined {
 	return headerMatch ? headerMatch[1] : undefined;
 }
 
+/**
+ * Strip trailing dot/ellipsis runs (e.g. "Reading ....", "Working…") and trailing whitespace
+ * from a label. Tool progress messages often append "..." as a fake spinner; we render our own
+ * animation, so the static dots are redundant noise.
+ */
+function stripTrailingDots(text: string): string {
+	return text.replace(/[\s.…]+$/, '').trimEnd();
+}
+
 interface ILazyToolItem {
 	kind: 'tool';
 	lazy: Lazy<{ domNode: HTMLElement; disposable?: IDisposable }>;
@@ -118,7 +127,8 @@ export class ChatThinkingContentPart extends ChatCollapsibleContentPart implemen
 	private content: IChatThinkingPart;
 	private currentThinkingValue: string;
 	private currentTitle: string;
-	private defaultTitle = localize('chat.thinking.header', 'Working...');
+	private defaultTitle = localize('chat.thinking.header', 'Working');
+	private thinkingTitle = localize('chat.thinking.reasoning', 'Thinking');
 	private textContainer!: HTMLElement;
 	private markdownResult: IRenderedMarkdown | undefined;
 	private wrapper!: HTMLElement;
@@ -148,8 +158,10 @@ export class ChatThinkingContentPart extends ChatCollapsibleContentPart implemen
 		@IHoverService hoverService: IHoverService,
 	) {
 		const initialText = extractTextFromPart(content);
-		const extractedTitle = extractTitleFromThinkingContent(initialText)
-			?? 'Working...';
+		const extractedHeader = extractTitleFromThinkingContent(initialText);
+		// No literal "..." here: the animated ellipsis (rendered separately) provides the motion,
+		// and a static "Working..." string would otherwise stick as the finished title.
+		const extractedTitle = extractedHeader ?? localize('chat.thinking.initial', 'Thinking');
 
 		super(extractedTitle, context, undefined, hoverService);
 
@@ -161,8 +173,8 @@ export class ChatThinkingContentPart extends ChatCollapsibleContentPart implemen
 		this.autoCollapseMode = configuredMode === ThinkingDisplayMode.AutoCollapse;
 
 		this.currentTitle = extractedTitle;
-		if (extractedTitle !== this.defaultTitle) {
-			this.lastExtractedTitle = extractedTitle;
+		if (extractedHeader) {
+			this.lastExtractedTitle = extractedHeader;
 		}
 		this.currentThinkingValue = initialText;
 
@@ -188,11 +200,14 @@ export class ChatThinkingContentPart extends ChatCollapsibleContentPart implemen
 
 		const node = this.domNode;
 		node.classList.add('chat-thinking-box');
+		// While the thinking part is active (still streaming/working), mark it so the
+		// "Working..." title shimmers. Removed once the part finalizes/goes inactive.
+		node.classList.toggle('chat-thinking-active', this.isActive && !this.element.isComplete);
 		node.tabIndex = 0;
 
 		if (this.fixedScrollingMode) {
 			node.classList.add('chat-thinking-fixed-mode');
-			this.currentTitle = this.defaultTitle;
+			this.refreshActiveTitle();
 			if (this._collapseButton && !this.element.isComplete) {
 				this._setLoadingIcon();
 			}
@@ -493,6 +508,10 @@ export class ChatThinkingContentPart extends ChatCollapsibleContentPart implemen
 			setTimeout(() => this.scrollToBottomIfEnabled(), 0);
 		}
 
+		// Keep the header context-aware as reasoning streams in (e.g. "Thinking…" before any
+		// tool runs). The extracted-title path below handles richer labels when available.
+		this.refreshActiveTitle();
+
 		const extractedTitle = extractTitleFromThinkingContent(raw);
 		if (extractedTitle && extractedTitle !== this.currentTitle) {
 			if (!this.extractedTitles.includes(extractedTitle)) {
@@ -519,6 +538,7 @@ export class ChatThinkingContentPart extends ChatCollapsibleContentPart implemen
 
 	public markAsInactive(): void {
 		this.isActive = false;
+		this.domNode.classList.remove('chat-thinking-active');
 	}
 
 	public finalizeTitleIfDefault(): void {
@@ -527,6 +547,7 @@ export class ChatThinkingContentPart extends ChatCollapsibleContentPart implemen
 			this.wrapper.classList.remove('chat-thinking-streaming');
 		}
 		this.streamingCompleted = true;
+		this.domNode.classList.remove('chat-thinking-active');
 
 		if (this._collapseButton) {
 			this._collapseButton.icon = Codicon.check;
@@ -753,10 +774,128 @@ export class ChatThinkingContentPart extends ChatCollapsibleContentPart implemen
 		this.singleItemInfo = undefined;
 	}
 
+	/**
+	 * The label to show while the block is still active. Prefers the most recent concrete
+	 * action (tool message / extracted reasoning header). Falls back to "Thinking…" when
+	 * there is reasoning text but no action yet, and "Working…" otherwise.
+	 */
+	private computeActiveTitle(): string {
+		if (this.lastExtractedTitle) {
+			return stripTrailingDots(this.lastExtractedTitle);
+		}
+		// This is a thinking/reasoning block, so default to "Thinking" (not "Working") even
+		// before any reasoning text has streamed in.
+		return this.thinkingTitle;
+	}
+
+	/**
+	 * Drive the collapsible header with a context-aware label while streaming. This also
+	 * handles fixed-scrolling mode, where the header would otherwise stay pinned to "Working…".
+	 */
+	private refreshActiveTitle(): void {
+		if (this.streamingCompleted || this.element.isComplete) {
+			return;
+		}
+		// In non-fixed mode the expanded view manages its own title; only drive it here when
+		// collapsed. In fixed mode we always drive it (the content scrolls below the header).
+		if (this.fixedScrollingMode || !this._isExpanded.get()) {
+			const title = this.computeActiveTitle();
+			this.currentTitle = title;
+			super.setTitle(title);
+		}
+	}
+
+	/**
+	 * Build a concise, context-aware "finished" summary from the actions tracked during the
+	 * block. Used when LLM title generation isn't available (e.g. local-only model setups),
+	 * replacing the generic "Finished working and invoked N tools".
+	 */
+	private buildFinishedSummary(): string {
+		const titles = this.extractedTitles;
+		let edited = 0;
+		let read = 0;
+		let searched = 0;
+		let ran = 0;
+		let lastEditedFile: string | undefined;
+
+		// Only treat a token as a filename if it actually looks like one (has an extension or a
+		// path separator) so we never surface tool names like "modifyFile" as the edited file.
+		const findFileName = (raw: string): string | undefined => {
+			const candidates = [
+				raw.match(/`([^`]+)`/)?.[1],
+				...(raw.match(/[\w\-./\\]+\.[a-zA-Z0-9]+/g) ?? [])
+			].filter((c): c is string => !!c);
+			for (const c of candidates) {
+				const cleaned = c.replace(/[)\].,]+$/, '');
+				if (/[./\\]/.test(cleaned) && /\.[a-zA-Z0-9]+$/.test(cleaned)) {
+					return cleaned.split(/[/\\]/).pop();
+				}
+			}
+			return undefined;
+		};
+
+		for (const raw of titles) {
+			const t = raw.toLowerCase();
+			if (/\b(edit|edited|editing|updat|modif|chang|refactor|creat|wrote|writing|replac)/.test(t)) {
+				edited++;
+				const file = findFileName(raw);
+				if (file) {
+					lastEditedFile = file;
+				}
+			} else if (/\b(search|searching|grep|look(ed|ing)?\s+up|find|finding)/.test(t)) {
+				searched++;
+			} else if (/\b(ran|running|execut|terminal|command|\$)/.test(t)) {
+				ran++;
+			} else if (/\b(read|reading|review|examin|inspect|check)/.test(t)) {
+				read++;
+			}
+		}
+
+		const parts: string[] = [];
+		if (edited === 1 && lastEditedFile) {
+			parts.push(localize('chat.thinking.summary.editedOne', 'Edited {0}', lastEditedFile));
+		} else if (edited === 1) {
+			parts.push(localize('chat.thinking.summary.editedFile', 'Edited a file'));
+		} else if (edited > 1) {
+			parts.push(localize('chat.thinking.summary.editedMany', 'Edited {0} files', edited));
+		}
+		if (read === 1) {
+			parts.push(localize('chat.thinking.summary.readOne', 'reviewed a file'));
+		} else if (read > 1) {
+			parts.push(localize('chat.thinking.summary.readMany', 'reviewed {0} files', read));
+		}
+		if (searched > 0) {
+			parts.push(localize('chat.thinking.summary.searched', 'searched the codebase'));
+		}
+		if (ran === 1) {
+			parts.push(localize('chat.thinking.summary.ranOne', 'ran a command'));
+		} else if (ran > 1) {
+			parts.push(localize('chat.thinking.summary.ranMany', 'ran {0} commands', ran));
+		}
+
+		if (parts.length > 0) {
+			// Capitalize and join naturally: "A", "A and B", "A, B and C".
+			let summary: string;
+			if (parts.length === 1) {
+				summary = parts[0];
+			} else {
+				summary = parts.slice(0, -1).join(', ') + localize('chat.thinking.summary.and', ' and ') + parts[parts.length - 1];
+			}
+			return summary.charAt(0).toUpperCase() + summary.slice(1);
+		}
+
+		// No recognizable tool actions.
+		if (this.toolInvocationCount > 0) {
+			return localize('chat.thinking.finished.withTools', 'Finished working and invoked {0} tool{1}', this.toolInvocationCount, this.toolInvocationCount === 1 ? '' : 's');
+		}
+		if (this.lastExtractedTitle) {
+			return this.lastExtractedTitle;
+		}
+		return localize('chat.thinking.finishedThinking', 'Finished thinking');
+	}
+
 	private setFallbackTitle(): void {
-		const finalLabel = this.toolInvocationCount > 0
-			? localize('chat.thinking.finished.withTools', 'Finished working and invoked {0} tool{1}', this.toolInvocationCount, this.toolInvocationCount === 1 ? '' : 's')
-			: localize('chat.thinking.finished', 'Finished Working');
+		const finalLabel = this.buildFinishedSummary();
 
 		this.currentTitle = finalLabel;
 		// With lazy rendering, wrapper may not be created yet if content hasn't been expanded
@@ -881,10 +1020,9 @@ export class ChatThinkingContentPart extends ChatCollapsibleContentPart implemen
 						currentToolLabel = updatedMessage;
 						this.lastExtractedTitle = updatedMessage;
 
-						// make sure not to set title if expanded
-						if (!this.fixedScrollingMode && !this._isExpanded.read(undefined)) {
-							this.setTitle(updatedMessage);
-						}
+						// Drive the header with the current tool action. refreshActiveTitle handles
+						// both fixed mode and the collapsed non-fixed view (and skips when expanded).
+						this.refreshActiveTitle();
 					}
 				};
 

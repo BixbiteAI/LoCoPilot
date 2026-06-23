@@ -72,33 +72,33 @@ function parseDuckDuckGoHtml(html: string, maxResults: number): IWebSearchResult
 		} catch {
 			continue;
 		}
-		if (!url.startsWith('http')) url = 'https://' + url;
-		if (seen.has(url)) continue;
+		if (!url.startsWith('http')) { url = 'https://' + url; }
+		if (seen.has(url)) { continue; }
 		seen.add(url);
 		const title = m[2].trim().replace(/\s+/g, ' ');
-		if (!title) continue;
+		if (!title) { continue; }
 		results.push({ title, url, description: undefined });
 	}
-	if (results.length > 0) return results;
+	if (results.length > 0) { return results; }
 	// Fallback: markdown-style (e.g. if response was converted)
 	const blocks = html.split(/##\s*\[/);
 	for (let i = 1; i < blocks.length && results.length < maxResults; i++) {
 		const block = blocks[i];
 		const closeBracket = block.indexOf(']');
-		if (closeBracket === -1) continue;
+		if (closeBracket === -1) { continue; }
 		const title = block.slice(0, closeBracket).trim();
 		const parenStart = block.indexOf('(', closeBracket);
-		if (parenStart === -1) continue;
+		if (parenStart === -1) { continue; }
 		const uddgMatch = block.slice(parenStart).match(/uddg=([^&\s]+)/);
-		if (!uddgMatch) continue;
+		if (!uddgMatch) { continue; }
 		let url: string;
 		try {
 			url = decodeURIComponent(uddgMatch[1].replace(/&amp;/g, '&'));
 		} catch {
 			continue;
 		}
-		if (!url.startsWith('http')) url = 'https://' + url;
-		if (seen.has(url)) continue;
+		if (!url.startsWith('http')) { url = 'https://' + url; }
+		if (seen.has(url)) { continue; }
 		seen.add(url);
 		const rest = block.slice(closeBracket + 1);
 		const snippetMatch = rest.match(/\]\s*\([^)]+\)\s*\n?\s*\[([^\]]+)\]/);
@@ -171,7 +171,7 @@ export class WebSearchTool implements IToolImpl {
 		const fetchContents = params.fetchContents === true;
 
 		try {
-			progress.report({ message: `Searching the web for "${query}"...` });
+			progress.report({ message: `Searching the web for "${query}"` });
 
 			let results: IWebSearchResult[];
 
@@ -254,7 +254,7 @@ export class WebSearchTool implements IToolImpl {
 			}
 
 			if (toFetch.length > 0) {
-				progress.report({ message: 'Fetching content from top results...' });
+				progress.report({ message: 'Fetching content from top results' });
 				for (let i = 0; i < toFetch.length; i++) {
 					const r = toFetch[i];
 					try {

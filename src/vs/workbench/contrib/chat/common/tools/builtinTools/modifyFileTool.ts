@@ -237,7 +237,7 @@ export class ModifyFileTool implements IToolImpl {
 						toolResultError: 'Directory-like empty file refused'
 					};
 				}
-				progress.report({ message: `Creating file ${params.path}...` });
+				progress.report({ message: `Creating file ${params.path}` });
 				const content = VSBuffer.fromString(params.newString);
 				await this.fileService.createFile(fileUri, content, { overwrite: false });
 				const lineCount = params.newString.split('\n').length;
@@ -250,7 +250,7 @@ export class ModifyFileTool implements IToolImpl {
 			// --- File exists ---
 			if (isEmptyOld) {
 				// Replace entire file with newString
-				progress.report({ message: `Replacing entire file ${params.path}...` });
+				progress.report({ message: `Replacing entire file ${params.path}` });
 				const newContent = params.newString;
 				const uri = CellUri.parse(fileUri)?.notebook ?? fileUri;
 				const isNotebook = this.notebookService.hasSupportedNotebooks(uri) && this.notebookService.getNotebookTextModel(uri);
@@ -285,7 +285,7 @@ export class ModifyFileTool implements IToolImpl {
 			}
 
 			// --- Partial replace (oldString non-empty) ---
-			progress.report({ message: `Editing ${params.path}...` });
+			progress.report({ message: `Editing ${params.path}` });
 
 			if (params.oldString === params.newString) {
 				return {
@@ -368,6 +368,14 @@ export class ModifyFileTool implements IToolImpl {
 	}
 
 	async prepareToolInvocation(context: IToolInvocationPreparationContext, token: CancellationToken): Promise<IPreparedToolInvocation | undefined> {
-		return undefined;
+		const path: string | undefined = context.parameters?.path;
+		const name = path ? path.split(/[/\\]/).filter(Boolean).pop() : undefined;
+		if (!name) {
+			return undefined;
+		}
+		return {
+			invocationMessage: localize('modifyFile.invoking', "Editing {0}", name),
+			pastTenseMessage: localize('modifyFile.invoked', "Edited {0}", name),
+		};
 	}
 }
