@@ -392,7 +392,16 @@ export class LoCoPilotLanguageModelProvider extends Disposable implements ILangu
 			// unlimited, any positive value caps the thinking tokens. Without this the server defaults to
 			// -1 (logged as `reasoning-budget: activated, budget=2147483647`) and ignores `reasoning_effort`
 			// entirely, so the Low/Medium/High picker had no effect on bundled llama.cpp.
-			body.reasoning_budget = reasoningBudgetTokens(effort);
+			const requested = reasoningBudgetTokens(effort);
+			// Clamp a positive budget so thinking can't eat the whole output window and starve the answer.
+			// max_tokens (already on the body) is derived from the context window; reserve room for the reply.
+			// -1 (max) stays unclamped - llama.cpp caps it to the context itself.
+			if (requested > 0 && typeof body.max_tokens === 'number' && body.max_tokens > 0) {
+				const answerReserve = 512;
+				body.reasoning_budget = Math.min(requested, Math.max(answerReserve, body.max_tokens - answerReserve));
+			} else {
+				body.reasoning_budget = requested;
+			}
 			if (effort === 'off') {
 				// Servers that gate thinking on a chat-template flag (qwen3 on llama.cpp/ollama) need this too.
 				body.chat_template_kwargs = { ...(body.chat_template_kwargs ?? {}), enable_thinking: false };

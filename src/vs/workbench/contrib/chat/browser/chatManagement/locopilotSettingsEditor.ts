@@ -284,7 +284,7 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 	private serverStartErrors = new Map<string, string>();
 
 	private dimension: Dimension | undefined;
-	private selectedSection: string = LOCOPILOT_SETTINGS_SECTION_ADD_MODEL;
+	private selectedSection: string = LOCOPILOT_SETTINGS_SECTION_LIST_MODELS;
 	private sections: SectionItem[] = [];
 
 	private currentLogsModelId: string | undefined;
