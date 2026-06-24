@@ -6,7 +6,7 @@
 /* eslint-disable @typescript-eslint/no-explicit-any, curly */
 /* eslint-disable local/code-no-in-operator */
 
-import { AsyncIterableSource, timeout } from '../../../../base/common/async.js';
+import { AsyncIterableSource } from '../../../../base/common/async.js';
 import { encodeBase64, streamToBuffer } from '../../../../base/common/buffer.js';
 import { createMarkdownCommandLink } from '../../../../base/common/htmlContent.js';
 import { CancellationToken } from '../../../../base/common/cancellation.js';
@@ -22,7 +22,6 @@ import { ChatConfiguration, ChatAgentLocation } from '../common/constants.js';
 import { DEFAULT_PICKER_MODEL_REPO_ID } from './locopilotModelCatalog.js';
 import { ILoCoPilotFileLog } from './locopilotFileLog.js';
 import { INotificationService } from '../../../../platform/notification/common/notification.js';
-import { IProgressService, ProgressLocation } from '../../../../platform/progress/common/progress.js';
 import { IStorageService } from '../../../../platform/storage/common/storage.js';
 import { getReasoningEffort, reasoningBudgetTokens, ReasoningEffort } from '../common/locopilotReasoningEffort.js';
 import { ICustomLanguageModelsService, ICustomLanguageModel, getCustomModelListLabel, deriveTokenLimits, defaultContextWindow, TOOL_FAILURE_DISABLE_THRESHOLD, customModelSupportsVision } from '../common/customLanguageModelsService.js';
@@ -58,7 +57,6 @@ export class LoCoPilotLanguageModelProvider extends Disposable implements ILangu
 		@ILoCoPilotLocalModelRunner private readonly localModelRunner: ILoCoPilotLocalModelRunner,
 		@IConfigurationService private readonly configurationService: IConfigurationService,
 		@INotificationService private readonly notificationService: INotificationService,
-		@IProgressService private readonly progressService: IProgressService,
 		@IStorageService private readonly storageService: IStorageService,
 	) {
 		super();
@@ -564,20 +562,30 @@ export class LoCoPilotLanguageModelProvider extends Disposable implements ILangu
 	private _applyOpenAiReasoningEffort(body: any, modelName: string, local: boolean): void {
 		const effort = this._reasoningEffort();
 		if (local) {
-			// llama.cpp reads `reasoning_budget` (NOT `reasoning_effort`): 0 disables thinking, -1 is
-			// unlimited, any positive value caps the thinking tokens. Without this the server defaults to
-			// -1 (logged as `reasoning-budget: activated, budget=2147483647`) and ignores `reasoning_effort`
-			// entirely, so the Low/Medium/High picker had no effect on bundled llama.cpp.
+			// llama.cpp gates the thinking budget on the request field `reasoning_budget_tokens` (NOT
+			// `reasoning_budget`, which is the CLI/env name only and is silently dropped from the request
+			// body): 0 disables thinking, -1 is unlimited, any positive value caps the thinking tokens.
+			// Sending the wrong field name makes the server fall back to its -1 default (logged as
+			// `reasoning-budget: activated, budget=2147483647`), so Low/Medium/High collapse to Max. We send
+			// `reasoning_budget_tokens` (verified against bundled build 9704; `thinking_budget_tokens` is an
+			// accepted alias) and keep the legacy `reasoning_budget` for any older/forked build that read it.
 			const requested = reasoningBudgetTokens(effort);
 			// Clamp a positive budget so thinking can't eat the whole output window and starve the answer.
 			// max_tokens (already on the body) is derived from the context window; reserve room for the reply.
 			// -1 (max) stays unclamped - llama.cpp caps it to the context itself.
+			let budget = requested;
 			if (requested > 0 && typeof body.max_tokens === 'number' && body.max_tokens > 0) {
 				const answerReserve = 512;
-				body.reasoning_budget = Math.min(requested, Math.max(answerReserve, body.max_tokens - answerReserve));
-			} else {
-				body.reasoning_budget = requested;
+				budget = Math.min(requested, Math.max(answerReserve, body.max_tokens - answerReserve));
 			}
+			// `thinking_budget_tokens` is the field this bundled build (b9704) actually honors; the
+			// `reasoning_budget_tokens` name documented elsewhere is silently ignored by it (verified by
+			// probing the live server: budget 0/16 via reasoning_budget_tokens still emits full thinking,
+			// while thinking_budget_tokens caps it). We send all three names so the budget takes effect
+			// across builds; unknown fields are ignored by the server.
+			body.thinking_budget_tokens = budget;
+			body.reasoning_budget_tokens = budget;
+			body.reasoning_budget = budget; // legacy/fork compatibility; unknown fields are ignored by the server
 			if (effort === 'off') {
 				// Servers that gate thinking on a chat-template flag (qwen3 on llama.cpp/ollama) need this too.
 				body.chat_template_kwargs = { ...(body.chat_template_kwargs ?? {}), enable_thinking: false };
@@ -1057,36 +1065,6 @@ export class LoCoPilotLanguageModelProvider extends Disposable implements ILangu
 		return response.res.statusCode ?? 0;
 	}
 
-	/**
-	 * Runs `start` (the server launch + readiness wait) under a Window progress indicator that reads
-	 * "Loading <model>… <phase>", so a cold start looks like the model loading rather than a slow response.
-	 * The message is refreshed from the runner's live load phase/progress while the weights load. Only used
-	 * when the server was not already running.
-	 */
-	private async _withModelLoadingProgress(model: ICustomLanguageModel, token: CancellationToken, start: (token: CancellationToken) => Promise<string | undefined>): Promise<string | undefined> {
-		const label = model.displayName || model.modelName;
-		return this.progressService.withProgress<string | undefined>(
-			{ location: ProgressLocation.Window, title: `Loading ${label}…`, type: 'loading' },
-			async progress => {
-				let done = false;
-				// Poll the runner's phase/progress and reflect it in the indicator until the start resolves.
-				(async () => {
-					while (!done && !token.isCancellationRequested) {
-						const phase = this.localModelRunner.getServerPhase(model.id);
-						const detail = this.localModelRunner.getLoadProgress(model.id)
-							?? (phase === 'starting' ? 'starting engine…' : phase === 'loading' ? 'loading into memory…' : '');
-						progress.report({ message: detail ? `Loading ${label} - ${detail}` : `Loading ${label}...` });
-						await timeout(700);
-					}
-				})();
-				try {
-					return await start(token);
-				} finally {
-					done = true;
-				}
-			}
-		);
-	}
 
 	private async _callLocalModel(model: ICustomLanguageModel, messages: IChatMessage[], options: { [name: string]: unknown }, stream: AsyncIterableSource<IChatResponsePart | IChatResponsePart[]>, token: CancellationToken): Promise<any> {
 		this._log(`[LoCoPilot Provider] Calling local model: ${model.modelName}`);

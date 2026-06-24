@@ -454,7 +454,7 @@ export class CustomLanguageModelsService extends Disposable implements ICustomLa
 		}
 	}
 
-	async applyDerivedMetadata(id: string, derived: Partial<Pick<ICustomLanguageModel, 'contextWindow' | 'format' | 'useNativeTools'>>): Promise<void> {
+	async applyDerivedMetadata(id: string, derived: Partial<Pick<ICustomLanguageModel, 'contextWindow' | 'format' | 'useNativeTools' | 'supportsVision'>>): Promise<void> {
 		const index = this.models.findIndex(m => m.id === id);
 		if (index < 0) {
 			return;
