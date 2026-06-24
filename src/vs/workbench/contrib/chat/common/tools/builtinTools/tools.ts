@@ -16,7 +16,10 @@ import { createListDirectoryToolData, ListDirectoryTool } from './listDirectoryT
 import { createReadLintsToolData, ReadLintsTool } from './readLintsTool.js';
 import { createGrepToolData, GrepTool } from './grepTool.js';
 import { createFindFilesToolData, FindFilesTool } from './findFilesTool.js';
-import { createOutlineToolData, OutlineTool } from './outlineTool.js';
+// outline: commented out - it's a regex-based symbol scraper that the model can reproduce with
+// grep (e.g. pattern "function|class|def|export"). Re-enable the import + registration below if
+// a dedicated outline tool is wanted again.
+// import { createOutlineToolData, OutlineTool } from './outlineTool.js';
 // Enable createFile for more tools if desired (LLM does not see it when commented out)
 // import { createCreateFileToolData, CreateFileTool } from './createFileTool.js';
 // import { createStringReplaceToolData, StringReplaceTool } from './stringReplaceTool.js';
@@ -50,11 +53,12 @@ export class BuiltinToolsContribution extends Disposable implements IWorkbenchCo
 		const findFilesTool = instantiationService.createInstance(FindFilesTool);
 		this._register(toolsService.registerTool(createFindFilesToolData(), findFilesTool));
 
-		// Outline tool: compact symbol map of a file (read-only, no node dependency)
-		const outlineTool = instantiationService.createInstance(OutlineTool);
-		this._register(toolsService.registerTool(createOutlineToolData(), outlineTool));
+		// Outline tool: regex-based symbol map - NOT registered. The model reproduces it with grep
+		// (e.g. "function|class|def|export"). Re-enable here if a dedicated outline tool is wanted:
+		// const outlineTool = instantiationService.createInstance(OutlineTool);
+		// this._register(toolsService.registerTool(createOutlineToolData(), outlineTool));
 
-		// Register web search tool (requires chat.webSearch.apiKey in settings)
+		// Register web search tool (works out of the box via DuckDuckGo; optional Brave API key)
 		const webSearchTool = instantiationService.createInstance(WebSearchTool);
 		this._register(toolsService.registerTool(createWebSearchToolData(), webSearchTool));
 

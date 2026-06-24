@@ -53,8 +53,8 @@ import { isAppleSiliconMac } from '../locopilotMlxServer.js';
 import { findCatalogEntry, getCatalogSuitability, getRecommendedRepoId, ModelSuitability } from '../locopilotModelCatalog.js';
 // [engine-ui] Only needed by the commented-out engine dropdown in renderAgentSettings; uncomment to restore.
 // import { isMacintosh } from '../../../../../base/common/platform.js';
-// import { IConfigurationService } from '../../../../../platform/configuration/common/configuration.js';
-// import { ChatConfiguration } from '../../common/constants.js';
+import { IConfigurationService } from '../../../../../platform/configuration/common/configuration.js';
+import { ChatConfiguration } from '../../common/constants.js';
 
 const $ = DOM.$;
 
@@ -265,6 +265,7 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 	private agentSettingsBaseline: {
 		maxIterations: number;
 		autoRunSandbox: boolean;
+		braveApiKey: string;
 		askCoding: boolean;
 		agentCoding: boolean;
 		planCoding: boolean;
@@ -275,6 +276,7 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 	} | undefined;
 	private maxIterationsInput!: InputBox;
 	private autoRunCommandsInSandboxToggle!: Toggle;
+	private braveApiKeyInput!: InputBox;
 	// [engine-ui] private engineSelectBox!: SelectBox;
 	/** Phase 3: per-workspace ("this project only") agent instructions. */
 	private workspaceInstructionsTextarea!: HTMLTextAreaElement;
@@ -312,7 +314,7 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 		@ILoCoPilotProjectMemoryService private readonly projectMemoryService: ILoCoPilotProjectMemoryService,
 		@IClipboardService private readonly clipboardService: IClipboardService,
 		@ITimerService private readonly timerService: ITimerService,
-		// [engine-ui] @IConfigurationService private readonly configurationService: IConfigurationService,
+		@IConfigurationService private readonly configurationService: IConfigurationService,
 	) {
 		super(LoCoPilotSettingsEditor.ID, group, telemetryService, themeService, storageService);
 		this.agentSettingsService = agentSettingsService;
@@ -1576,6 +1578,25 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 		DOM.append(autoRunWrap, this.autoRunCommandsInSandboxToggle.domNode);
 		this._register(this.autoRunCommandsInSandboxToggle.onChange(() => this.updateAgentSettingsDirtyIndicators()));
 
+		// Web search API key (Brave). Optional: when empty, web search falls back to DuckDuckGo
+		// (no key needed). When set, the webSearch tool uses the Brave Search API for better
+		// rate limits and quality. See webSearchTool.ts (reads ChatConfiguration.WebSearchApiKey).
+		const braveRow = DOM.append(execCard, $('.agent-setting-row'));
+		const braveText = DOM.append(braveRow, $('.agent-setting-text'));
+		const braveLabel = DOM.append(braveText, $('label.locopilot-setting-label'));
+		braveLabel.textContent = localize('locopilotSettings.braveApiKey', "Web search API key (Brave)");
+		const braveDesc = DOM.append(braveText, $('.agent-setting-description'));
+		braveDesc.textContent = localize('locopilotSettings.braveApiKeyDescription', "Optional. Leave empty to use free DuckDuckGo search. Enter a Brave Search API key for better results - get a free key at https://brave.com/search/api/.");
+		const braveControl = DOM.append(braveRow, $('.agent-setting-control'));
+		const braveWrap = DOM.append(braveControl, $('.agent-setting-input-wrap.agent-setting-brave-wrap'));
+		this.braveApiKeyInput = this._register(new InputBox(DOM.append(braveWrap, $('div')), this.contextViewService, {
+			placeholder: localize('locopilotSettings.braveApiKeyPlaceholder', "Enter Brave Search API key"),
+			type: 'password',
+			inputBoxStyles: locopilotSettingsInputBoxStyles
+		}));
+		this.braveApiKeyInput.value = this.configurationService.getValue<string>(ChatConfiguration.WebSearchApiKey) ?? '';
+		this._register(this.braveApiKeyInput.onDidChange(() => this.updateAgentSettingsDirtyIndicators()));
+
 		// [engine-ui] The local-model engine (auto/cpu/gpu) is decided automatically (see
 		// LoCoPilotLocalModelRunner._resolveServerLaunch). The override is intentionally NOT shown in this
 		// panel - power users can still change it via the "LoCoPilot: Select Local Model Engine" command or
@@ -1820,6 +1841,7 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 	private takeAgentSettingsSnapshotFromPersisted(): {
 		maxIterations: number;
 		autoRunSandbox: boolean;
+		braveApiKey: string;
 		askCoding: boolean;
 		agentCoding: boolean;
 		planCoding: boolean;
@@ -1831,6 +1853,7 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 		return {
 			maxIterations: this.agentSettingsService.getMaxIterationsPerRequest(),
 			autoRunSandbox: this.agentSettingsService.getAutoRunCommandsInSandbox(),
+			braveApiKey: (this.configurationService.getValue<string>(ChatConfiguration.WebSearchApiKey) ?? '').trim(),
 			askCoding: this.agentSettingsService.getAskUseCodingSystemPrompt(),
 			agentCoding: this.agentSettingsService.getAgentUseCodingSystemPrompt(),
 			planCoding: this.agentSettingsService.getPlanUseCodingSystemPrompt(),
@@ -1844,6 +1867,7 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 	private snapshotAgentPanelFromUI(): {
 		maxIterations: number;
 		autoRunSandbox: boolean;
+		braveApiKey: string;
 		askCoding: boolean;
 		agentCoding: boolean;
 		planCoding: boolean;
@@ -1856,6 +1880,7 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 		return {
 			maxIterations: isNaN(rawN) ? -1 : rawN,
 			autoRunSandbox: this.autoRunCommandsInSandboxToggle.checked,
+			braveApiKey: this.braveApiKeyInput.value.trim(),
 			askCoding: this.askCodingSystemPromptToggle.checked,
 			agentCoding: this.agentCodingSystemPromptToggle.checked,
 			planCoding: this.planCodingSystemPromptToggle.checked,
@@ -1879,6 +1904,7 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 		return (
 			b.maxIterations !== cur.maxIterations ||
 			b.autoRunSandbox !== cur.autoRunSandbox ||
+			b.braveApiKey !== cur.braveApiKey ||
 			b.askCoding !== cur.askCoding ||
 			b.agentCoding !== cur.agentCoding ||
 			b.planCoding !== cur.planCoding ||
@@ -1928,6 +1954,7 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 		this.maxIterationsInput.value = String(this.agentSettingsService.getMaxIterationsPerRequest());
 		this.validateMaxIterations();
 		this.autoRunCommandsInSandboxToggle.checked = this.agentSettingsService.getAutoRunCommandsInSandbox();
+		this.braveApiKeyInput.value = this.configurationService.getValue<string>(ChatConfiguration.WebSearchApiKey) ?? '';
 		this.askCodingSystemPromptToggle.checked = this.agentSettingsService.getAskUseCodingSystemPrompt();
 		this.agentCodingSystemPromptToggle.checked = this.agentSettingsService.getAgentUseCodingSystemPrompt();
 		this.planCodingSystemPromptToggle.checked = this.agentSettingsService.getPlanUseCodingSystemPrompt();
@@ -1962,6 +1989,10 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 		try {
 			this.agentSettingsService.setMaxIterationsPerRequest(n);
 			this.agentSettingsService.setAutoRunCommandsInSandbox(this.autoRunCommandsInSandboxToggle.checked);
+			// Persist the Brave Search API key. Empty -> clear the setting so the webSearch tool
+			// falls back to free DuckDuckGo search.
+			const braveKey = this.braveApiKeyInput.value.trim();
+			await this.configurationService.updateValue(ChatConfiguration.WebSearchApiKey, braveKey === '' ? undefined : braveKey);
 			this.agentSettingsService.setAskUseCodingSystemPrompt(this.askCodingSystemPromptToggle.checked);
 			this.agentSettingsService.setAgentUseCodingSystemPrompt(this.agentCodingSystemPromptToggle.checked);
 			this.agentSettingsService.setPlanUseCodingSystemPrompt(this.planCodingSystemPromptToggle.checked);

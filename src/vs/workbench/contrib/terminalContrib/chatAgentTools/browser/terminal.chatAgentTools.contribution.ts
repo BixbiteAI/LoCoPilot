@@ -22,12 +22,14 @@ import { TerminalContextKeys } from '../../../terminal/common/terminalContextKey
 import { TerminalChatAgentToolsCommandId } from '../common/terminal.chatAgentTools.js';
 import { TerminalChatAgentToolsSettingId } from '../common/terminalChatAgentToolsConfiguration.js';
 import { AwaitTerminalTool, AwaitTerminalToolData } from './tools/awaitTerminalTool.js';
-import { GetTerminalLastCommandTool, GetTerminalLastCommandToolData } from './tools/getTerminalLastCommandTool.js';
+// getTerminalLastCommand / getTerminalSelection: hidden from the agent (see registration below).
+// import { GetTerminalLastCommandTool, GetTerminalLastCommandToolData } from './tools/getTerminalLastCommandTool.js';
 import { GetTerminalOutputTool, GetTerminalOutputToolData } from './tools/getTerminalOutputTool.js';
-import { GetTerminalSelectionTool, GetTerminalSelectionToolData } from './tools/getTerminalSelectionTool.js';
+// import { GetTerminalSelectionTool, GetTerminalSelectionToolData } from './tools/getTerminalSelectionTool.js';
 import { ConfirmTerminalCommandTool, ConfirmTerminalCommandToolData } from './tools/runInTerminalConfirmationTool.js';
 import { RunInTerminalTool, createRunInTerminalToolData } from './tools/runInTerminalTool.js';
-import { CreateAndRunTaskTool, CreateAndRunTaskToolData } from './tools/task/createAndRunTaskTool.js';
+// createAndRunTask: hidden from the agent (see registration below).
+// import { CreateAndRunTaskTool, CreateAndRunTaskToolData } from './tools/task/createAndRunTaskTool.js';
 import { GetTaskOutputTool, GetTaskOutputToolData } from './tools/task/getTaskOutputTool.js';
 import { RunTaskTool, RunTaskToolData } from './tools/task/runTaskTool.js';
 import { InstantiationType, registerSingleton } from '../../../../../platform/instantiation/common/extensions.js';
@@ -102,14 +104,17 @@ class ChatAgentToolsContribution extends Disposable implements IWorkbenchContrib
 			this._register(toolsService.executeToolSet.addTool(runInTerminalToolData));
 		});
 
-		const getTerminalSelectionTool = instantiationService.createInstance(GetTerminalSelectionTool);
-		this._register(toolsService.registerTool(GetTerminalSelectionToolData, getTerminalSelectionTool));
-
-		const getTerminalLastCommandTool = instantiationService.createInstance(GetTerminalLastCommandTool);
-		this._register(toolsService.registerTool(GetTerminalLastCommandToolData, getTerminalLastCommandTool));
-
-		this._register(toolsService.readToolSet.addTool(GetTerminalSelectionToolData));
-		this._register(toolsService.readToolSet.addTool(GetTerminalLastCommandToolData));
+		// getTerminalSelection / getTerminalLastCommand: NOT registered - hidden from the agent.
+		// These read interactive state (the user's manual terminal selection / last typed command)
+		// which is irrelevant to an autonomous agent and only adds tool-selection noise. The agent
+		// uses runInTerminal + getTerminalOutput instead. Re-enable here if inline/terminal chat
+		// needs them:
+		// const getTerminalSelectionTool = instantiationService.createInstance(GetTerminalSelectionTool);
+		// this._register(toolsService.registerTool(GetTerminalSelectionToolData, getTerminalSelectionTool));
+		// const getTerminalLastCommandTool = instantiationService.createInstance(GetTerminalLastCommandTool);
+		// this._register(toolsService.registerTool(GetTerminalLastCommandToolData, getTerminalLastCommandTool));
+		// this._register(toolsService.readToolSet.addTool(GetTerminalSelectionToolData));
+		// this._register(toolsService.readToolSet.addTool(GetTerminalLastCommandToolData));
 
 		// #endregion
 
@@ -121,10 +126,14 @@ class ChatAgentToolsContribution extends Disposable implements IWorkbenchContrib
 		const getTaskOutputTool = instantiationService.createInstance(GetTaskOutputTool);
 		this._register(toolsService.registerTool(GetTaskOutputToolData, getTaskOutputTool));
 
-		const createAndRunTaskTool = instantiationService.createInstance(CreateAndRunTaskTool);
-		this._register(toolsService.registerTool(CreateAndRunTaskToolData, createAndRunTaskTool));
+		// createAndRunTask: NOT registered - hidden from the agent. Unlike runTask/getTaskOutput
+		// (which are gated by `when: TasksAvailableContext`), this tool had no gate and was always
+		// exposed, overlapping runInTerminal. The agent uses runInTerminal instead. Re-enable here
+		// if needed:
+		// const createAndRunTaskTool = instantiationService.createInstance(CreateAndRunTaskTool);
+		// this._register(toolsService.registerTool(CreateAndRunTaskToolData, createAndRunTaskTool));
+		// this._register(toolsService.executeToolSet.addTool(CreateAndRunTaskToolData));
 		this._register(toolsService.executeToolSet.addTool(RunTaskToolData));
-		this._register(toolsService.executeToolSet.addTool(CreateAndRunTaskToolData));
 		this._register(toolsService.readToolSet.addTool(GetTaskOutputToolData));
 
 		// #endregion

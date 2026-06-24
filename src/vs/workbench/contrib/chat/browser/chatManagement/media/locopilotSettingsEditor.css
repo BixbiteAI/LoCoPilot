@@ -423,6 +423,11 @@
 	width: 80px;
 }
 
+/* Web search (Brave) API key: wider so the key is readable. Overrides the 80px default above. */
+.locopilot-settings-editor .agent-setting-brave-wrap.agent-setting-brave-wrap {
+	width: 220px;
+}
+
 /* Llama.cpp server path: wide enough for long filesystem paths */
 .locopilot-settings-editor .agent-setting-path-wrap {
 	flex: 1 1 auto;

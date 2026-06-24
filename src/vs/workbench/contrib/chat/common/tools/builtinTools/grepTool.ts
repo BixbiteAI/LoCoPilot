@@ -48,7 +48,12 @@ export function createGrepToolData(): IToolData {
 			},
 			contextLines: {
 				type: 'number',
-				description: 'Optional: Number of lines of context to show before and after each match (0-5). Defaults to 0.'
+				description: 'Optional: Number of lines of context to show before and after each match (0-5). Defaults to 0. Ignored unless outputMode is "content".'
+			},
+			outputMode: {
+				type: 'string',
+				enum: ['content', 'files_with_matches', 'count'],
+				description: 'Optional: How to report results. "content" (default) shows matching lines with file:line. "files_with_matches" lists only the file paths that contain a match (cheap; use to locate files before reading). "count" reports the number of matches per file. Defaults to "content".'
 			},
 			maxResults: {
 				type: 'number',
@@ -65,7 +70,7 @@ export function createGrepToolData(): IToolData {
 		icon: ThemeIcon.fromId(Codicon.search.id),
 		displayName: localize('tool.grep.displayName', 'Search code with regex'),
 		userDescription: localize('tool.grep.userDescription', 'Search for code patterns using regular expressions'),
-		modelDescription: 'Search code using regular expressions (ripgrep-style). Find exact text patterns, function names, or complex regex matches.\n\nUse this tool to:\n- Find all occurrences of a function/class/variable\n- Search for TODO comments or specific patterns\n- Locate code that matches a regex\n- Find files containing specific text\n\nBest practices:\n- Use exact strings for simple searches (faster)\n- Use regex for complex patterns\n- Use glob to filter file types: "*.ts", "*.{js,jsx}"\n- Set maxResults to avoid overwhelming output\n- Use contextLines (1-3) to see surrounding code\n\nOutput format:\n- file.ts:LINE: matched line content\n- Grouped by file for readability\n- Shows total matches found\n\nExamples:\n- Find function: pattern="function myFunc"\n- Find TODOs: pattern="TODO|FIXME"\n- TypeScript only: glob="*.ts"',
+		modelDescription: 'Search code using regular expressions (ripgrep-style). Find exact text patterns, function names, or complex regex matches.\n\nUse this tool to:\n- Find all occurrences of a function/class/variable\n- Search for TODO comments or specific patterns\n- Locate code that matches a regex\n- Find files containing specific text\n\nBest practices:\n- Use exact strings for simple searches (faster)\n- Use regex for complex patterns\n- Use glob to filter file types: "*.ts", "*.{js,jsx}"\n- Set maxResults to avoid overwhelming output\n- Use contextLines (1-3) to see surrounding code\n- Use outputMode="files_with_matches" to just locate files cheaply, then readFile them\n- Use outputMode="count" to gauge how widespread a pattern is\n\nOutput format (outputMode="content", default):\n- file.ts:LINE: matched line content (context lines are prefixed with "-" instead of ":")\n- Grouped by file for readability\n- Shows total matches found\n\nExamples:\n- Find function: pattern="function myFunc"\n- Find TODOs: pattern="TODO|FIXME"\n- TypeScript only: glob="*.ts"\n- Just the files: pattern="useEffect", outputMode="files_with_matches"',
 		source: ToolDataSource.Internal,
 		inputSchema: inputSchema,
 		alwaysDisplayInputOutput: true
@@ -78,6 +83,7 @@ interface IGrepToolParams {
 	glob?: string;
 	caseInsensitive?: boolean;
 	contextLines?: number;
+	outputMode?: 'content' | 'files_with_matches' | 'count';
 	maxResults?: number;
 }
 
@@ -90,6 +96,7 @@ export class GrepTool implements IToolImpl {
 
 	async invoke(invocation: IToolInvocation, countTokens: CountTokensCallback, progress: ToolProgress, token: CancellationToken): Promise<IToolResult> {
 		const params = invocation.parameters as IGrepToolParams;
+		const outputMode = params.outputMode ?? 'content';
 
 		try {
 			const workspace = this.workspaceService.getWorkspace();
@@ -130,7 +137,7 @@ export class GrepTool implements IToolImpl {
 					includePattern: params.glob ? { [params.glob]: true } : undefined
 				}],
 				maxResults: params.maxResults || 100,
-				surroundingContext: params.contextLines || 0
+				surroundingContext: outputMode === 'content' ? (params.contextLines || 0) : 0
 			};
 
 			// Execute search
@@ -143,36 +150,52 @@ export class GrepTool implements IToolImpl {
 			}
 
 			// Format results
+			const workspaceRoot = workspace.folders[0].uri.fsPath;
 			const results: string[] = [];
 			let totalMatches = 0;
+			let fileCount = 0;
 
 			for (const fileMatch of searchResult.results as IFileMatch[]) {
 				if (!fileMatch.results || fileMatch.results.length === 0) {
 					continue;
 				}
 
-				// Get relative path from workspace root
-				const workspaceRoot = workspace.folders[0].uri.fsPath;
 				const relativePath = path.relative(workspaceRoot, fileMatch.resource.fsPath) || fileMatch.resource.fsPath;
-				results.push(`\n${relativePath} (${fileMatch.results.length} matches):`);
+				// Count only real matches (context lines are not matches)
+				const matchCount = fileMatch.results.filter(m => resultIsMatch(m)).length;
+				totalMatches += matchCount;
+				fileCount++;
 
+				if (outputMode === 'files_with_matches') {
+					results.push(relativePath);
+					continue;
+				}
+				if (outputMode === 'count') {
+					results.push(`${relativePath}: ${matchCount}`);
+					continue;
+				}
+
+				// content mode (default)
+				results.push(`\n${relativePath} (${matchCount} matches):`);
 				for (const match of fileMatch.results) {
 					if (resultIsMatch(match)) {
 						const textMatch = match as ITextSearchMatch;
 						const lineNum = textMatch.rangeLocations[0]?.source.startLineNumber ?? 0;
 						const lineText = textMatch.previewText.trim();
+						// ":" marks a matching line
 						results.push(`  ${lineNum}: ${lineText}`);
 					} else {
-						// ITextSearchContext
+						// ITextSearchContext - "-" marks a surrounding context line
 						const lineNum = (match as { lineNumber: number }).lineNumber;
 						const lineText = (match as { text: string }).text.trim();
-						results.push(`  ${lineNum}: ${lineText}`);
+						results.push(`  ${lineNum}- ${lineText}`);
 					}
-					totalMatches++;
 				}
 			}
 
-			const summary = `Found ${totalMatches} matches in ${searchResult.results.length} files`;
+			const summary = outputMode === 'files_with_matches'
+				? `Found matches in ${fileCount} files`
+				: `Found ${totalMatches} matches in ${fileCount} files`;
 			const limitNote = searchResult.limitHit ? `\n\n(Search limit reached at ${params.maxResults || 100} results. Use more specific patterns to narrow results.)` : '';
 			const nextHint = '\n\nProceed to the next step or goal.';
 
