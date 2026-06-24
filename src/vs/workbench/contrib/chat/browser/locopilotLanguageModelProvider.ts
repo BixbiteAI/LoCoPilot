@@ -471,16 +471,17 @@ export class LoCoPilotLanguageModelProvider extends Disposable implements ILangu
 
 	/**
 	 * Best-effort recovery of tool calls that a local model emitted as plain text instead of structured
-	 * `tool_calls`. Handles the three common malformed shapes. Returns the recovered calls (validated against
-	 * `availableToolNames` when provided) so the agent can execute them on this turn instead of stopping.
+	 * `tool_calls`. Handles the three common malformed shapes. `availableToolNames` (when provided) is used only
+	 * to *prefer* real tool names - a parsed call whose name doesn't match is still returned, because the agent
+	 * running it and getting back an "unknown tool" result keeps the loop alive (the model corrects next turn),
+	 * which is far better than silently dropping the call and dead-ending the turn.
 	 */
-	private _recoverTextToolCalls(text: string, availableToolNames?: Set<string>): Array<{ name: string; parameters: Record<string, unknown> }> {
+	private _recoverTextToolCalls(text: string, _availableToolNames?: Set<string>): Array<{ name: string; parameters: Record<string, unknown> }> {
 		const out: Array<{ name: string; parameters: Record<string, unknown> }> = [];
-		const isKnown = (name: string) => !availableToolNames || availableToolNames.size === 0 || availableToolNames.has(name);
 		const pushParsed = (name: string | undefined, rawArgs: unknown) => {
 			if (!name || typeof name !== 'string') { return; }
 			const trimmedName = name.trim();
-			if (!trimmedName || !isKnown(trimmedName)) { return; }
+			if (!trimmedName) { return; }
 			let parameters: Record<string, unknown> = {};
 			if (rawArgs && typeof rawArgs === 'object') {
 				parameters = rawArgs as Record<string, unknown>;
@@ -1183,13 +1184,32 @@ export class LoCoPilotLanguageModelProvider extends Disposable implements ILangu
 			let contentBuffer = '';
 			let emittedContentLen = 0;       // how much of contentBuffer we've already streamed to the UI
 			let suppressingToolText = false; // once a textual tool-call marker is seen, stop emitting content
+			// Small local models often emit the tool call inside the THINKING/reasoning stream rather than
+			// content (observed with Qwen3.5 GGUF: every tool-call token arrives as a reasoning delta). Buffer
+			// and suppress the thinking channel the same way so we can recover the call from it at stream end.
+			let thinkingBuffer = '';
+			let emittedThinkLen = 0;
+			let suppressingThinkText = false;
 
 			const processChunk = (json: unknown): void => {
 				const choice = (json as IOpenAiStreamChunk).choices?.[0];
 				const localReasoning = this._reasoningTextFromOpenAiDelta(choice?.delta);
 				if (localReasoning) {
 					this._log(`[LoCoPilot Provider] Reasoning delta: ${localReasoning.substring(0, 200)}${localReasoning.length > 200 ? '...' : ''}`);
-					this._emitThinking(stream, localReasoning);
+					thinkingBuffer += localReasoning;
+					if (!suppressingThinkText) {
+						const tIdx = this._textToolCallMarkerIndex(thinkingBuffer);
+						if (tIdx >= 0) {
+							if (tIdx > emittedThinkLen) {
+								this._emitThinking(stream, thinkingBuffer.slice(emittedThinkLen, tIdx));
+							}
+							emittedThinkLen = thinkingBuffer.length;
+							suppressingThinkText = true;
+						} else {
+							this._emitThinking(stream, localReasoning);
+							emittedThinkLen = thinkingBuffer.length;
+						}
+					}
 				}
 				if (choice?.delta?.content) {
 					contentBuffer += choice.delta.content;
@@ -1257,18 +1277,20 @@ export class LoCoPilotLanguageModelProvider extends Disposable implements ILangu
 				}
 			}
 
-			// Fallback for local models that emit tool calls as plain text instead of structured tool_calls.
-			// We suppressed the raw markup from the UI during streaming (suppressingToolText); now try to
-			// recover the call so the agent can run it on this turn rather than dead-ending.
-			if (accumulatedToolCalls.size === 0 && suppressingToolText) {
+			// Fallback for local models that emit tool calls as plain text instead of structured tool_calls -
+			// either in the content stream OR the thinking/reasoning stream. We suppressed the raw markup from
+			// the UI during streaming; now try to recover the call (from whichever buffer carried it) so the
+			// agent runs it on this turn instead of dead-ending with "no tool calls".
+			if (accumulatedToolCalls.size === 0 && (suppressingToolText || suppressingThinkText)) {
 				const availableToolNames = new Set<string>(
 					(Array.isArray(body.tools) ? body.tools : [])
 						.map((t: any) => t?.function?.name || t?.name)
 						.filter((n: unknown): n is string => typeof n === 'string')
 				);
-				const recovered = this._recoverTextToolCalls(contentBuffer, availableToolNames);
+				const recoverySource = `${contentBuffer}\n${thinkingBuffer}`;
+				const recovered = this._recoverTextToolCalls(recoverySource, availableToolNames);
 				if (recovered.length > 0) {
-					this._log(`[LoCoPilot Provider] Recovered ${recovered.length} text-formatted tool call(s) the model emitted as content.`);
+					this._log(`[LoCoPilot Provider] Recovered ${recovered.length} text-formatted tool call(s) the model emitted as content/thinking.`);
 					for (const call of recovered) {
 						stream.emitOne({ type: 'tool_use', name: call.name, toolCallId: `recovered_${generateUuid()}`, parameters: call.parameters });
 					}
@@ -1376,6 +1398,11 @@ export class LoCoPilotLanguageModelProvider extends Disposable implements ILangu
 			let contentBuffer = '';
 			let emittedContentLen = 0;
 			let suppressingToolText = false;
+			// See the local-model branch: some models emit the tool call in the thinking stream, so buffer and
+			// suppress reasoning too and recover from it at stream end.
+			let thinkingBuffer = '';
+			let emittedThinkLen = 0;
+			let suppressingThinkText = false;
 
 			const status = await this._fetchSSEStream(url, headers, JSON.stringify(body), token, json => {
 				const choice = (json as IOpenAiStreamChunk).choices?.[0];
@@ -1400,7 +1427,20 @@ export class LoCoPilotLanguageModelProvider extends Disposable implements ILangu
 				}
 				const reasoningDelta = this._reasoningTextFromOpenAiDelta(delta);
 				if (reasoningDelta) {
-					this._emitThinking(stream, reasoningDelta);
+					thinkingBuffer += reasoningDelta;
+					if (!suppressingThinkText) {
+						const tIdx = this._textToolCallMarkerIndex(thinkingBuffer);
+						if (tIdx >= 0) {
+							if (tIdx > emittedThinkLen) {
+								this._emitThinking(stream, thinkingBuffer.slice(emittedThinkLen, tIdx));
+							}
+							emittedThinkLen = thinkingBuffer.length;
+							suppressingThinkText = true;
+						} else {
+							this._emitThinking(stream, reasoningDelta);
+							emittedThinkLen = thinkingBuffer.length;
+						}
+					}
 				}
 				if (delta?.tool_calls) {
 					for (const tc of delta.tool_calls) {
@@ -1438,18 +1478,20 @@ export class LoCoPilotLanguageModelProvider extends Disposable implements ILangu
 				}
 			}
 
-			// Fallback for local models that emit tool calls as plain text instead of structured tool_calls.
-			// We suppressed the raw markup from the UI during streaming (suppressingToolText); now try to
-			// recover the call so the agent can run it on this turn rather than dead-ending.
-			if (accumulatedToolCalls.size === 0 && suppressingToolText) {
+			// Fallback for local models that emit tool calls as plain text instead of structured tool_calls -
+			// either in the content stream OR the thinking/reasoning stream. We suppressed the raw markup from
+			// the UI during streaming; now try to recover the call (from whichever buffer carried it) so the
+			// agent runs it on this turn instead of dead-ending with "no tool calls".
+			if (accumulatedToolCalls.size === 0 && (suppressingToolText || suppressingThinkText)) {
 				const availableToolNames = new Set<string>(
 					(Array.isArray(body.tools) ? body.tools : [])
 						.map((t: any) => t?.function?.name || t?.name)
 						.filter((n: unknown): n is string => typeof n === 'string')
 				);
-				const recovered = this._recoverTextToolCalls(contentBuffer, availableToolNames);
+				const recoverySource = `${contentBuffer}\n${thinkingBuffer}`;
+				const recovered = this._recoverTextToolCalls(recoverySource, availableToolNames);
 				if (recovered.length > 0) {
-					this._log(`[LoCoPilot Provider] Recovered ${recovered.length} text-formatted tool call(s) the model emitted as content.`);
+					this._log(`[LoCoPilot Provider] Recovered ${recovered.length} text-formatted tool call(s) the model emitted as content/thinking.`);
 					for (const call of recovered) {
 						stream.emitOne({ type: 'tool_use', name: call.name, toolCallId: `recovered_${generateUuid()}`, parameters: call.parameters });
 					}
@@ -1570,13 +1612,32 @@ export class LoCoPilotLanguageModelProvider extends Disposable implements ILangu
 			let contentBuffer = '';
 			let emittedContentLen = 0;       // how much of contentBuffer we've already streamed to the UI
 			let suppressingToolText = false; // once a textual tool-call marker is seen, stop emitting content
+			// Small local models often emit the tool call inside the THINKING/reasoning stream rather than
+			// content (observed with Qwen3.5 GGUF: every tool-call token arrives as a reasoning delta). Buffer
+			// and suppress the thinking channel the same way so we can recover the call from it at stream end.
+			let thinkingBuffer = '';
+			let emittedThinkLen = 0;
+			let suppressingThinkText = false;
 
 			const processChunk = (json: unknown): void => {
 				const choice = (json as IOpenAiStreamChunk).choices?.[0];
 				const localReasoning = this._reasoningTextFromOpenAiDelta(choice?.delta);
 				if (localReasoning) {
 					this._log(`[LoCoPilot Provider] Reasoning delta: ${localReasoning.substring(0, 200)}${localReasoning.length > 200 ? '...' : ''}`);
-					this._emitThinking(stream, localReasoning);
+					thinkingBuffer += localReasoning;
+					if (!suppressingThinkText) {
+						const tIdx = this._textToolCallMarkerIndex(thinkingBuffer);
+						if (tIdx >= 0) {
+							if (tIdx > emittedThinkLen) {
+								this._emitThinking(stream, thinkingBuffer.slice(emittedThinkLen, tIdx));
+							}
+							emittedThinkLen = thinkingBuffer.length;
+							suppressingThinkText = true;
+						} else {
+							this._emitThinking(stream, localReasoning);
+							emittedThinkLen = thinkingBuffer.length;
+						}
+					}
 				}
 				if (choice?.delta?.content) {
 					contentBuffer += choice.delta.content;
@@ -1644,18 +1705,20 @@ export class LoCoPilotLanguageModelProvider extends Disposable implements ILangu
 				}
 			}
 
-			// Fallback for local models that emit tool calls as plain text instead of structured tool_calls.
-			// We suppressed the raw markup from the UI during streaming (suppressingToolText); now try to
-			// recover the call so the agent can run it on this turn rather than dead-ending.
-			if (accumulatedToolCalls.size === 0 && suppressingToolText) {
+			// Fallback for local models that emit tool calls as plain text instead of structured tool_calls -
+			// either in the content stream OR the thinking/reasoning stream. We suppressed the raw markup from
+			// the UI during streaming; now try to recover the call (from whichever buffer carried it) so the
+			// agent runs it on this turn instead of dead-ending with "no tool calls".
+			if (accumulatedToolCalls.size === 0 && (suppressingToolText || suppressingThinkText)) {
 				const availableToolNames = new Set<string>(
 					(Array.isArray(body.tools) ? body.tools : [])
 						.map((t: any) => t?.function?.name || t?.name)
 						.filter((n: unknown): n is string => typeof n === 'string')
 				);
-				const recovered = this._recoverTextToolCalls(contentBuffer, availableToolNames);
+				const recoverySource = `${contentBuffer}\n${thinkingBuffer}`;
+				const recovered = this._recoverTextToolCalls(recoverySource, availableToolNames);
 				if (recovered.length > 0) {
-					this._log(`[LoCoPilot Provider] Recovered ${recovered.length} text-formatted tool call(s) the model emitted as content.`);
+					this._log(`[LoCoPilot Provider] Recovered ${recovered.length} text-formatted tool call(s) the model emitted as content/thinking.`);
 					for (const call of recovered) {
 						stream.emitOne({ type: 'tool_use', name: call.name, toolCallId: `recovered_${generateUuid()}`, parameters: call.parameters });
 					}
