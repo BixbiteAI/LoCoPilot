@@ -1586,7 +1586,7 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 		const braveLabel = DOM.append(braveText, $('label.locopilot-setting-label'));
 		braveLabel.textContent = localize('locopilotSettings.braveApiKey', "Web search API key (Brave)");
 		const braveDesc = DOM.append(braveText, $('.agent-setting-description'));
-		braveDesc.textContent = localize('locopilotSettings.braveApiKeyDescription', "Optional. Leave empty to use free DuckDuckGo search. Enter a Brave Search API key for better results - get a free key at https://brave.com/search/api/.");
+		braveDesc.textContent = localize('locopilotSettings.braveApiKeyDescription', "Optional. Leave empty to use DuckDuckGo search. Enter a Brave Search API key for better results - get a key at https://brave.com/search/api/.");
 		const braveControl = DOM.append(braveRow, $('.agent-setting-control'));
 		const braveWrap = DOM.append(braveControl, $('.agent-setting-input-wrap.agent-setting-brave-wrap'));
 		this.braveApiKeyInput = this._register(new InputBox(DOM.append(braveWrap, $('div')), this.contextViewService, {
