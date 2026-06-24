@@ -576,12 +576,12 @@ export function catalogModelToSeed(entry: ICatalogModel): Omit<ICustomLanguageMo
  * hidden and can be surfaced via Show in "My Models".
  */
 const DEFAULT_VISIBLE_CATALOG_IDS: ReadonlySet<string> = new Set([
-	'qwen3-4b-gguf',
-	'qwen3-8b-gguf',
+	// Current-generation Qwen line only (3.5 MTP + 3.6). The prior-gen `qwen3-4b-gguf` / `qwen3-8b-gguf`
+	// are intentionally NOT here: they are superseded by Qwen3.5 4B/9B (MTP) and stay seeded hidden, so the
+	// picker shows one clean generation with no duplicates. Users can still surface them via Show in My Models.
 	'gemma4-12b-gguf',
 	'qwen36-27b-gguf',
 	'devstral-small-24b-gguf',
-	// Additional models surfaced in the picker by default.
 	'qwen35-0_8b-mtp-gguf',
 	'qwen35-4b-mtp-gguf',
 	'qwen35-9b-mtp-gguf',
@@ -590,11 +590,53 @@ const DEFAULT_VISIBLE_CATALOG_IDS: ReadonlySet<string> = new Set([
 ]);
 
 /**
- * Repo id of the model pre-selected in the chat picker for first-time users (smallest, runs almost anywhere).
- * Seeded models store the catalog `repoId` as their `modelName`, so the provider matches on this to flag the
- * picker default. Once a user picks a different model, their choice is persisted and wins over this default.
+ * The smallest model we will ever pre-select: a tiny, fast, current-gen build that runs almost anywhere. Used
+ * as the floor by {@link getDefaultPickerRepoId} and as the fallback when RAM is unknown.
  */
-export const DEFAULT_PICKER_MODEL_REPO_ID = 'unsloth/Qwen3-4B-GGUF';
+export const DEFAULT_PICKER_FLOOR_REPO_ID = 'unsloth/Qwen3.5-4B-MTP-GGUF';
+
+/**
+ * Repo id of the model pre-selected in the chat picker for first-time users, chosen CONSERVATIVELY for the
+ * detected RAM: we pick a model one tier below what the machine could maximally handle, so the out-of-box
+ * default never OOMs or crawls on a machine sitting at a tier's RAM minimum. The floor is Qwen3.5 4B (MTP).
+ *
+ * Seeded models store the catalog `repoId` as their `modelName`, so the provider matches on this to flag the
+ * picker default. Once a user picks a different model their choice is persisted and wins over this default;
+ * the recommended badge then makes the maximal pick one obvious click away.
+ *
+ * `ramGB <= 0` means RAM is not detected yet -> floor (safe everywhere).
+ */
+export function getDefaultPickerRepoId(ramGB: number): string {
+	if (ramGB >= 32) {
+		return 'unsloth/gemma-4-12b-it-GGUF'; // 16 GB-tier model on a 32 GB+ machine: comfortable headroom.
+	}
+	// 16 GB and 8 GB machines (and unknown RAM) both land on the floor: tiny, fast, always-works.
+	return DEFAULT_PICKER_FLOOR_REPO_ID;
+}
+
+/**
+ * Repo id of the single "Best for you" model for the detected RAM tier: the most capable model that stays
+ * COMFORTABLE in day-to-day use once the host editor (Electron) and OS overhead are accounted for. It is
+ * deliberately one notch below the absolute largest model the tier could technically load - e.g. on 16 GB it
+ * is Qwen3.5 9B (~5.5 GB Q4), NOT Gemma 4 12B (~7 GB), which loads but leaves little headroom for the editor
+ * plus KV cache.
+ *
+ * Curated by hand (not derived from raw weight size) because "comfortable" depends on runtime + KV + editor
+ * overhead that a size threshold can't capture cleanly across tiers. This is the SINGLE source of truth for
+ * the "Best for you" badge, shared by the chat model picker and the model-list editor so the two always agree.
+ *
+ * Distinct from {@link getDefaultPickerRepoId}: that is the even-safer model AUTO-SELECTED on first run; this
+ * is the recommended upgrade the badge points at. `ramGB <= 0` (RAM unknown) -> the safe small build.
+ */
+export function getRecommendedRepoId(ramGB: number): string {
+	if (ramGB >= 32) {
+		return 'unsloth/Qwen3.6-27B-GGUF'; // flagship dense coder; comfortable on 32 GB+.
+	}
+	if (ramGB >= 16) {
+		return 'unsloth/Qwen3.5-9B-MTP-GGUF'; // ~5.5 GB Q4; smooth on 16 GB alongside the editor.
+	}
+	return DEFAULT_PICKER_FLOOR_REPO_ID; // 8 GB / unknown: the tiny fast build is the comfortable best.
+}
 
 /** Whether a catalog entry should be seeded hidden: explicit `defaultHidden` wins, else hidden unless allowlisted. */
 export function catalogDefaultHidden(entry: ICatalogModel): boolean {

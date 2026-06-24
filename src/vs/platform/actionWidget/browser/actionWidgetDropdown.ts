@@ -32,6 +32,11 @@ export interface IActionWidgetDropdownAction extends IAction {
 	 * When true, only show this item when there is an active search query.
 	 */
 	searchOnly?: boolean;
+	/**
+	 * When true, selecting this item does NOT close the dropdown. Use for in-place toggles whose `run`
+	 * mutates state and calls `refreshItems()` to rebuild the list (e.g. "Show/Hide hidden models").
+	 */
+	keepDropdownOpen?: boolean;
 }
 
 // TODO @lramos15 - Should we just make IActionProvider templated?
@@ -51,6 +56,12 @@ export interface IActionWidgetDropdownOptions extends IBaseDropdownOptions, IAct
 
 	// Function that returns the anchor element for the dropdown
 	getAnchor?: () => HTMLElement;
+
+	/**
+	 * Invoked once at the very start of each open, before actions are fetched. Use to reset any transient
+	 * per-open UI state (e.g. collapse a "show hidden" toggle) so every fresh open starts from a default.
+	 */
+	onBeforeShow?: () => void;
 
 	/**
 	 * Name used for telemetry tracking when the dropdown closes.
@@ -133,7 +144,9 @@ export class ActionWidgetDropdown extends BaseDropdown {
 			return;
 		}
 
-		let actionBarActions = this._options.actionBarActions ?? this._options.actionBarActionProvider?.getActions() ?? [];
+		// Reset any transient per-open state before reading actions, so every fresh open starts from a default.
+		this._options.onBeforeShow?.();
+
 		const actions = this._options.actions ?? this._options.actionProvider?.getActions() ?? [];
 
 		// Track the currently selected option before opening
@@ -153,6 +166,11 @@ export class ActionWidgetDropdown extends BaseDropdown {
 		const actionWidgetDelegate: IActionListDelegate<IActionWidgetDropdownAction> = {
 			onSelect: (action, preview) => {
 				selectedOption = action;
+				// In-place toggles keep the dropdown open and rebuild the list themselves via refreshItems().
+				if (action.keepDropdownOpen) {
+					action.run();
+					return;
+				}
 				this.actionWidgetService.hide();
 				action.run();
 			},
@@ -164,13 +182,21 @@ export class ActionWidgetDropdown extends BaseDropdown {
 			}
 		};
 
-		actionBarActions = actionBarActions.map(action => ({
-			...action,
-			run: async (...args: unknown[]) => {
-				this.actionWidgetService.hide();
-				return action.run(...args);
-			}
-		}));
+		// Fresh, wrapped bottom-bar actions. Re-fetched on refresh so toggle labels update. Most actions close the
+		// dropdown on run; an action can opt out with `keepDropdownOpen` (e.g. an in-place Show/Hide toggle).
+		const buildActionBarActions = (): IAction[] => {
+			const raw = this._options.actionBarActions ?? this._options.actionBarActionProvider?.getActions() ?? [];
+			return raw.map(action => ({
+				...action,
+				run: async (...args: unknown[]) => {
+					if (!(action as IActionWidgetDropdownAction).keepDropdownOpen) {
+						this.actionWidgetService.hide();
+					}
+					return action.run(...args);
+				}
+			}));
+		};
+		const actionBarActions = buildActionBarActions();
 
 		const accessibilityProvider: Partial<IListAccessibilityProvider<IActionListItem<IActionWidgetDropdownAction>>> = {
 			isChecked(element) {
@@ -199,7 +225,8 @@ export class ActionWidgetDropdown extends BaseDropdown {
 			actionBarActions,
 			accessibilityProvider,
 			{ searchable: this._options.searchable, maxVisibleItems: this._options.maxVisibleItems },
-			itemsProvider
+			itemsProvider,
+			buildActionBarActions
 		);
 	}
 

@@ -50,7 +50,7 @@ import { IMarkdownRendererService } from '../../../../../platform/markdown/brows
 import { ILoCoPilotLocalModelRunner } from '../locopilotLocalModelRunner.js';
 import { ITimerService } from '../../../../services/timer/browser/timerService.js';
 import { isAppleSiliconMac } from '../locopilotMlxServer.js';
-import { findCatalogEntry, getCatalogSuitability, ModelSuitability } from '../locopilotModelCatalog.js';
+import { findCatalogEntry, getCatalogSuitability, getRecommendedRepoId, ModelSuitability } from '../locopilotModelCatalog.js';
 // [engine-ui] Only needed by the commented-out engine dropdown in renderAgentSettings; uncomment to restore.
 // import { isMacintosh } from '../../../../../base/common/platform.js';
 // import { IConfigurationService } from '../../../../../platform/configuration/common/configuration.js';
@@ -1118,8 +1118,8 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 		const nameLabel = DOM.append(row1, $('.model-name'));
 		const nameText = DOM.append(nameLabel, $('span.model-name-text'));
 		nameText.textContent = getCustomModelListLabel(model);
-		// "Best for you" models get a double-tick after the name; hovering it explains the recommendation.
-		if (this.modelSuitability(model) === 'best') {
+		// The single "Best for you" recommendation gets a double-tick after the name; hovering it explains why.
+		if (this.isRecommendedForSystem(model)) {
 			const bestIcon = DOM.append(nameLabel, $('span.model-name-best-icon'));
 			bestIcon.appendChild(renderIcon(Codicon.pass));
 			bestIcon.title = localize('customLanguageModels.bestForYou.tooltip', 'Recommended: sized for your system memory.');
@@ -1196,10 +1196,10 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 			chip.textContent = text;
 			return chip;
 		};
-		// Hardware-fit badge (catalog models only): "Best for you" when sized for this machine, or a
-		// soft "Needs N GB RAM" / Apple-Silicon warning when it won't run comfortably here.
+		// Hardware-fit badge (catalog models only): "Best for you" on the single curated recommendation for this
+		// machine, or a soft "Needs N GB RAM" / Apple-Silicon warning when a model won't run comfortably here.
 		const suitability = this.modelSuitability(model);
-		if (suitability === 'best') {
+		if (this.isRecommendedForSystem(model)) {
 			const chip = addChip(localize('customLanguageModels.bestForYou', 'Best for you'), 'best');
 			chip.title = localize('customLanguageModels.bestForYou.tooltip', 'Recommended: sized for your system memory.');
 		} else if (suitability === 'too-big') {
@@ -2185,6 +2185,17 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 	private modelSuitability(model: ICustomLanguageModel): ModelSuitability {
 		const entry = findCatalogEntry(model.modelName, model.format);
 		return getCatalogSuitability(entry, this.detectedRamGB(), isAppleSiliconMac());
+	}
+
+	/**
+	 * Whether this model is THE single "Best for you" recommendation for the detected RAM - the curated
+	 * comfortable pick shared with the chat model picker (see {@link getRecommendedRepoId}). Only one catalog
+	 * model qualifies per machine; needs detected RAM. Drives the "Best for you" tick/chip so the model list
+	 * and the picker always badge the same model.
+	 */
+	private isRecommendedForSystem(model: ICustomLanguageModel): boolean {
+		const ramGB = this.detectedRamGB();
+		return ramGB > 0 && model.modelName === getRecommendedRepoId(ramGB);
 	}
 
 	private renderSelectedSection(): void {

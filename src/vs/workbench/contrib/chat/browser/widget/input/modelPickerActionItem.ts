@@ -26,8 +26,10 @@ import { MANAGE_CHAT_COMMAND_ID } from '../../../common/constants.js';
 import { ILanguageModelChatMetadataAndIdentifier } from '../../../common/languageModels.js';
 import { DEFAULT_MODEL_PICKER_CATEGORY } from '../../../common/widget/input/modelPickerWidget.js';
 import { ChatInputPickerActionViewItem, IChatInputPickerOptions } from './chatInputPickerActionItem.js';
-import { ICustomLanguageModelsService, getCustomModelListLabel } from '../../../common/customLanguageModelsService.js';
+import { ICustomLanguageModelsService, ICustomLanguageModel, getCustomModelListLabel } from '../../../common/customLanguageModelsService.js';
 import { LOCOPILOT_SETTINGS_SECTION_LIST_MODELS } from '../../chatManagement/locopilotSettingsEditorInput.js';
+import { getRecommendedRepoId } from '../../locopilotModelCatalog.js';
+import { ITimerService } from '../../../../../services/timer/browser/timerService.js';
 import { ExtensionIdentifier } from '../../../../../../platform/extensions/common/extensions.js';
 
 export interface IModelPickerDelegate {
@@ -88,9 +90,35 @@ function selectCustomModelInChat(delegate: IModelPickerDelegate, customLanguageM
 	});
 }
 
-function modelDelegateToWidgetActionsProvider(delegate: IModelPickerDelegate, telemetryService: ITelemetryService, customLanguageModelsService: ICustomLanguageModelsService, actionWidgetService: IActionWidgetService): IActionWidgetDropdownActionProvider {
+/**
+ * Detected system RAM in GB (0 if not yet measured). `startupMetrics` throws before the timer service is
+ * ready, so the read is guarded; by the time the picker opens it is ready. Mirrors the model-list editor's
+ * "Best for you" RAM source so the picker badge and the list badge agree.
+ */
+function detectedRamGB(timerService: ITimerService): number {
+	try {
+		const totalmem = timerService.startupMetrics.totalmem;
+		return typeof totalmem === 'number' && totalmem > 0 ? totalmem / (1024 * 1024 * 1024) : 0;
+	} catch {
+		return 0;
+	}
+}
+
+/** Shared, mutable picker UI state. Toggled by the bottom "Show hidden models" action and read when building the list. */
+interface IModelPickerState {
+	showHidden: boolean;
+}
+
+function modelDelegateToWidgetActionsProvider(delegate: IModelPickerDelegate, telemetryService: ITelemetryService, customLanguageModelsService: ICustomLanguageModelsService, actionWidgetService: IActionWidgetService, timerService: ITimerService, state: IModelPickerState): IActionWidgetDropdownActionProvider {
 	return {
 		getActions: () => {
+			// "Best for you" badges the single curated COMFORTABLE recommendation for this machine (the most
+			// capable model that runs smoothly once editor/OS overhead is accounted for - e.g. Qwen3.5 9B on
+			// 16 GB, not Gemma 4 12B). Shared with the model-list editor via getRecommendedRepoId so both agree.
+			// This is the "best upgrade" signpost; the picker still AUTO-SELECTS the even-safer conservative default.
+			const ramGB = detectedRamGB(timerService);
+			const recommendedRepoId = getRecommendedRepoId(ramGB);
+			const isBestForSystem = (m: ICustomLanguageModel): boolean => m.modelName === recommendedRepoId;
 			// Custom models are sourced here (not from delegate.getModels()), so locopilot vendor models are
 			// filtered out of the standard list below to avoid listing them twice. Use the VISIBLE set (not
 			// just chat-ready) so curated not-yet-downloaded catalog models appear; selecting one and sending
@@ -102,15 +130,21 @@ function modelDelegateToWidgetActionsProvider(delegate: IModelPickerDelegate, te
 			// Convert custom models to ILanguageModelChatMetadataAndIdentifier format
 			const selectedCustomModelId = customLanguageModelsService.getSelectedCustomModelId();
 			const customModelActions: IActionWidgetDropdownAction[] = customModels.map(customModel => {
+				// "Best for you": sized for this machine's RAM/engine. Star the label and explain it on hover,
+				// matching the model-list badge so the maximal pick is one obvious click from the conservative default.
+				const best = isBestForSystem(customModel);
+				const baseLabel = getCustomModelListLabel(customModel);
+				const kindLabel = customModel.type === 'cloud' ? localize('chat.modelPicker.cloud', 'Cloud') : localize('chat.modelPicker.local', 'Local');
+				const bestTooltip = localize('chat.modelPicker.bestForYou.tooltip', 'Recommended: sized for your system memory.');
 				return {
 					id: customModel.id,
 					enabled: true,
 					checked: customModel.id === selectedCustomModelId,
 					category: { label: 'Custom Models', order: 100 },
 					class: undefined,
-					description: customModel.type === 'cloud' ? localize('chat.modelPicker.cloud', 'Cloud') : localize('chat.modelPicker.local', 'Local'),
-					tooltip: getCustomModelListLabel(customModel),
-					label: getCustomModelListLabel(customModel),
+					description: best ? localize('chat.modelPicker.bestForYou.desc', '{0} - Best for you', kindLabel) : kindLabel,
+					tooltip: best ? `${baseLabel} - ${bestTooltip}` : baseLabel,
+					label: baseLabel,
 					hover: undefined,
 					toolbarActions: [
 						toAction({
@@ -136,19 +170,25 @@ function modelDelegateToWidgetActionsProvider(delegate: IModelPickerDelegate, te
 				};
 			});
 
-			// Hidden custom models - only visible when searching
+			// Hidden custom models. By default these are search-only; toggling "Show hidden models" (bottom bar)
+			// flips `state.showHidden` so they render inline in their own "Hidden Models" section AFTER the shown
+			// ones (higher category order + a header). Searching still surfaces them regardless of the toggle.
 			const hiddenModelActions: IActionWidgetDropdownAction[] = hiddenCustomModels.map(hiddenModel => {
 				return {
 					id: hiddenModel.id,
 					enabled: true,
 					checked: false,
-					category: { label: 'Custom Models', order: 100 },
+					// Only break them into their own labelled section when revealed; otherwise keep them in the
+					// Custom Models category (search-only) so no empty separator/header shows while they're hidden.
+					category: state.showHidden
+						? { label: localize('chat.modelPicker.hiddenSection', 'Hidden Models'), order: 200, showHeader: true }
+						: { label: 'Custom Models', order: 100 },
 					class: undefined,
 					description: hiddenModel.type === 'cloud' ? localize('chat.modelPicker.cloud', 'Cloud') : localize('chat.modelPicker.local', 'Local'),
 					tooltip: getCustomModelListLabel(hiddenModel),
 					label: getCustomModelListLabel(hiddenModel),
 					hover: undefined,
-					searchOnly: true,
+					searchOnly: !state.showHidden,
 					toolbarActions: [
 						toAction({
 							id: `unhide-${hiddenModel.id}`,
@@ -213,17 +253,41 @@ function modelDelegateToWidgetActionsProvider(delegate: IModelPickerDelegate, te
 				} satisfies IActionWidgetDropdownAction;
 			});
 
-			// Combine standard models, visible custom models, and hidden custom models (searchOnly)
+			// Combine standard models, visible custom models, and (when revealed via the sticky footer toggle)
+			// hidden custom models. The Show/Hide toggle itself lives in the bottom action bar (sticky footer).
 			return [...standardModelActions, ...customModelActions, ...hiddenModelActions];
 		}
 	};
 }
 
-function getModelPickerActionBarActionProvider(commandService: ICommandService, chatEntitlementService: IChatEntitlementService, productService: IProductService, customLanguageModelsService: ICustomLanguageModelsService): IActionProvider {
+function getModelPickerActionBarActionProvider(commandService: ICommandService, chatEntitlementService: IChatEntitlementService, productService: IProductService, customLanguageModelsService: ICustomLanguageModelsService, actionWidgetService: IActionWidgetService, state: IModelPickerState): IActionProvider {
 
 	const actionProvider: IActionProvider = {
 		getActions: () => {
 			const additionalActions: IAction[] = [];
+
+			// Sticky-footer Show/Hide toggle for the hidden models, rendered as a link/button in the bottom action
+			// bar (always pinned at the bottom, never scrolls with the list). Only offered when hidden models exist.
+			// `keepDropdownOpen` stops the dropdown from closing; refreshItems() rebuilds BOTH the list and this bar,
+			// so the label/icon flip between "Show" and "Hide" as the state changes. State resets to collapsed on
+			// each fresh open via the picker's visibility hook (not here), so this getActions can run on refresh.
+			const hiddenCount = customLanguageModelsService.getCustomModels().filter(m => m.hidden).length;
+			if (hiddenCount > 0) {
+				additionalActions.push(Object.assign(
+					toAction({
+						id: 'locopilotToggleHiddenModels',
+						label: state.showHidden
+							? localize('chat.modelPicker.hideHidden', 'Show less')
+							: localize('chat.modelPicker.showHidden', 'Show more'),
+						run: () => {
+							state.showHidden = !state.showHidden;
+							actionWidgetService.refreshItems();
+						}
+					}),
+					{ keepDropdownOpen: true }
+				));
+				additionalActions.push(new Separator());
+			}
 
 			// Always offer a way to reach the full model list, where users can Show hidden catalog models,
 			// download, hide, or delete. The picker itself only shows the curated/visible few.
@@ -266,38 +330,36 @@ function getModelPickerActionBarActionProvider(commandService: ICommandService, 
 				chatEntitlementService.entitlement === ChatEntitlement.Unknown;
 
 			// Only add if user is not new/anonymous (to avoid duplicate with "moreModels" below)
-			if (!isNewOrAnonymousUser && chatEntitlementService.entitlement !== ChatEntitlement.Free) {
-				additionalActions.push({
-					id: 'addLanguageModels',
-					label: localize('chat.addLanguageModels', "Add Model"),
-					enabled: true,
-					tooltip: localize('chat.addLanguageModels.tooltip', "Add custom language models (Cloud or Local)"),
-					class: undefined,
-					run: () => {
-						commandService.executeCommand('workbench.action.chat.openLoCoPilotSettings', { section: 'add-model' });
-					}
-				});
-			}
+			// NOTE: "Add Model" button temporarily commented out per request.
+			// if (!isNewOrAnonymousUser && chatEntitlementService.entitlement !== ChatEntitlement.Free) {
+			// 	additionalActions.push({
+			// 		id: 'addLanguageModels',
+			// 		label: localize('chat.addLanguageModels', "Add Model"),
+			// 		enabled: true,
+			// 		tooltip: localize('chat.addLanguageModels.tooltip', "Add custom language models (Cloud or Local)"),
+			// 		class: undefined,
+			// 		run: () => {
+			// 			commandService.executeCommand('workbench.action.chat.openLoCoPilotSettings', { section: 'add-model' });
+			// 		}
+			// 	});
+			// }
 
-			// Add separator if there are other actions
-			if (additionalActions.length > 0) {
-				additionalActions.push(new Separator());
-			}
-
-			// Add sign-in / upgrade option if entitlement is anonymous / free / new user
-			if (isNewOrAnonymousUser || chatEntitlementService.entitlement === ChatEntitlement.Free) {
+			// "Add Model" (new/anonymous user) entry temporarily removed from the picker per request. The Free-user
+			// "Add Premium Models" upgrade entry is kept. To restore "Add Model", re-add the isNewOrAnonymousUser
+			// branch below (open LoCoPilot settings 'add-model' section).
+			if (!isNewOrAnonymousUser && chatEntitlementService.entitlement === ChatEntitlement.Free) {
+				// Separator before the upgrade group, only when there is something above it.
+				if (additionalActions.length > 0) {
+					additionalActions.push(new Separator());
+				}
 				additionalActions.push({
 					id: 'moreModels',
-					label: isNewOrAnonymousUser ? localize('chat.moreModels', "Add Model") : localize('chat.morePremiumModels', "Add Premium Models"),
+					label: localize('chat.morePremiumModels', "Add Premium Models"),
 					enabled: true,
-					tooltip: isNewOrAnonymousUser ? localize('chat.moreModels.tooltip', "Add Model") : localize('chat.morePremiumModels.tooltip', "Add Premium Models"),
+					tooltip: localize('chat.morePremiumModels.tooltip', "Add Premium Models"),
 					class: undefined,
 					run: () => {
-						if (isNewOrAnonymousUser) {
-							commandService.executeCommand('workbench.action.chat.openLoCoPilotSettings', { section: 'add-model' });
-						} else {
-							commandService.executeCommand('workbench.action.chat.upgradePlan');
-						}
+						commandService.executeCommand('workbench.action.chat.upgradePlan');
 					}
 				});
 			}
@@ -327,6 +389,7 @@ export class ModelPickerActionItem extends ChatInputPickerActionViewItem {
 		@ITelemetryService telemetryService: ITelemetryService,
 		@IProductService productService: IProductService,
 		@ICustomLanguageModelsService customLanguageModelsService: ICustomLanguageModelsService,
+		@ITimerService timerService: ITimerService,
 	) {
 		// Get initial model name
 		const initialModel = delegate.currentModel.get();
@@ -349,9 +412,15 @@ export class ModelPickerActionItem extends ChatInputPickerActionViewItem {
 			run: () => { }
 		};
 
+		// Shared between the list and the bottom bar so the toggle and the rendered list stay in sync within one
+		// open. Reset to collapsed on each fresh open via onDropdownVisibilityChanged (see below).
+		const pickerState: IModelPickerState = { showHidden: false };
 		const modelPickerActionWidgetOptions: Omit<IActionWidgetDropdownOptions, 'label' | 'labelRenderer'> = {
-			actionProvider: modelDelegateToWidgetActionsProvider(delegate, telemetryService, customLanguageModelsService, actionWidgetService),
-			actionBarActionProvider: getModelPickerActionBarActionProvider(commandService, chatEntitlementService, productService, customLanguageModelsService),
+			actionProvider: modelDelegateToWidgetActionsProvider(delegate, telemetryService, customLanguageModelsService, actionWidgetService, timerService, pickerState),
+			actionBarActionProvider: getModelPickerActionBarActionProvider(commandService, chatEntitlementService, productService, customLanguageModelsService, actionWidgetService, pickerState),
+			// Every fresh open starts with hidden models collapsed. Toggling mid-session uses refreshItems(), which
+			// does not call this, so an expanded list is only ever reset on the next open.
+			onBeforeShow: () => { pickerState.showHidden = false; },
 			reporter: { name: 'ChatModelPicker', includeOptions: true },
 			searchable: true,
 			maxVisibleItems: 10,

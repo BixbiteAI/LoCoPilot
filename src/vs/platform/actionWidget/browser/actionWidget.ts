@@ -36,11 +36,12 @@ export const IActionWidgetService = createDecorator<IActionWidgetService>('actio
 export interface IActionWidgetService {
 	readonly _serviceBrand: undefined;
 
-	show<T>(user: string, supportsPreview: boolean, items: readonly IActionListItem<T>[], delegate: IActionListDelegate<T>, anchor: HTMLElement | StandardMouseEvent | IAnchor, container: HTMLElement | undefined, actionBarActions?: readonly IAction[], accessibilityProvider?: Partial<IListAccessibilityProvider<IActionListItem<T>>>, listOptions?: IActionListOptions, itemsProvider?: () => readonly IActionListItem<T>[]): void;
+	show<T>(user: string, supportsPreview: boolean, items: readonly IActionListItem<T>[], delegate: IActionListDelegate<T>, anchor: HTMLElement | StandardMouseEvent | IAnchor, container: HTMLElement | undefined, actionBarActions?: readonly IAction[], accessibilityProvider?: Partial<IListAccessibilityProvider<IActionListItem<T>>>, listOptions?: IActionListOptions, itemsProvider?: () => readonly IActionListItem<T>[], actionBarItemsProvider?: () => readonly IAction[]): void;
 
 	/**
-	 * Refresh the list by re-fetching items from the provider supplied to `show()`.
-	 * The dropdown stays open; only the list contents are updated.
+	 * Refresh the list by re-fetching items from the provider supplied to `show()`. If an action-bar items
+	 * provider was supplied, the bottom action bar is rebuilt too (so toggle labels update), and the widget is
+	 * re-laid-out and re-anchored. The dropdown stays open.
 	 */
 	refreshItems(): void;
 
@@ -58,6 +59,14 @@ class ActionWidgetService extends Disposable implements IActionWidgetService {
 
 	private readonly _list = this._register(new MutableDisposable<ActionList<unknown>>());
 	private _itemsProvider: (() => readonly IActionListItem<unknown>[]) | undefined;
+	/** Width passed to the last list layout, reused when re-laying out on refresh so the list keeps its sizing. */
+	private _cachedActionBarWidth = 0;
+	/** Fresh source of bottom-bar actions, used to rebuild the action bar on refresh (so toggle labels update). */
+	private _actionBarItemsProvider: (() => readonly IAction[]) | undefined;
+	/** The current widget root and its rendered action bar, kept so refresh can swap the action bar in place. */
+	private _widget: HTMLElement | undefined;
+	private _actionBarElement: HTMLElement | undefined;
+	private readonly _actionBar = this._register(new MutableDisposable<ActionBar>());
 
 	constructor(
 		@IContextViewService private readonly _contextViewService: IContextViewService,
@@ -67,9 +76,10 @@ class ActionWidgetService extends Disposable implements IActionWidgetService {
 		super();
 	}
 
-	show<T>(user: string, supportsPreview: boolean, items: readonly IActionListItem<T>[], delegate: IActionListDelegate<T>, anchor: HTMLElement | StandardMouseEvent | IAnchor, container: HTMLElement | undefined, actionBarActions?: readonly IAction[], accessibilityProvider?: Partial<IListAccessibilityProvider<IActionListItem<T>>>, listOptions?: IActionListOptions, itemsProvider?: () => readonly IActionListItem<T>[]): void {
+	show<T>(user: string, supportsPreview: boolean, items: readonly IActionListItem<T>[], delegate: IActionListDelegate<T>, anchor: HTMLElement | StandardMouseEvent | IAnchor, container: HTMLElement | undefined, actionBarActions?: readonly IAction[], accessibilityProvider?: Partial<IListAccessibilityProvider<IActionListItem<T>>>, listOptions?: IActionListOptions, itemsProvider?: () => readonly IActionListItem<T>[], actionBarItemsProvider?: () => readonly IAction[]): void {
 		const visibleContext = ActionWidgetContextKeys.Visible.bindTo(this._contextKeyService);
 		this._itemsProvider = itemsProvider as (() => readonly IActionListItem<unknown>[]) | undefined;
+		this._actionBarItemsProvider = actionBarItemsProvider;
 
 		const list = this._instantiationService.createInstance(ActionList, user, supportsPreview, items, delegate, accessibilityProvider, listOptions);
 		this._contextViewService.showContextView({
@@ -93,6 +103,15 @@ class ActionWidgetService extends Disposable implements IActionWidgetService {
 		if (this._itemsProvider && this._list.value) {
 			const newItems = this._itemsProvider();
 			this._list.value.setAllItems(newItems);
+			// Rebuild the bottom action bar too, so e.g. a Show/Hide toggle's label and icon update in place.
+			if (this._actionBarItemsProvider) {
+				this._cachedActionBarWidth = this._renderActionBar(this._actionBarItemsProvider());
+			}
+			// The item count may have changed (e.g. a toggle revealed more rows), so re-run the list layout to
+			// resize the window, then re-layout the context view so it stays anchored to its trigger (growing
+			// upward when there's no room below) instead of overflowing or detaching from the button.
+			this._list.value.layout(this._cachedActionBarWidth);
+			this._contextViewService.layout();
 		}
 	}
 
@@ -141,17 +160,11 @@ class ActionWidgetService extends Disposable implements IActionWidgetService {
 		renderDisposables.add(dom.addDisposableListener(pointerBlock, dom.EventType.POINTER_MOVE, () => pointerBlock.remove()));
 		renderDisposables.add(dom.addDisposableListener(pointerBlock, dom.EventType.MOUSE_DOWN, () => pointerBlock.remove()));
 
-		// Action bar
-		let actionBarWidth = 0;
-		if (actionBarActions.length) {
-			const actionBar = this._createActionBar('.action-widget-action-bar', actionBarActions);
-			if (actionBar) {
-				widget.appendChild(actionBar.getContainer().parentElement!);
-				renderDisposables.add(actionBar);
-				actionBarWidth = actionBar.getContainer().offsetWidth;
-			}
-		}
+		// Action bar (bottom). Built via a helper so refreshItems() can rebuild it in place with fresh labels.
+		this._widget = widget;
+		const actionBarWidth = this._renderActionBar(actionBarActions);
 
+		this._cachedActionBarWidth = actionBarWidth;
 		const width = this._list.value?.layout(actionBarWidth);
 		widget.style.width = `${width}px`;
 
@@ -168,6 +181,30 @@ class ActionWidgetService extends Disposable implements IActionWidgetService {
 		return renderDisposables;
 	}
 
+	/**
+	 * (Re)build the bottom action bar inside the current widget, replacing any existing one. Returns its width
+	 * (used as the list layout's min width). Safe to call repeatedly; used on initial render and on refresh.
+	 */
+	private _renderActionBar(actions: readonly IAction[]): number {
+		// Remove the previously rendered action bar, if any.
+		this._actionBarElement?.remove();
+		this._actionBarElement = undefined;
+		this._actionBar.clear();
+
+		if (!this._widget || !actions.length) {
+			return 0;
+		}
+		const actionBar = this._createActionBar('.action-widget-action-bar', actions);
+		if (!actionBar) {
+			return 0;
+		}
+		const wrapper = actionBar.getContainer().parentElement!;
+		this._widget.appendChild(wrapper);
+		this._actionBarElement = wrapper;
+		this._actionBar.value = actionBar;
+		return actionBar.getContainer().offsetWidth;
+	}
+
 	private _createActionBar(className: string, actions: readonly IAction[]): ActionBar | undefined {
 		if (!actions.length) {
 			return undefined;
@@ -181,6 +218,11 @@ class ActionWidgetService extends Disposable implements IActionWidgetService {
 
 	private _onWidgetClosed(didCancel?: boolean): void {
 		this._list.value?.hide(didCancel);
+		// Drop references to the now-removed DOM/action bar so a later refresh can't touch a stale widget.
+		this._actionBar.clear();
+		this._actionBarElement = undefined;
+		this._widget = undefined;
+		this._actionBarItemsProvider = undefined;
 	}
 }
 

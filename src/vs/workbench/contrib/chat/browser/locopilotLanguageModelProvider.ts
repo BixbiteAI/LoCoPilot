@@ -19,7 +19,8 @@ import { ILogService } from '../../../../platform/log/common/log.js';
 import { IRequestService } from '../../../../platform/request/common/request.js';
 import { IConfigurationService } from '../../../../platform/configuration/common/configuration.js';
 import { ChatConfiguration, ChatAgentLocation } from '../common/constants.js';
-import { DEFAULT_PICKER_MODEL_REPO_ID } from './locopilotModelCatalog.js';
+import { getDefaultPickerRepoId } from './locopilotModelCatalog.js';
+import { ITimerService } from '../../../services/timer/browser/timerService.js';
 import { ILoCoPilotFileLog } from './locopilotFileLog.js';
 import { INotificationService } from '../../../../platform/notification/common/notification.js';
 import { IStorageService } from '../../../../platform/storage/common/storage.js';
@@ -58,6 +59,7 @@ export class LoCoPilotLanguageModelProvider extends Disposable implements ILangu
 		@IConfigurationService private readonly configurationService: IConfigurationService,
 		@INotificationService private readonly notificationService: INotificationService,
 		@IStorageService private readonly storageService: IStorageService,
+		@ITimerService private readonly timerService: ITimerService,
 	) {
 		super();
 		this._log('[LoCoPilot] Initializing Language Model Provider');
@@ -104,6 +106,20 @@ export class LoCoPilotLanguageModelProvider extends Disposable implements ILangu
 	private _log(msg: string, ...args: unknown[]): void {
 		this.logService.info(msg, ...args);
 		this.locopilotFileLog.log(msg, ...args);
+	}
+
+	/**
+	 * Detected system RAM in GB, or 0 if not yet measured. Sourced from the startup metrics the timer service
+	 * collects on every platform (no node `os` import needed in this browser layer). `startupMetrics` THROWS
+	 * if read before `whenReady()` resolves, so the read is guarded; by the time the picker is shown it is ready.
+	 */
+	private _detectedRamGB(): number {
+		try {
+			const totalmem = this.timerService.startupMetrics.totalmem;
+			return typeof totalmem === 'number' && totalmem > 0 ? totalmem / (1024 * 1024 * 1024) : 0;
+		} catch {
+			return 0;
+		}
 	}
 
 	/**
@@ -209,6 +225,8 @@ export class LoCoPilotLanguageModelProvider extends Disposable implements ILangu
 			.slice()
 			.sort((a, b) => getCustomModelListLabel(a).localeCompare(getCustomModelListLabel(b), undefined, { sensitivity: 'base', numeric: true }));
 		this._log(`[LoCoPilot Provider] provideLanguageModelChatInfo called, found ${customModels.length} custom models`);
+		// Conservative, RAM-aware out-of-box default (one tier below max; floor = Qwen3.5 4B MTP).
+		const defaultPickerRepoId = getDefaultPickerRepoId(this._detectedRamGB());
 		const result = customModels.map(m => {
 			// Input/output budgets are derived from the single user-set context window.
 			const isLocal = m.provider === 'huggingface' || m.provider === 'localhost' || m.provider === 'ollama';
@@ -217,7 +235,7 @@ export class LoCoPilotLanguageModelProvider extends Disposable implements ILangu
 
 			// First-time users land on the smallest seeded model. VS Code only honors this when nothing is
 			// persisted yet; once the user picks any other model their choice is stored and takes precedence.
-			const isPickerDefault = m.modelName === DEFAULT_PICKER_MODEL_REPO_ID;
+			const isPickerDefault = m.modelName === defaultPickerRepoId;
 			const isDefaultForLocation = isPickerDefault
 				? {
 					[ChatAgentLocation.Chat]: true,

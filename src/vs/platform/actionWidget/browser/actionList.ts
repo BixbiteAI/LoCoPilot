@@ -496,8 +496,17 @@ export class ActionList<T> extends Disposable {
 		const containerClientHeight = this._layoutService.getContainer(dom.getWindow(this.domNode)).clientHeight;
 		let listHeight: number;
 		if (this._listOptions?.maxVisibleItems) {
+			// `maxVisibleItems` caps how tall the window can get (and items scroll beyond it), but when there
+			// are FEWER items than that we shrink to fit instead of leaving empty space below. The dropdown is
+			// anchored above its trigger, so a shorter list keeps its bottom edge pinned to the button and the
+			// top edge moves down - exactly the "stick to the dropdown" behaviour we want for short lists.
+			const numHeaders = items.filter(item => item.kind === 'header').length;
+			const numSeparators = items.filter(item => item.kind === 'separator').length;
+			const naturalHeight = items.length * this._actionLineHeight
+				+ numHeaders * (this._headerLineHeight - this._actionLineHeight)
+				+ numSeparators * (this._separatorLineHeight - this._actionLineHeight);
 			const fixedHeight = this._listOptions.maxVisibleItems * this._actionLineHeight;
-			listHeight = Math.min(fixedHeight, containerClientHeight * maxVhPrecentage);
+			listHeight = Math.min(fixedHeight, naturalHeight, containerClientHeight * maxVhPrecentage);
 		} else {
 			const numHeaders = items.filter(item => item.kind === 'header').length;
 			const numSeparators = items.filter(item => item.kind === 'separator').length;
