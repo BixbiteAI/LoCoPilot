@@ -983,6 +983,7 @@ export class ChatListItemRenderer extends Disposable implements ITreeRenderer<Ch
 		const parts: IChatContentPart[] = [];
 
 		let inlineSlashCommandRendered = false;
+		let bubbleNode: HTMLElement | undefined;
 		content.forEach((data, contentIndex) => {
 			const context: IChatContentPartRenderContext = {
 				element,
@@ -1021,6 +1022,9 @@ export class ChatListItemRenderer extends Disposable implements ITreeRenderer<Ch
 
 				if (newPart.domNode) {
 					templateData.value.appendChild(newPart.domNode);
+					if (!bubbleNode && data.kind === 'markdownContent') {
+						bubbleNode = newPart.domNode;
+					}
 				}
 				parts.push(newPart);
 			}
@@ -1039,6 +1043,56 @@ export class ChatListItemRenderer extends Disposable implements ITreeRenderer<Ch
 			}
 			templateData.elementDisposables.add(newPart);
 		}
+
+		if (!element.confirmation && bubbleNode) {
+			this.applyRequestBubbleClamp(templateData, bubbleNode);
+		}
+	}
+
+	/**
+	 * Adds a max-height + internal scroll to long user request bubbles, with a
+	 * "Show more / Show less" toggle to expand the message fully.
+	 */
+	private applyRequestBubbleClamp(templateData: IChatListItemTemplate, bubble: HTMLElement): void {
+		bubble.classList.add('chat-request-clamp');
+
+		const toggle = dom.$('a.chat-request-expand-toggle');
+		toggle.setAttribute('role', 'button');
+		toggle.tabIndex = 0;
+
+		const setExpanded = (expanded: boolean) => {
+			bubble.classList.toggle('expanded', expanded);
+			toggle.textContent = expanded ? localize('chat.showLess', "Show less") : localize('chat.showMore', "Show more");
+		};
+
+		const onToggle = () => setExpanded(!bubble.classList.contains('expanded'));
+		templateData.elementDisposables.add(dom.addDisposableListener(toggle, dom.EventType.CLICK, e => {
+			e.preventDefault();
+			e.stopPropagation();
+			onToggle();
+		}));
+		templateData.elementDisposables.add(dom.addDisposableListener(toggle, dom.EventType.KEY_DOWN, e => {
+			const ev = new StandardKeyboardEvent(e);
+			if (ev.equals(KeyCode.Space) || ev.equals(KeyCode.Enter)) {
+				ev.preventDefault();
+				ev.stopPropagation();
+				onToggle();
+			}
+		}));
+
+		// Measure once laid out, and only surface the toggle when the content actually overflows.
+		templateData.elementDisposables.add(dom.scheduleAtNextAnimationFrame(dom.getWindow(bubble), () => {
+			const overflows = bubble.scrollHeight - bubble.clientHeight > 2;
+			if (overflows) {
+				setExpanded(false);
+				if (toggle.parentElement !== bubble) {
+					bubble.appendChild(toggle);
+				}
+			} else {
+				bubble.classList.remove('chat-request-clamp', 'expanded');
+				toggle.remove();
+			}
+		}));
 	}
 
 	/**

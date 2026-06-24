@@ -2673,6 +2673,41 @@ have to be updated for changes to the rules above, or to support more deeply nes
 		margin-left: auto;
 	}
 
+	/* Clamp tall user request bubbles to a max height with internal scroll */
+	.interactive-item-container.interactive-request .value .rendered-markdown.chat-request-clamp {
+		max-height: 180px;
+		overflow-y: auto;
+	}
+
+	.interactive-item-container.interactive-request .value .rendered-markdown.chat-request-clamp.expanded {
+		max-height: none;
+		overflow-y: visible;
+	}
+
+	/* Chevron toggle pinned to the bottom-right inside the request bubble */
+	.interactive-item-container.interactive-request .value .rendered-markdown.chat-request-clamp {
+		/* room so the chevron never overlaps the last line of text */
+		padding-bottom: 20px;
+	}
+
+	.interactive-item-container.interactive-request .value .chat-request-expand-toggle {
+		position: sticky;
+		bottom: 0;
+		float: right;
+		clear: both;
+		margin: -2px -4px -4px 0;
+		padding: 0 2px;
+		font-size: 11px;
+		cursor: pointer;
+		color: var(--vscode-textLink-foreground);
+		user-select: none;
+	}
+
+	.interactive-item-container.interactive-request .value .chat-request-expand-toggle:hover {
+		color: var(--vscode-textLink-activeForeground);
+		text-decoration: underline;
+	}
+
 	.interactive-item-container.interactive-request .value .rendered-markdown.clickable:hover {
 		cursor: pointer;
 		background-color: var(--vscode-chat-requestBubbleHoverBackground);
