@@ -23,6 +23,7 @@ import {
 	ToolDataSource,
 	ToolProgress
 } from '../languageModelToolsService.js';
+import { buildFileLinkInvocationMessage, resolveToolFileUri } from './toolHelpers.js';
 
 export const CreateFileToolId = 'createFile';
 
@@ -132,9 +133,10 @@ export class CreateFileTool implements IToolImpl {
 		if (!name) {
 			return undefined;
 		}
+		const uri = resolveToolFileUri(path, this.workspaceService);
 		return {
-			invocationMessage: localize('createFile.invoking', "Creating {0}", name),
-			pastTenseMessage: localize('createFile.invoked', "Created {0}", name),
+			invocationMessage: buildFileLinkInvocationMessage(localize('createFile.invoking', "Creating {0}", '{0}'), name, uri),
+			pastTenseMessage: buildFileLinkInvocationMessage(localize('createFile.invoked', "Created {0}", '{0}'), name, uri),
 		};
 	}
 }

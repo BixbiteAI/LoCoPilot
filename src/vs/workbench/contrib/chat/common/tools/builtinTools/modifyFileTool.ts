@@ -33,6 +33,7 @@ import {
 	ToolDataSource,
 	ToolProgress
 } from '../languageModelToolsService.js';
+import { buildFileLinkInvocationMessage, resolveToolFileUri } from './toolHelpers.js';
 
 /** Convert a byte offset and length in content to an editor IRange (1-based line/column). */
 function offsetToRange(content: string, startOffset: number, length: number): IRange {
@@ -373,9 +374,10 @@ export class ModifyFileTool implements IToolImpl {
 		if (!name) {
 			return undefined;
 		}
+		const uri = resolveToolFileUri(path, this.workspaceService);
 		return {
-			invocationMessage: localize('modifyFile.invoking', "Editing {0}", name),
-			pastTenseMessage: localize('modifyFile.invoked', "Edited {0}", name),
+			invocationMessage: buildFileLinkInvocationMessage(localize('modifyFile.invoking', "Editing {0}", '{0}'), name, uri),
+			pastTenseMessage: buildFileLinkInvocationMessage(localize('modifyFile.invoked', "Edited {0}", '{0}'), name, uri),
 		};
 	}
 }

@@ -3,7 +3,7 @@
  *  Licensed under the MIT License. See License.txt in the project root for license information.
  *--------------------------------------------------------------------------------------------*/
 
-import { $, clearNode, hide } from '../../../../../../base/browser/dom.js';
+import { $, addDisposableListener, clearNode, hide } from '../../../../../../base/browser/dom.js';
 import { alert } from '../../../../../../base/browser/ui/aria/aria.js';
 import { DomScrollableElement } from '../../../../../../base/browser/ui/scrollbar/scrollableElement.js';
 import { ScrollbarVisibility } from '../../../../../../base/common/scrollable.js';
@@ -307,6 +307,22 @@ export class ChatThinkingContentPart extends ChatCollapsibleContentPart implemen
 			return this.scrollableElement.getDomNode();
 		}
 
+		// In the non-fixed modes the wrapper is a plain CSS-capped scroll container. The
+		// surrounding chat list (monaco-list) otherwise swallows the wheel event, so the page
+		// scrolls instead of the box. Keep the wheel inside the box until it reaches an edge,
+		// then let it bubble so the conversation continues scrolling naturally.
+		this._register(addDisposableListener(this.wrapper, 'wheel', (e: WheelEvent) => {
+			const el = this.wrapper;
+			if (!el || el.scrollHeight <= el.clientHeight) {
+				return;
+			}
+			const atTop = el.scrollTop <= 0 && e.deltaY < 0;
+			const atBottom = Math.ceil(el.scrollTop + el.clientHeight) >= el.scrollHeight && e.deltaY > 0;
+			if (!atTop && !atBottom) {
+				e.stopPropagation();
+			}
+		}));
+
 		this.updateDropdownClickability();
 		return this.wrapper;
 	}
@@ -327,13 +343,38 @@ export class ChatThinkingContentPart extends ChatCollapsibleContentPart implemen
 		}
 	}
 
+	/**
+	 * Pin the active reasoning view to its latest content. In fixed mode this defers to the
+	 * DomScrollableElement; in the other modes (AutoCollapse / CollapsedPreview / plain
+	 * expanded) the wrapper itself is the scroll container (capped via CSS), so both streaming
+	 * reasoning text and appended tool-call items keep it scrolled to the bottom.
+	 */
+	private scrollActiveViewToBottom(): void {
+		if (this.fixedScrollingMode && this.scrollableElement) {
+			setTimeout(() => this.scrollToBottomIfEnabled(), 0);
+			return;
+		}
+		if (!this.wrapper) {
+			return;
+		}
+		setTimeout(() => {
+			if (this.wrapper) {
+				this.wrapper.scrollTop = this.wrapper.scrollHeight;
+			}
+		}, 0);
+	}
+
 	private scrollToBottomIfEnabled(): void {
 		if (!this.scrollableElement || !this.autoScrollEnabled) {
 			return;
 		}
 
+		// Constrain to the fixed window while actively streaming (whether the block is
+		// expanded or collapsed). The expanded fixed-scrolling view starts expanded, so a
+		// collapsed-only guard would let it grow unbounded as reasoning streams in.
+		const isStreaming = this.fixedScrollingMode && !this.streamingCompleted;
 		const isCollapsed = this.domNode.classList.contains('chat-used-context-collapsed');
-		if (!isCollapsed) {
+		if (!isStreaming && !isCollapsed) {
 			return;
 		}
 
@@ -504,9 +545,7 @@ export class ChatThinkingContentPart extends ChatCollapsibleContentPart implemen
 		this.currentThinkingValue = next;
 		this.renderMarkdown(next, reuseExisting);
 
-		if (this.fixedScrollingMode && this.scrollableElement) {
-			setTimeout(() => this.scrollToBottomIfEnabled(), 0);
-		}
+		this.scrollActiveViewToBottom();
 
 		// Keep the header context-aware as reasoning streams in (e.g. "Thinking…" before any
 		// tool runs). The extracted-title path below handles richer labels when available.
@@ -1144,9 +1183,8 @@ export class ChatThinkingContentPart extends ChatCollapsibleContentPart implemen
 
 		this.wrapper.appendChild(itemWrapper);
 
-		if (this.fixedScrollingMode && this.scrollableElement) {
-			setTimeout(() => this.scrollToBottomIfEnabled(), 0);
-		}
+		// Keep the thinking block pinned to the newest item (tool call / edit) as it streams in.
+		this.scrollActiveViewToBottom();
 	}
 
 	private materializeLazyItem(item: ILazyItem): void {

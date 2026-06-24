@@ -22,6 +22,7 @@ import {
 	ToolDataSource,
 	ToolProgress
 } from '../languageModelToolsService.js';
+import { buildFileLinkInvocationMessage, resolveToolFileUri } from './toolHelpers.js';
 
 export const ReadFileToolId = 'readFile';
 
@@ -209,9 +210,10 @@ export class ReadFileTool implements IToolImpl {
 		if (!name) {
 			return undefined;
 		}
+		const uri = resolveToolFileUri(path, this.workspaceService);
 		return {
-			invocationMessage: localize('readFile.invoking', "Reading {0}", name),
-			pastTenseMessage: localize('readFile.invoked', "Read {0}", name),
+			invocationMessage: buildFileLinkInvocationMessage(localize('readFile.invoking', "Reading {0}", '{0}'), name, uri),
+			pastTenseMessage: buildFileLinkInvocationMessage(localize('readFile.invoked', "Read {0}", '{0}'), name, uri),
 		};
 	}
 }

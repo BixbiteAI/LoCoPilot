@@ -31,6 +31,7 @@ import {
 	ToolDataSource,
 	ToolProgress
 } from '../languageModelToolsService.js';
+import { buildFileLinkInvocationMessage, resolveToolFileUri } from './toolHelpers.js';
 
 /** Convert a byte offset and length in content to an editor IRange (1-based line/column). */
 function offsetToRange(content: string, startOffset: number, length: number): IRange {
@@ -251,9 +252,10 @@ export class StringReplaceTool implements IToolImpl {
 		if (!name) {
 			return undefined;
 		}
+		const uri = resolveToolFileUri(path, this.workspaceService);
 		return {
-			invocationMessage: localize('stringReplace.invoking', "Editing {0}", name),
-			pastTenseMessage: localize('stringReplace.invoked', "Edited {0}", name),
+			invocationMessage: buildFileLinkInvocationMessage(localize('stringReplace.invoking', "Editing {0}", '{0}'), name, uri),
+			pastTenseMessage: buildFileLinkInvocationMessage(localize('stringReplace.invoked', "Edited {0}", '{0}'), name, uri),
 		};
 	}
 }

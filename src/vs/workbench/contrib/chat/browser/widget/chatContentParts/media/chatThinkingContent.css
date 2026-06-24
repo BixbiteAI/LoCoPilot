@@ -22,6 +22,14 @@
 		max-height: none;
 	}
 
+	/* Keep the expanded reasoning box (non-fixed modes) at a fixed window so it never grows */
+	/* unbounded, both while streaming and after it finishes when manually expanded. Content */
+	/* scrolls internally and is auto-scrolled to the latest line in JS during streaming. */
+	&:not(.chat-thinking-fixed-mode):not(.chat-used-context-collapsed) .chat-used-context-list.chat-thinking-collapsible {
+		max-height: 200px;
+		overflow-y: auto;
+	}
+
 	.monaco-button.hidden,
 	.chat-pinned-preview.hidden {
 		display: none;
@@ -210,13 +218,22 @@
 		display: block;
 	}
 
+	/* While streaming and expanded, keep a fixed window so the reasoning block doesn't grow */
+	/* unbounded. Content scrolls internally (auto-scrolled to the latest line in JS). */
 	&:not(.chat-used-context-collapsed) .chat-used-context-list.chat-thinking-collapsible.chat-thinking-streaming {
+		max-height: 200px;
+		overflow: hidden;
+		display: block;
+	}
+
+	/* Once streaming completes, let the expanded block size to its content. */
+	&:not(.chat-used-context-collapsed) .chat-used-context-list.chat-thinking-collapsible:not(.chat-thinking-streaming) {
 		max-height: none;
 		overflow: visible;
 		display: block;
 	}
 
-	&:not(.chat-used-context-collapsed) > .monaco-scrollable-element {
+	&:not(.chat-used-context-collapsed) > .monaco-scrollable-element:has(.chat-used-context-list.chat-thinking-collapsible:not(.chat-thinking-streaming)) {
 		overflow: visible;
 		height: auto;
 
