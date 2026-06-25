@@ -97,7 +97,7 @@ function extractTitleFromThinkingContent(content: string): string | undefined {
  * animation, so the static dots are redundant noise.
  */
 function stripTrailingDots(text: string): string {
-	return text.replace(/[\s.…]+$/, '').trimEnd();
+	return text.replace(/[\s.\u2026]+$/, '').trimEnd();
 }
 
 interface ILazyToolItem {
