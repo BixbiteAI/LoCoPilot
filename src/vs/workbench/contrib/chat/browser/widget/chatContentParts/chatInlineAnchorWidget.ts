@@ -110,6 +110,10 @@ export function renderFileWidgets(element: HTMLElement, instantiationService: II
 					linkText
 				};
 				shouldRenderWidget = true;
+				// Strip the marker so the resource that gets opened is the plain file URI
+				// (a lingering ?vscodeLinkType=... query would mis-key the opened editor).
+				searchParams.delete('vscodeLinkType');
+				uri = uri.with({ query: searchParams.toString() });
 			}
 		}
 

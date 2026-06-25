@@ -6,7 +6,7 @@
 /* eslint-disable @typescript-eslint/no-explicit-any, curly */
 /* eslint-disable local/code-no-in-operator */
 
-import { AsyncIterableSource } from '../../../../base/common/async.js';
+import { AsyncIterableSource, timeout } from '../../../../base/common/async.js';
 import { encodeBase64, streamToBuffer } from '../../../../base/common/buffer.js';
 import { createMarkdownCommandLink } from '../../../../base/common/htmlContent.js';
 import { CancellationToken } from '../../../../base/common/cancellation.js';
@@ -167,18 +167,19 @@ export class LoCoPilotLanguageModelProvider extends Disposable implements ILangu
 	}
 
 	/**
-	 * Chat error panel renders this as Markdown. By the time this shows, auto-start has either been
-	 * turned off or already tried and failed, so we don't offer another "Run" click here - instead we
-	 * point at My Models, where the user can see the server logs and start/stop it manually.
+	 * Chat error panel renders this as Markdown. This shows when the model's server isn't ready yet - often
+	 * just a slow first launch (weights still loading) rather than a hard failure, and the server keeps coming
+	 * up in the background. There is no manual "start" action in the chat panel, so we tell the user to simply
+	 * wait a moment and resend; we still link My Models in case they want to inspect the server logs.
 	 */
 	private _getLocalLlamaServerNotRunningMessage(modelName: string, displayName?: string): string {
 		const label = displayName?.trim() || modelName;
 		const openModels = createMarkdownCommandLink({
-			title: 'Open My Models',
+			title: 'My Models',
 			id: 'workbench.action.chat.openLoCoPilotSettings',
 			arguments: [{ section: LOCOPILOT_SETTINGS_SECTION_LIST_MODELS }],
 		});
-		return `**${label}** could not be started. ${openModels} to view its logs or start it manually.`;
+		return `**${label}** is taking a moment to start. Please wait a few seconds and send your message again. If it keeps happening, open ${openModels} to view its logs.`;
 	}
 
 	/**
@@ -307,6 +308,17 @@ export class LoCoPilotLanguageModelProvider extends Disposable implements ILangu
 			return false;
 		}
 		return /not\s*support|unsupported|isn'?t support|does\s*not\s*support|no endpoints?|cannot|not\s*available|not\s*allowed|invalid|400/.test(m);
+	}
+
+	/**
+	 * True when a streaming request to a *local* server dropped mid-flight in a way that signals the server is
+	 * still coming up rather than a real failure. A freshly-launched llama.cpp/mlx server binds its HTTP port
+	 * (so the readiness probe's GET /models returns 200) a beat before it can actually serve a generation; the
+	 * first chat request then gets its chunked response cut off -> net::ERR_INCOMPLETE_CHUNKED_ENCODING, or a
+	 * bare socket reset (ECONNRESET). These are transient and worth a silent re-wait + retry instead of an error.
+	 */
+	private _isTransientLocalStreamDrop(errMsg: string): boolean {
+		return /ERR_INCOMPLETE_CHUNKED_ENCODING|ERR_EMPTY_RESPONSE|ECONNRESET|socket hang up|premature close|terminated|network error/i.test(errMsg);
 	}
 
 	/**
@@ -1259,7 +1271,37 @@ export class LoCoPilotLanguageModelProvider extends Disposable implements ILangu
 			};
 
 			const errorSink = { body: '' };
-			let status = await this._fetchSSEStream(url, headers, JSON.stringify(body), token, processChunk, errorSink);
+			let status = 0;
+			// A just-started local server can bind its HTTP port (passing the GET /models readiness probe) a
+			// moment before it can actually stream a generation, so the very first request gets cut off mid-stream
+			// (ERR_INCOMPLETE_CHUNKED_ENCODING / connection reset). While nothing has been emitted to the UI yet,
+			// treat that as "still warming up": wait for the server to settle and retry under the same "Working…"
+			// spinner instead of surfacing a scary network error. Only retry when the stream is still empty, so we
+			// never duplicate already-shown text/tool calls.
+			const maxStreamWarmupRetries = 4;
+			for (let streamAttempt = 0; ; streamAttempt++) {
+				try {
+					status = await this._fetchSSEStream(url, headers, JSON.stringify(body), token, processChunk, errorSink);
+					break;
+				} catch (streamErr: unknown) {
+					const dropMsg = streamErr && typeof (streamErr as Error).message === 'string' ? (streamErr as Error).message : String(streamErr);
+					const nothingEmittedYet = emittedContentLen === 0 && emittedThinkLen === 0 && accumulatedToolCalls.size === 0;
+					const canRetry = this._isTransientLocalStreamDrop(dropMsg)
+						&& nothingEmittedYet
+						&& streamAttempt < maxStreamWarmupRetries
+						&& !token.isCancellationRequested
+						&& !this._isCanceledError(dropMsg);
+					if (!canRetry) {
+						throw streamErr;
+					}
+					this._log(`[LoCoPilot Provider] Local server dropped the stream while warming up (attempt ${streamAttempt + 1}/${maxStreamWarmupRetries}); re-waiting for readiness and retrying: ${dropMsg}`);
+					errorSink.body = '';
+					// Re-confirm readiness (re-waits if the server is mid-(re)load) and give it a short, growing
+					// backoff to finish spinning up its generation backend before the next attempt.
+					await this.localModelRunner.ensureServerForModel(model.id, token);
+					await timeout(Math.min(500 * (streamAttempt + 1), 2000));
+				}
+			}
 
 			// Fallback: If 400 error and tools were provided, retry without tools
 			if (status === 400 && body.tools) {

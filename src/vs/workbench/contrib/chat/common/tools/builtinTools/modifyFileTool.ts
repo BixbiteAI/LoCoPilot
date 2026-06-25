@@ -205,6 +205,10 @@ export class ModifyFileTool implements IToolImpl {
 				fileUri = URI.joinPath(workspace.folders[0].uri, params.path);
 			}
 
+			// Basename used for the progress messages below so they show a clickable file chip
+			// (via buildFileLinkInvocationMessage) instead of the full absolute path.
+			const fileName = params.path.split(/[/\\]/).filter(Boolean).pop() ?? params.path;
+
 			const isEmptyOld = params.oldString.length === 0;
 			let fileExists: boolean;
 			let currentContent: string;
@@ -238,7 +242,7 @@ export class ModifyFileTool implements IToolImpl {
 						toolResultError: 'Directory-like empty file refused'
 					};
 				}
-				progress.report({ message: `Creating file ${params.path}` });
+				progress.report({ message: buildFileLinkInvocationMessage(localize('modifyFile.creating', "Creating file {0}", '{0}'), fileName, fileUri) });
 				const content = VSBuffer.fromString(params.newString);
 				await this.fileService.createFile(fileUri, content, { overwrite: false });
 				const lineCount = params.newString.split('\n').length;
@@ -251,7 +255,7 @@ export class ModifyFileTool implements IToolImpl {
 			// --- File exists ---
 			if (isEmptyOld) {
 				// Replace entire file with newString
-				progress.report({ message: `Replacing entire file ${params.path}` });
+				progress.report({ message: buildFileLinkInvocationMessage(localize('modifyFile.replacingEntire', "Replacing entire file {0}", '{0}'), fileName, fileUri) });
 				const newContent = params.newString;
 				const uri = CellUri.parse(fileUri)?.notebook ?? fileUri;
 				const isNotebook = this.notebookService.hasSupportedNotebooks(uri) && this.notebookService.getNotebookTextModel(uri);
@@ -286,7 +290,7 @@ export class ModifyFileTool implements IToolImpl {
 			}
 
 			// --- Partial replace (oldString non-empty) ---
-			progress.report({ message: `Editing ${params.path}` });
+			progress.report({ message: buildFileLinkInvocationMessage(localize('modifyFile.editing', "Editing {0}", '{0}'), fileName, fileUri) });
 
 			if (params.oldString === params.newString) {
 				return {

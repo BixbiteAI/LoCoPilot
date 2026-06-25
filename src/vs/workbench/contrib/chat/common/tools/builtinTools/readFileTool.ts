@@ -105,7 +105,8 @@ export class ReadFileTool implements IToolImpl {
 				fileUri = URI.joinPath(workspace.folders[0].uri, params.path);
 			}
 
-			progress.report({ message: `Reading ${params.path}` });
+			const fileName = params.path.split(/[/\\]/).filter(Boolean).pop() ?? params.path;
+			progress.report({ message: buildFileLinkInvocationMessage(localize('readFile.reading', "Reading {0}", '{0}'), fileName, fileUri) });
 
 			// Check if file exists
 			const stat = await this.fileService.stat(fileUri);

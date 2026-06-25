@@ -42,15 +42,18 @@ export function resolveToolFileUri(path: string | undefined, workspaceService: I
 /**
  * Build a tool invocation message where the file name is a clickable link that opens the file.
  * `template` must be a localized string containing a single `{0}` placeholder (e.g. "Reading {0}").
- * When the path resolves to a URI we substitute an empty-text markdown link, which the chat
- * renderer turns into an inline file widget (shows the basename, opens the file on click). When it
- * can't be resolved, we fall back to the plain file name so the message still reads correctly.
+ * When the path resolves to a URI we substitute a markdown link whose text is the file name and
+ * whose href carries `vscodeLinkType=file`; renderFileWidgets() turns that into an inline file
+ * widget (file icon + name, opens the file on click). The explicit link text (rather than an
+ * empty-text link) guarantees the name survives markdown rendering and stays clickable. When the
+ * path can't be resolved, we fall back to the plain file name so the message still reads correctly.
  */
 export function buildFileLinkInvocationMessage(template: string, name: string, uri: URI | undefined): MarkdownString {
 	if (!uri) {
 		return new MarkdownString(template.replace('{0}', name));
 	}
-	// Empty link text -> renderFileWidgets() renders an inline, clickable file anchor.
-	const link = `[](${uri.toString()})`;
+	// `vscodeLinkType=file` + visible link text -> renderFileWidgets() renders a clickable file chip.
+	const href = uri.with({ query: uri.query ? `${uri.query}&vscodeLinkType=file` : 'vscodeLinkType=file' });
+	const link = `[${name}](${href.toString()})`;
 	return new MarkdownString(template.replace('{0}', link), { isTrusted: true });
 }

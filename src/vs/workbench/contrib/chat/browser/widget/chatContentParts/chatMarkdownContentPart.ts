@@ -82,6 +82,34 @@ interface IMarkdownPartCodeBlockInfo extends IChatCodeBlockInfo {
 	isStreamingEdit: boolean;
 }
 
+/**
+ * Remove `<vscode_codeblock_uri …>…</vscode_codeblock_uri>` markers that appear as plain
+ * paragraph text rather than inside a fenced code block. During live streaming these markers
+ * always sit inside the edit's code fence (where the code-block renderer consumes them to show
+ * the edit pill), but when a session is restored from history the marker can end up as loose
+ * markdown text - which the renderer then escapes and shows verbatim to the user. We strip only
+ * the out-of-fence occurrences so the in-fence ones (needed to render the edit) are preserved.
+ */
+function stripLeakedCodeblockUriMarkers(text: string): string {
+	if (!text.includes('<vscode_codeblock_uri')) {
+		return text;
+	}
+	const fenceRe = /^\s*(```|~~~)/;
+	const markerRe = /<vscode_codeblock_uri[^>]*>.*?<\/vscode_codeblock_uri>/g;
+	let inFence = false;
+	const lines = text.split('\n');
+	for (let i = 0; i < lines.length; i++) {
+		if (fenceRe.test(lines[i])) {
+			inFence = !inFence;
+			continue;
+		}
+		if (!inFence && lines[i].includes('<vscode_codeblock_uri')) {
+			lines[i] = lines[i].replace(markerRe, '');
+		}
+	}
+	return lines.join('\n');
+}
+
 export class ChatMarkdownContentPart extends Disposable implements IChatContentPart {
 
 	private static ID_POOL = 0;
@@ -160,7 +188,14 @@ export class ChatMarkdownContentPart extends Disposable implements IChatContentP
 				breaks: true,
 			};
 
-			const result = this._register(renderer.render(markdown.content, {
+			// Restored-from-history responses can carry codeblock-uri markers as loose paragraph
+			// text; strip those so they aren't shown verbatim (in-fence markers are preserved).
+			const sanitizedContent = {
+				...markdown.content,
+				value: stripLeakedCodeblockUriMarkers(markdown.content.value),
+			};
+
+			const result = this._register(renderer.render(sanitizedContent, {
 				sanitizerConfig: MarkedKatexSupport.getSanitizerOptions({
 					allowedTags: allowedChatMarkdownHtmlTags,
 					allowedAttributes: allowedMarkdownHtmlAttributes,
@@ -168,7 +203,11 @@ export class ChatMarkdownContentPart extends Disposable implements IChatContentP
 				fillInIncompleteTokens,
 				codeBlockRendererSync: (languageId, text, raw) => {
 					const isCodeBlockComplete = !isResponseVM(context.element) || context.element.isComplete || !raw || codeblockHasClosingBackticks(raw);
-					if ((!text || (text.startsWith('<vscode_codeblock_uri') && !text.includes('\n'))) && !isCodeBlockComplete) {
+					// Hide an empty code block (e.g. the leftover edit-placeholder fence in a
+					// restored session) regardless of completion; only hide a marker-only block
+					// while still streaming, so a completed edit still renders its pill below.
+					const isMarkerOnlyStreaming = text.startsWith('<vscode_codeblock_uri') && !text.includes('\n') && !isCodeBlockComplete;
+					if (!text || isMarkerOnlyStreaming) {
 						const hideEmptyCodeblock = $('div');
 						hideEmptyCodeblock.style.display = 'none';
 						return hideEmptyCodeblock;

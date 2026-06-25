@@ -166,6 +166,14 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 		/** Latest parsed load-progress line shown in the loading UI. */
 		loadProgress?: string;
 	}>();
+	/**
+	 * The terminal that owns each model's *current* launch. A model can be stopped and restarted (manual
+	 * Retry, LRU eviction then reuse, engine handoff), which leaves the previous terminal's onExit listener
+	 * still registered. Without an ownership check, that stale exit would delete the freshly-started record
+	 * and fire a bogus "Couldn't start…" crash for a model that is actually running/starting. Each onExit
+	 * compares against this map and ignores the event unless it owns the live launch.
+	 */
+	private readonly _activeLaunchTerminals = new Map<string, ITerminalInstance>();
 	/** Models we are intentionally stopping, so the process-exit handler doesn't report a stop as a crash. */
 	private readonly _intentionalStops = new Set<string>();
 	/** Models whose server process exited before it ever became ready (so readiness polling can bail early). */
@@ -426,6 +434,28 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 	}
 
 	/**
+	 * Cancels an in-flight launch - a model still in its 'starting' phase (terminal spawned, weights loading)
+	 * that has NOT yet been promoted into runningServers. The resident budget must be able to unload these too:
+	 * a rapid model switch (select A in the picker, then select B before A finishes its ~5s startup) otherwise
+	 * leaves A invisible to the count budget, so both end up running. Disposing the launch terminal tears down
+	 * the process; the per-engine launch routine re-checks launch ownership (via _activeLaunchTerminals) before
+	 * promoting, so a cancelled launch will not resurrect itself as a running server.
+	 */
+	private _cancelStartingServer(modelId: string): void {
+		const terminal = this._activeLaunchTerminals.get(modelId);
+		this._intentionalStops.add(modelId); // a llama onExit registered during the window must treat this as a clean stop
+		this._startInFlight.delete(modelId);
+		this._endStarting(modelId);
+		if (terminal) {
+			// Drop ownership first so the launch routine's promotion guard sees the mismatch and aborts; the
+			// llama onExit handler also early-returns on the same mismatch, so no stale crash is reported.
+			this._activeLaunchTerminals.delete(modelId);
+			terminal.dispose();
+		}
+		this._log(`[LoCoPilot Runner] Cancelled in-flight launch for model ${modelId} (resident budget / single-active).`);
+	}
+
+	/**
 	 * Records that a model was just used: bumps its LRU timestamp and (re)arms the idle-unload timer.
 	 * Called on every request path so a model in active use is never evicted.
 	 */
@@ -507,6 +537,19 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 				this.stopServer(id);
 			}
 		}
+		// Same cross-engine guard for launches still in their 'starting' phase (not yet in runningServers).
+		// Without this, selecting a second model before the first finished loading would let two engines come
+		// up at once - the most common path to an out-of-memory abort on a switch.
+		for (const id of Array.from(this.startingServers)) {
+			if (id === keepModelId) {
+				continue;
+			}
+			const kind = await this._intendedServerKind(id);
+			if (kind !== keepKind) {
+				this._log(`[LoCoPilot Runner] Cross-engine switch: cancelling in-flight ${kind} launch ${id} before starting ${keepKind} model ${keepModelId}.`);
+				this._cancelStartingServer(id);
+			}
+		}
 
 		// We are about to add keepModelId, so the others may occupy at most max-1 slots.
 		const evictable = () => Array.from(this.runningServers.entries())
@@ -553,6 +596,19 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 			freedBytes += otherCost.get(lruId) ?? 0;
 			this.stopServer(lruId);
 			others = evictable();
+		}
+
+		// In-flight launches (still 'starting', not yet promoted to runningServers) also occupy a slot against
+		// the count budget. This is the actual cause of "I selected one model, then another, and both run": the
+		// second launch's budget check ran while the first was still in its startup window, so runningServers
+		// looked empty and nothing was evicted. Cancel any *other* still-starting launches that would push the
+		// committed total (resident others + starting others + the incoming model) over the count budget.
+		const residentOtherCount = () => Array.from(this.runningServers.keys()).filter(id => id !== keepModelId).length;
+		const startingOthers = Array.from(this.startingServers).filter(id => id !== keepModelId);
+		while (startingOthers.length > 0 && residentOtherCount() + startingOthers.length + 1 > max) {
+			const victim = startingOthers.pop()!;
+			this._log(`[LoCoPilot Runner] Resident count budget (${max}) reached; cancelling in-flight launch ${victim}.`);
+			this._cancelStartingServer(victim);
 		}
 	}
 
@@ -1314,12 +1370,20 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 					// device memory" -> exit 1). Transient terminals are torn down cleanly on reload, so each
 					// window starts from a clean slate and the pre-warmed model loads reliably.
 					isTransient: true,
+					// Run the server process normally but keep its terminal out of the panel/tab list. The
+					// server logs still flow through terminal.onLineData below (so the in-app "Logs" view in
+					// the model UI keeps working); they just no longer clutter the user's terminal.
+					hideFromUser: true,
 				}
 			});
 
 			const logs: string[] = [];
 			this._crashedBeforeReady.delete(modelId);
 			this._intentionalStops.delete(modelId);
+			// This terminal now owns the model's lifecycle. Any previously-registered onExit (from an earlier
+			// start that was stopped/evicted/retried) will see a mismatch here and ignore its exit, so it can't
+			// clobber this record or raise a false crash for a model that is now running.
+			this._activeLaunchTerminals.set(modelId, terminal);
 
 			this._register(terminal.onLineData(line => {
 				logs.push(line);
@@ -1350,9 +1414,19 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 			// unsupported CPU, etc.) so nothing ever bound the port. Surface a concrete message instead.
 			this._register(terminal.onExit(code => {
 				const exitCode = typeof code === 'number' ? code : undefined;
+				// Ignore exits from a terminal that no longer owns this model's launch. A stale handler firing
+				// after a restart must not delete the new record or report a crash for a model that is now up.
+				if (this._activeLaunchTerminals.get(modelId) !== terminal) {
+					this._log(`[LoCoPilot Runner] Ignoring exit (code ${exitCode ?? 'n/a'}) from a superseded terminal for model ${modelId}.`);
+					return;
+				}
+				this._activeLaunchTerminals.delete(modelId);
 				this._releaseReservedPort(port); // the process is gone; free its port reservation
 				const wasIntentional = this._intentionalStops.delete(modelId);
-				if (this.runningServers.has(modelId)) {
+				// Only delete the record if it is still THIS terminal's record (defensive: a concurrent restart
+				// could have replaced it between the ownership check above and here).
+				const current = this.runningServers.get(modelId);
+				if (current && current.terminal === terminal) {
 					this.runningServers.delete(modelId);
 					this._onDidServerStateChange.fire(modelId);
 				}
@@ -1381,6 +1455,16 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 				this._releaseReservedPort(port);
 				this.startingServers.delete(modelId);
 				this._log(`[LoCoPilot Runner] Not marking ${modelId} as running - it crashed during startup.`);
+				return;
+			}
+
+			// The resident budget may have cancelled this launch while we waited (e.g. the user selected another
+			// model). _cancelStartingServer dropped our ownership and disposed the terminal, so do NOT promote a
+			// dead terminal into runningServers - that was how two models ended up "running" at once.
+			if (this._activeLaunchTerminals.get(modelId) !== terminal) {
+				this._releaseReservedPort(port);
+				this.startingServers.delete(modelId);
+				this._log(`[LoCoPilot Runner] Launch for ${modelId} was superseded/cancelled during startup; not promoting to running.`);
 				return;
 			}
 
@@ -1634,12 +1718,26 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 					// Transient so the process is torn down on window reload instead of being orphaned by the
 					// pty host (see the llama-server launch for the full rationale).
 					isTransient: true,
+					// Keep the server terminal hidden; logs still reach the in-app Logs view via onLineData.
+					hideFromUser: true,
 				}
 			});
+			// Claim launch ownership so the resident budget can cancel this in-flight launch (and the promotion
+			// guard below can detect that cancellation) just like the llama path.
+			this._activeLaunchTerminals.set(modelId, terminal);
 			await new Promise<void>(resolve => setTimeout(resolve, 400));
 			await terminal.sendText(cmdLine, true);
 
 			await timeout(5000);
+
+			// The resident budget may have cancelled this launch while we waited (user selected another model).
+			// Don't promote a disposed terminal into runningServers - that produced two "running" models at once.
+			if (this._activeLaunchTerminals.get(modelId) !== terminal) {
+				this._releaseReservedPort(port);
+				this.startingServers.delete(modelId);
+				this._log(`[LoCoPilot Runner] MLX launch for ${modelId} was superseded/cancelled during startup; not promoting to running.`);
+				return;
+			}
 
 			const logs: string[] = [];
 			this.startingServers.delete(modelId);
@@ -1677,6 +1775,9 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 
 			this._register(terminal.onDisposed(() => {
 				this._releaseReservedPort(port);
+				if (this._activeLaunchTerminals.get(modelId) === terminal) {
+					this._activeLaunchTerminals.delete(modelId);
+				}
 				if (this.runningServers.has(modelId)) {
 					this.runningServers.delete(modelId);
 					this._onDidServerStateChange.fire(modelId);
@@ -1724,6 +1825,8 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 					name: `Ollama - ${model.modelName}`,
 					// Transient so it doesn't get revived/orphaned across window reloads (see llama-server).
 					isTransient: true,
+					// Keep the server terminal hidden; logs still reach the in-app Logs view via onLineData.
+					hideFromUser: true,
 				}
 			});
 			await new Promise<void>(resolve => setTimeout(resolve, 400));
