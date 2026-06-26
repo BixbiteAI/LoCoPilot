@@ -31,6 +31,7 @@ import { IWorkbenchContribution } from '../../../common/contributions.js';
 import { LOCOPILOT_SETTINGS_SECTION_LIST_MODELS } from './chatManagement/locopilotSettingsEditorInput.js';
 
 import { ILoCoPilotLocalModelRunner } from './locopilotLocalModelRunner.js';
+import { ILoCoPilotLiveStatsService } from './locopilotLiveStatsService.js';
 
 /** Shape of a single SSE chunk from an OpenAI-compatible `/chat/completions` stream. */
 interface IOpenAiStreamChunk {
@@ -43,6 +44,20 @@ interface IOpenAiStreamChunk {
 			tool_calls?: Array<{ index?: number; id?: string; function?: { name?: string; arguments?: string | object } }>;
 		};
 	}>;
+	/** llama.cpp's non-standard per-response timing block (present on each chunk with `timings_per_token`). */
+	timings?: {
+		predicted_n?: number;
+		predicted_per_second?: number;
+		prompt_n?: number;
+		cache_n?: number;
+	};
+	/** OpenAI `usage` block, emitted on the final chunk with `stream_options.include_usage`. */
+	usage?: {
+		prompt_tokens?: number;
+		completion_tokens?: number;
+		total_tokens?: number;
+		prompt_tokens_details?: { cached_tokens?: number };
+	};
 }
 
 export class LoCoPilotLanguageModelProvider extends Disposable implements ILanguageModelChatProvider, IWorkbenchContribution {
@@ -60,6 +75,7 @@ export class LoCoPilotLanguageModelProvider extends Disposable implements ILangu
 		@INotificationService private readonly notificationService: INotificationService,
 		@IStorageService private readonly storageService: IStorageService,
 		@ITimerService private readonly timerService: ITimerService,
+		@ILoCoPilotLiveStatsService private readonly liveStatsService: ILoCoPilotLiveStatsService,
 	) {
 		super();
 		this._log('[LoCoPilot] Initializing Language Model Provider');
@@ -216,6 +232,33 @@ export class LoCoPilotLanguageModelProvider extends Disposable implements ILangu
 		}
 		const t = delta.reasoning_content ?? delta.reasoning ?? delta.thinking;
 		return typeof t === 'string' && t.length > 0 ? t : undefined;
+	}
+
+	/**
+	 * Pull real generation stats out of a local-server SSE chunk into the live-stats service so the timer bar
+	 * can show exact tokens / tokens-per-second instead of a word-count estimate. `timings` (llama.cpp) rides
+	 * on every chunk; `usage` arrives on the final chunk. Both are absent for servers that don't support them,
+	 * in which case nothing is recorded and the UI falls back to the estimate.
+	 */
+	private _ingestServerStats(json: unknown, report: boolean): void {
+		if (!report) {
+			return;
+		}
+		const chunk = json as IOpenAiStreamChunk;
+		const timings = chunk?.timings;
+		const usage = chunk?.usage;
+		if (!timings && !usage) {
+			return;
+		}
+		this.liveStatsService.update({
+			// usage is authoritative for token counts; timings.predicted_n tracks it live mid-stream.
+			completionTokens: usage?.completion_tokens ?? timings?.predicted_n,
+			promptTokens: usage?.prompt_tokens ?? timings?.prompt_n,
+			tokensPerSecond: typeof timings?.predicted_per_second === 'number'
+				? Math.round(timings.predicted_per_second)
+				: undefined,
+			cachedTokens: usage?.prompt_tokens_details?.cached_tokens ?? timings?.cache_n,
+		});
 	}
 
 	async provideLanguageModelChatInfo(options: ILanguageModelChatInfoOptions, token: CancellationToken): Promise<ILanguageModelChatMetadataAndIdentifier[]> {
@@ -1135,9 +1178,21 @@ export class LoCoPilotLanguageModelProvider extends Disposable implements ILangu
 			messages: mappedMessages,
 			stream: true,
 			temperature: 0.3,
-			max_tokens: maxOutputTokens
+			max_tokens: maxOutputTokens,
+			// Ask the local server (llama.cpp / mlx_lm) for real token counts and a measured generation rate
+			// so the timer bar can show exact "tokens" and "tokens/sec" instead of a word-count estimate.
+			// `timings_per_token` makes llama.cpp attach its `timings` block (predicted_n, predicted_per_second)
+			// to every SSE chunk; `stream_options.include_usage` guarantees a final OpenAI `usage` block.
+			timings_per_token: true,
+			stream_options: { include_usage: true }
 		};
 		this._applyOpenAiReasoningEffort(body, servedModelId, true /* local */);
+		// Only the foreground panel turn drives the timer bar's token/rate display. Background/auxiliary calls
+		// (title generation, context compaction, probes) must not touch the live stats or they leak phantom
+		// tokens into the panel before the user's own generation starts.
+		const reportStats = options.locopilotForegroundTurn === true;
+		// Start a fresh server-stats call for this agent iteration (totals accumulate across the turn).
+		if (reportStats) { this.liveStatsService.beginCall(); }
 
 		// Add tools if provided.
 		// Fallback logic: if the request is too large for the local context (4096), 
@@ -1219,6 +1274,10 @@ export class LoCoPilotLanguageModelProvider extends Disposable implements ILangu
 			let suppressingThinkText = false;
 
 			const processChunk = (json: unknown): void => {
+				// Real generation stats from the local server. llama.cpp puts a `timings` block on each chunk
+				// (with `timings_per_token`); both engines emit an OpenAI `usage` block on the final chunk
+				// (with `stream_options.include_usage`). Prefer these exact numbers over the word estimate.
+				this._ingestServerStats(json, reportStats);
 				const choice = (json as IOpenAiStreamChunk).choices?.[0];
 				const localReasoning = this._reasoningTextFromOpenAiDelta(choice?.delta);
 				if (localReasoning) {
@@ -1596,9 +1655,15 @@ export class LoCoPilotLanguageModelProvider extends Disposable implements ILangu
 			messages: mappedMessages,
 			stream: true,
 			temperature: 0.3,
-			max_tokens: maxOutputTokens
+			max_tokens: maxOutputTokens,
+			// Real token counts + measured rate (ignored by servers that don't support them). See _callLocalModel.
+			timings_per_token: true,
+			stream_options: { include_usage: true }
 		};
 		this._applyOpenAiReasoningEffort(body, openAiModel, true /* local */);
+		// Only the foreground panel turn drives the timer bar (see _callLocalModel).
+		const reportStats = options.locopilotForegroundTurn === true;
+		if (reportStats) { this.liveStatsService.beginCall(); }
 
 		// Add tools if provided
 		if (options.tools && Array.isArray(options.tools) && options.tools.length > 0) {
@@ -1677,6 +1742,10 @@ export class LoCoPilotLanguageModelProvider extends Disposable implements ILangu
 			let suppressingThinkText = false;
 
 			const processChunk = (json: unknown): void => {
+				// Real generation stats from the local server. llama.cpp puts a `timings` block on each chunk
+				// (with `timings_per_token`); both engines emit an OpenAI `usage` block on the final chunk
+				// (with `stream_options.include_usage`). Prefer these exact numbers over the word estimate.
+				this._ingestServerStats(json, reportStats);
 				const choice = (json as IOpenAiStreamChunk).choices?.[0];
 				const localReasoning = this._reasoningTextFromOpenAiDelta(choice?.delta);
 				if (localReasoning) {

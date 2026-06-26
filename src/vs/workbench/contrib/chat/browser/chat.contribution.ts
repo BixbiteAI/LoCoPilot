@@ -69,6 +69,7 @@ import { LoCoPilotUpdateCheckContribution } from './locopilotUpdateCheckService.
 import { ILoCoPilotLocalModelRunner, LoCoPilotLocalModelRunner } from './locopilotLocalModelRunner.js';
 import { ILoCoPilotOllamaService, LoCoPilotOllamaService } from './locopilotOllamaService.js';
 import { ILoCoPilotProjectMemoryService, LoCoPilotProjectMemoryService } from './locopilotProjectMemoryService.js';
+import { ILoCoPilotLiveStatsService, LoCoPilotLiveStatsService } from './locopilotLiveStatsService.js';
 import { LoCoPilotProjectMemoryToolsContribution } from './tools/projectMemoryToolsContribution.js';
 import { LanguageModelToolsExtensionPointHandler } from '../common/tools/languageModelToolsContribution.js';
 import { BuiltinToolsContribution } from '../common/tools/builtinTools/tools.js';
@@ -1689,5 +1690,6 @@ registerSingleton(ILoCoPilotAgentSettingsService, LoCoPilotAgentSettingsService,
 registerSingleton(ILoCoPilotProjectMemoryService, LoCoPilotProjectMemoryService, InstantiationType.Delayed);
 registerSingleton(ILoCoPilotLocalModelRunner, LoCoPilotLocalModelRunner, InstantiationType.Delayed);
 registerSingleton(ILoCoPilotOllamaService, LoCoPilotOllamaService, InstantiationType.Delayed);
+registerSingleton(ILoCoPilotLiveStatsService, LoCoPilotLiveStatsService, InstantiationType.Delayed);
 
 ChatWidget.CONTRIBS.push(ChatDynamicVariableModel);

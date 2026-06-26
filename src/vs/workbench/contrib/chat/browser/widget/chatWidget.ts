@@ -44,6 +44,7 @@ import { EditorResourceAccessor } from '../../../../common/editor.js';
 import { IEditorService } from '../../../../services/editor/common/editorService.js';
 import { IChatEntitlementService } from '../../../../services/chat/common/chatEntitlementService.js';
 import { ILifecycleService } from '../../../../services/lifecycle/common/lifecycle.js';
+import { ILoCoPilotLiveStatsService } from '../locopilotLiveStatsService.js';
 import { checkModeOption } from '../../common/chat.js';
 import { IChatAgentAttachmentCapabilities, IChatAgentCommand, IChatAgentData, IChatAgentService } from '../../common/participants/chatAgents.js';
 import { ChatContextKeys } from '../../common/actions/chatContextKeys.js';
@@ -233,6 +234,8 @@ export class ChatWidget extends Disposable implements IChatWidget {
 	private bodyDimension: dom.Dimension | undefined;
 	private visibleChangeCount = 0;
 	private requestInProgress: IContextKey<boolean>;
+	/** Tracks the rising edge of an active request so we can reset live server stats once per turn. */
+	private _liveStatsTimerActive = false;
 	private agentInInput: IContextKey<boolean>;
 	private currentRequest: Promise<void> | undefined;
 
@@ -360,7 +363,8 @@ export class ChatWidget extends Disposable implements IChatWidget {
 		@IChatSessionsService private readonly chatSessionsService: IChatSessionsService,
 		@IAgentSessionsService private readonly agentSessionsService: IAgentSessionsService,
 		@IChatTodoListService private readonly chatTodoListService: IChatTodoListService,
-		@ILifecycleService private readonly lifecycleService: ILifecycleService
+		@ILifecycleService private readonly lifecycleService: ILifecycleService,
+		@ILoCoPilotLiveStatsService private readonly liveStatsService: ILoCoPilotLiveStatsService
 	) {
 		super();
 
@@ -1788,6 +1792,14 @@ export class ChatWidget extends Disposable implements IChatWidget {
 			// so the displayed total time is continuous rather than resetting after each approval.
 			const needsInput = !!this.viewModel.model.requestNeedsInput.get();
 			const timerActive = inProgress || needsInput;
+			if (timerActive && !this._liveStatsTimerActive) {
+				// Rising edge of a request (idle -> active) = a new turn. Clear server-reported token/rate stats
+				// here - reliable regardless of which onDidChange event batch we're in, unlike keying off the
+				// 'addRequest' event, which can land on a different tick than the timer start and would otherwise
+				// let the previous turn's totals linger during the next prompt's long processing phase.
+				this.liveStatsService.reset();
+			}
+			this._liveStatsTimerActive = timerActive;
 			this.inputPart.setRequestInProgress(timerActive, () => {
 				const last = vm.getItems().findLast(item => isResponseVM(item)) as { response?: { value: ReadonlyArray<{ kind: string; value?: string | string[] }> }; contentUpdateTimings?: { lastWordCount: number; impliedWordLoadRate: number } } | undefined;
 				const timings = last?.contentUpdateTimings;
@@ -1800,14 +1812,20 @@ export class ChatWidget extends Disposable implements IChatWidget {
 						}
 					}
 				}
+				// Real stats from a local server (llama.cpp / mlx_lm), when available. These are exact token
+				// counts and a measured rate; the timer bar prefers them over the word-count estimate below.
+				const server = this.liveStatsService.get();
+				const serverTokens = typeof server?.completionTokens === 'number' ? server.completionTokens : undefined;
+				const serverTokensPerSecond = typeof server?.tokensPerSecond === 'number' ? server.tokensPerSecond : undefined;
+				const serverPromptTokens = typeof server?.promptTokens === 'number' ? server.promptTokens : undefined;
 				if (timings) {
-					return { ...timings, thinkingWordCount };
+					return { ...timings, thinkingWordCount, serverTokens, serverTokensPerSecond, serverPromptTokens };
 				}
 				// During the pure-reasoning phase no output text has streamed yet, so
 				// `contentUpdateTimings` is undefined. Still surface thinking tokens so the
 				// counter isn't blank while the model is only reasoning.
-				if (thinkingWordCount > 0) {
-					return { lastWordCount: 0, impliedWordLoadRate: 0, thinkingWordCount };
+				if (thinkingWordCount > 0 || serverTokens !== undefined) {
+					return { lastWordCount: 0, impliedWordLoadRate: 0, thinkingWordCount, serverTokens, serverTokensPerSecond, serverPromptTokens };
 				}
 				return undefined;
 			}, needsInput);

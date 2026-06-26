@@ -162,6 +162,10 @@ export class UnifiedAgent {
 			// Send request to LLM with tools
 			const tools = this.formatToolsForLLM(allTools, llmNameById);
 			const options: any = {};
+			// Mark this as the foreground panel turn so the provider reports real token/rate stats to the timer
+			// bar for it only. Background/auxiliary model calls (title generation, context compaction, capability
+			// probes) don't set this, so their tokens never leak into the panel's "tokens / tokens-per-sec" display.
+			options.locopilotForegroundTurn = true;
 			if (tools.length > 0) {
 				options.tools = tools;
 				this._log(`[LoCoPilot] Sending ${tools.length} tools to LLM`);

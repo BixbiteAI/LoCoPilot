@@ -2171,7 +2171,7 @@ export class ChatInputPart extends Disposable implements IHistoryNavigationWidge
 		return `${thousands.toFixed(1).replace(/\.0$/, '')}k`;
 	}
 
-	public setRequestInProgress(inProgress: boolean, getStats?: () => { lastWordCount: number; impliedWordLoadRate: number; thinkingWordCount?: number } | undefined, paused?: boolean): void {
+	public setRequestInProgress(inProgress: boolean, getStats?: () => { lastWordCount: number; impliedWordLoadRate: number; thinkingWordCount?: number; serverTokens?: number; serverTokensPerSecond?: number; serverPromptTokens?: number } | undefined, paused?: boolean): void {
 		if (!this._timerBar) {
 			return;
 		}
@@ -2240,15 +2240,17 @@ export class ChatInputPart extends Disposable implements IHistoryNavigationWidge
 					const elapsed = Math.max(0, Math.floor(elapsedMs / 1000));
 					const isPaused = this._timerPauseStartedAt !== undefined;
 					const stats = getStats?.();
-					// The underlying stats are word counts. Convert to an estimated token
-					// count using an average words->tokens ratio (~1.4 tokens per word for
-					// typical English/code output). This is an estimate, not an exact count.
+					// Local servers (llama.cpp / mlx_lm) report exact token counts and a measured generation
+					// rate; when present we show those true numbers instead of the word-count estimate. Remote
+					// providers don't, so we fall back to converting words->tokens (~1.4 tokens/word).
+					const hasServerStats = typeof stats?.serverTokens === 'number';
 					const outputWords = stats?.lastWordCount ?? 0;
 					const thinkingWords = stats?.thinkingWordCount ?? 0;
 					const totalWords = outputWords + thinkingWords;
 					const outputTokens = Math.round(outputWords * ChatInputPart.WORDS_TO_TOKENS);
 					const thinkingTokens = Math.round(thinkingWords * ChatInputPart.WORDS_TO_TOKENS);
-					const totalTokens = outputTokens + thinkingTokens;
+					// Real generated-token total from the server, or the word-based estimate as a fallback.
+					const totalTokens = hasServerStats ? stats!.serverTokens! : (outputTokens + thinkingTokens);
 					// Use the stream tracker's implied load rate (words/sec) which ignores
 					// pauses for tool calls, latency and thinking gaps, rather than dividing
 					// by total wall-clock elapsed time. Convert that rate to tokens/sec.
@@ -2256,8 +2258,11 @@ export class ChatInputPart extends Disposable implements IHistoryNavigationWidge
 					// (active generation). A wall-clock fallback over total elapsed time would
 					// include reasoning/tool/latency gaps and report a misleadingly low rate,
 					// so during those gaps we hide the rate rather than show a wrong number.
+					// Prefer the server's measured tokens/sec; otherwise convert the estimated word rate.
 					const wordRate = stats?.impliedWordLoadRate ?? 0;
-					const rate = wordRate > 0 ? Math.round(wordRate * ChatInputPart.WORDS_TO_TOKENS) : 0;
+					const rate = typeof stats?.serverTokensPerSecond === 'number'
+						? Math.round(stats.serverTokensPerSecond)
+						: (wordRate > 0 ? Math.round(wordRate * ChatInputPart.WORDS_TO_TOKENS) : 0);
 
 					// Detect whether output is actively streaming. The implied rate above is
 					// retained by the tracker between updates, so we additionally require that
@@ -2282,7 +2287,12 @@ export class ChatInputPart extends Disposable implements IHistoryNavigationWidge
 					const isThinkingStreaming = !isStreaming && lastThinkingChangeAt > 0 && (now - lastThinkingChangeAt) < RATE_IDLE_TIMEOUT_MS;
 					const thinkingElapsedMs = thinkingStartedAt > 0 ? now - thinkingStartedAt : 0;
 					const thinkingRate = isThinkingStreaming && thinkingElapsedMs > 0 ? Math.round(thinkingTokens / (thinkingElapsedMs / 1000)) : 0;
-					const effectiveRate = isStreaming ? rate : thinkingRate;
+					// With a real server rate, use it whenever generation is active (output or reasoning); the
+					// server's measured tokens/sec already covers reasoning tokens. Otherwise fall back to the
+					// phase-specific word-estimate rate.
+					const effectiveRate = hasServerStats
+						? ((isStreaming || isThinkingStreaming) ? rate : 0)
+						: (isStreaming ? rate : thinkingRate);
 
 					timeEl.textContent = ChatInputPart.formatElapsed(elapsed);
 
@@ -2290,10 +2300,18 @@ export class ChatInputPart extends Disposable implements IHistoryNavigationWidge
 					sep1.style.display = hasTok ? '' : 'none';
 					tokEl.style.display = hasTok ? '' : 'none';
 					if (hasTok) {
-						tokEl.textContent = `~${ChatInputPart.formatTokenCount(totalTokens)} tokens`;
-						tokEl.title = thinkingTokens > 0
-							? `~${outputTokens} output + ~${thinkingTokens} thinking (estimated from ${totalWords} words)`
-							: `Estimated from ${totalWords} words`;
+						// Real server counts show an exact figure; the word estimate keeps the "~" prefix.
+						tokEl.textContent = `${hasServerStats ? '' : '~'}${ChatInputPart.formatTokenCount(totalTokens)} tokens`;
+						if (hasServerStats) {
+							const prompt = stats?.serverPromptTokens;
+							tokEl.title = typeof prompt === 'number'
+								? `${totalTokens} generated tokens (+ ${prompt} prompt tokens), reported by the local server`
+								: `${totalTokens} generated tokens, reported by the local server`;
+						} else {
+							tokEl.title = thinkingTokens > 0
+								? `~${outputTokens} output + ~${thinkingTokens} thinking (estimated from ${totalWords} words)`
+								: `Estimated from ${totalWords} words`;
+						}
 					}
 
 					// While paused awaiting approval nothing is generating, so a stale rate would
