@@ -49,6 +49,7 @@ import { IEditorGroupView } from './editor.js';
 import './media/breadcrumbscontrol.css';
 import { ScrollbarVisibility } from '../../../../base/common/scrollable.js';
 import { CancellationToken } from '../../../../base/common/cancellation.js';
+import { ICommandService } from '../../../../platform/commands/common/commands.js';
 
 class OutlineItem extends BreadcrumbsItem {
 
@@ -215,6 +216,28 @@ export interface IBreadcrumbsControlOptions {
 
 const separatorIcon = registerIcon('breadcrumb-separator', Codicon.chevronRight, localize('separatorIcon', 'Icon for the separator in the breadcrumbs.'));
 
+// Preview toggle (far right of breadcrumbs). Kept in sync with the matching
+// command + view-type + extension list in `contrib/htmlPreview/browser/htmlPreview.contribution.ts`.
+const TOGGLE_PREVIEW_COMMAND_ID = 'locopilot.preview.toggle';
+const PREVIEW_EDITOR_VIEW_TYPE = 'locopilot.preview';
+const PREVIEW_TOGGLE_WIDTH = 80;
+const MARKDOWN_PREVIEW_EXTENSIONS = new Set(['md', 'markdown', 'mdown', 'mkd', 'mkdn']);
+const HTML_PREVIEW_EXTENSIONS = new Set(['html', 'htm', 'xhtml']);
+
+function getPreviewKind(uri: URI | undefined): 'markdown' | 'html' | undefined {
+	if (!uri) {
+		return undefined;
+	}
+	const ext = (uri.path.split('.').pop() ?? '').toLowerCase();
+	if (MARKDOWN_PREVIEW_EXTENSIONS.has(ext)) {
+		return 'markdown';
+	}
+	if (HTML_PREVIEW_EXTENSIONS.has(ext)) {
+		return 'html';
+	}
+	return undefined;
+}
+
 export class BreadcrumbsControl {
 
 	static readonly HEIGHT = 22;
@@ -249,6 +272,8 @@ export class BreadcrumbsControl {
 
 	readonly domNode: HTMLDivElement;
 	private readonly _widget: BreadcrumbsWidget;
+	private readonly _previewToggle: HTMLDivElement;
+	private _previewToggleVisible = false;
 
 	private readonly _disposables = new DisposableStore();
 	private readonly _breadcrumbsDisposables = new DisposableStore();
@@ -274,7 +299,8 @@ export class BreadcrumbsControl {
 		@IEditorService private readonly _editorService: IEditorService,
 		@ILabelService private readonly _labelService: ILabelService,
 		@IConfigurationService configurationService: IConfigurationService,
-		@IBreadcrumbsService breadcrumbsService: IBreadcrumbsService
+		@IBreadcrumbsService breadcrumbsService: IBreadcrumbsService,
+		@ICommandService private readonly _commandService: ICommandService
 	) {
 		this.domNode = document.createElement('div');
 		this.domNode.classList.add('breadcrumbs-control');
@@ -309,6 +335,23 @@ export class BreadcrumbsControl {
 		this._hoverDelegate = getDefaultHoverDelegate('mouse');
 
 		this._disposables.add(breadcrumbsService.register(this._editorGroup.id, this._widget));
+
+		// Preview toggle button at the far right of the breadcrumbs row. Renders
+		// markdown/HTML files in a preview, and is hidden for all other files.
+		this._previewToggle = dom.append(this.domNode, dom.$('div.breadcrumbs-preview-toggle.hidden'));
+		this._previewToggle.setAttribute('role', 'button');
+		this._previewToggle.tabIndex = 0;
+		this._disposables.add(dom.addDisposableListener(this._previewToggle, dom.EventType.MOUSE_DOWN, e => {
+			// Prevent the editor/tab from stealing focus before we run the command.
+			e.preventDefault();
+			e.stopPropagation();
+		}));
+		this._disposables.add(dom.addDisposableListener(this._previewToggle, dom.EventType.CLICK, e => {
+			e.preventDefault();
+			e.stopPropagation();
+			this._togglePreview();
+		}));
+
 		this.hide();
 	}
 
@@ -333,7 +376,49 @@ export class BreadcrumbsControl {
 	}
 
 	layout(dim: dom.Dimension | undefined): void {
-		this._widget.layout(dim);
+		if (dim && this._previewToggleVisible) {
+			// Reserve room on the right for the preview toggle button.
+			this._widget.layout(new dom.Dimension(Math.max(0, dim.width - PREVIEW_TOGGLE_WIDTH), dim.height));
+		} else {
+			this._widget.layout(dim);
+		}
+	}
+
+	private _togglePreview(): void {
+		const uri = EditorResourceAccessor.getOriginalUri(this._editorGroup.activeEditor, { supportSideBySide: SideBySideEditor.PRIMARY });
+		if (getPreviewKind(uri)) {
+			this._commandService.executeCommand(TOGGLE_PREVIEW_COMMAND_ID, uri);
+		}
+	}
+
+	private _updatePreviewToggle(uri: URI | undefined): void {
+		const kind = getPreviewKind(uri);
+		const visible = !!kind;
+
+		if (visible) {
+			// When the rendered preview is showing, the button flips to the source
+			// language so the user can switch back; otherwise it offers a preview.
+			const inPreview = this._editorGroup.activeEditor?.editorId === PREVIEW_EDITOR_VIEW_TYPE;
+			if (inPreview) {
+				this._previewToggle.textContent = kind === 'markdown'
+					? localize('previewToggle.toMarkdown', "Markdown")
+					: localize('previewToggle.toHtml', "HTML");
+				this._previewToggle.title = localize('previewToggle.showSource', "Show Source");
+			} else {
+				this._previewToggle.textContent = localize('previewToggle.preview', "Preview");
+				this._previewToggle.title = kind === 'markdown'
+					? localize('previewToggle.previewMarkdown', "Preview Markdown")
+					: localize('previewToggle.previewHtml', "Preview HTML");
+			}
+		}
+
+		if (visible === this._previewToggleVisible) {
+			return;
+		}
+		this._previewToggleVisible = visible;
+		this._previewToggle.classList.toggle('hidden', !visible);
+		// Re-layout so the breadcrumbs widget makes room for (or reclaims) the button.
+		this._editorGroup.relayout();
 	}
 
 	isHidden(): boolean {
@@ -346,6 +431,7 @@ export class BreadcrumbsControl {
 		this._breadcrumbsDisposables.clear();
 		this._ckBreadcrumbsVisible.set(false);
 		this.domNode.classList.toggle('hidden', true);
+		this._updatePreviewToggle(undefined);
 
 		if (!wasHidden) {
 			this._onDidVisibilityChange.fire();
@@ -391,6 +477,7 @@ export class BreadcrumbsControl {
 
 		this.show();
 		this._ckBreadcrumbsPossible.set(true);
+		this._updatePreviewToggle(fileInfoUri ?? uri);
 
 		const model = this._instantiationService.createInstance(BreadcrumbsModel,
 			fileInfoUri ?? uri,

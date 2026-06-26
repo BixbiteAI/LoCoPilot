@@ -347,6 +347,9 @@ import './contrib/themes/browser/themes.contribution.js';
 // Update
 import './contrib/update/browser/update.contribution.js';
 
+// HTML / Markdown preview toggle (breadcrumbs)
+import './contrib/htmlPreview/browser/htmlPreview.contribution.js';
+
 // Surveys
 import './contrib/surveys/browser/nps.contribution.js';
 import './contrib/surveys/browser/languageSurveys.contribution.js';

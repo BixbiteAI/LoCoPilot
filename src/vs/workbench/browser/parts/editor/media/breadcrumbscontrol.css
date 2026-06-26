@@ -7,6 +7,51 @@
 	display: none;
 }
 
+.monaco-workbench .part.editor > .content .editor-group-container .breadcrumbs-control {
+	display: flex;
+	align-items: center;
+}
+
+/* The breadcrumbs widget is sized explicitly via layout(); keep it from growing past the toggle. */
+.monaco-workbench .part.editor > .content .editor-group-container .breadcrumbs-control > .monaco-scrollable-element {
+	flex: 0 0 auto;
+}
+
+.monaco-workbench .part.editor > .content .editor-group-container .breadcrumbs-control .breadcrumbs-preview-toggle {
+	flex: 0 0 auto;
+	margin-left: auto;
+	height: 18px;
+	line-height: 18px;
+	padding: 0 8px;
+	margin-right: 6px;
+	display: flex;
+	align-items: center;
+	justify-content: center;
+	cursor: pointer;
+	font-size: 11px;
+	white-space: nowrap;
+	opacity: 0.85;
+	border-radius: 4px;
+	border: 1px solid var(--vscode-contrastBorder, transparent);
+	background-color: var(--vscode-badge-background);
+	color: var(--vscode-badge-foreground);
+	outline: none;
+}
+
+.monaco-workbench .part.editor > .content .editor-group-container .breadcrumbs-control .breadcrumbs-preview-toggle:focus,
+.monaco-workbench .part.editor > .content .editor-group-container .breadcrumbs-control .breadcrumbs-preview-toggle:focus-visible {
+	outline: none;
+}
+
+.monaco-workbench .part.editor > .content .editor-group-container .breadcrumbs-control .breadcrumbs-preview-toggle.hidden {
+	display: none;
+}
+
+.monaco-workbench .part.editor > .content .editor-group-container .breadcrumbs-control .breadcrumbs-preview-toggle:hover {
+	opacity: 1;
+	background-color: var(--vscode-toolbar-hoverBackground);
+}
+
 .monaco-workbench .part.editor > .content .editor-group-container .breadcrumbs-control .monaco-breadcrumb-item.selected .monaco-icon-label,
 .monaco-workbench .part.editor > .content .editor-group-container .breadcrumbs-control .monaco-breadcrumb-item.focused .monaco-icon-label {
 	text-decoration-line: underline;
