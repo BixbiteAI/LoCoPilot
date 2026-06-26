@@ -122,7 +122,7 @@ export class UnifiedAgent {
 
 		// Get model metadata and available tools
 		const modelMetadata = this.languageModelsService.lookupLanguageModel(modelId);
-		const allTools = await this.getAvailableTools(modelMetadata, request);
+		const allTools = await this.getAvailableTools(modelMetadata, request.userSelectedTools);
 
 		// LLM providers (Anthropic/OpenAI) require function names matching ^[a-zA-Z0-9_-]{1,64}$.
 		// Built-in tool ids satisfy this, but MCP/extension tool ids can contain other characters
@@ -434,6 +434,56 @@ export class UnifiedAgent {
 	}
 
 	/**
+	 * Pre-process the stable system+tools prefix on the model server so the user's FIRST real message
+	 * doesn't pay the full cold prompt-eval cost (on local models this prefix is ~thousands of tokens
+	 * and can take >2 minutes to process from cold). We send the EXACT same system prompt + tool set a
+	 * real agent turn sends, with a trivial user message, as a background (non-foreground) call. The
+	 * llama.cpp prompt cache then holds the system+tools prefix; the first real turn matches it by
+	 * longest-common-prefix and only processes the few new user tokens.
+	 *
+	 * For local models, sendChatRequest also auto-starts the server and waits for readiness, so this
+	 * doubles as "start the server on selection" without any extra plumbing. Best-effort: every
+	 * failure is swallowed (the model may not be downloaded, the server may be busy, etc.).
+	 */
+	async warmUp(modelId: string, systemPrompt: string, token: CancellationToken): Promise<void> {
+		try {
+			const modelMetadata = this.languageModelsService.lookupLanguageModel(modelId);
+			// Same tool set a real turn sends with the default (no explicit) tool selection.
+			const allTools = await this.getAvailableTools(modelMetadata, {});
+			const { llmNameById } = this.buildToolNameMap(allTools);
+			const tools = this.formatToolsForLLM(allTools, llmNameById);
+
+			const messages: IChatMessage[] = [
+				{ role: ChatMessageRole.System, content: [{ type: 'text', value: systemPrompt }] },
+				{ role: ChatMessageRole.User, content: [{ type: 'text', value: 'hi' }] },
+			];
+			const options: any = { locopilotForegroundTurn: false };
+			if (tools.length > 0) {
+				options.tools = tools;
+			}
+
+			this._log(`[LoCoPilot] Warming prefix for ${modelId} (${tools.length} tools)...`);
+			const response = await this.languageModelsService.sendChatRequest(
+				modelId,
+				nullExtensionDescription.identifier,
+				messages,
+				options,
+				token
+			);
+			// Drain the stream; we discard the output - only the cached prefix matters.
+			for await (const _ of response.stream) {
+				if (token.isCancellationRequested) {
+					break;
+				}
+			}
+			await response.result;
+			this._log(`[LoCoPilot] Prefix warm-up completed for ${modelId}`);
+		} catch (e) {
+			this._log(`[LoCoPilot] Prefix warm-up failed (ignored): ${e}`);
+		}
+	}
+
+	/**
 	 * Execute a single tool call and format its result for the conversation.
 	 * Returns the tool_result message plus any image parts to surface to the model for vision.
 	 * Never throws - tool errors are returned as an error tool_result so the loop can recover.
@@ -616,9 +666,9 @@ export class UnifiedAgent {
 	/**
 	 * Get available tools for the model, filtered by user selection and model compatibility
 	 */
-	private async getAvailableTools(modelMetadata: any, request: IChatAgentRequest): Promise<IToolData[]> {
+	private async getAvailableTools(modelMetadata: any, userSelectedTools: IChatAgentRequest['userSelectedTools']): Promise<IToolData[]> {
 		const allTools = Array.from(this.toolsService.getTools(undefined));
-		const userSelectedTools = request.userSelectedTools || {};
+		const selected = userSelectedTools || {};
 
 		// Filter tools
 		const availableTools = allTools.filter(tool => {
@@ -629,9 +679,9 @@ export class UnifiedAgent {
 
 			// Check user selection (if specified)
 			const toolId = tool.id;
-			if (Object.keys(userSelectedTools).length > 0) {
+			if (Object.keys(selected).length > 0) {
 				// User has made explicit selections
-				if (userSelectedTools[toolId] === false) {
+				if (selected[toolId] === false) {
 					return false; // Explicitly disabled
 				}
 			}

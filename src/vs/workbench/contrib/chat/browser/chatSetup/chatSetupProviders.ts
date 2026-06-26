@@ -1100,6 +1100,49 @@ export class LoCoPilotBuiltInAgent extends Disposable implements IChatAgentImple
 		super();
 		const maxIterations = this.agentSettingsService.getMaxIterationsPerRequest();
 		this.unifiedAgent = new UnifiedAgent(this.languageModelsService, this.toolsService, this.logService, this.workspaceService, this.locopilotFileLog, maxIterations);
+
+		// Warm the model's stable system+tools prefix ahead of the user's first message so that first
+		// message isn't stuck behind a cold, multi-thousand-token prompt-eval. Fire once for whatever
+		// model is already selected, and again whenever the selection changes to a different local model.
+		this._register(this.customLanguageModelsService.onDidChangeCustomModels(() => this._maybeWarmSelectedModelPrefix()));
+		this._maybeWarmSelectedModelPrefix();
+	}
+
+	/** Last model id we kicked off a prefix warm-up for, so list changes don't re-warm the same model. */
+	private _lastWarmedModelId: string | undefined;
+
+	/**
+	 * If a downloaded LOCAL model is selected (or is the only chat-ready option), pre-process its
+	 * system+tools prefix in the background. Remote/cloud models are skipped - they have no local
+	 * prompt cache to warm and a real call would cost tokens for nothing. Best-effort and deduped.
+	 */
+	private _maybeWarmSelectedModelPrefix(): void {
+		const modelId = this.customLanguageModelsService.getSelectedCustomModelId()
+			?? this.customLanguageModelsService.getChatSelectableCustomModels()[0]?.id;
+		if (!modelId || modelId === this._lastWarmedModelId) {
+			return;
+		}
+		const model = this.customLanguageModelsService.getCustomModels().find(m => m.id === modelId);
+		// Only warm models that are local-served and actually downloaded (chat-ready).
+		if (!model || model.type !== 'local' || needsDownloadOrPullRetry(model) || model.isDownloading) {
+			return;
+		}
+		this._lastWarmedModelId = modelId;
+		// Build the SAME stable agent system prompt a real turn uses: default agent prompt + the stable
+		// workspace context. Volatile editor state is intentionally excluded (it lives in the user turn),
+		// so this prefix matches the real turn's prefix and the cache hits.
+		(async () => {
+			try {
+				let systemPrompt = this.getDefaultSystemPrompt(ChatModeKind.Agent, undefined);
+				const workspaceContext = await this.getWorkspaceContext();
+				if (workspaceContext) {
+					systemPrompt = systemPrompt + '\n\n' + workspaceContext;
+				}
+				await this.unifiedAgent.warmUp(modelId, systemPrompt, CancellationToken.None);
+			} catch (e) {
+				this._log(`[LoCoPilot] Prefix warm trigger failed (ignored): ${e}`);
+			}
+		})();
 	}
 
 	private _log(msg: string, ...args: unknown[]): void {
@@ -1328,14 +1371,13 @@ Preserve: key facts, decisions, code changes, file names and paths, user prefere
 			this._log(`[LoCoPilot] Failed to build project memory block: ${e}`);
 		}
 
-		context += `\n# WORKSPACE & EDITOR CONTEXT\n\n`;
+		// NOTE: Only STABLE, project-level facts belong here - this string becomes the system prompt,
+		// which is the cached prefix (system + tools) the llama.cpp prompt cache reuses across turns.
+		// Volatile editor state (open files, active file, cursor, selection) is deliberately NOT added
+		// here; it is injected into the current user turn by buildMessages instead, so that opening a
+		// file or moving the cursor never invalidates the cached prefix and forces a full reprocess.
+		context += `\n# WORKSPACE\n\n`;
 		context += `**Workspace Root:** \`${workspaceRoot.fsPath}\`\n`;
-
-		// Add editor context (open files, active file, cursor position)
-		const editorContext = await this.getEditorContext();
-		if (editorContext) {
-			context += editorContext;
-		}
 
 		// Try to detect project type by looking for common config files
 		const commonConfigFiles = [
@@ -1740,13 +1782,27 @@ Focus on making the exact changes requested while preserving code structure and 
 		// 3. Add current request with variables
 		const currentContent: IChatMessage['content'] = [];
 
+		// Volatile editor context (open files, active file, cursor, selection) lives in the CURRENT
+		// user turn - NOT the system prompt - so it never busts the cached system+tools prefix. It is
+		// placed before the user's message so the message text is the last thing the model reads (the
+		// task it should focus on). Agent mode only, matching where it was previously surfaced.
+		if (modeKind === ChatModeKind.Agent) {
+			const editorContext = await this.getEditorContext();
+			if (editorContext.trim()) {
+				currentContent.push({
+					type: 'text',
+					value: `# CURRENT EDITOR CONTEXT (ambient reference only - the user's request below is the task)\n${editorContext}`
+				});
+			}
+		}
+
 		// Add variables/attachments to current message
 		if (request.variables?.variables) {
 			const variableContent = await this.convertVariablesToContent([...request.variables.variables]);
 			currentContent.push(...variableContent);
 		}
 
-		// Add the actual message text
+		// Add the actual message text (kept last so the user's request is what the model focuses on)
 		currentContent.push({ type: 'text', value: request.message });
 
 		messages.push({
@@ -1791,7 +1847,15 @@ Message: ${firstMessage.substring(0, 500)}`;
 				models[0],
 				new ExtensionIdentifier('core'),
 				[{ role: ChatMessageRole.User, content: [{ type: 'text', value: prompt }] }],
-				{},
+				{
+					// A title is 6-8 words - never let a thinking model spend a full chain-of-thought (we saw
+					// ~460 reasoning tokens / ~17s) on it. Force reasoning off and cap the output hard. This
+					// also frees the single server slot quickly so the user's real first message isn't stuck
+					// behind it. (Background call: locopilotForegroundTurn is left unset so it doesn't touch
+					// the timer bar's token stats.)
+					locopilotReasoningEffort: 'off',
+					locopilotMaxOutputTokens: 24,
+				},
 				token
 			);
 			let title = '';

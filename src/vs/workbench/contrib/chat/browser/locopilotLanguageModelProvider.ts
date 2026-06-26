@@ -633,8 +633,17 @@ export class LoCoPilotLanguageModelProvider extends Disposable implements ILangu
 	 * always pass the level there; for OpenAI cloud we only attach it to reasoning-capable models so a
 	 * non-reasoning model (e.g. gpt-4o) isn't rejected by the default 'low'. `off` omits the field.
 	 */
-	private _applyOpenAiReasoningEffort(body: any, modelName: string, local: boolean): void {
-		const effort = this._reasoningEffort();
+	private _applyOpenAiReasoningEffort(body: any, modelName: string, local: boolean, options?: { [name: string]: unknown }): void {
+		// Per-request override (e.g. title generation forces 'off' so it doesn't waste a full chain-of-thought
+		// on a 6-word title). Falls back to the user's global picker when no override is given.
+		const override = options?.locopilotReasoningEffort as ReasoningEffort | undefined;
+		const effort = override ?? this._reasoningEffort();
+		// Per-request output cap (e.g. title generation: a few dozen tokens). Tightens max_tokens before the
+		// thinking budget is derived from it, so both the budget and the answer stay short.
+		const cap = options?.locopilotMaxOutputTokens;
+		if (typeof cap === 'number' && cap > 0 && typeof body.max_tokens === 'number') {
+			body.max_tokens = Math.min(body.max_tokens, Math.floor(cap));
+		}
 		if (local) {
 			// llama.cpp's thinking budget is honored ONLY via the request field `thinking_budget_tokens`
 			// (verified by probing bundled build b9789: a conflicting `thinking_budget_tokens` always wins,
@@ -735,7 +744,7 @@ export class LoCoPilotLanguageModelProvider extends Disposable implements ILangu
 			temperature: 0.3,
 			max_tokens: maxOutputTokens
 		};
-		this._applyOpenAiReasoningEffort(body, requestModelName, isLocalModel);
+		this._applyOpenAiReasoningEffort(body, requestModelName, isLocalModel, options);
 
 		// Add tools if provided (unless caller disabled them, e.g. HF model without function-calling support)
 		if (!opts?.disableTools && options.tools && Array.isArray(options.tools) && options.tools.length > 0) {
@@ -1186,7 +1195,7 @@ export class LoCoPilotLanguageModelProvider extends Disposable implements ILangu
 			timings_per_token: true,
 			stream_options: { include_usage: true }
 		};
-		this._applyOpenAiReasoningEffort(body, servedModelId, true /* local */);
+		this._applyOpenAiReasoningEffort(body, servedModelId, true /* local */, options);
 		// Only the foreground panel turn drives the timer bar's token/rate display. Background/auxiliary calls
 		// (title generation, context compaction, probes) must not touch the live stats or they leak phantom
 		// tokens into the panel before the user's own generation starts.
@@ -1499,7 +1508,7 @@ export class LoCoPilotLanguageModelProvider extends Disposable implements ILangu
 			max_tokens: maxOutputTokens,
 		};
 		// Ollama: enable thinking on compatible models (qwen3, etc.) per the user's effort setting; 'off' omits it.
-		this._applyOpenAiReasoningEffort(body, model.modelName, true /* local */);
+		this._applyOpenAiReasoningEffort(body, model.modelName, true /* local */, options);
 
 		if (filteredTools && filteredTools.length > 0 && model.useNativeTools) {
 			body.tools = filteredTools;
@@ -1660,7 +1669,7 @@ export class LoCoPilotLanguageModelProvider extends Disposable implements ILangu
 			timings_per_token: true,
 			stream_options: { include_usage: true }
 		};
-		this._applyOpenAiReasoningEffort(body, openAiModel, true /* local */);
+		this._applyOpenAiReasoningEffort(body, openAiModel, true /* local */, options);
 		// Only the foreground panel turn drives the timer bar (see _callLocalModel).
 		const reportStats = options.locopilotForegroundTurn === true;
 		if (reportStats) { this.liveStatsService.beginCall(); }

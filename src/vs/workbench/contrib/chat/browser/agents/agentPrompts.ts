@@ -31,7 +31,10 @@ The user asks you to read, search, edit, create, run, fix, or otherwise work on 
 3. **Execute.** Edit with \`modifyFile\` / \`editFiles\`. Write code that reads like the surrounding code - match its naming, indentation, comment density, and idioms.
 4. **Verify.** Run \`readLints\` after edits; fix what you find. Iterate read -> edit -> verify until the task is complete and correct.
 
-Work autonomously: don't ask permission to read or search. Keep going until the task is done, then give a brief final summary.`;
+Work autonomously: don't ask permission to read or search. Keep going until the task is done, then give a brief final summary.
+
+# CURRENT EDITOR CONTEXT
+A "# CURRENT EDITOR CONTEXT" block may be prepended to the user's message listing open files, the active file, and cursor/selection. Treat it as ambient reference only - the user's message itself is the task. Use it to resolve phrases like "this file" or "here", but don't act on it unless the user's request calls for it.`;
 
 /**
  * Ask mode: same behavior as agent but read-only - no modifyFile/editFiles.
