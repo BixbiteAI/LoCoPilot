@@ -12,6 +12,16 @@
 	align-items: center;
 }
 
+/*
+ * The breadcrumbs widget only paints its background across its own (shrunk) width,
+ * leaving the strip reserved for the preview toggle showing the editor header
+ * background instead. Paint that strip with the breadcrumb background so the whole
+ * row is one uniform color around the button.
+ */
+.monaco-workbench .part.editor > .content .editor-group-container > .title .breadcrumbs-below-tabs .breadcrumbs-control {
+	background-color: var(--vscode-breadcrumb-background);
+}
+
 /* The breadcrumbs widget is sized explicitly via layout(); keep it from growing past the toggle. */
 .monaco-workbench .part.editor > .content .editor-group-container .breadcrumbs-control > .monaco-scrollable-element {
 	flex: 0 0 auto;
