@@ -40,19 +40,33 @@ export function setReasoningEffort(storageService: IStorageService, effort: Reas
 }
 
 /**
+ * Fraction of the model's output window that each effort level is allowed to spend on thinking.
+ * Budgets are computed relative to the window rather than as fixed token counts so the same level
+ * scales with the model/task: a small model on a short window gets a tight budget, a large model on
+ * a long window gets a generous one. `off`/`max` are sentinels handled in {@link reasoningBudgetTokens}.
+ */
+const REASONING_EFFORT_FRACTION: Readonly<Record<Exclude<ReasoningEffort, 'off' | 'max'>, number>> = {
+	low: 0.15,
+	medium: 0.35,
+	high: 0.70,
+};
+/** Floor so a tiny output window can't collapse a thinking budget to near-zero. */
+const REASONING_BUDGET_FLOOR = 64;
+/** Window assumed when the caller can't supply one (keeps the level meaningful rather than 0). */
+const DEFAULT_OUTPUT_WINDOW = 8192;
+
+/**
  * Token budget for providers that take an explicit "thinking budget" (Anthropic `budget_tokens`,
- * Gemini `thinkingConfig.thinkingBudget`, llama.cpp `reasoning_budget`) rather than a level string.
+ * Gemini `thinkingConfig.thinkingBudget`, llama.cpp `thinking_budget_tokens`) rather than a level
+ * string. Scales with `outputWindow` (the request's max output tokens) - see {@link REASONING_EFFORT_FRACTION}.
  *
- * Sentinel values:
- *  - `0`  -> thinking disabled (llama.cpp accepts this directly; cloud providers omit the field).
+ * Sentinel return values:
+ *  - `0`  -> thinking disabled (llama.cpp also needs `enable_thinking:false`; cloud providers omit the field).
  *  - `-1` -> unlimited / "max" thinking (llama.cpp default; cloud providers clamp to their own ceiling).
  */
-export function reasoningBudgetTokens(effort: ReasoningEffort): number {
-	switch (effort) {
-		case 'off': return 0;
-		case 'low': return 2048;
-		case 'medium': return 8192;
-		case 'high': return 16384;
-		case 'max': return -1;
-	}
+export function reasoningBudgetTokens(effort: ReasoningEffort, outputWindow: number): number {
+	if (effort === 'off') { return 0; }
+	if (effort === 'max') { return -1; }
+	const window = outputWindow > 0 ? outputWindow : DEFAULT_OUTPUT_WINDOW;
+	return Math.max(REASONING_BUDGET_FLOOR, Math.round(REASONING_EFFORT_FRACTION[effort] * window));
 }

@@ -593,30 +593,26 @@ export class LoCoPilotLanguageModelProvider extends Disposable implements ILangu
 	private _applyOpenAiReasoningEffort(body: any, modelName: string, local: boolean): void {
 		const effort = this._reasoningEffort();
 		if (local) {
-			// llama.cpp gates the thinking budget on the request field `reasoning_budget_tokens` (NOT
-			// `reasoning_budget`, which is the CLI/env name only and is silently dropped from the request
-			// body): 0 disables thinking, -1 is unlimited, any positive value caps the thinking tokens.
-			// Sending the wrong field name makes the server fall back to its -1 default (logged as
-			// `reasoning-budget: activated, budget=2147483647`), so Low/Medium/High collapse to Max. We send
-			// `reasoning_budget_tokens` (verified against bundled build 9704; `thinking_budget_tokens` is an
-			// accepted alias) and keep the legacy `reasoning_budget` for any older/forked build that read it.
-			const requested = reasoningBudgetTokens(effort);
+			// llama.cpp's thinking budget is honored ONLY via the request field `thinking_budget_tokens`
+			// (verified by probing bundled build b9789: a conflicting `thinking_budget_tokens` always wins,
+			// while `reasoning_budget_tokens` and `reasoning_budget` are silently ignored). A positive value
+			// forces the end-of-thinking tag once that many thinking tokens are produced; -1 is unlimited.
+			// NOTE: a budget of 0 does NOT disable thinking here - only `enable_thinking:false` does (below).
+			// Budget scales with the request's output window (max_tokens, derived from the context window).
+			const window = (typeof body.max_tokens === 'number' && body.max_tokens > 0) ? body.max_tokens : 0;
+			const requested = reasoningBudgetTokens(effort, window);
 			// Clamp a positive budget so thinking can't eat the whole output window and starve the answer.
-			// max_tokens (already on the body) is derived from the context window; reserve room for the reply.
 			// -1 (max) stays unclamped - llama.cpp caps it to the context itself.
 			let budget = requested;
-			if (requested > 0 && typeof body.max_tokens === 'number' && body.max_tokens > 0) {
+			if (requested > 0 && window > 0) {
 				const answerReserve = 512;
-				budget = Math.min(requested, Math.max(answerReserve, body.max_tokens - answerReserve));
+				budget = Math.min(requested, Math.max(answerReserve, window - answerReserve));
 			}
-			// `thinking_budget_tokens` is the field this bundled build (b9704) actually honors; the
-			// `reasoning_budget_tokens` name documented elsewhere is silently ignored by it (verified by
-			// probing the live server: budget 0/16 via reasoning_budget_tokens still emits full thinking,
-			// while thinking_budget_tokens caps it). We send all three names so the budget takes effect
-			// across builds; unknown fields are ignored by the server.
+			// `thinking_budget_tokens` is the only field the bundled build honors; the other two are dead on
+			// llama.cpp but accepted by some mlx/ollama forks, so we send all three (unknown fields are ignored).
 			body.thinking_budget_tokens = budget;
 			body.reasoning_budget_tokens = budget;
-			body.reasoning_budget = budget; // legacy/fork compatibility; unknown fields are ignored by the server
+			body.reasoning_budget = budget;
 			if (effort === 'off') {
 				// Servers that gate thinking on a chat-template flag (qwen3 on llama.cpp/ollama) need this too.
 				body.chat_template_kwargs = { ...(body.chat_template_kwargs ?? {}), enable_thinking: false };
@@ -650,7 +646,7 @@ export class LoCoPilotLanguageModelProvider extends Disposable implements ILangu
 		// Anthropic requires budget_tokens >= 1024 and strictly less than max_tokens; temperature must be unset.
 		// 'max' (-1) means "as much as the output cap allows", so clamp to maxOutputTokens - 1024.
 		const ceiling = Math.max(1024, maxOutputTokens - 1024);
-		const requested = reasoningBudgetTokens(effort);
+		const requested = reasoningBudgetTokens(effort, maxOutputTokens);
 		const budget = requested === -1 ? ceiling : Math.max(1024, Math.min(requested, ceiling));
 		body.thinking = { type: 'enabled', budget_tokens: budget };
 		delete body.temperature;
@@ -665,7 +661,8 @@ export class LoCoPilotLanguageModelProvider extends Disposable implements ILangu
 		}
 		body.generationConfig = body.generationConfig ?? {};
 		// Gemini's thinkingBudget natively accepts our sentinels: 0 disables thinking, -1 is dynamic/unlimited.
-		body.generationConfig.thinkingConfig = { thinkingBudget: reasoningBudgetTokens(effort) };
+		const window = (typeof body.generationConfig.maxOutputTokens === 'number' && body.generationConfig.maxOutputTokens > 0) ? body.generationConfig.maxOutputTokens : 0;
+		body.generationConfig.thinkingConfig = { thinkingBudget: reasoningBudgetTokens(effort, window) };
 	}
 
 	private async _callOpenAI(model: ICustomLanguageModel, messages: IChatMessage[], options: { [name: string]: unknown }, stream: AsyncIterableSource<IChatResponsePart | IChatResponsePart[]>, token: CancellationToken, opts?: { url?: string; modelName?: string; providerLabel?: string; disableTools?: boolean }): Promise<any> {
