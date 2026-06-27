@@ -628,6 +628,15 @@ export class LoCoPilotLanguageModelProvider extends Disposable implements ILangu
 	}
 
 	/**
+	 * Newer OpenAI models (o-series, gpt-5+) reject the legacy `max_tokens` field (must use
+	 * `max_completion_tokens`) and only accept the default temperature (1). Detect them so we can
+	 * adjust the request body accordingly and avoid 400s.
+	 */
+	private _openAiUsesCompletionTokens(name: string): boolean {
+		return /(^|[^a-z])o[134](\b|-)|gpt-5/i.test(name);
+	}
+
+	/**
 	 * Apply reasoning effort to an OpenAI-style request body via the `reasoning_effort` field.
 	 * `local` servers (llama.cpp/mlx/ollama/localhost) tolerate the field and gate thinking on it, so we
 	 * always pass the level there; for OpenAI cloud we only attach it to reasoning-capable models so a
@@ -745,6 +754,17 @@ export class LoCoPilotLanguageModelProvider extends Disposable implements ILangu
 			max_tokens: maxOutputTokens
 		};
 		this._applyOpenAiReasoningEffort(body, requestModelName, isLocalModel, options);
+
+		// Newer OpenAI cloud models (o-series, gpt-5+) reject the legacy `max_tokens` field and require
+		// `max_completion_tokens`; they also only accept the default temperature (1). Rewrite the body to
+		// match (applied only to the real OpenAI provider, after the reasoning cap above adjusts max_tokens).
+		if (model.provider === 'openai' && this._openAiUsesCompletionTokens(requestModelName)) {
+			if (typeof body.max_tokens === 'number') {
+				body.max_completion_tokens = body.max_tokens;
+				delete body.max_tokens;
+			}
+			delete body.temperature;
+		}
 
 		// Add tools if provided (unless caller disabled them, e.g. HF model without function-calling support)
 		if (!opts?.disableTools && options.tools && Array.isArray(options.tools) && options.tools.length > 0) {
@@ -893,7 +913,19 @@ export class LoCoPilotLanguageModelProvider extends Disposable implements ILangu
 		}, token);
 
 		if (response.res.statusCode !== 200) {
-			throw new Error(this._getApiErrorMessage('Anthropic', response.res.statusCode ?? 0));
+			// Surface Anthropic's actual error body (shape: {"error":{"message":"..."}}) so the real cause
+			// (bad model id, thinking/temperature conflict, etc.) is visible, not just the generic message.
+			let detail = '';
+			try {
+				const buf = await streamToBuffer(response.stream);
+				const json = JSON.parse(buf.toString()) as { error?: { message?: string } };
+				if (json?.error?.message) {
+					detail = ` ${json.error.message}`;
+				}
+			} catch {
+				// ignore
+			}
+			throw new Error(this._getApiErrorMessage('Anthropic', response.res.statusCode ?? 0) + detail);
 		}
 
 		return new Promise<void>((resolve, reject) => {

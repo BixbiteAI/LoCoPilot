@@ -93,6 +93,20 @@ export const LOCOPILOT_DEFAULT_CATALOG: readonly ICatalogModel[] = [
 
 	// ---- Gemma 4 (Google) ----
 	{
+		catalogId: 'gemma4-e2b-gguf',
+		displayName: 'Gemma 4 E2B',
+		vendor: 'Google',
+		blurb: 'Smallest Gemma 4 (edge-class ~2B effective); tool calling + vision. Runs on 8 GB.',
+		repoId: 'unsloth/gemma-4-E2B-it-GGUF',
+		supportsVision: true,
+		format: 'Q4_K_M',
+		engine: 'gguf',
+		approxSizeBytes: Math.round(2.9 * GB),
+		minRamGB: 8,
+		tier: '8 GB',
+		contextWindow: 131072,
+	},
+	{
 		catalogId: 'gemma4-e4b-gguf',
 		displayName: 'Gemma 4 E4B',
 		vendor: 'Google',
@@ -317,12 +331,91 @@ export const LOCOPILOT_DEFAULT_CATALOG: readonly ICatalogModel[] = [
 		defaultHidden: true,
 		contextWindow: 262144,
 	},
+	{
+		catalogId: 'qwen36-35b-a3b-mtp-gguf',
+		displayName: 'Qwen3.6 35B-A3B MoE (MTP)',
+		vendor: 'Alibaba (Qwen)',
+		blurb: 'Qwen3.6 MoE (35B total, ~3B active) with Multi-Token Prediction heads; faster decoding via llama.cpp speculative.',
+		repoId: 'unsloth/Qwen3.6-35B-A3B-MTP-GGUF',
+		supportsVision: true,
+		format: 'Q4_K_M',
+		engine: 'gguf',
+		approxSizeBytes: Math.round(21 * GB),
+		minRamGB: 32,
+		tier: '32 GB+',
+		mtp: true,
+		defaultHidden: true,
+		contextWindow: 262144,
+	},
+
+	// =========================================================================================
+	// June 2026 additions: cross-platform GGUF coder + extra current-gen small models.
+	// =========================================================================================
+	{
+		catalogId: 'qwen3-coder-30b-a3b-gguf',
+		displayName: 'Qwen3 Coder 30B-A3B',
+		vendor: 'Alibaba (Qwen)',
+		blurb: 'Top MoE coder (30B total, ~3B active - fast); GGUF build runs on any platform via llama.cpp.',
+		repoId: 'unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF',
+		supportsVision: false,
+		format: 'Q4_K_M',
+		engine: 'gguf',
+		approxSizeBytes: Math.round(17 * GB),
+		minRamGB: 32,
+		tier: '32 GB+',
+		contextWindow: 262144,
+	},
+	{
+		catalogId: 'granite-4_1-8b-gguf',
+		displayName: 'Granite 4.1 8B',
+		vendor: 'IBM',
+		blurb: 'IBM Granite 4.1; strong tool-calling and enterprise tasks. Fits 16 GB.',
+		repoId: 'unsloth/granite-4.1-8b-GGUF',
+		supportsVision: false,
+		format: 'Q4_K_M',
+		engine: 'gguf',
+		approxSizeBytes: Math.round(5 * GB),
+		minRamGB: 16,
+		tier: '16 GB',
+		contextWindow: 131072,
+	},
+	{
+		catalogId: 'lfm2_5-8b-a1b-gguf',
+		displayName: 'LFM2.5 8B-A1B MoE',
+		vendor: 'Liquid AI',
+		blurb: 'Liquid Foundation MoE (8B total, ~1B active) - very fast on modest hardware.',
+		repoId: 'unsloth/LFM2.5-8B-A1B-GGUF',
+		supportsVision: false,
+		format: 'Q4_K_M',
+		engine: 'gguf',
+		approxSizeBytes: Math.round(5 * GB),
+		minRamGB: 16,
+		tier: '16 GB',
+		contextWindow: 131072,
+	},
+	{
+		catalogId: 'gpt-oss-20b-gguf',
+		displayName: 'GPT-OSS 20B',
+		vendor: 'OpenAI',
+		blurb: 'OpenAI open-weight 20B MoE (~3.6B active - fast); GGUF build runs on any platform via llama.cpp.',
+		repoId: 'unsloth/gpt-oss-20b-GGUF',
+		supportsVision: false,
+		format: 'Q4_K_M',
+		engine: 'gguf',
+		approxSizeBytes: Math.round(11 * GB),
+		minRamGB: 16,
+		tier: '16 GB',
+		contextWindow: 131072,
+	},
 
 	// =========================================================================================
 	// Proven prior generation (verified working). Keep or comment out as desired.
 	// =========================================================================================
 
 	// ---- Tier 1: 8 GB (entry, runs almost anywhere) ----
+	// SUPERSEDED (commented out 2026-06): Qwen3 4B -> Qwen3.5 4B (MTP); Gemma 3 4B -> Gemma 4 E2B/E4B.
+	// Uncomment to bring either back.
+	/*
 	{
 		catalogId: 'qwen3-4b-gguf',
 		displayName: 'Qwen3 4B',
@@ -351,6 +444,7 @@ export const LOCOPILOT_DEFAULT_CATALOG: readonly ICatalogModel[] = [
 		tier: '8 GB',
 		contextWindow: 131072,
 	},
+	*/
 	{
 		catalogId: 'phi4-mini-gguf',
 		displayName: 'Phi-4 mini',
@@ -367,6 +461,9 @@ export const LOCOPILOT_DEFAULT_CATALOG: readonly ICatalogModel[] = [
 	},
 
 	// ---- Tier 2: 16 GB (sweet spot) ----
+	// SUPERSEDED (commented out 2026-06): Qwen3 8B (GGUF + MLX) -> Qwen3.5 9B (MTP);
+	// Gemma 3 12B -> Gemma 4 12B. Uncomment to bring any back. (DeepSeek R1 distill kept below.)
+	/*
 	{
 		catalogId: 'qwen3-8b-gguf',
 		displayName: 'Qwen3 8B',
@@ -411,6 +508,7 @@ export const LOCOPILOT_DEFAULT_CATALOG: readonly ICatalogModel[] = [
 		tier: '16 GB',
 		contextWindow: 131072,
 	},
+	*/
 	{
 		catalogId: 'deepseek-r1-distill-14b-gguf',
 		displayName: 'DeepSeek-R1 Distill 14B',
@@ -456,6 +554,8 @@ export const LOCOPILOT_DEFAULT_CATALOG: readonly ICatalogModel[] = [
 		tier: '32 GB+',
 		contextWindow: 32768,
 	},
+	// SUPERSEDED (commented out 2026-06): Qwen3 32B (MLX) -> Qwen3.6 27B. Uncomment to restore.
+	/*
 	{
 		catalogId: 'qwen3-32b-mlx',
 		displayName: 'Qwen3 32B (MLX)',
@@ -471,6 +571,7 @@ export const LOCOPILOT_DEFAULT_CATALOG: readonly ICatalogModel[] = [
 		requiresAppleSilicon: true,
 		contextWindow: 32768,
 	},
+	*/
 	{
 		catalogId: 'deepseek-r1-distill-32b-gguf',
 		displayName: 'DeepSeek-R1 Distill 32B',
@@ -488,6 +589,9 @@ export const LOCOPILOT_DEFAULT_CATALOG: readonly ICatalogModel[] = [
 	},
 
 	// ---- Tier 4: prior-gen Qwen3 MoE (fast, only ~3B active) - both formats ----
+	// SUPERSEDED (commented out 2026-06): Qwen3 30B-A3B (GGUF + MLX) -> Qwen3.6 35B-A3B (and MTP twin).
+	// Uncomment to restore.
+	/*
 	{
 		catalogId: 'qwen3-30b-a3b-gguf',
 		displayName: 'Qwen3 30B-A3B MoE',
@@ -517,6 +621,7 @@ export const LOCOPILOT_DEFAULT_CATALOG: readonly ICatalogModel[] = [
 		requiresAppleSilicon: true,
 		contextWindow: 32768,
 	},
+	*/
 	{
 		catalogId: 'gpt-oss-20b-mlx',
 		displayName: 'GPT-OSS 20B (MLX)',
@@ -546,6 +651,41 @@ export const LOCOPILOT_DEFAULT_CATALOG: readonly ICatalogModel[] = [
 		tier: '32 GB+',
 		requiresAppleSilicon: true,
 		contextWindow: 262144,
+	},
+
+	// =========================================================================================
+	// Tier 5: 64 GB+ (workstation-class). Models whose Q4 weights need ~45-60 GB; only seeded as a
+	// comfortable pick once the machine has the RAM. Qwen3 Coder Next is the curated "Best for you"
+	// here (see getRecommendedRepoId); GPT-OSS 120B is the heavier alternative, seeded hidden.
+	// =========================================================================================
+	{
+		catalogId: 'qwen3-coder-next-gguf',
+		displayName: 'Qwen3 Coder Next',
+		vendor: 'Alibaba (Qwen)',
+		blurb: 'Flagship dense coder; top open-model quality for 64 GB+ workstations.',
+		repoId: 'unsloth/Qwen3-Coder-Next-GGUF',
+		supportsVision: false,
+		format: 'Q4_K_M',
+		engine: 'gguf',
+		approxSizeBytes: Math.round(45 * GB),
+		minRamGB: 64,
+		tier: '64 GB+',
+		contextWindow: 262144,
+	},
+	{
+		catalogId: 'gpt-oss-120b-gguf',
+		displayName: 'GPT-OSS 120B',
+		vendor: 'OpenAI',
+		blurb: 'OpenAI open-weight 120B MoE (~5B active); needs a 64 GB+ workstation.',
+		repoId: 'unsloth/gpt-oss-120b-GGUF',
+		supportsVision: false,
+		format: 'Q4_K_M',
+		engine: 'gguf',
+		approxSizeBytes: Math.round(58.5 * GB),
+		minRamGB: 64,
+		tier: '64 GB+',
+		defaultHidden: true,
+		contextWindow: 131072,
 	},
 ];
 
@@ -587,6 +727,10 @@ const DEFAULT_VISIBLE_CATALOG_IDS: ReadonlySet<string> = new Set([
 	'qwen35-9b-mtp-gguf',
 	'qwen36-35b-a3b-gguf',
 	'gemma4-e4b-gguf',
+	// 32 GB+ tier: the curated "Best for you" pick (dedicated coder MoE), visible so it shows badged in the picker.
+	'qwen3-coder-30b-a3b-gguf',
+	// 64 GB+ tier: the curated "Best for you" pick, visible so workstation users see it badged in the picker.
+	'qwen3-coder-next-gguf',
 ]);
 
 /**
@@ -607,6 +751,9 @@ export const DEFAULT_PICKER_FLOOR_REPO_ID = 'unsloth/Qwen3.5-4B-MTP-GGUF';
  * `ramGB <= 0` means RAM is not detected yet -> floor (safe everywhere).
  */
 export function getDefaultPickerRepoId(ramGB: number): string {
+	if (ramGB >= 64) {
+		return 'unsloth/Qwen3.6-27B-GGUF'; // 32 GB-tier flagship on a 64 GB+ workstation: comfortable headroom.
+	}
 	if (ramGB >= 32) {
 		return 'unsloth/gemma-4-12b-it-GGUF'; // 16 GB-tier model on a 32 GB+ machine: comfortable headroom.
 	}
@@ -629,8 +776,11 @@ export function getDefaultPickerRepoId(ramGB: number): string {
  * is the recommended upgrade the badge points at. `ramGB <= 0` (RAM unknown) -> the safe small build.
  */
 export function getRecommendedRepoId(ramGB: number): string {
+	if (ramGB >= 64) {
+		return 'unsloth/Qwen3-Coder-Next-GGUF'; // flagship dense coder (~45 GB Q4); comfortable on 64 GB+.
+	}
 	if (ramGB >= 32) {
-		return 'unsloth/Qwen3.6-27B-GGUF'; // flagship dense coder; comfortable on 32 GB+.
+		return 'unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF'; // dedicated coder MoE (~3B active - fast); comfortable on 32 GB+.
 	}
 	if (ramGB >= 16) {
 		return 'unsloth/Qwen3.5-9B-MTP-GGUF'; // ~5.5 GB Q4; smooth on 16 GB alongside the editor.
@@ -655,6 +805,7 @@ export type ModelSuitability = 'best' | 'ok' | 'too-big' | 'incompatible' | 'unk
 
 /** Map detected system RAM (GB) to the catalog `tier` bucket that best fits it. */
 export function bestTierForRam(ramGB: number): ICatalogModel['tier'] {
+	if (ramGB >= 64) { return '64 GB+'; }
 	if (ramGB >= 32) { return '32 GB+'; }
 	if (ramGB >= 16) { return '16 GB'; }
 	return '8 GB';
