@@ -2171,7 +2171,7 @@ export class ChatInputPart extends Disposable implements IHistoryNavigationWidge
 		return `${thousands.toFixed(1).replace(/\.0$/, '')}k`;
 	}
 
-	public setRequestInProgress(inProgress: boolean, getStats?: () => { lastWordCount: number; impliedWordLoadRate: number; thinkingWordCount?: number; serverTokens?: number; serverTokensPerSecond?: number; serverPromptTokens?: number } | undefined, paused?: boolean): void {
+	public setRequestInProgress(inProgress: boolean, getStats?: () => { lastWordCount: number; impliedWordLoadRate: number; thinkingWordCount?: number; serverTokens?: number; serverTokensPerSecond?: number; serverPromptTokens?: number; serverEstimated?: boolean } | undefined, paused?: boolean): void {
 		if (!this._timerBar) {
 			return;
 		}
@@ -2244,6 +2244,9 @@ export class ChatInputPart extends Disposable implements IHistoryNavigationWidge
 					// rate; when present we show those true numbers instead of the word-count estimate. Remote
 					// providers don't, so we fall back to converting words->tokens (~1.4 tokens/word).
 					const hasServerStats = typeof stats?.serverTokens === 'number';
+					// Server-authoritative numbers (llama.cpp usage/timings) show exactly; client-derived ones
+					// (mlx_lm without usage/timings - tallied from the stream) keep the "~" estimate prefix.
+					const serverEstimated = stats?.serverEstimated === true;
 					const outputWords = stats?.lastWordCount ?? 0;
 					const thinkingWords = stats?.thinkingWordCount ?? 0;
 					const totalWords = outputWords + thinkingWords;
@@ -2300,13 +2303,16 @@ export class ChatInputPart extends Disposable implements IHistoryNavigationWidge
 					sep1.style.display = hasTok ? '' : 'none';
 					tokEl.style.display = hasTok ? '' : 'none';
 					if (hasTok) {
-						// Real server counts show an exact figure; the word estimate keeps the "~" prefix.
-						tokEl.textContent = `${hasServerStats ? '' : '~'}${ChatInputPart.formatTokenCount(totalTokens)} tokens`;
+						// Server-authoritative counts show an exact figure; word estimates and client-tallied
+						// (mlx_lm) counts keep the "~" prefix to signal they're approximate.
+						const approx = !hasServerStats || serverEstimated;
+						tokEl.textContent = `${approx ? '~' : ''}${ChatInputPart.formatTokenCount(totalTokens)} tokens`;
 						if (hasServerStats) {
 							const prompt = stats?.serverPromptTokens;
-							tokEl.title = typeof prompt === 'number'
-								? `${totalTokens} generated tokens (+ ${prompt} prompt tokens), reported by the local server`
-								: `${totalTokens} generated tokens, reported by the local server`;
+							const promptSuffix = typeof prompt === 'number' ? ` (+ ${prompt} prompt tokens)` : '';
+							tokEl.title = serverEstimated
+								? `~${totalTokens} generated tokens${promptSuffix}, counted from the stream (server reported no token usage)`
+								: `${totalTokens} generated tokens${promptSuffix}, reported by the local server`;
 						} else {
 							tokEl.title = thinkingTokens > 0
 								? `~${outputTokens} output + ~${thinkingTokens} thinking (estimated from ${totalWords} words)`

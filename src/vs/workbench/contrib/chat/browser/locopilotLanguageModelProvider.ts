@@ -247,18 +247,25 @@ export class LoCoPilotLanguageModelProvider extends Disposable implements ILangu
 		const chunk = json as IOpenAiStreamChunk;
 		const timings = chunk?.timings;
 		const usage = chunk?.usage;
-		if (!timings && !usage) {
-			return;
+		if (timings || usage) {
+			this.liveStatsService.update({
+				// usage is authoritative for token counts; timings.predicted_n tracks it live mid-stream.
+				completionTokens: usage?.completion_tokens ?? timings?.predicted_n,
+				promptTokens: usage?.prompt_tokens ?? timings?.prompt_n,
+				tokensPerSecond: typeof timings?.predicted_per_second === 'number'
+					? Math.round(timings.predicted_per_second)
+					: undefined,
+				cachedTokens: usage?.prompt_tokens_details?.cached_tokens ?? timings?.cache_n,
+			});
 		}
-		this.liveStatsService.update({
-			// usage is authoritative for token counts; timings.predicted_n tracks it live mid-stream.
-			completionTokens: usage?.completion_tokens ?? timings?.predicted_n,
-			promptTokens: usage?.prompt_tokens ?? timings?.prompt_n,
-			tokensPerSecond: typeof timings?.predicted_per_second === 'number'
-				? Math.round(timings.predicted_per_second)
-				: undefined,
-			cachedTokens: usage?.prompt_tokens_details?.cached_tokens ?? timings?.cache_n,
-		});
+		// Client-side fallback tally: local servers stream ~one token per SSE delta. Counting each delta that
+		// carries generated text (content or reasoning) lets servers that emit no `usage`/`timings` - e.g. some
+		// mlx_lm builds - still surface a token count + a wall-clock tokens/sec. The service ignores this tally
+		// whenever the server reports real numbers, so llama.cpp is unaffected.
+		const delta = chunk?.choices?.[0]?.delta;
+		if (delta && (delta.content || this._reasoningTextFromOpenAiDelta(delta))) {
+			this.liveStatsService.recordClientToken();
+		}
 	}
 
 	async provideLanguageModelChatInfo(options: ILanguageModelChatInfoOptions, token: CancellationToken): Promise<ILanguageModelChatMetadataAndIdentifier[]> {

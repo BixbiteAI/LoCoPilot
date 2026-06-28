@@ -1818,14 +1818,17 @@ export class ChatWidget extends Disposable implements IChatWidget {
 				const serverTokens = typeof server?.completionTokens === 'number' ? server.completionTokens : undefined;
 				const serverTokensPerSecond = typeof server?.tokensPerSecond === 'number' ? server.tokensPerSecond : undefined;
 				const serverPromptTokens = typeof server?.promptTokens === 'number' ? server.promptTokens : undefined;
+				// True when the numbers are client-derived (no server usage/timings, e.g. some mlx_lm builds);
+				// the timer bar then shows them with a "~" prefix to signal they're approximate.
+				const serverEstimated = server?.estimated === true;
 				if (timings) {
-					return { ...timings, thinkingWordCount, serverTokens, serverTokensPerSecond, serverPromptTokens };
+					return { ...timings, thinkingWordCount, serverTokens, serverTokensPerSecond, serverPromptTokens, serverEstimated };
 				}
 				// During the pure-reasoning phase no output text has streamed yet, so
 				// `contentUpdateTimings` is undefined. Still surface thinking tokens so the
 				// counter isn't blank while the model is only reasoning.
 				if (thinkingWordCount > 0 || serverTokens !== undefined) {
-					return { lastWordCount: 0, impliedWordLoadRate: 0, thinkingWordCount, serverTokens, serverTokensPerSecond, serverPromptTokens };
+					return { lastWordCount: 0, impliedWordLoadRate: 0, thinkingWordCount, serverTokens, serverTokensPerSecond, serverPromptTokens, serverEstimated };
 				}
 				return undefined;
 			}, needsInput);
