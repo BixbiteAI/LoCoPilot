@@ -99,6 +99,17 @@ export function customModelSupportsVision(model: ICustomLanguageModel): boolean 
 }
 
 /**
+ * Whether vision should actually be LOADED at runtime (i.e. pass `--mmproj` to llama.cpp). Distinct from
+ * {@link customModelSupportsVision}, which is the model's *capability* (drives the projector download and the
+ * picker's image-attach offer). Loading the projector costs ~1GB+ of the GPU/Metal working set, so it is
+ * OFF by default and only turned on per-model when the user enables it (e.g. on first image attach). This is
+ * what keeps a 16GB Mac from OOM-ing on a vision model the user only ever uses for text.
+ */
+export function customModelVisionEnabled(model: ICustomLanguageModel): boolean {
+	return model.visionEnabled === true && model.supportsVision !== false;
+}
+
+/**
  * Derive the token budgets from a single context window.
  * - maxOutputTokens: reply cap = min(provider cap, 25% of the window), never below {@link OUTPUT_FLOOR}.
  *   Output is an (almost) constant absolute cap in practice, not a fixed % of the window, hence the min().
@@ -180,6 +191,14 @@ export interface ICustomLanguageModel {
 	supportsVision?: boolean;
 	/** True when the runtime auto-disabled vision after the server rejected an image (e.g. "image input is not supported / mmproj"). Distinct from a user setting; surfaced in the UI. */
 	visionAutoDisabled?: boolean;
+	/**
+	 * Whether to actually LOAD the multimodal projector (`--mmproj`) at runtime. Separate from
+	 * {@link supportsVision} (the capability): the projector is downloaded for capable models but NOT loaded
+	 * by default, because it costs ~1GB+ of the GPU/Metal working set and most use is text-only. Turned on
+	 * per-model when the user enables vision (e.g. on first image attach). Undefined/false means text-only at
+	 * runtime even though the model can do images. See {@link customModelVisionEnabled}.
+	 */
+	visionEnabled?: boolean;
 }
 
 export interface ICustomLanguageModelsService {

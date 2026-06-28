@@ -8,7 +8,7 @@ import { URI } from '../../../../base/common/uri.js';
 import { ILogService } from '../../../../platform/log/common/log.js';
 import { IConfigurationService } from '../../../../platform/configuration/common/configuration.js';
 import { IFileService } from '../../../../platform/files/common/files.js';
-import { ICustomLanguageModelsService, type ICustomLanguageModel } from '../common/customLanguageModelsService.js';
+import { ICustomLanguageModelsService, customModelVisionEnabled, type ICustomLanguageModel } from '../common/customLanguageModelsService.js';
 import { ChatConfiguration } from '../common/constants.js';
 import { ILoCoPilotFileLog } from './locopilotFileLog.js';
 import { registerAction2, Action2 } from '../../../../platform/actions/common/actions.js';
@@ -701,6 +701,13 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 			if (draftActive) {
 				runtime += weightBytes; // self-draft (MTP) or a same-size draft model roughly doubles weights.
 			}
+			// The mmproj projector is only loaded when vision is explicitly enabled (see customModelVisionEnabled).
+			if (model.localPath && customModelVisionEnabled(model)) {
+				const mmprojPath = await this.resolveMmprojPath(model.localPath);
+				if (mmprojPath) {
+					runtime += await this._fileBytes(mmprojPath);
+				}
+			}
 		}
 		return weightBytes + runtime;
 	}
@@ -721,6 +728,16 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 			// path missing / unreadable -> treat as unknown (0), so it never blocks a load
 		}
 		return 0;
+	}
+
+	/** Size in bytes of a single file (e.g. the mmproj projector), or 0 when missing/unreadable. */
+	private async _fileBytes(filePath: string): Promise<number> {
+		try {
+			const stat = await this.fileService.stat(URI.file(filePath));
+			return stat.isFile ? (stat.size ?? 0) : 0;
+		} catch {
+			return 0;
+		}
 	}
 
 	stopManagedServers(exceptModelId?: string): void {
@@ -894,7 +911,7 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 	 *
 	 * All steps are best-effort: any missing data leaves the base tuning untouched.
 	 */
-	private async _augmentTuningWithHardware(modelPath: string, backend: LlamaBackend, base: LlamaServerTuning): Promise<LlamaServerTuning> {
+	private async _augmentTuningWithHardware(modelPath: string, backend: LlamaBackend, base: LlamaServerTuning, extraResidentBytes: number = 0): Promise<LlamaServerTuning> {
 		const hw = await this._getHardwareInfo();
 		if (!hw) {
 			return base;
@@ -908,7 +925,14 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 		}
 
 		const info = await this._getModelInfo(modelPath);
-		const budget = await this._memoryBudgetBytes(backend, hw);
+		const rawBudget = await this._memoryBudgetBytes(backend, hw);
+		// Reserve for co-resident allocations the main weights+KV split below does NOT otherwise see: a draft/
+		// MTP model (a second copy of the weights) and the mmproj projector. Without this, the offload and the
+		// context clamp size themselves as if those extras were free, then overflow the device at decode.
+		const budget = rawBudget !== undefined ? Math.max(0, rawBudget - Math.max(0, extraResidentBytes)) : undefined;
+		if (rawBudget !== undefined && extraResidentBytes > 0) {
+			this._log(`[LoCoPilot Runner] Reserving ~${Math.round(extraResidentBytes / 1e9)}GB for draft/projector; weights+KV budget ${Math.round(rawBudget / 1e9)}GB -> ${Math.round((budget ?? 0) / 1e9)}GB.`);
+		}
 
 		// #1 MoE expert offload vs dense partial GPU offload. These are mutually exclusive: a MoE model uses
 		// --n-cpu-moe (keep attention on GPU, experts on CPU); a dense model uses --n-gpu-layers.
@@ -986,7 +1010,7 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 	 * `discreteVramBytes`: dedicated VRAM (CUDA/Vulkan) that can hold offloaded weights ON TOP of system RAM;
 	 * undefined on unified-memory (Metal) / CPU, where weights live in system RAM regardless of any offload.
 	 */
-	private async _checkModelFitsOrNotify(modelId: string, modelPath: string, discreteVramBytes: number | undefined): Promise<boolean> {
+	private async _checkModelFitsOrNotify(modelId: string, modelPath: string, backend: LlamaBackend, discreteVramBytes: number | undefined, extraResidentBytes: number = 0): Promise<boolean> {
 		const model = this.customLanguageModelsService.getCustomModels().find(m => m.id === modelId);
 		if (!model) {
 			return true;
@@ -1013,10 +1037,19 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 		const GB = 1024 * 1024 * 1024;
 		const kvMinBytes = MIN_CLAMPED_CONTEXT * perTokenPerLayer * layerCount;
 		const runtimeOverhead = Math.round(1.5 * GB); // host buffers / compute scratch; conservative.
-		const requiredBytes = weightBytes + kvMinBytes + runtimeOverhead;
+		// extraResidentBytes covers a draft/MTP model (a second copy of the weights) and the mmproj projector
+		// when vision is enabled - both are loaded ON TOP of the weights+KV and previously went uncounted here,
+		// so an MTP + vision model passed this gate and then OOM-ed the GPU at decode.
+		const requiredBytes = weightBytes + kvMinBytes + runtimeOverhead + Math.max(0, extraResidentBytes);
 
-		// Usable memory: system RAM left for inference, plus discrete VRAM when weights can offload to a GPU.
-		const usableBytes = usableSystemMemoryBytes(mem.totalmem) + (discreteVramBytes && discreteVramBytes > 0 ? discreteVramBytes : 0);
+		// Usable memory:
+		//  - metal (Apple Silicon): the WIRED working-set ceiling (~70% of unified RAM). macOS caps a Metal
+		//    app there; using the looser 85% system figure (the old bug) let a model clear this gate and then
+		//    bust the GPU ceiling at decode (kIOGPUCommandBufferCallbackErrorOutOfMemory).
+		//  - cuda/vulkan/cpu: system RAM left for inference (85%), plus discrete VRAM when weights offload to a GPU.
+		const usableBytes = backend === 'metal'
+			? metalOffloadBudgetBytes(mem.totalmem)
+			: usableSystemMemoryBytes(mem.totalmem) + (discreteVramBytes && discreteVramBytes > 0 ? discreteVramBytes : 0);
 		if (requiredBytes <= usableBytes) {
 			return true;
 		}
@@ -1366,9 +1399,10 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 		if (model.provider === 'huggingface' && isAppleSiliconMac()) {
 			const hasGguf = await this.pathResolvesToGguf(model.localPath);
 			if (shouldUseMlxServerForHfModel(model, hasGguf, true)) {
-				// Same pre-flight fit check as the llama.cpp path: MLX runs on Apple Silicon unified memory,
-				// so there is no separate VRAM pool - weights + KV must fit usable system RAM.
-				if (!await this._checkModelFitsOrNotify(modelId, model.localPath, undefined)) {
+				// Same pre-flight fit check as the llama.cpp path: MLX runs on Apple Silicon unified memory via
+				// Metal, so there is no separate VRAM pool and the same ~70% wired working-set ceiling applies -
+				// pass 'metal' so the gate uses that ceiling rather than the looser 85% system figure.
+				if (!await this._checkModelFitsOrNotify(modelId, model.localPath, 'metal', undefined)) {
 					return;
 				}
 				await this._startMlxServerInTerminal(modelId, model as ICustomLanguageModel & { localPath: string });
@@ -1419,21 +1453,37 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 			const vram = (hw?.gpus ?? []).map(g => g.totalVramBytes).filter(v => v > 0);
 			discreteVramBytes = vram.length ? Math.max(...vram) : undefined;
 		}
-		if (!await this._checkModelFitsOrNotify(modelId, modelPath, discreteVramBytes)) {
+
+		// Build the base tuning and resolve the vision projector FIRST, so both the pre-flight fit check and
+		// the hardware-aware budget below account for the *full* resident footprint - weights + KV + a draft
+		// model (MTP) + the mmproj projector. Loading these extras without reserving for them is what OOM-ed
+		// the Metal command buffer (kIOGPUCommandBufferCallbackErrorOutOfMemory) on a 16GB Mac.
+		const baseTuning = this._getLlamaTuning(model);
+		// Vision: load the projector (`--mmproj`) ONLY when the user has explicitly enabled vision for this
+		// model. The projector is downloaded for every vision-capable model, but loading it wires ~1GB+ into
+		// the GPU/Metal working set. So it stays off by default (text-only) and is opt-in per model; see
+		// customModelVisionEnabled.
+		let mmprojBytes = 0;
+		if (customModelVisionEnabled(model)) {
+			const mmprojPath = await this.resolveMmprojPath(model.localPath);
+			if (mmprojPath) {
+				baseTuning.mmprojPath = mmprojPath;
+				mmprojBytes = await this._fileBytes(mmprojPath);
+				this._log(`[LoCoPilot Runner] Vision enabled for ${modelId}: using projector ${mmprojPath} (~${Math.round(mmprojBytes / 1e6)}MB).`);
+			}
+		}
+		// A draft/MTP model loads a second copy of the weights (self-draft) or a same-size sidecar, so it
+		// roughly doubles the weight footprint. mmprojBytes is the projector when vision is on.
+		const draftActive = !!baseTuning.multiTokenPrediction || !!(baseTuning.draftModelPath && baseTuning.draftModelPath.trim());
+		const weightBytesForBudget = await this._weightBytesOnDisk(modelPath);
+		const extraResidentBytes = (draftActive ? weightBytesForBudget : 0) + mmprojBytes;
+
+		if (!await this._checkModelFitsOrNotify(modelId, modelPath, backend, discreteVramBytes, extraResidentBytes)) {
 			return;
 		}
 
 		const port = await this.findAvailablePort(LOCOPILOT_LLAMA_SERVER_PORT);
-		const tuning = await this._augmentTuningWithHardware(modelPath, backend, this._getLlamaTuning(model));
-		// Vision: when a projector was downloaded next to the weights, pass it so the server accepts images.
-		// Skipped for models the user marked text-only (no point loading a projector they won't use).
-		if (model.supportsVision !== false) {
-			const mmprojPath = await this.resolveMmprojPath(model.localPath);
-			if (mmprojPath) {
-				tuning.mmprojPath = mmprojPath;
-				this._log(`[LoCoPilot Runner] Vision enabled for ${modelId}: using projector ${mmprojPath}.`);
-			}
-		}
+		const tuning = await this._augmentTuningWithHardware(modelPath, backend, baseTuning, extraResidentBytes);
 		const { command, args } = getLlamaCppServerCommand(modelPath, backend, serverPath, port, tuning);
 		this._log(`[LoCoPilot Runner] Starting llama.cpp server for model ${modelId} on port ${port} with backend: ${backend}`);
 

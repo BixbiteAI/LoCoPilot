@@ -36,7 +36,7 @@ import { defaultButtonStyles, getInputBoxStyle, getSelectBoxStyles, defaultToggl
 import { settingsSelectBackground, settingsSelectBorder, settingsSelectForeground, settingsSelectListBorder, settingsTextInputBackground, settingsTextInputBorder, settingsTextInputForeground } from '../../../preferences/common/settingsEditorColorRegistry.js';
 import { Toggle } from '../../../../../base/browser/ui/toggle/toggle.js';
 import { SelectBox, ISelectOptionItem, ISelectData } from '../../../../../base/browser/ui/selectBox/selectBox.js';
-import { ICustomLanguageModelsService, ICustomLanguageModel, getCustomModelListLabel, customModelSupportsVision, needsDownloadOrPullRetry, DEFAULT_CONTEXT_WINDOW_CLOUD, DEFAULT_CONTEXT_WINDOW_LOCAL, MIN_CONTEXT_WINDOW, MAX_CONTEXT_WINDOW } from '../../common/customLanguageModelsService.js';
+import { ICustomLanguageModelsService, ICustomLanguageModel, getCustomModelListLabel, customModelSupportsVision, customModelVisionEnabled, needsDownloadOrPullRetry, DEFAULT_CONTEXT_WINDOW_CLOUD, DEFAULT_CONTEXT_WINDOW_LOCAL, MIN_CONTEXT_WINDOW, MAX_CONTEXT_WINDOW } from '../../common/customLanguageModelsService.js';
 import { IDialogService } from '../../../../../platform/dialogs/common/dialogs.js';
 import { IClipboardService } from '../../../../../platform/clipboard/common/clipboardService.js';
 import { ICommandService } from '../../../../../platform/commands/common/commands.js';
@@ -865,7 +865,10 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 				hfFastest: isHfCloud ? !this.addFormHfFastestToggle.checked : undefined,
 				// Vision is collected for local models only (cloud relies on provider metadata). A confirmed
 				// HF/Ollama capability can still refine this after download; the My Models toggle can change it.
+				// Ticking it on add is explicit intent to use images, so enable runtime loading too (visionEnabled),
+				// not just the capability - otherwise the projector would download but never load.
 				supportsVision: this.addFormCurrentModelType === 'local' ? this.addFormVisionToggle.checked : undefined,
+				visionEnabled: this.addFormCurrentModelType === 'local' && this.addFormVisionToggle.checked ? true : undefined,
 			});
 			const listLabel = getCustomModelListLabel(addedModel);
 
@@ -1297,8 +1300,15 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 				await this.customLanguageModelsService.updateCustomModel(model.id, { mtp: mtpToggle.checked });
 			}));
 		}
-		// Vision toggle: whether this model can read image attachments. Shown for local and HF-cloud models.
-		if (model.type === 'local' || model.provider === 'huggingface-cloud') {
+		// Vision toggle: only shown for models that actually SUPPORT images, so text-only models stay clean.
+		// A local model is vision-capable once that's confirmed - catalog entries, HF/Ollama enrichment, or a
+		// projector found on disk at download all set supportsVision=true; the user can also declare it via the
+		// add-model form's vision toggle. The switch itself then controls runtime loading (visionEnabled),
+		// which is off until the user turns it on. HF-cloud multimodal models keep their provider-driven flag.
+		const showVisionToggle = model.type === 'local'
+			? model.supportsVision === true
+			: model.provider === 'huggingface-cloud' && customModelSupportsVision(model);
+		if (showVisionToggle) {
 			const visionDesc = model.visionAutoDisabled
 				? localize('customLanguageModels.visionAutoDisabledDescription', 'Vision was turned off automatically because this model couldn\'t read the last image. Turn it back on to try again.')
 				: localize('customLanguageModels.visionDescription', 'Allow image attachments for this model. Only enable for models that can read images.');
@@ -1309,12 +1319,22 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 			const visionWrap = DOM.append(visionContainer, $('.model-action-tools.agent-setting-switch-wrap'));
 			const visionToggle = this._register(new Toggle({
 				title: visionDesc,
-				isChecked: customModelSupportsVision(model),
+				// For local models the toggle reflects whether vision is actually LOADED (visionEnabled): the
+				// projector is downloaded for capable models but not loaded until the user opts in here, so the
+				// switch must show the real runtime state, not the mere capability. Cloud vision is capability-only.
+				isChecked: model.type === 'local' ? customModelVisionEnabled(model) : customModelSupportsVision(model),
 				...defaultToggleStyles
 			}));
 			DOM.append(visionWrap, visionToggle.domNode);
 			this._register(visionToggle.onChange(async () => {
-				await this.customLanguageModelsService.updateCustomModel(model.id, { supportsVision: visionToggle.checked });
+				const checked = visionToggle.checked;
+				// Local: an explicit user toggle is intent to use images, so it drives BOTH the capability
+				// (supportsVision) and the runtime load (visionEnabled) together - turning it on loads the
+				// projector (the runner reserves memory for it); turning it off keeps the model text-only.
+				const updates = model.type === 'local'
+					? { supportsVision: checked, visionEnabled: checked }
+					: { supportsVision: checked };
+				await this.customLanguageModelsService.updateCustomModel(model.id, updates);
 			}));
 		}
 		// HF cloud routing toggle: on = cheapest, off = fastest. Shown only for HF cloud models.
