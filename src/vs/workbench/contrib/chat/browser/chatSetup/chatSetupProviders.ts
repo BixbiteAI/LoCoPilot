@@ -66,6 +66,7 @@ import { IWorkbenchIssueService } from '../../../issue/common/issue.js';
 import { IDefaultAccountService } from '../../../../../platform/defaultAccount/common/defaultAccount.js';
 import { IHostService } from '../../../../services/host/browser/host.js';
 import { UnifiedAgent } from '../agents/unifiedAgent.js';
+import { STREAMING_EDITS_ENABLED, STREAMING_EDITS_PROTOCOL_PROMPT } from '../agents/streamingEdits.js';
 import { ILoCoPilotAgentSettingsService } from '../locopilotAgentSettingsService.js';
 import { ILoCoPilotProjectMemoryService } from '../locopilotProjectMemoryService.js';
 import { IWorkspaceContextService } from '../../../../../platform/workspace/common/workspace.js';
@@ -1726,6 +1727,13 @@ Focus on making the exact changes requested while preserving code structure and 
 			if (workspaceContext) {
 				systemPrompt = systemPrompt + '\n\n' + workspaceContext;
 			}
+		}
+
+		// Streaming-edits mode: append the SEARCH/REPLACE write protocol so the model writes files as parseable
+		// text (which streams live on local backends) instead of via the modifyFile tool. Only for writing modes
+		// (Agent/Edit), never Plan or Ask which are read-only.
+		if (STREAMING_EDITS_ENABLED && systemPrompt && (modeKind === ChatModeKind.Agent || modeKind === ChatModeKind.Edit) && modeInfo?.modeId !== 'plan') {
+			systemPrompt = systemPrompt + STREAMING_EDITS_PROTOCOL_PROMPT;
 		}
 
 		if (systemPrompt) {

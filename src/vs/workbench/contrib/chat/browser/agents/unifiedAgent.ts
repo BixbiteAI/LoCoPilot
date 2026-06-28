@@ -16,6 +16,9 @@ import { IChatProgress } from '../../common/chatService/chatService.js';
 import { ChatImageMimeType, ChatMessageRole, IChatMessage, IChatMessageImagePart, IChatResponseToolUsePart, ILanguageModelsService, LanguageModelPartAudience } from '../../common/languageModels.js';
 import { ILanguageModelToolsService, IToolData, toolMatchesModel } from '../../common/tools/languageModelToolsService.js';
 import { ContextManager } from './contextManager.js';
+import { STREAMING_EDITS_ENABLED, StreamingEditFilter } from './streamingEdits.js';
+import { generateUuid } from '../../../../../base/common/uuid.js';
+import { URI } from '../../../../../base/common/uri.js';
 /**
  * Unified agent that runs the language model with the given messages and streams progress.
  * This implements a full agentic loop with tool calling support.
@@ -51,6 +54,14 @@ const NO_PROGRESS_REORIENT_THRESHOLD = 3;
 const MUTATING_TOOL_IDS = new Set<string>(['modifyFile', 'editFile_internal']);
 
 /**
+ * Tool ids that are registered (for internal use, e.g. core codeMapper edits) but must NOT be advertised to
+ * the model. `editFile_internal` (EditTool) ships with an empty `modelDescription` and no `inputSchema`, so
+ * sending it to the model just adds a phantom, unusable function - weak models try to call it and fail/loop.
+ * `modifyFile` is the single intended file writer (it handles create + full replace + partial replace).
+ */
+const INTERNAL_ONLY_TOOL_IDS = new Set<string>(['editFile_internal']);
+
+/**
  * Tool ids that are safe to run concurrently within a single agent turn: read-only inspection
  * tools plus runSubagent (used for read-only parallel research). Edit/mutating tools are
  * deliberately excluded so they run sequentially and never race on the same files.
@@ -77,7 +88,7 @@ export class UnifiedAgent {
 		private readonly languageModelsService: ILanguageModelsService,
 		private readonly toolsService: ILanguageModelToolsService,
 		private readonly logService: ILogService,
-		_workspaceService: IWorkspaceContextService,
+		private readonly workspaceService: IWorkspaceContextService,
 		private readonly locopilotFileLog: ILoCoPilotFileLog,
 		maxIterations: number = DEFAULT_MAX_ITERATIONS
 	) {
@@ -187,6 +198,86 @@ export class UnifiedAgent {
 			let lastEmittedDisplayLength = 0;
 			let lastEmittedThinkingLength = 0;
 
+			// Streaming-edits mode: parse SEARCH/REPLACE blocks out of the content stream live. Whole-file writes
+			// (empty SEARCH) render as the native collapsible edit card (codeblockUri + streamed textEdits);
+			// partial edits render as a markdown diff (clear -/+). Each block is applied via modifyFile (invoked
+			// WITHOUT chat context, so it neither draws its own card nor a "Creating file" chip - we own the UI).
+			const editFailures: string[] = [];
+			let streamingEditApplied = false;
+			// State for the one block currently streaming (blocks are sequential): either a native card or a diff.
+			let card: { uri: URI; line: number; col: number } | undefined;
+			let diffOpen = false;
+			const resolveEditUri = (p: string): URI => {
+				if (p.startsWith('/') || /^[a-zA-Z]:/.test(p)) { return URI.file(p); }
+				const folders = this.workspaceService.getWorkspace().folders;
+				return folders.length > 0 ? URI.joinPath(folders[0].uri, p) : URI.file(p);
+			};
+			const editFilter = STREAMING_EDITS_ENABLED ? new StreamingEditFilter({
+				prose: text => progress([{ kind: 'markdownContent', content: new MarkdownString(text) }]),
+				blockStart: (path, isWholeFile) => {
+					if (isWholeFile) {
+						const uri = resolveEditUri(path);
+						const undoStopId = generateUuid();
+						progress([
+							{ kind: 'markdownContent', content: new MarkdownString('\n````\n') },
+							{ kind: 'codeblockUri', uri, isEdit: true, undoStopId },
+							{ kind: 'markdownContent', content: new MarkdownString('\n````\n') },
+							{ kind: 'textEdit', uri, edits: [] },
+						]);
+						card = { uri, line: 1, col: 1 };
+					} else {
+						progress([{ kind: 'markdownContent', content: new MarkdownString(`\n\n**Editing \`${path}\`**\n\n\`\`\`diff\n`) }]);
+						diffOpen = true;
+					}
+				},
+				blockDeletion: line => {
+					if (diffOpen) { progress([{ kind: 'markdownContent', content: new MarkdownString(`-${line}\n`) }]); }
+				},
+				blockReplaceLine: line => {
+					if (card) {
+						const text = line + '\n';
+						progress([{ kind: 'textEdit', uri: card.uri, edits: [{ range: { startLineNumber: card.line, startColumn: card.col, endLineNumber: card.line, endColumn: card.col }, text }] }]);
+						for (const ch of text) { if (ch === '\n') { card.line++; card.col = 1; } else { card.col++; } }
+					} else if (diffOpen) {
+						progress([{ kind: 'markdownContent', content: new MarkdownString(`+${line}\n`) }]);
+					}
+				},
+				blockEnd: () => {
+					if (card) {
+						progress([{ kind: 'textEdit', uri: card.uri, edits: [], done: true }]);
+						card = undefined;
+					} else if (diffOpen) {
+						progress([{ kind: 'markdownContent', content: new MarkdownString('```\n') }]);
+						diffOpen = false;
+					}
+				},
+				apply: async (path, search, replace) => {
+					try {
+						// Invoke modifyFile WITHOUT a chat context: that suppresses both its own edit card AND the
+						// "Creating file X" tool-invocation chip (the filter already renders the UI). modifyFile
+						// resolves the path via the workspace and writes straight to disk.
+						const result = await this.toolsService.invokeTool({
+							callId: `lcedit_${generateUuid()}`,
+							toolId: 'modifyFile',
+							parameters: { path, oldString: search, newString: replace },
+							context: undefined,
+							chatRequestId: request.requestId
+						}, async () => 0, token);
+						if (result?.toolResultError) {
+							editFailures.push(`${path}: ${result.toolResultError}`);
+							progress([{ kind: 'markdownContent', content: new MarkdownString(`\n\n> ⚠️ Could not apply edit to \`${path}\`: ${result.toolResultError}\n\n`) }]);
+						} else {
+							streamingEditApplied = true;
+							successfulMutations++;
+						}
+					} catch (e) {
+						const msg = e instanceof Error ? e.message : String(e);
+						editFailures.push(`${path}: ${msg}`);
+						progress([{ kind: 'markdownContent', content: new MarkdownString(`\n\n> ⚠️ Could not apply edit to \`${path}\`: ${msg}\n\n`) }]);
+					}
+				}
+			}) : undefined;
+
 			for await (const part of response.stream) {
 				if (token.isCancellationRequested) {
 					break;
@@ -196,15 +287,21 @@ export class UnifiedAgent {
 				for (const p of parts) {
 					if (p.type === 'text') {
 						fullText += p.value;
-						const displaySoFar = fullText;
-						const delta = displaySoFar.slice(lastEmittedDisplayLength);
-						if (delta) {
-							progress([{
-								kind: 'markdownContent',
-								content: new MarkdownString(delta)
-							}]);
-							lastEmittedDisplayLength = displaySoFar.length;
+						if (editFilter) {
+							// Filter renders prose + live diff and applies edits; it owns the display here.
+							editFilter.push(p.value);
 							hasEverEmitted = true;
+						} else {
+							const displaySoFar = fullText;
+							const delta = displaySoFar.slice(lastEmittedDisplayLength);
+							if (delta) {
+								progress([{
+									kind: 'markdownContent',
+									content: new MarkdownString(delta)
+								}]);
+								lastEmittedDisplayLength = displaySoFar.length;
+								hasEverEmitted = true;
+							}
 						}
 					} else if (p.type === 'thinking' && p.value) {
 						const chunk = Array.isArray(p.value) ? p.value.join('') : p.value;
@@ -232,21 +329,26 @@ export class UnifiedAgent {
 
 			const displayText = fullText;
 
-			// Emit final delta so UI has full text (chat model appends each progress chunk)
-			const finalDelta = displayText.slice(lastEmittedDisplayLength);
-			if (finalDelta) {
-				progress([{
-					kind: 'markdownContent',
-					content: new MarkdownString(finalDelta)
-				}]);
-				hasEverEmitted = true;
-			} else if (displayText.length > 0 && lastEmittedDisplayLength === 0) {
-				// Safety: ensure we emit at least once when there is content
-				progress([{
-					kind: 'markdownContent',
-					content: new MarkdownString(displayText)
-				}]);
-				hasEverEmitted = true;
+			if (editFilter) {
+				// Flush the final partial line and await all pending applies (writes happen here).
+				await editFilter.finalize();
+			} else {
+				// Emit final delta so UI has full text (chat model appends each progress chunk)
+				const finalDelta = displayText.slice(lastEmittedDisplayLength);
+				if (finalDelta) {
+					progress([{
+						kind: 'markdownContent',
+						content: new MarkdownString(finalDelta)
+					}]);
+					hasEverEmitted = true;
+				} else if (displayText.length > 0 && lastEmittedDisplayLength === 0) {
+					// Safety: ensure we emit at least once when there is content
+					progress([{
+						kind: 'markdownContent',
+						content: new MarkdownString(displayText)
+					}]);
+					hasEverEmitted = true;
+				}
 			}
 
 			await response.result;
@@ -271,8 +373,17 @@ export class UnifiedAgent {
 				});
 			}
 
-			// No tool calls: the model has given its final response, stop the loop
+			// No tool calls: the model has given its final response, stop the loop - UNLESS a streaming edit
+			// failed this round, in which case feed the failure back so the model can correct it next turn.
 			if (toolCalls.length === 0) {
+				if (editFailures.length > 0) {
+					conversationMessages.push({
+						role: ChatMessageRole.User,
+						content: [{ type: 'text', value: `Some SEARCH/REPLACE edits could not be applied:\n${editFailures.map(f => `- ${f}`).join('\n')}\n\nFor a failed partial edit, readFile the file and copy the EXACT current text into the SEARCH section, then re-emit the block. For a new file, leave SEARCH empty.` }]
+					});
+					this._log(`[LoCoPilot] Agent continuing: ${editFailures.length} streaming edit(s) failed, re-prompting`);
+					continue;
+				}
 				this._log(`[LoCoPilot] Agent completed: no tool calls in response`);
 				break;
 			}
@@ -339,7 +450,8 @@ export class UnifiedAgent {
 			// This is the "running model" a strong model keeps in its head, made explicit so weak
 			// models inherit it: count real progress, classify repeated error CLASSES (not exact
 			// args), and inject targeted guidance instead of letting the model spin.
-			let progressedThisRound = false;
+			// A streaming SEARCH/REPLACE edit that landed this round is real forward progress too.
+			let progressedThisRound = streamingEditApplied;
 			let erroredThisRound = false;
 			const coachingNotes: string[] = [];
 			// First pass: did we make REAL progress (a successful edit) this round? Progress means the
@@ -672,6 +784,19 @@ export class UnifiedAgent {
 
 		// Filter tools
 		const availableTools = allTools.filter(tool => {
+			// Internal-only tools (e.g. editFile_internal) are registered but must not be shown to the model -
+			// they have no usable description/schema and only confuse it. See INTERNAL_ONLY_TOOL_IDS.
+			if (INTERNAL_ONLY_TOOL_IDS.has(tool.id)) {
+				return false;
+			}
+
+			// In streaming-edits mode the model writes files via the SEARCH/REPLACE text protocol, not the
+			// modifyFile tool - so hide it from the model. It stays registered and we invoke it directly to
+			// apply each parsed block (see _applyStreamingEdit).
+			if (STREAMING_EDITS_ENABLED && tool.id === 'modifyFile') {
+				return false;
+			}
+
 			// Check if tool matches the model
 			if (!toolMatchesModel(tool, modelMetadata)) {
 				return false;
