@@ -26,6 +26,9 @@ import {
 	computeCpuMoeLayers,
 	clampContextSize,
 	shouldUseBundledVulkan,
+	metalOffloadBudgetBytes,
+	usableSystemMemoryBytes,
+	KV_BUDGET_FRACTION,
 	DEFAULT_LLAMA_CONTEXT_SIZE,
 	MIN_CLAMPED_CONTEXT,
 	LOCOPILOT_LLAMA_SERVER_PORT,
@@ -59,6 +62,7 @@ import { IEnvironmentService, INativeEnvironmentService } from '../../../../plat
 import { IRequestService } from '../../../../platform/request/common/request.js';
 import { CancellationToken } from '../../../../base/common/cancellation.js';
 import { timeout } from '../../../../base/common/async.js';
+import { LOCOPILOT_SETTINGS_SECTION_LIST_MODELS } from './chatManagement/locopilotSettingsEditorInput.js';
 
 export const ILoCoPilotLocalModelRunner = createDecorator<ILoCoPilotLocalModelRunner>('locopilotLocalModelRunner');
 
@@ -858,7 +862,10 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 	/**
 	 * Memory budget (bytes) the weights may use on a given backend, or undefined when unknown:
 	 *  - discrete GPU (cuda/vulkan): the largest detected dedicated VRAM pool (any vendor).
-	 *  - metal (Apple Silicon): total system RAM (unified memory shared with the CPU).
+	 *  - metal (Apple Silicon): the unified-memory WIRED ceiling ({@link metalOffloadBudgetBytes}), i.e. a
+	 *    fraction of total RAM - NOT raw total. macOS caps a Metal app's working set at ~70% of RAM; sizing
+	 *    the offload/KV budget off raw total (the old bug) let us wire weights + a large KV past that limit,
+	 *    which paged to SSD and hung/overheated the machine into a thermal shutdown.
 	 *  - cpu: undefined (the resident-budget/eviction path handles RAM pressure instead).
 	 */
 	private async _memoryBudgetBytes(backend: LlamaBackend, hw: ISystemHardwareInfo): Promise<number | undefined> {
@@ -868,7 +875,8 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 		}
 		if (backend === 'metal') {
 			const mem = await this._getSystemMemory();
-			return mem?.totalmem;
+			const budget = mem?.totalmem ? metalOffloadBudgetBytes(mem.totalmem) : 0;
+			return budget > 0 ? budget : undefined;
 		}
 		return undefined;
 	}
@@ -904,25 +912,30 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 
 		// #1 MoE expert offload vs dense partial GPU offload. These are mutually exclusive: a MoE model uses
 		// --n-cpu-moe (keep attention on GPU, experts on CPU); a dense model uses --n-gpu-layers.
+		// Size the offload off the budget MINUS the KV reserve: weights and the KV cache share the same
+		// device memory, so a model whose weights nearly fill the budget must still offload enough to leave
+		// room for KV - otherwise we wire full weights PLUS a large KV past the limit and page/OOM.
 		if (backend !== 'cpu' && budget && budget > 0) {
+			const offloadBudget = Math.floor(budget * (1 - KV_BUDGET_FRACTION));
 			const modelBytes = await this._weightBytesOnDisk(modelPath);
 			if (isMoeModelInfo(info) && tuning.cpuMoeLayers === undefined) {
-				const moe = computeCpuMoeLayers({ backend, modelBytes, layerCount: info.layerCount, expertCount: info.expertCount, memoryBudgetBytes: budget });
+				const moe = computeCpuMoeLayers({ backend, modelBytes, layerCount: info.layerCount, expertCount: info.expertCount, memoryBudgetBytes: offloadBudget });
 				if (moe !== undefined) {
 					tuning.cpuMoeLayers = moe;
-					this._log(`[LoCoPilot Runner] MoE model (${Math.round(modelBytes / 1e9)}GB, ${info.expertCount} experts) exceeds the ${Math.round(budget / 1e9)}GB budget; offloading experts of ${moe}/${info.layerCount} blocks to CPU (--n-cpu-moe).`);
+					this._log(`[LoCoPilot Runner] MoE model (${Math.round(modelBytes / 1e9)}GB, ${info.expertCount} experts) exceeds the ${Math.round(offloadBudget / 1e9)}GB weight budget; offloading experts of ${moe}/${info.layerCount} blocks to CPU (--n-cpu-moe).`);
 				}
 			} else if (!isMoeModelInfo(info) && tuning.gpuLayers === undefined && (backend === 'cuda' || backend === 'vulkan')) {
-				const layers = computeGpuLayers({ backend, modelBytes, layerCount: info.layerCount, vramBytes: budget });
+				const layers = computeGpuLayers({ backend, modelBytes, layerCount: info.layerCount, vramBytes: offloadBudget });
 				if (layers !== undefined) {
 					tuning.gpuLayers = layers;
-					this._log(`[LoCoPilot Runner] Dense model (${Math.round(modelBytes / 1e9)}GB) exceeds the ${Math.round(budget / 1e9)}GB VRAM budget; offloading ${layers}/${info.layerCount} layers to GPU, rest on CPU.`);
+					this._log(`[LoCoPilot Runner] Dense model (${Math.round(modelBytes / 1e9)}GB) exceeds the ${Math.round(offloadBudget / 1e9)}GB VRAM weight budget; offloading ${layers}/${info.layerCount} layers to GPU, rest on CPU.`);
 				}
 			}
 		}
 
 		// #5 Context clamp: never request more than the model supports, nor more than the KV budget can hold.
-		// Use ~25% of the memory budget as the KV-cache allowance (weights take the rest).
+		// Use KV_BUDGET_FRACTION of the memory budget as the KV-cache allowance (weights take the rest); this
+		// matches the reserve carved out of the offload budget above so the two decisions stay consistent.
 		if (tuning.contextSize && tuning.contextSize > 0) {
 			// Estimate KV bytes/token/layer from the model's attention geometry (f16 - conservative, since
 			// large windows actually run q8_0 which is ~half). Falls back to clampContextSize's own default
@@ -932,7 +945,7 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 			const clamped = clampContextSize({
 				requestedContext: tuning.contextSize,
 				modelContextLength: info.contextLength,
-				kvBudgetBytes: budget ? budget * 0.25 : undefined,
+				kvBudgetBytes: budget ? budget * KV_BUDGET_FRACTION : undefined,
 				layerCount: info.layerCount,
 				kvBytesPerTokenPerLayer: perTokenPerLayer,
 			});
@@ -957,6 +970,71 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 		}
 
 		return tuning;
+	}
+
+	/**
+	 * Pre-flight fit check. Returns true when the model can plausibly run on this machine; returns false -
+	 * after showing a clear, actionable notification - when it cannot fit even at the minimum context. This
+	 * is the guard that stops an oversized model from launching straight into the swap/OOM death spiral
+	 * (UI freeze -> 100% GPU -> heat -> thermal shutdown) that a too-big GGUF causes on a memory-tight machine.
+	 *
+	 * Honest-but-lenient: we only block when even the SMALLEST viable footprint (weights + a minimum KV cache
+	 * + a runtime slice) exceeds usable memory, so a model that merely needs context/offload tuning still
+	 * launches (the budget/clamp logic handles it). Any missing input (unknown weight size, no RAM stats, web)
+	 * returns true so we never block a launch we can't reason about.
+	 *
+	 * `discreteVramBytes`: dedicated VRAM (CUDA/Vulkan) that can hold offloaded weights ON TOP of system RAM;
+	 * undefined on unified-memory (Metal) / CPU, where weights live in system RAM regardless of any offload.
+	 */
+	private async _checkModelFitsOrNotify(modelId: string, modelPath: string, discreteVramBytes: number | undefined): Promise<boolean> {
+		const model = this.customLanguageModelsService.getCustomModels().find(m => m.id === modelId);
+		if (!model) {
+			return true;
+		}
+		const weightBytes = await this._weightBytesOnDisk(modelPath);
+		if (weightBytes <= 0) {
+			return true; // unknown size -> can't reason about it, don't block.
+		}
+		const mem = await this._getSystemMemory();
+		if (!mem?.totalmem) {
+			return true; // no RAM stats (e.g. web) -> don't block.
+		}
+
+		// Minimum resident footprint: weights + the smallest KV cache we'd ever allocate + a runtime slice.
+		// The GGUF probe is best-effort (it does not apply to MLX directories); fall back to safe defaults.
+		let info: IGgufModelInfo | undefined;
+		try {
+			info = await this._getModelInfo(modelPath);
+		} catch {
+			info = undefined;
+		}
+		const perTokenPerLayer = (info && kvBytesPerTokenPerLayer(info, 2)) || 4096;
+		const layerCount = info?.layerCount && info.layerCount > 0 ? info.layerCount : 32;
+		const GB = 1024 * 1024 * 1024;
+		const kvMinBytes = MIN_CLAMPED_CONTEXT * perTokenPerLayer * layerCount;
+		const runtimeOverhead = Math.round(1.5 * GB); // host buffers / compute scratch; conservative.
+		const requiredBytes = weightBytes + kvMinBytes + runtimeOverhead;
+
+		// Usable memory: system RAM left for inference, plus discrete VRAM when weights can offload to a GPU.
+		const usableBytes = usableSystemMemoryBytes(mem.totalmem) + (discreteVramBytes && discreteVramBytes > 0 ? discreteVramBytes : 0);
+		if (requiredBytes <= usableBytes) {
+			return true;
+		}
+
+		const needGb = Math.ceil(requiredBytes / GB);
+		const haveGb = Math.max(1, Math.round(usableBytes / GB));
+		this._log(`[LoCoPilot Runner] Refusing to start ${modelId}: needs ~${needGb}GB but only ~${haveGb}GB is usable on this machine.`);
+		const name = model.displayName || model.modelName;
+		const message = `"${name}" needs about ${needGb} GB of memory to run, but only about ${haveGb} GB is available on this machine. Please choose a smaller model.`;
+		this.notificationService.prompt(Severity.Error, message, [
+			{
+				label: 'Choose Another Model',
+				run: () => {
+					this.commandService.executeCommand('workbench.action.chat.openLoCoPilotSettings', { section: LOCOPILOT_SETTINGS_SECTION_LIST_MODELS });
+				}
+			}
+		]);
+		return false;
 	}
 
 	/**
@@ -1288,6 +1366,11 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 		if (model.provider === 'huggingface' && isAppleSiliconMac()) {
 			const hasGguf = await this.pathResolvesToGguf(model.localPath);
 			if (shouldUseMlxServerForHfModel(model, hasGguf, true)) {
+				// Same pre-flight fit check as the llama.cpp path: MLX runs on Apple Silicon unified memory,
+				// so there is no separate VRAM pool - weights + KV must fit usable system RAM.
+				if (!await this._checkModelFitsOrNotify(modelId, model.localPath, undefined)) {
+					return;
+				}
 				await this._startMlxServerInTerminal(modelId, model as ICustomLanguageModel & { localPath: string });
 				return;
 			}
@@ -1326,6 +1409,19 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 		}
 
 		const modelPath = await this.resolveModelFilePath(model.localPath);
+
+		// Pre-flight fit check: refuse (with a clear toast) a model that can't fit this machine, rather than
+		// spawning it into a swap/OOM hang. Discrete GPUs (CUDA/Vulkan) can hold offloaded weights in VRAM on
+		// top of system RAM; Metal/CPU keep weights in system RAM, so no extra pool is added.
+		let discreteVramBytes: number | undefined;
+		if (backend === 'cuda' || backend === 'vulkan') {
+			const hw = await this._getHardwareInfo();
+			const vram = (hw?.gpus ?? []).map(g => g.totalVramBytes).filter(v => v > 0);
+			discreteVramBytes = vram.length ? Math.max(...vram) : undefined;
+		}
+		if (!await this._checkModelFitsOrNotify(modelId, modelPath, discreteVramBytes)) {
+			return;
+		}
 
 		const port = await this.findAvailablePort(LOCOPILOT_LLAMA_SERVER_PORT);
 		const tuning = await this._augmentTuningWithHardware(modelPath, backend, this._getLlamaTuning(model));

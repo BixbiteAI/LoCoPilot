@@ -13,6 +13,10 @@ import {
 	getLlamaCppServerCommand,
 	resolveKvCacheType,
 	shouldUseBundledVulkan,
+	metalOffloadBudgetBytes,
+	usableSystemMemoryBytes,
+	METAL_WIRED_MEMORY_FRACTION,
+	USABLE_SYSTEM_MEMORY_FRACTION,
 	KV_AUTO_QUANT_CONTEXT_THRESHOLD,
 	VULKAN_MIN_DEDICATED_VRAM_BYTES,
 	MIN_CLAMPED_CONTEXT,
@@ -97,6 +101,26 @@ suite('LoCoPilot llama.cpp server', () => {
 		test('result clamped to [1, layerCount]', () => {
 			const n = computeCpuMoeLayers({ backend: 'vulkan', modelBytes: 200 * GB, layerCount: 32, expertCount: 64, memoryBudgetBytes: 2 * GB });
 			assert.strictEqual(n, 32);
+		});
+	});
+
+	suite('memory budgets', () => {
+		const GB = 1024 * 1024 * 1024;
+
+		test('metalOffloadBudgetBytes is the wired fraction of total, not raw total', () => {
+			assert.strictEqual(metalOffloadBudgetBytes(32 * GB), Math.floor(32 * GB * METAL_WIRED_MEMORY_FRACTION));
+			// The whole point of the fix: the budget must be strictly less than total RAM.
+			assert.ok(metalOffloadBudgetBytes(32 * GB) < 32 * GB);
+		});
+
+		test('usableSystemMemoryBytes leaves headroom below total', () => {
+			assert.strictEqual(usableSystemMemoryBytes(16 * GB), Math.floor(16 * GB * USABLE_SYSTEM_MEMORY_FRACTION));
+			assert.ok(usableSystemMemoryBytes(16 * GB) < 16 * GB);
+		});
+
+		test('zero / unknown total -> 0 (callers skip the budget)', () => {
+			assert.strictEqual(metalOffloadBudgetBytes(0), 0);
+			assert.strictEqual(usableSystemMemoryBytes(0), 0);
 		});
 	});
 

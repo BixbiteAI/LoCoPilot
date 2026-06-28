@@ -188,6 +188,47 @@ export const DEFAULT_LLAMA_CONTEXT_SIZE = 16384;
 export const KV_AUTO_QUANT_CONTEXT_THRESHOLD = 32768;
 
 /**
+ * Fraction of Apple-Silicon unified memory the GPU may WIRE for inference. macOS caps a Metal app's
+ * working set at roughly `recommendedMaxWorkingSetSize` (~70% of total RAM on M-series); trying to wire
+ * more than this forces the OS to page weights to SSD, which thrashes the machine (freeze, sustained 100%
+ * GPU, heat, thermal shutdown). So the offload/KV budget on Metal must be sized off this fraction of TOTAL
+ * RAM - never raw total, which ignores both this ceiling and the RAM the OS + editor already hold.
+ */
+export const METAL_WIRED_MEMORY_FRACTION = 0.70;
+
+/**
+ * Fraction of TOTAL system RAM treated as usable for inference (weights + KV) when deciding whether a model
+ * fits the machine AT ALL (the pre-flight gate). Leaves headroom for the OS + editor. Based on total rather
+ * than currently-free RAM on purpose: macOS reports much of its RAM as non-free (file cache / purgeable)
+ * even when it is reclaimable, so a free-based gate would block models that actually run.
+ */
+export const USABLE_SYSTEM_MEMORY_FRACTION = 0.85;
+
+/**
+ * Fraction of the memory budget reserved for the KV cache (the rest is for weights). Used both to size the
+ * KV-cache context clamp AND to shrink the weight-offload budget, so a model close to the device limit
+ * offloads experts/layers instead of wiring the full weights PLUS a large KV past the limit.
+ */
+export const KV_BUDGET_FRACTION = 0.25;
+
+/**
+ * Usable unified-memory budget (bytes) for GPU offload on Apple Silicon (Metal): a fraction of total RAM
+ * bounded by the wired working-set ceiling. Returns 0 when total is unknown so callers skip the budget.
+ */
+export function metalOffloadBudgetBytes(totalmemBytes: number): number {
+	return totalmemBytes > 0 ? Math.floor(totalmemBytes * METAL_WIRED_MEMORY_FRACTION) : 0;
+}
+
+/**
+ * Usable system-RAM budget (bytes) for the pre-flight fit check: a fraction of total RAM left after the
+ * OS + editor. On Apple Silicon, offloading experts to "CPU" keeps them in the SAME unified pool, so the
+ * weights + KV must fit this budget regardless of offload. Returns 0 when total is unknown.
+ */
+export function usableSystemMemoryBytes(totalmemBytes: number): number {
+	return totalmemBytes > 0 ? Math.floor(totalmemBytes * USABLE_SYSTEM_MEMORY_FRACTION) : 0;
+}
+
+/**
  * Resolves the concrete KV cache type to use. 'auto' chooses q8_0 once the context window reaches
  * {@link KV_AUTO_QUANT_CONTEXT_THRESHOLD}, else f16. A fixed type is returned unchanged.
  */

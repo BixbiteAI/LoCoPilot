@@ -31,6 +31,7 @@ import { toErrorMessage } from '../../../../base/common/errorMessage.js';
 import { CancellationError, isCancellationError } from '../../../../base/common/errors.js';
 import { ICommandService } from '../../../../platform/commands/common/commands.js';
 import { LOCOPILOT_SETTINGS_SECTION_LIST_MODELS } from './chatManagement/locopilotSettingsEditorInput.js';
+import { usableSystemMemoryBytes } from './locopilotLlamaCppServer.js';
 
 const HF_API_BASE = 'https://huggingface.co';
 const HF_RESOLVE = `${HF_API_BASE}`;
@@ -387,7 +388,9 @@ export class LoCoPilotModelDownloadService extends Disposable implements IWorkbe
 		let vram = 0;
 		try {
 			const stats = await this.nativeHostService.getOSStatistics();
-			ram = stats.totalmem ?? 0;
+			// Usable RAM, not raw total: the OS + editor always hold a slice, so sizing the quant off raw total
+			// over-states capacity and skips the downgrade on machines that can't actually run the bigger quant.
+			ram = usableSystemMemoryBytes(stats.totalmem ?? 0);
 		} catch { /* ignore */ }
 		try {
 			const hw = await this.systemInfoService.getHardwareInfo();
