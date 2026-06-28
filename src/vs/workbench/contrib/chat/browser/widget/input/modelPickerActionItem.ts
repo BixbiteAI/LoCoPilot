@@ -266,13 +266,29 @@ function getModelPickerActionBarActionProvider(commandService: ICommandService, 
 		getActions: () => {
 			const additionalActions: IAction[] = [];
 
+			// Always offer a way to reach the full model list, where users can Show hidden catalog models,
+			// download, hide, or delete. The picker itself only shows the curated/visible few.
+			// Pushed first so "Manage Models" sits on the LEFT of the bottom action bar.
+			additionalActions.push({
+				id: 'locopilotManageModels',
+				label: localize('chat.manageModels', "Manage Models"),
+				enabled: true,
+				tooltip: localize('chat.manageModels.tooltip', "Open the model list to show, hide, download, or remove models"),
+				class: undefined,
+				run: () => {
+					commandService.executeCommand('workbench.action.chat.openLoCoPilotSettings', { section: LOCOPILOT_SETTINGS_SECTION_LIST_MODELS });
+				}
+			});
+
 			// Sticky-footer Show/Hide toggle for the hidden models, rendered as a link/button in the bottom action
 			// bar (always pinned at the bottom, never scrolls with the list). Only offered when hidden models exist.
 			// `keepDropdownOpen` stops the dropdown from closing; refreshItems() rebuilds BOTH the list and this bar,
 			// so the label/icon flip between "Show" and "Hide" as the state changes. State resets to collapsed on
 			// each fresh open via the picker's visibility hook (not here), so this getActions can run on refresh.
+			// Pushed after "Manage Models" so the "Show more" toggle sits on the RIGHT.
 			const hiddenCount = customLanguageModelsService.getCustomModels().filter(m => m.hidden).length;
 			if (hiddenCount > 0) {
+				additionalActions.push(new Separator());
 				additionalActions.push(Object.assign(
 					toAction({
 						id: 'locopilotToggleHiddenModels',
@@ -286,21 +302,7 @@ function getModelPickerActionBarActionProvider(commandService: ICommandService, 
 					}),
 					{ keepDropdownOpen: true }
 				));
-				additionalActions.push(new Separator());
 			}
-
-			// Always offer a way to reach the full model list, where users can Show hidden catalog models,
-			// download, hide, or delete. The picker itself only shows the curated/visible few.
-			additionalActions.push({
-				id: 'locopilotManageModels',
-				label: localize('chat.manageModels', "Manage Models"),
-				enabled: true,
-				tooltip: localize('chat.manageModels.tooltip', "Open the model list to show, hide, download, or remove models"),
-				class: undefined,
-				run: () => {
-					commandService.executeCommand('workbench.action.chat.openLoCoPilotSettings', { section: LOCOPILOT_SETTINGS_SECTION_LIST_MODELS });
-				}
-			});
 
 			// Add "Original" option (existing Language Models screen)
 			if (

@@ -66,9 +66,16 @@
 	min-width: 30px;
 	border-radius: 8px;
 	background: var(--vscode-toolbar-hoverBackground, rgba(127, 127, 127, 0.12));
+	/* Icon always renders in the same color as the tab label text (no separate tint), so the chip reads as one unit. */
 	color: var(--vscode-foreground);
-	opacity: 0.85;
+	opacity: 1;
 	transition: background-color 0.12s ease, color 0.12s ease, opacity 0.12s ease;
+}
+
+/* Force the codicon glyph to inherit the chip's (label) color in every state. */
+.locopilot-settings-editor .locopilot-settings-tab-icon .codicon,
+.locopilot-settings-editor .locopilot-settings-tab-icon .codicon::before {
+	color: inherit;
 }
 
 .locopilot-settings-editor .locopilot-settings-tab-icon .codicon {
@@ -120,8 +127,9 @@
 }
 
 .locopilot-settings-editor .locopilot-settings-tab.active .locopilot-settings-tab-icon {
-	background: var(--vscode-inputOption-activeBackground, var(--vscode-button-background));
-	color: var(--vscode-inputOption-activeForeground, var(--vscode-button-foreground));
+	/* Neutral chip + label-matching color so the active icon stays the same color as its text. */
+	background: var(--vscode-toolbar-hoverBackground, rgba(127, 127, 127, 0.18));
+	color: var(--vscode-list-activeSelectionForeground, var(--vscode-foreground));
 	opacity: 1;
 }
 
