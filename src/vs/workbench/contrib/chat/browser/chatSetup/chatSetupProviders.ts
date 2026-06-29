@@ -1826,6 +1826,15 @@ Focus on making the exact changes requested while preserving code structure and 
 			return undefined;
 		}
 		try {
+			// Prefer the model the user has actually selected for this chat - it is known to be
+			// usable (it's what they're chatting with), so we avoid blindly grabbing models[0]
+			// which may be a provider the user has no valid API key for (e.g. an Anthropic model
+			// without a key would throw "invalid x-api-key" and silently kill title generation).
+			const selectedModelId = this.chatWidgetService.lastFocusedWidget?.input.currentLanguageModel;
+			if (selectedModelId && this.languageModelsService.lookupLanguageModel(selectedModelId)) {
+				this._log(`[LoCoPilot] Using selected model for title generation: ${selectedModelId}`);
+				return await this._generateTitleWithModel(selectedModelId, firstMessage, token);
+			}
 			// Prefer LoCoPilot custom models, then fallback to any available model for title generation
 			let models = await this.languageModelsService.selectLanguageModels({ vendor: 'locopilot' });
 			if (!models.length) {
@@ -1840,44 +1849,49 @@ Focus on making the exact changes requested while preserving code structure and 
 			if (!models.length || token.isCancellationRequested) {
 				return undefined;
 			}
-			const prompt = `Generate a very short title (max 6-8 words) for a chat that starts with this message. Reply with only the title, no quotes or extra punctuation.
-
-Message: ${firstMessage.substring(0, 500)}`;
-			const response = await this.languageModelsService.sendChatRequest(
-				models[0],
-				new ExtensionIdentifier('core'),
-				[{ role: ChatMessageRole.User, content: [{ type: 'text', value: prompt }] }],
-				{
-					// A title is 6-8 words - never let a thinking model spend a full chain-of-thought (we saw
-					// ~460 reasoning tokens / ~17s) on it. Force reasoning off and cap the output hard. This
-					// also frees the single server slot quickly so the user's real first message isn't stuck
-					// behind it. (Background call: locopilotForegroundTurn is left unset so it doesn't touch
-					// the timer bar's token stats.)
-					locopilotReasoningEffort: 'off',
-					locopilotMaxOutputTokens: 24,
-				},
-				token
-			);
-			let title = '';
-			for await (const part of response.stream) {
-				if (Array.isArray(part)) {
-					for (const p of part) {
-						if (p.type === 'text') {
-							title += p.value;
-						}
-					}
-				} else if (part.type === 'text') {
-					title += part.value;
-				}
-			}
-			await response.result;
-			title = title.trim().split('\n')[0].substring(0, 80);
-			if (title && !token.isCancellationRequested) {
-				this._log(`[LoCoPilot] Generated session title: ${title}`);
-				return title;
-			}
+			return await this._generateTitleWithModel(models[0], firstMessage, token);
 		} catch (e) {
 			this.logService.warn(`[LoCoPilot] Failed to generate chat title: ${e}`);
+		}
+		return undefined;
+	}
+
+	private async _generateTitleWithModel(modelId: string, firstMessage: string, token: CancellationToken): Promise<string | undefined> {
+		const prompt = `Summarize the topic of this message as a short title (3-6 words, a noun phrase, Title Case, no quotes or end punctuation). Do not echo the message.
+
+Message: ${firstMessage.substring(0, 500)}`;
+		const response = await this.languageModelsService.sendChatRequest(
+			modelId,
+			new ExtensionIdentifier('core'),
+			[{ role: ChatMessageRole.User, content: [{ type: 'text', value: prompt }] }],
+			{
+				// A title is 6-8 words - never let a thinking model spend a full chain-of-thought (we saw
+				// ~460 reasoning tokens / ~17s) on it. Force reasoning off and cap the output hard. This
+				// also frees the single server slot quickly so the user's real first message isn't stuck
+				// behind it. (Background call: locopilotForegroundTurn is left unset so it doesn't touch
+				// the timer bar's token stats.)
+				locopilotReasoningEffort: 'off',
+				locopilotMaxOutputTokens: 24,
+			},
+			token
+		);
+		let title = '';
+		for await (const part of response.stream) {
+			if (Array.isArray(part)) {
+				for (const p of part) {
+					if (p.type === 'text') {
+						title += p.value;
+					}
+				}
+			} else if (part.type === 'text') {
+				title += part.value;
+			}
+		}
+		await response.result;
+		title = title.trim().split('\n')[0].substring(0, 80);
+		if (title && !token.isCancellationRequested) {
+			this._log(`[LoCoPilot] Generated session title: ${title}`);
+			return title;
 		}
 		return undefined;
 	}
