@@ -45,6 +45,56 @@ body {
 	-webkit-user-select: none;
 }
 
+/*
+ * Theme native (browser) scrollbars to match the app theme.
+ *
+ * Most scroll areas use Monaco's custom scrollbar (a themed <div>), but some
+ * containers (model list, thinking block, settings editors, etc.) use raw
+ * `overflow: auto/scroll`, which renders the OS-native scrollbar. On some
+ * platforms that native scrollbar is drawn solid white regardless of the app
+ * theme. These rules force the native scrollbar to use the same theme variables
+ * as Monaco's custom scrollbar so it looks consistent everywhere.
+ *
+ * This only affects native scrollbars; Monaco's custom scrollbar is a separate
+ * DOM element and is unaffected by `::-webkit-scrollbar`.
+ */
+.monaco-workbench ::-webkit-scrollbar,
+.monaco-workbench::-webkit-scrollbar {
+	width: 10px;
+	height: 10px;
+}
+
+.monaco-workbench ::-webkit-scrollbar-track,
+.monaco-workbench::-webkit-scrollbar-track {
+	background: transparent;
+}
+
+.monaco-workbench ::-webkit-scrollbar-thumb,
+.monaco-workbench::-webkit-scrollbar-thumb {
+	background-color: var(--vscode-scrollbarSlider-background, rgba(121, 121, 121, 0.4));
+	border-radius: 10px;
+}
+
+.monaco-workbench ::-webkit-scrollbar-thumb:hover,
+.monaco-workbench::-webkit-scrollbar-thumb:hover {
+	background-color: var(--vscode-scrollbarSlider-hoverBackground, rgba(100, 100, 100, 0.7));
+}
+
+.monaco-workbench ::-webkit-scrollbar-thumb:active,
+.monaco-workbench::-webkit-scrollbar-thumb:active {
+	background-color: var(--vscode-scrollbarSlider-activeBackground, rgba(191, 191, 191, 0.4));
+}
+
+.monaco-workbench ::-webkit-scrollbar-corner,
+.monaco-workbench::-webkit-scrollbar-corner {
+	background: transparent;
+}
+
+/* Firefox / standards fallback for native scroll containers */
+.monaco-workbench {
+	scrollbar-color: var(--vscode-scrollbarSlider-background, rgba(121, 121, 121, 0.4)) transparent;
+}
+
 .monaco-workbench {
 	font-size: 13px;
 	line-height: 1.4em;

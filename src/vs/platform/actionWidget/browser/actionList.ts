@@ -472,48 +472,51 @@ export class ActionList<T> extends Disposable {
 	layout(minWidth: number): number {
 		const items = this._visibleItems;
 
-		// Measure max width from currently visible items
-		let maxWidth = minWidth;
-		if (items.length >= 50) {
-			maxWidth = 380;
-		} else {
-			const itemWidths: number[] = items.map((_, index): number => {
-				const element = this._getRowElement(index);
-				if (element) {
-					element.style.width = 'auto';
-					const width = element.getBoundingClientRect().width;
-					element.style.width = '';
-					return width;
-				}
-				return 0;
-			});
-			maxWidth = Math.max(...itemWidths, minWidth) + 28;
-		}
-
-		// When maxVisibleItems is set, use a fixed list height so the dropdown doesn't
-		// jump when the filter produces fewer results. Items scroll inside this fixed window.
+		// --- Height calc (done first so we know whether the list will actually scroll) ---
 		const maxVhPrecentage = 0.7;
 		const containerClientHeight = this._layoutService.getContainer(dom.getWindow(this.domNode)).clientHeight;
+		const numHeaders = items.filter(item => item.kind === 'header').length;
+		const numSeparators = items.filter(item => item.kind === 'separator').length;
+		const naturalHeight = items.length * this._actionLineHeight
+			+ numHeaders * (this._headerLineHeight - this._actionLineHeight)
+			+ numSeparators * (this._separatorLineHeight - this._actionLineHeight);
 		let listHeight: number;
 		if (this._listOptions?.maxVisibleItems) {
 			// `maxVisibleItems` caps how tall the window can get (and items scroll beyond it), but when there
 			// are FEWER items than that we shrink to fit instead of leaving empty space below. The dropdown is
 			// anchored above its trigger, so a shorter list keeps its bottom edge pinned to the button and the
 			// top edge moves down - exactly the "stick to the dropdown" behaviour we want for short lists.
-			const numHeaders = items.filter(item => item.kind === 'header').length;
-			const numSeparators = items.filter(item => item.kind === 'separator').length;
-			const naturalHeight = items.length * this._actionLineHeight
-				+ numHeaders * (this._headerLineHeight - this._actionLineHeight)
-				+ numSeparators * (this._separatorLineHeight - this._actionLineHeight);
 			const fixedHeight = this._listOptions.maxVisibleItems * this._actionLineHeight;
 			listHeight = Math.min(fixedHeight, naturalHeight, containerClientHeight * maxVhPrecentage);
 		} else {
-			const numHeaders = items.filter(item => item.kind === 'header').length;
-			const numSeparators = items.filter(item => item.kind === 'separator').length;
-			const itemsHeight = items.length * this._actionLineHeight;
-			const heightWithHeaders = itemsHeight + numHeaders * this._headerLineHeight - numHeaders * this._actionLineHeight;
-			const heightWithSeparators = heightWithHeaders + numSeparators * this._separatorLineHeight - numSeparators * this._actionLineHeight;
-			listHeight = Math.min(heightWithSeparators, containerClientHeight * maxVhPrecentage);
+			listHeight = Math.min(naturalHeight, containerClientHeight * maxVhPrecentage);
+		}
+		// The list scrolls only when its content is taller than the window it's shown in.
+		const willScroll = listHeight < naturalHeight - 0.5;
+
+		// --- Width calc ---
+		// Measure max content width from the currently rendered rows.
+		let maxWidth = minWidth;
+		if (items.length >= 50) {
+			maxWidth = 380;
+		} else {
+			let contentWidth = minWidth;
+			for (let index = 0; index < items.length; index++) {
+				const element = this._getRowElement(index);
+				if (element) {
+					element.style.width = 'auto';
+					// Math.ceil avoids sub-pixel truncation on fractional display scaling
+					// (e.g. 125%/150% DPI), which otherwise clips the label with an ellipsis.
+					contentWidth = Math.max(contentWidth, Math.ceil(element.getBoundingClientRect().width));
+					element.style.width = '';
+				}
+			}
+			// Horizontal chrome that sits outside the measured row content:
+			//  - widget padding (4px each side) + row padding (4px each side) = 16px, always
+			//  - the vertical scrollbar (~12px) only when the list actually scrolls, so short
+			//    menus (reasoning / mode pickers) don't get dead space on the right.
+			const horizontalChrome = 16 + (willScroll ? 12 : 0);
+			maxWidth = contentWidth + horizontalChrome;
 		}
 
 		this._list.layout(listHeight, maxWidth);
