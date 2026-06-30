@@ -1817,7 +1817,15 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 				this.workspaceInstructionsTextarea.focus();
 			}
 		};
-		this._register(DOM.addDisposableListener(header, 'click', () => setExpanded(!expanded)));
+		this._register(DOM.addDisposableListener(header, 'click', () => {
+			setExpanded(!expanded);
+			// After a mouse click the header keeps focus, so its :focus-visible (teal) outline
+			// lingers - especially noticeable after collapsing. Blur it so the outline clears
+			// immediately; keyboard activation (Enter/Space) still keeps the focus ring for a11y.
+			if (!expanded) {
+				header.blur();
+			}
+		}));
 		this._register(DOM.addDisposableListener(header, 'keydown', (e: KeyboardEvent) => {
 			if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); setExpanded(!expanded); }
 		}));

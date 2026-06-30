@@ -153,7 +153,10 @@
 	height: 100%;
 	overflow-y: auto;
 	overflow-x: hidden;
-	padding-bottom: 24px;
+	/* No bottom padding here: the agent-settings tab has a sticky footer that must pin to the
+	 * true bottom edge. Any bottom padding on the scroller would push the footer's pin-point up
+	 * and leave a transparent strip below it through which scrolling content shows. The other
+	 * tabs get their bottom breathing room from their own panel padding instead (below). */
 }
 
 .locopilot-settings-editor .header-title-container {
@@ -192,7 +195,9 @@
 }
 
 .locopilot-settings-editor .locopilot-settings-body {
-	padding: 15px;
+	/* No bottom padding: the agent tab's sticky footer is the last child and must reach the true
+	 * bottom edge with no gap below it. Tabs that need bottom breathing room add it themselves. */
+	padding: 15px 15px 0 15px;
 	min-height: 100%;
 	box-sizing: border-box;
 }
@@ -222,6 +227,9 @@
 .locopilot-settings-editor .add-models-panel,
 .locopilot-settings-editor .list-models-panel {
 	display: block;
+	/* Bottom breathing room, previously provided by the scroll container's padding-bottom.
+	 * Lives here now so the agent tab's sticky footer can reach the true bottom edge. */
+	padding-bottom: 24px;
 }
 
 /* Agent settings */
