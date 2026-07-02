@@ -1051,13 +1051,15 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 
 		const q = this.modelSearchQuery.toLowerCase().trim();
 		const isModelDownloaded = (m: ICustomLanguageModel): boolean => {
-			if (m.type === 'cloud') { return true; }
 			return !!(m.localPath && !needsDownloadOrPullRetry(m) && !m.isDownloading);
 		};
 		const matchesFilters = (m: ICustomLanguageModel): boolean => {
 			if (this.modelTypeFilter !== 'all' && m.type !== this.modelTypeFilter) { return false; }
-			if (this.modelStatusFilter === 'downloaded' && !isModelDownloaded(m)) { return false; }
-			if (this.modelStatusFilter === 'not-downloaded' && isModelDownloaded(m)) { return false; }
+			// "Downloaded" / "Not downloaded" are local-only concepts: cloud models have no weights to fetch,
+			// so they belong to neither bucket. Exclude them from both status filters (they still show under
+			// Status = All or the Type = Cloud filter).
+			if (this.modelStatusFilter === 'downloaded' && (m.type === 'cloud' || !isModelDownloaded(m))) { return false; }
+			if (this.modelStatusFilter === 'not-downloaded' && (m.type === 'cloud' || isModelDownloaded(m))) { return false; }
 			if (this.modelVisibilityFilter === 'shown' && m.hidden) { return false; }
 			if (this.modelVisibilityFilter === 'hidden' && !m.hidden) { return false; }
 			if (this.modelBestFilter === 'best' && this.modelSuitability(m) !== 'best') { return false; }
@@ -1449,16 +1451,25 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 				startCommand();
 			}));
 		} else if (isRunning) {
-			// Running: Stop + Logs. There is no manual Run button - local models auto-start on first
-			// use (see ensureServerForModel), so the list only needs to stop a running server or show its logs.
-			const btn = this._register(new Button(runSlot, { ...defaultButtonStyles, secondary: true }));
-			btn.label = localize('customLanguageModels.stopServer', 'Stop server');
+			// Running: Stop + Logs. Local models also auto-start on first use (see ensureServerForModel),
+			// so the button below is a convenience to spin up (or shut down) the server ahead of a request.
+			const btn = this._register(new Button(runSlot, { ...defaultButtonStyles, secondary: true, supportIcons: true, title: localize('customLanguageModels.stopServerTooltip', 'Unload this model and stop its server') }));
+			btn.label = '$(stop-circle) ' + localize('customLanguageModels.stopServer', 'Stop server');
 			this._register(btn.onDidClick(() => this.localModelRunner.stopServer(modelId)));
 			const logsButton = this._register(new Button(actionsContainer, { ...defaultButtonStyles, secondary: true, title: localize('customLanguageModels.logs.viewTooltip', 'View server logs') }));
 			logsButton.label = localize('customLanguageModels.logs', 'Logs');
 			this._register(logsButton.onDidClick(() => this._showLogsOverlay(modelId, modelLabel)));
+		} else {
+			// Not running and no error: offer a manual Start button. The server would otherwise start
+			// automatically on the first message (ensureServerForModel), but showing an explicit Start
+			// mirrors the Stop button and lets users pre-warm the model before chatting.
+			const startBtn = this._register(new Button(runSlot, { ...defaultButtonStyles, secondary: true, supportIcons: true, title: localize('customLanguageModels.startServerTooltip', 'Load this model and start its server') }));
+			startBtn.label = '$(play) ' + localize('customLanguageModels.startServer', 'Start server');
+			this._register(startBtn.onDidClick(() => {
+				this.serverStartErrors.delete(modelId);
+				startCommand();
+			}));
 		}
-		// else: not running and no error - nothing to show; the server starts automatically on first message.
 	}
 
 	private _showLogsOverlay(modelId: string, modelLabel: string): void {

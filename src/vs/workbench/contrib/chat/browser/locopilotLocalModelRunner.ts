@@ -1386,6 +1386,12 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 			return;
 		}
 
+		// Enforce the resident-model budget here, at the single choke point every launch flows through
+		// (auto-start-on-use, the manual "Start server" button, Retry, and the model picker all reach this).
+		// Doing it here - rather than only in ensureServerForModel - means a manual start also evicts the
+		// least-recently-used other server, so we never end up with more resident servers than the budget allows.
+		await this._enforceResidentBudget(modelId);
+
 		// Wait until the workbench has finished restoring before spawning. During early startup VS Code
 		// revives/restores persistent terminals; a terminal we create before that restoration runs gets
 		// torn down with the pty (SIGHUP), which is the "exit 1 right after the server started listening"
@@ -1654,11 +1660,9 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 		// no-op (startServerInTerminal guards on runningServers) and re-budgeting could evict the very model
 		// we are waiting on.
 		if (!existingRec) {
-			// Free RAM under an LRU budget instead of killing every other server: a recently-used model stays
-			// warm so switching back to it is instant. singleActiveModel forces the budget to 1 (old behavior).
-			await this._enforceResidentBudget(modelId);
-
 			// Launch (no-op if another caller already kicked it off; startServerInTerminal guards on runningServers).
+			// The resident-model budget (LRU eviction, singleActiveModel -> 1) is enforced inside the launch itself
+			// (_doStartServerInTerminal), so every start path - manual button, Retry, picker, auto-start - is bounded.
 			await this.startServerInTerminal(modelId);
 		}
 
