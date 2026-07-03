@@ -88,8 +88,12 @@ class LanguageModelResponse {
 
 			} else if (part.type === 'data') {
 				out = new extHostTypes.LanguageModelDataPart(part.data.buffer, part.mimeType, part.audience);
-			} else {
+			} else if (part.type === 'tool_use') {
 				out = new extHostTypes.LanguageModelToolCallPart(part.toolCallId, part.name, part.parameters);
+			} else {
+				// tool_use_start / tool_use_delta are internal streaming-progress parts (gated to the
+				// built-in agent's requests); never forward them to extensions.
+				continue;
 			}
 			lmResponseParts.push(out);
 		}

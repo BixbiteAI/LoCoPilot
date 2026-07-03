@@ -147,6 +147,30 @@ export interface IChatResponseToolUsePart {
 	thoughtSignature?: string;
 }
 
+/**
+ * Emitted mid-stream as soon as a streaming tool call has an id and name but its arguments are
+ * still being generated. Lets the chat UI show a live "preparing tool call" invocation instead of
+ * staying silent until the full arguments have buffered. Only emitted when the request options set
+ * `locopilotStreamToolCalls: true` (the built-in agent), so extension consumers never see it.
+ */
+export interface IChatResponseToolUseStartPart {
+	type: 'tool_use_start';
+	name: string;
+	toolCallId: string;
+}
+
+/**
+ * Streaming update for an in-flight tool call's arguments. `argsText` is the FULL raw JSON
+ * argument text accumulated so far (not just the delta), so consumers can best-effort parse it
+ * without tracking state. Gated the same way as {@link IChatResponseToolUseStartPart}.
+ */
+export interface IChatResponseToolUseDeltaPart {
+	type: 'tool_use_delta';
+	name: string;
+	toolCallId: string;
+	argsText: string;
+}
+
 export interface IChatResponseThinkingPart {
 	type: 'thinking';
 	value: string | string[];
@@ -164,7 +188,7 @@ export interface IChatResponsePullRequestPart {
 	linkTag: string;
 }
 
-export type IChatResponsePart = IChatResponseTextPart | IChatResponseToolUsePart | IChatResponseDataPart | IChatResponseThinkingPart;
+export type IChatResponsePart = IChatResponseTextPart | IChatResponseToolUsePart | IChatResponseToolUseStartPart | IChatResponseToolUseDeltaPart | IChatResponseDataPart | IChatResponseThinkingPart;
 
 export type IExtendedChatResponsePart = IChatResponsePullRequestPart;
 

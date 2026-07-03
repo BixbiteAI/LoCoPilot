@@ -24,10 +24,12 @@ import { IChatService } from '../../chatService/chatService.js';
 import { ChatModeKind } from '../../constants.js';
 import {
 	CountTokensCallback,
+	IStreamedToolInvocation,
 	IToolData,
 	IToolImpl,
 	IToolInvocation,
 	IToolInvocationPreparationContext,
+	IToolInvocationStreamContext,
 	IPreparedToolInvocation,
 	IToolResult,
 	ToolDataSource,
@@ -164,6 +166,39 @@ export class ModifyFileTool implements IToolImpl {
 			content: [{ kind: 'text', value: message }],
 			toolResultError: 'Linter errors introduced'
 		};
+	}
+
+	/**
+	 * Live invocation message while the model is still STREAMING this call's arguments (llama.cpp
+	 * streams them token by token). The schema orders fields path -> oldString -> newString, so the
+	 * file name appears within the first few tokens and the message then ticks up a live line count
+	 * while the content generates - instead of the chat sitting silent until the call completes.
+	 * `rawInput` is a best-effort parse of the partial JSON, so every field may be missing/truncated.
+	 */
+	async handleToolStream(context: IToolInvocationStreamContext, _token: CancellationToken): Promise<IStreamedToolInvocation | undefined> {
+		const input = (context.rawInput ?? {}) as Partial<IModifyFileToolParams>;
+		const path = typeof input.path === 'string' && input.path.trim().length > 0 ? input.path : undefined;
+		if (!path) {
+			return { invocationMessage: localize('modifyFile.streaming.preparing', "Preparing file edit") };
+		}
+		const fileName = path.split(/[/\\]/).filter(Boolean).pop() ?? path;
+		const fileUri = resolveToolFileUri(path, this.workspaceService);
+		// oldString streams before newString: known-empty means full write (create/overwrite), known
+		// non-empty means a targeted edit. While it's still unknown, stay neutral with "Editing".
+		const isFullWrite = typeof input.oldString === 'string' && input.oldString.length === 0;
+		const newString = typeof input.newString === 'string' ? input.newString : undefined;
+		if (newString === undefined) {
+			const template = isFullWrite
+				? localize('modifyFile.streaming.writing', "Writing {0}")
+				: localize('modifyFile.streaming.editing', "Editing {0}");
+			return { invocationMessage: buildFileLinkInvocationMessage(template, fileName, fileUri) };
+		}
+		// `localize` fills {1} with the live count while the literal '{0}' survives for the file link.
+		const lineCount = newString.split('\n').length;
+		const template = isFullWrite
+			? localize('modifyFile.streaming.writingLines', "Writing {0} ({1} lines)", '{0}', String(lineCount))
+			: localize('modifyFile.streaming.editingLines', "Editing {0} ({1} lines)", '{0}', String(lineCount));
+		return { invocationMessage: buildFileLinkInvocationMessage(template, fileName, fileUri) };
 	}
 
 	async invoke(invocation: IToolInvocation, countTokens: CountTokensCallback, progress: ToolProgress, token: CancellationToken): Promise<IToolResult> {

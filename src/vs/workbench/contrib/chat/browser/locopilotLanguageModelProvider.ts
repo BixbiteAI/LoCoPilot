@@ -1306,8 +1306,13 @@ export class LoCoPilotLanguageModelProvider extends Disposable implements ILangu
 		}
 
 		const headers: Record<string, string> = { 'Content-Type': 'application/json', 'Accept': 'text/event-stream' };
+		// Streaming tool-call parts: llama.cpp streams `delta.tool_calls` argument fragments token by
+		// token, so we can surface "tool call in progress" (name + partial args) to the chat UI while
+		// the arguments are still generating. Gated to the built-in agent's requests so extension
+		// consumers of the LM API never see the extra part types.
+		const streamToolCallParts = options.locopilotStreamToolCalls === true;
 		try {
-			const accumulatedToolCalls: Map<number, { id?: string; name?: string; args: string }> = new Map();
+			const accumulatedToolCalls: Map<number, { id?: string; name?: string; args: string; startEmitted?: boolean }> = new Map();
 			// Full assistant content seen so far. We buffer it so that if a local model emits a tool call as
 			// plain text (instead of structured tool_calls), we can (a) stop printing the raw markup to the UI
 			// the moment we spot a marker, and (b) recover the call at stream end. See _recoverTextToolCalls.
@@ -1369,7 +1374,28 @@ export class LoCoPilotLanguageModelProvider extends Disposable implements ILangu
 						if (!acc) { acc = { args: '' }; accumulatedToolCalls.set(idx, acc); }
 						if (tc.id) { acc.id = tc.id; }
 						if (tc.function?.name) { acc.name = tc.function.name; }
-						if (tc.function?.arguments !== undefined) { acc.args += tc.function.arguments; }
+						let argsGrew = false;
+						if (tc.function?.arguments !== undefined) {
+							// Some llama.cpp builds return `arguments` as a parsed JSON object instead of a
+							// string (breaking strict OpenAI compat); normalize so we never concatenate
+							// "[object Object]" into the accumulated argument text.
+							const chunk = typeof tc.function.arguments === 'string' ? tc.function.arguments : JSON.stringify(tc.function.arguments);
+							if (chunk.length > 0) {
+								acc.args += chunk;
+								argsGrew = true;
+							}
+						}
+						// Surface the in-flight call to the UI as soon as we know which tool it is, then
+						// keep feeding the accumulated argument text so the invocation card can update live.
+						if (streamToolCallParts && acc.id && acc.name) {
+							if (!acc.startEmitted) {
+								acc.startEmitted = true;
+								stream.emitOne({ type: 'tool_use_start', name: acc.name, toolCallId: acc.id });
+							}
+							if (argsGrew) {
+								stream.emitOne({ type: 'tool_use_delta', name: acc.name, toolCallId: acc.id, argsText: acc.args });
+							}
+						}
 					}
 				}
 			};
@@ -1774,8 +1800,11 @@ export class LoCoPilotLanguageModelProvider extends Disposable implements ILangu
 		}
 
 		const headers: Record<string, string> = { 'Content-Type': 'application/json', 'Accept': 'text/event-stream' };
+		// Same streaming tool-call surfacing as _callLocalModel (localhost servers are commonly
+		// llama.cpp too); gated to the built-in agent's requests.
+		const streamToolCallParts = options.locopilotStreamToolCalls === true;
 		try {
-			const accumulatedToolCalls: Map<number, { id?: string; name?: string; args: string }> = new Map();
+			const accumulatedToolCalls: Map<number, { id?: string; name?: string; args: string; startEmitted?: boolean }> = new Map();
 			// Full assistant content seen so far. We buffer it so that if a local model emits a tool call as
 			// plain text (instead of structured tool_calls), we can (a) stop printing the raw markup to the UI
 			// the moment we spot a marker, and (b) recover the call at stream end. See _recoverTextToolCalls.
@@ -1837,7 +1866,28 @@ export class LoCoPilotLanguageModelProvider extends Disposable implements ILangu
 						if (!acc) { acc = { args: '' }; accumulatedToolCalls.set(idx, acc); }
 						if (tc.id) { acc.id = tc.id; }
 						if (tc.function?.name) { acc.name = tc.function.name; }
-						if (tc.function?.arguments !== undefined) { acc.args += tc.function.arguments; }
+						let argsGrew = false;
+						if (tc.function?.arguments !== undefined) {
+							// Some llama.cpp builds return `arguments` as a parsed JSON object instead of a
+							// string (breaking strict OpenAI compat); normalize so we never concatenate
+							// "[object Object]" into the accumulated argument text.
+							const chunk = typeof tc.function.arguments === 'string' ? tc.function.arguments : JSON.stringify(tc.function.arguments);
+							if (chunk.length > 0) {
+								acc.args += chunk;
+								argsGrew = true;
+							}
+						}
+						// Surface the in-flight call to the UI as soon as we know which tool it is, then
+						// keep feeding the accumulated argument text so the invocation card can update live.
+						if (streamToolCallParts && acc.id && acc.name) {
+							if (!acc.startEmitted) {
+								acc.startEmitted = true;
+								stream.emitOne({ type: 'tool_use_start', name: acc.name, toolCallId: acc.id });
+							}
+							if (argsGrew) {
+								stream.emitOne({ type: 'tool_use_delta', name: acc.name, toolCallId: acc.id, argsText: acc.args });
+							}
+						}
 					}
 				}
 			};

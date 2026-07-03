@@ -3,6 +3,7 @@
  *  Licensed under the MIT License. See License.txt in the project root for license information.
  *--------------------------------------------------------------------------------------------*/
 
+import '../media/chatToolStreamingPreview.css';
 import * as dom from '../../../../../../../base/browser/dom.js';
 import { IMarkdownString, MarkdownString } from '../../../../../../../base/common/htmlContent.js';
 import { autorun } from '../../../../../../../base/common/observable.js';
@@ -13,6 +14,34 @@ import { IChatCodeBlockInfo } from '../../../chat.js';
 import { IChatContentPartRenderContext } from '../chatContentParts.js';
 import { ChatProgressContentPart } from '../chatProgressContentPart.js';
 import { BaseChatToolInvocationSubPart } from './chatToolInvocationSubPart.js';
+
+/** Argument fields that hold the "content being generated" for common editing tools. */
+const CONTENT_FIELD_CANDIDATES = ['newString', 'content', 'text', 'code'];
+
+/** Max preview lines / max chars per line shown for streaming tool-call content. */
+const PREVIEW_TAIL_LINES = 3;
+const PREVIEW_MAX_LINE_LENGTH = 200;
+
+/**
+ * Extract a short live tail of the content an in-flight tool call is generating (e.g. modifyFile's
+ * `newString`) from its best-effort-parsed partial input, so the user sees the file being written.
+ */
+function extractStreamingContentPreview(partialInput: unknown): string | undefined {
+	if (!partialInput || typeof partialInput !== 'object') {
+		return undefined;
+	}
+	for (const field of CONTENT_FIELD_CANDIDATES) {
+		const value = (partialInput as Record<string, unknown>)[field];
+		if (typeof value === 'string' && value.trim().length > 0) {
+			const lines = value.replace(/\s+$/, '').split('\n');
+			return lines
+				.slice(-PREVIEW_TAIL_LINES)
+				.map(l => l.length > PREVIEW_MAX_LINE_LENGTH ? `${l.slice(0, PREVIEW_MAX_LINE_LENGTH)}…` : l)
+				.join('\n');
+		}
+	}
+	return undefined;
+}
 
 /**
  * Sub-part for rendering a tool invocation in the streaming state.
@@ -89,7 +118,17 @@ export class ChatToolStreamingSubPart extends BaseChatToolInvocationSubPart {
 				toolInvocation
 			));
 
-			dom.reset(container, part.domNode);
+			// Live tail of the content being generated (e.g. the file modifyFile is writing), so long
+			// generations show visible progress instead of just a static message.
+			const previewText = extractStreamingContentPreview(currentState.partialInput.read(reader));
+			if (previewText) {
+				const preview = document.createElement('pre');
+				preview.classList.add('chat-tool-streaming-preview');
+				preview.textContent = previewText;
+				dom.reset(container, part.domNode, preview);
+			} else {
+				dom.reset(container, part.domNode);
+			}
 		}));
 
 		return container;

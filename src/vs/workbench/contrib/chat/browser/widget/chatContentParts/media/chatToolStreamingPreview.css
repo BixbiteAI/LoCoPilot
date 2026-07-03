@@ -1,0 +1,20 @@
+/*---------------------------------------------------------------------------------------------
+ *  Copyright (c) Microsoft Corporation. All rights reserved.
+ *  Licensed under the MIT License. See License.txt in the project root for license information.
+ *--------------------------------------------------------------------------------------------*/
+
+/* Live tail of the file content an in-flight tool call is generating (streaming tool state). */
+.interactive-item-container .chat-tool-streaming-preview {
+	margin: 2px 0 4px 22px; /* aligns under the progress message text, past the codicon column */
+	padding: 4px 8px;
+	font-family: var(--monaco-monospace-font);
+	font-size: 11px;
+	line-height: 1.4;
+	color: var(--vscode-descriptionForeground);
+	background-color: var(--vscode-textCodeBlock-background);
+	border-radius: 4px;
+	white-space: pre-wrap;
+	word-break: break-all;
+	overflow: hidden;
+	max-height: 60px;
+}

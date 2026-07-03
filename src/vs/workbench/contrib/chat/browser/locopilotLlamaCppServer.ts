@@ -503,6 +503,10 @@ export function getLlamaCppServerCommand(modelPath: string, backend: LlamaBacken
 		'--port', port.toString(),
 		// Flash Attention: 'auto' enables it where supported and falls back to standard attention otherwise.
 		'-fa', flashAttention,
+		// Use the model's chat template for native tool calling. Required for llama-server to parse
+		// tool calls AND to stream `delta.tool_calls` argument fragments incrementally (which powers
+		// the live "editing file.ts" card in chat); without it tool-call args buffer to stream end.
+		'--jinja',
 	];
 
 	// Multimodal projector: enables image input. Only present for vision models whose projector was downloaded.

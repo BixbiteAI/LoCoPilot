@@ -5,6 +5,7 @@
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
 
+import { timeout } from '../../../../../base/common/async.js';
 import { CancellationToken } from '../../../../../base/common/cancellation.js';
 import { MarkdownString } from '../../../../../base/common/htmlContent.js';
 import { ILogService } from '../../../../../platform/log/common/log.js';
@@ -12,9 +13,11 @@ import { IWorkspaceContextService } from '../../../../../platform/workspace/comm
 import { ILoCoPilotFileLog } from '../locopilotFileLog.js';
 import { nullExtensionDescription } from '../../../../services/extensions/common/extensions.js';
 import { IChatAgentRequest, IChatAgentResult } from '../../common/participants/chatAgents.js';
-import { IChatProgress } from '../../common/chatService/chatService.js';
+import { IChatProgress, IChatToolInvocation } from '../../common/chatService/chatService.js';
+import { ChatToolInvocation } from '../../common/model/chatProgressTypes/chatToolInvocation.js';
 import { ChatImageMimeType, ChatMessageRole, IChatMessage, IChatMessageImagePart, IChatResponseToolUsePart, ILanguageModelsService, LanguageModelPartAudience } from '../../common/languageModels.js';
 import { ILanguageModelToolsService, IToolData, toolMatchesModel } from '../../common/tools/languageModelToolsService.js';
+import { parsePartialJsonObject } from '../../common/tools/partialJsonInput.js';
 import { ContextManager } from './contextManager.js';
 /**
  * Unified agent that runs the language model with the given messages and streams progress.
@@ -55,6 +58,20 @@ const MUTATING_TOOL_IDS = new Set<string>(['modifyFile', 'editFile_internal']);
  * tools plus runSubagent (used for read-only parallel research). Edit/mutating tools are
  * deliberately excluded so they run sequentially and never race on the same files.
  */
+/** Minimum time between streaming tool-card repaints, so we don't re-render per generated token. */
+const TOOL_STREAM_UPDATE_INTERVAL_MS = 100;
+
+/**
+ * A tool-invocation card begun while the call's arguments were still streaming from the model.
+ * `invocation` is undefined when the tool doesn't implement handleToolStream (no card shown).
+ */
+interface IStreamingToolCard {
+	invocation: IChatToolInvocation | undefined;
+	/** Latest full raw argument text waiting to be pushed to the card (coalesces bursts of deltas). */
+	pendingArgs?: string;
+	flushing: boolean;
+}
+
 const PARALLELIZABLE_TOOL_IDS = new Set<string>([
 	'semanticSearch',
 	'readFile',
@@ -166,6 +183,10 @@ export class UnifiedAgent {
 			// bar for it only. Background/auxiliary model calls (title generation, context compaction, capability
 			// probes) don't set this, so their tokens never leak into the panel's "tokens / tokens-per-sec" display.
 			options.locopilotForegroundTurn = true;
+			// Ask the provider to emit tool_use_start/tool_use_delta parts while a tool call's
+			// arguments are still streaming (llama.cpp streams them token by token), so the chat can
+			// show a live "editing file.ts" card instead of going silent until the call completes.
+			options.locopilotStreamToolCalls = true;
 			if (tools.length > 0) {
 				options.tools = tools;
 				this._log(`[LoCoPilot] Sending ${tools.length} tools to LLM`);
@@ -183,6 +204,9 @@ export class UnifiedAgent {
 			let fullText = '';
 			let fullThinking = '';
 			const toolCalls: IChatResponseToolUsePart[] = [];
+			// Invocation cards begun while tool-call arguments were still streaming, keyed by call id.
+			// invokeTool later adopts a card via the same callId and transitions it out of streaming.
+			const streamingToolCards = new Map<string, IStreamingToolCard>();
 			// Chat model merges markdownContent/thinking by appending; emit only deltas to avoid duplication
 			let lastEmittedDisplayLength = 0;
 			let lastEmittedThinkingLength = 0;
@@ -220,9 +244,37 @@ export class UnifiedAgent {
 						// LLM wants to call a tool
 						toolCalls.push(p as IChatResponseToolUsePart);
 						this._log(`[LoCoPilot] Tool call requested: ${p.name} (id: ${p.toolCallId})`);
+					} else if (p.type === 'tool_use_start') {
+						// A tool call's arguments are streaming: show its invocation card immediately
+						// (only tools that implement handleToolStream get a card; others return undefined).
+						if (request.sessionResource && !streamingToolCards.has(p.toolCallId)) {
+							const realToolId = idByLlmName.get(p.name) ?? p.name;
+							const invocation = this.toolsService.beginToolCall({
+								toolCallId: p.toolCallId,
+								toolId: realToolId,
+								chatRequestId: request.requestId,
+								sessionResource: request.sessionResource
+							});
+							streamingToolCards.set(p.toolCallId, { invocation, flushing: false });
+							if (invocation) {
+								this._log(`[LoCoPilot] Tool call streaming started: ${p.name} (id: ${p.toolCallId})`);
+							}
+						}
+					} else if (p.type === 'tool_use_delta') {
+						const card = streamingToolCards.get(p.toolCallId);
+						if (card?.invocation) {
+							card.pendingArgs = p.argsText;
+							// Fire-and-forget: the pump throttles itself and always applies the latest args.
+							void this._flushToolStreamUpdates(p.toolCallId, card, token);
+						}
 					}
 				}
 			}
+
+			// Finalize any card whose call never completed (cancelled mid-stream, or the provider
+			// never emitted the final tool_use). Cards for calls in toolCalls are adopted and
+			// transitioned by invokeTool below, so leave those alone.
+			this._finalizeDanglingToolCards(streamingToolCards, new Set(toolCalls.map(t => t.toolCallId)));
 
 			// Emit final thinking delta so we don't duplicate
 			const finalThinkingDelta = fullThinking.slice(lastEmittedThinkingLength);
@@ -297,6 +349,8 @@ export class UnifiedAgent {
 					kind: 'markdownContent',
 					content: new MarkdownString(`\n*Stopped: the same tool was called repeatedly with no progress. If the task is done, you can start a new message.*\n`)
 				}]);
+				// These calls will never be invoked; don't leave their cards spinning.
+				this._finalizeDanglingToolCards(streamingToolCards);
 				break;
 			}
 
@@ -480,6 +534,55 @@ export class UnifiedAgent {
 			this._log(`[LoCoPilot] Prefix warm-up completed for ${modelId}`);
 		} catch (e) {
 			this._log(`[LoCoPilot] Prefix warm-up failed (ignored): ${e}`);
+		}
+	}
+
+	/**
+	 * Throttled pump for a streaming tool call's argument updates. Best-effort parses the latest
+	 * partial JSON and forwards it to the tools service, which re-renders the invocation card
+	 * (via the tool's handleToolStream). Runs at most one update chain per card, paced at
+	 * TOOL_STREAM_UPDATE_INTERVAL_MS, always applying the newest pending args.
+	 */
+	private async _flushToolStreamUpdates(toolCallId: string, card: IStreamingToolCard, token: CancellationToken): Promise<void> {
+		if (card.flushing) {
+			return;
+		}
+		card.flushing = true;
+		try {
+			while (card.pendingArgs !== undefined && !token.isCancellationRequested) {
+				const argsText = card.pendingArgs;
+				card.pendingArgs = undefined;
+				const partialInput = parsePartialJsonObject(argsText);
+				if (partialInput) {
+					await this.toolsService.updateToolStream(toolCallId, partialInput, token);
+				}
+				// Pace repaints and let more argument tokens coalesce before the next update.
+				await timeout(TOOL_STREAM_UPDATE_INTERVAL_MS);
+			}
+		} catch (e) {
+			this._log(`[LoCoPilot] Streaming tool-card update failed (ignored): ${e}`);
+		} finally {
+			card.flushing = false;
+		}
+	}
+
+	/**
+	 * Finalize streaming invocation cards that will never be picked up by invokeTool (the call was
+	 * cancelled mid-stream, its arguments never completed, or the loop stopped before executing).
+	 * Without this the card would sit in the streaming/spinner state forever.
+	 */
+	private _finalizeDanglingToolCards(streamingToolCards: Map<string, IStreamingToolCard>, willBeInvoked?: Set<string>): void {
+		for (const [callId, card] of streamingToolCards) {
+			if (willBeInvoked?.has(callId)) {
+				continue;
+			}
+			card.pendingArgs = undefined;
+			const invocation = card.invocation;
+			if (invocation instanceof ChatToolInvocation && IChatToolInvocation.isStreaming(invocation)) {
+				this._log(`[LoCoPilot] Finalizing dangling streamed tool call (id: ${callId})`);
+				invocation.transitionFromStreaming(undefined, undefined, undefined);
+				invocation.didExecuteTool(undefined, true);
+			}
 		}
 	}
 
