@@ -1056,9 +1056,14 @@ export class ChatListItemRenderer extends Disposable implements ITreeRenderer<Ch
 	private applyRequestBubbleClamp(templateData: IChatListItemTemplate, bubble: HTMLElement): void {
 		bubble.classList.add('chat-request-clamp');
 
+		// The toggle lives in its own footer row placed *after* the bubble (not inside it), so it always sits
+		// on its own line at the bottom-right corner instead of floating over the last line of text. This is
+		// the same layout in both the collapsed ("Show more") and expanded ("Show less") states.
+		const footer = dom.$('.chat-request-expand-footer');
 		const toggle = dom.$('a.chat-request-expand-toggle');
 		toggle.setAttribute('role', 'button');
 		toggle.tabIndex = 0;
+		footer.appendChild(toggle);
 
 		const setExpanded = (expanded: boolean) => {
 			bubble.classList.toggle('expanded', expanded);
@@ -1085,12 +1090,12 @@ export class ChatListItemRenderer extends Disposable implements ITreeRenderer<Ch
 			const overflows = bubble.scrollHeight - bubble.clientHeight > 2;
 			if (overflows) {
 				setExpanded(false);
-				if (toggle.parentElement !== bubble) {
-					bubble.appendChild(toggle);
+				if (footer.parentElement !== bubble.parentElement) {
+					bubble.after(footer);
 				}
 			} else {
 				bubble.classList.remove('chat-request-clamp', 'expanded');
-				toggle.remove();
+				footer.remove();
 			}
 		}));
 	}

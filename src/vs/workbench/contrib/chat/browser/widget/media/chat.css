@@ -2673,39 +2673,66 @@ have to be updated for changes to the rules above, or to support more deeply nes
 		margin-left: auto;
 	}
 
-	/* Clamp tall user request bubbles to a max height with internal scroll */
+	/* Clamp tall user request bubbles: content is clipped (no internal scroll) and the "Show more" toggle sits in a footer row below the bubble, so it never overlaps the text. */
 	.interactive-item-container.interactive-request .value .rendered-markdown.chat-request-clamp {
 		max-height: 180px;
-		overflow-y: auto;
+		overflow: hidden;
+	}
+
+	/* Soft bottom fade so the clipped last line dissolves into the bubble instead of a hard cut. */
+	.interactive-item-container.interactive-request .value .rendered-markdown.chat-request-clamp:not(.expanded)::after {
+		content: '';
+		position: absolute;
+		left: 0;
+		right: 0;
+		bottom: 0;
+		height: 28px;
+		pointer-events: none;
+		background: linear-gradient(to bottom, transparent, var(--vscode-chat-requestBubbleBackground));
+		border-radius: 0 0 8px 8px;
 	}
 
 	.interactive-item-container.interactive-request .value .rendered-markdown.chat-request-clamp.expanded {
 		max-height: none;
-		overflow-y: visible;
+		overflow: visible;
 	}
 
-	/* Chevron toggle pinned to the bottom-right inside the request bubble */
-	.interactive-item-container.interactive-request .value .rendered-markdown.chat-request-clamp {
-		/* room so the chevron never overlaps the last line of text */
-		padding-bottom: 20px;
+	/* Footer row that holds the Show more / Show less toggle, right-aligned under the bubble on its own line. */
+	.interactive-item-container.interactive-request .value .chat-request-expand-footer {
+		display: flex;
+		justify-content: flex-end;
+		max-width: 90%;
+		margin-left: auto;
+		margin-top: 2px;
+		margin-bottom: 5px;
 	}
 
 	.interactive-item-container.interactive-request .value .chat-request-expand-toggle {
-		position: sticky;
-		bottom: 0;
-		float: right;
-		clear: both;
-		margin: -2px -4px -4px 0;
-		padding: 0 2px;
+		padding: 2px 8px;
 		font-size: 11px;
 		cursor: pointer;
-		color: var(--vscode-textLink-foreground);
+		color: var(--vscode-button-secondaryForeground, var(--vscode-textLink-foreground));
 		user-select: none;
+		/* Solid pill so it reads as a distinct button, matching the Show less style. */
+		background-color: var(--vscode-button-secondaryBackground, var(--vscode-badge-background));
+		border: 1px solid var(--vscode-contrastBorder, transparent);
+		border-radius: 4px;
+		/* Hidden until the request row is hovered/focused (revealed by the rules below). */
+		opacity: 0;
+		pointer-events: none;
+		transition: opacity 0.1s ease-in-out;
+	}
+
+	/* Reveal the toggle only while hovering the request row, or when it has keyboard focus. */
+	.interactive-item-container.interactive-request:hover .chat-request-expand-toggle,
+	.interactive-item-container.interactive-request .value .chat-request-expand-footer:focus-within .chat-request-expand-toggle,
+	.interactive-item-container.interactive-request .value .chat-request-expand-toggle:focus {
+		opacity: 1;
+		pointer-events: auto;
 	}
 
 	.interactive-item-container.interactive-request .value .chat-request-expand-toggle:hover {
-		color: var(--vscode-textLink-activeForeground);
-		text-decoration: underline;
+		background-color: var(--vscode-button-secondaryHoverBackground, var(--vscode-button-secondaryBackground));
 	}
 
 	.interactive-item-container.interactive-request .value .rendered-markdown.clickable:hover {
