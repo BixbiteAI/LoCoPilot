@@ -79,9 +79,22 @@ const STORAGE_KEY_WORKSPACE_PROMPT = 'locopilot.projectMemory.workspaceInstructi
 const STORAGE_KEY_LEARNED_FACTS = 'locopilot.projectMemory.learnedFacts';
 const STORAGE_KEY_PROFILE_CACHE = 'locopilot.projectMemory.profileCache';
 
+/** Directories that are build artifacts / dependencies - never shown in the structure tree. */
+const TREE_IGNORE_NAMES = new Set([
+	'node_modules', 'dist', 'coverage', 'tmp', 'temp', '__pycache__', 'venv', '.venv',
+	'target', 'bin', 'obj', 'Pods', 'DerivedData', 'vendor',
+]);
+/** Name prefixes to skip in the tree (out/, out-build/, out-vscode-min/, ...). */
+const TREE_IGNORE_PREFIXES = ['out'];
+
 /** Hard caps so the injected block stays small for local models. */
 const MAX_MEMORY_FILE_CHARS = 6000;
-const MAX_PROFILE_CHARS = 2000;
+const MAX_PROFILE_CHARS = 3600;
+const MAX_TREE_CHARS = 1200;
+const MAX_TREE_TOP_ENTRIES = 30;
+const MAX_TREE_CHILD_ENTRIES = 8;
+/** How many top-level child dirs to probe when the root itself has no project files. */
+const MAX_NESTED_PROBE_DIRS = 15;
 const MAX_WORKSPACE_INSTRUCTIONS_CHARS = 4000;
 const MAX_FACTS = 50;
 const MAX_FACT_CHARS = 500;
@@ -177,11 +190,27 @@ export class LoCoPilotProjectMemoryService implements ILoCoPilotProjectMemorySer
 	}
 
 	private async getOrBuildProfile(root: URI, token: CancellationToken): Promise<string | undefined> {
-		const present = await this.detectSignalFiles(root);
+		// The tree is built first: it is shown in the profile AND participates in the cache
+		// signature, and its top-level dirs double as nested-project probe candidates.
+		const tree = await this.buildDirectoryTree(root);
+
+		// Signal files at the workspace root - or, when the root is just a wrapper folder
+		// (e.g. the real project lives in a single subdirectory), at the nested project root.
+		let profileRoot = root;
+		let nestedDir: string | undefined;
+		let present = await this.detectSignalFiles(root);
 		if (present.length === 0) {
+			const nested = await this.findNestedProject(root, token);
+			if (nested) {
+				profileRoot = nested.uri;
+				nestedDir = nested.name;
+				present = nested.present;
+			}
+		}
+		if (present.length === 0 && !tree) {
 			return undefined;
 		}
-		const sig = await this.computeSignature(root, present, token);
+		const sig = await this.computeSignature(profileRoot, present, tree, token);
 
 		const cachedRaw = this.storageService.get(STORAGE_KEY_PROFILE_CACHE, StorageScope.WORKSPACE);
 		if (cachedRaw) {
@@ -195,7 +224,7 @@ export class LoCoPilotProjectMemoryService implements ILoCoPilotProjectMemorySer
 			}
 		}
 
-		const profile = await this.buildProfile(root, present);
+		const profile = await this.buildProfile(profileRoot, present, tree, nestedDir);
 		if (profile) {
 			const toStore: ICachedProfile = { sig, profile };
 			this.storageService.store(STORAGE_KEY_PROFILE_CACHE, JSON.stringify(toStore), StorageScope.WORKSPACE, StorageTarget.MACHINE);
@@ -217,8 +246,11 @@ export class LoCoPilotProjectMemoryService implements ILoCoPilotProjectMemorySer
 		return found;
 	}
 
-	/** Signature = hash of the contents of the present signal files, so the cache busts when they change. */
-	private async computeSignature(root: URI, present: string[], token: CancellationToken): Promise<number> {
+	/**
+	 * Signature = hash of the contents of the present signal files + the rendered structure tree,
+	 * so the cache busts when either changes.
+	 */
+	private async computeSignature(root: URI, present: string[], tree: string | undefined, token: CancellationToken): Promise<number> {
 		const parts: string[] = [];
 		for (const name of present) {
 			if (token.isCancellationRequested) {
@@ -231,11 +263,121 @@ export class LoCoPilotProjectMemoryService implements ILoCoPilotProjectMemorySer
 				parts.push(`${name}:?`);
 			}
 		}
+		if (tree) {
+			parts.push(`tree:${tree}`);
+		}
 		return hash(parts.join(' '));
 	}
 
-	private async buildProfile(root: URI, present: string[]): Promise<string | undefined> {
+	// ---- Phase 2: directory structure tree -----------------------------------
+
+	private isTreeVisible(name: string): boolean {
+		if (name.startsWith('.')) {
+			return false;
+		}
+		if (TREE_IGNORE_NAMES.has(name)) {
+			return false;
+		}
+		return !TREE_IGNORE_PREFIXES.some(p => name === p || name.startsWith(`${p}-`) || name.startsWith(`${p}_`) || name.startsWith(`${p}.`));
+	}
+
+	/**
+	 * Compact 2-level directory sketch of the workspace root. Dirs first, artifacts filtered,
+	 * hard-capped at MAX_TREE_CHARS so it stays ~300 tokens even on huge repos.
+	 */
+	private async buildDirectoryTree(root: URI): Promise<string | undefined> {
+		let top;
+		try {
+			top = await this.fileService.resolve(root);
+		} catch {
+			return undefined;
+		}
+		const sortEntries = (entries: { name: string; isDirectory: boolean }[]) =>
+			entries.filter(e => this.isTreeVisible(e.name))
+				.sort((a, b) => (a.isDirectory === b.isDirectory) ? a.name.localeCompare(b.name) : (a.isDirectory ? -1 : 1));
+
+		const topEntries = sortEntries(top.children ?? []);
+		if (topEntries.length === 0) {
+			return undefined;
+		}
+
 		const lines: string[] = [];
+		let chars = 0;
+		const push = (line: string): boolean => {
+			if (chars + line.length + 1 > MAX_TREE_CHARS) {
+				return false;
+			}
+			lines.push(line);
+			chars += line.length + 1;
+			return true;
+		};
+
+		let shown = 0;
+		for (const entry of topEntries) {
+			if (shown >= MAX_TREE_TOP_ENTRIES || !push(entry.isDirectory ? `${entry.name}/` : entry.name)) {
+				push(`... +${topEntries.length - shown} more`);
+				break;
+			}
+			shown++;
+			if (!entry.isDirectory) {
+				continue;
+			}
+			// Second level: a few children per dir, so the model sees where the code lives.
+			try {
+				const sub = await this.fileService.resolve(URI.joinPath(root, entry.name));
+				const subEntries = sortEntries(sub.children ?? []);
+				for (let i = 0; i < subEntries.length && i < MAX_TREE_CHILD_ENTRIES; i++) {
+					const e = subEntries[i];
+					if (!push(`  ${e.name}${e.isDirectory ? '/' : ''}`)) {
+						break;
+					}
+				}
+				if (subEntries.length > MAX_TREE_CHILD_ENTRIES) {
+					push(`  ... +${subEntries.length - MAX_TREE_CHILD_ENTRIES} more`);
+				}
+			} catch {
+				// unreadable dir - show it without children
+			}
+		}
+		return lines.length ? lines.join('\n') : undefined;
+	}
+
+	/**
+	 * When the workspace root itself has no project config (a wrapper folder), probe the immediate
+	 * child directories and treat the first one holding signal files as the real project root.
+	 */
+	private async findNestedProject(root: URI, token: CancellationToken): Promise<{ name: string; uri: URI; present: string[] } | undefined> {
+		let top;
+		try {
+			top = await this.fileService.resolve(root);
+		} catch {
+			return undefined;
+		}
+		const candidates = (top.children ?? [])
+			.filter(c => c.isDirectory && this.isTreeVisible(c.name))
+			.slice(0, MAX_NESTED_PROBE_DIRS);
+		let best: { name: string; uri: URI; present: string[] } | undefined;
+		for (const child of candidates) {
+			if (token.isCancellationRequested) {
+				break;
+			}
+			const present = await this.detectSignalFiles(child.resource);
+			if (present.length > (best?.present.length ?? 0)) {
+				best = { name: child.name, uri: child.resource, present };
+			}
+		}
+		if (best) {
+			this.log(`Nested project detected in subfolder: ${best.name}/`);
+		}
+		return best;
+	}
+
+	private async buildProfile(root: URI, present: string[], tree: string | undefined, nestedDir: string | undefined): Promise<string | undefined> {
+		const lines: string[] = [];
+
+		if (nestedDir) {
+			lines.push(`- **Project root:** \`${nestedDir}/\` - the workspace root itself has no project config; treat this subfolder as the main project (paths below are relative to it).`);
+		}
 
 		const langs = new Set<string>();
 		if (present.includes('package.json')) { langs.add('JavaScript/TypeScript (Node.js)'); }
@@ -271,6 +413,12 @@ export class LoCoPilotProjectMemoryService implements ILoCoPilotProjectMemorySer
 			} catch {
 				// malformed package.json - skip enrichment
 			}
+		}
+
+		// Structure tree last: it is the biggest section, so if anything gets truncated it's the
+		// tail of the tree rather than the stack/scripts facts above.
+		if (tree) {
+			lines.push(`- **Structure (workspace root, 2 levels, artifacts omitted):**\n\`\`\`\n${tree}\n\`\`\``);
 		}
 
 		if (lines.length === 0) {

@@ -1349,6 +1349,105 @@ Preserve: key facts, decisions, code changes, file names and paths, user prefere
 	}
 
 	/**
+	 * Locate the .git dir for the workspace (or for a nested project one level down when the
+	 * workspace root is just a wrapper folder). Resolved once per workspace and cached - only
+	 * HEAD / the reflog tail are re-read each turn.
+	 */
+	private _gitDirCache?: { root: string; gitDir: URI | undefined };
+
+	private async resolveGitDir(): Promise<URI | undefined> {
+		const root = this.workspaceService.getWorkspace().folders[0]?.uri;
+		if (!root) {
+			return undefined;
+		}
+		if (this._gitDirCache?.root === root.toString()) {
+			return this._gitDirCache.gitDir;
+		}
+		let gitDir = await this.tryGitDir(root);
+		if (!gitDir) {
+			try {
+				const stat = await this.fileService.resolve(root);
+				const childDirs = (stat.children ?? []).filter(c => c.isDirectory && !c.name.startsWith('.') && c.name !== 'node_modules').slice(0, 15);
+				for (const child of childDirs) {
+					gitDir = await this.tryGitDir(child.resource);
+					if (gitDir) {
+						break;
+					}
+				}
+			} catch {
+				// unreadable root - treat as no git
+			}
+		}
+		this._gitDirCache = { root: root.toString(), gitDir };
+		return gitDir;
+	}
+
+	private async tryGitDir(dir: URI): Promise<URI | undefined> {
+		const dotGit = URI.joinPath(dir, '.git');
+		try {
+			const stat = await this.fileService.stat(dotGit);
+			if (stat.isDirectory) {
+				return dotGit;
+			}
+			// Worktree/submodule: .git is a file containing "gitdir: <path>".
+			const content = (await this.fileService.readFile(dotGit)).value.toString();
+			const m = content.match(/^gitdir:\s*(.+?)\s*$/m);
+			if (m) {
+				const p = m[1];
+				const isAbs = p.startsWith('/') || /^[a-zA-Z]:[\\/]/.test(p);
+				return isAbs ? URI.file(p) : URI.joinPath(dir, p);
+			}
+		} catch {
+			// no .git here
+		}
+		return undefined;
+	}
+
+	/**
+	 * Tiny per-turn git snapshot: current branch + a few recent commit subjects, read straight
+	 * from .git (HEAD + reflog tail) via IFileService - no git process, ~50 tokens. Injected into
+	 * the CURRENT user turn (never the system prompt) so it stays fresh without busting the
+	 * cached system+tools prefix.
+	 */
+	private async getGitSnapshot(): Promise<string | undefined> {
+		try {
+			const gitDir = await this.resolveGitDir();
+			if (!gitDir) {
+				return undefined;
+			}
+			const parts: string[] = [];
+			const head = (await this.fileService.readFile(URI.joinPath(gitDir, 'HEAD'))).value.toString().trim();
+			const ref = head.match(/^ref:\s*refs\/heads\/(.+)$/);
+			parts.push(ref ? `on branch \`${ref[1]}\`` : `detached HEAD at \`${head.slice(0, 8)}\``);
+
+			try {
+				const logUri = URI.joinPath(gitDir, 'logs', 'HEAD');
+				const size = (await this.fileService.stat(logUri)).size ?? 0;
+				const tailLen = 8192;
+				const content = size > tailLen
+					? (await this.fileService.readFile(logUri, { position: size - tailLen, length: tailLen })).value.toString()
+					: (await this.fileService.readFile(logUri)).value.toString();
+				const subjects: string[] = [];
+				for (const line of content.split('\n')) {
+					const m = line.match(/\tcommit(?: \([^)]+\))?: (.+)$/);
+					if (m) {
+						subjects.push(m[1]);
+					}
+				}
+				const recent = subjects.slice(-3).reverse().map(s => s.length > 72 ? `${s.slice(0, 72)}...` : s);
+				if (recent.length) {
+					parts.push(`recent commits (newest first): ${recent.map(s => `"${s}"`).join(', ')}`);
+				}
+			} catch {
+				// no reflog (fresh repo) - branch alone is still useful
+			}
+			return `**Git:** ${parts.join('; ')}`;
+		} catch {
+			return undefined;
+		}
+	}
+
+	/**
 	 * Get workspace context for agent mode
 	 */
 	private async getWorkspaceContext(): Promise<string | undefined> {
@@ -1787,11 +1886,12 @@ Focus on making the exact changes requested while preserving code structure and 
 		// placed before the user's message so the message text is the last thing the model reads (the
 		// task it should focus on). Agent mode only, matching where it was previously surfaced.
 		if (modeKind === ChatModeKind.Agent) {
-			const editorContext = await this.getEditorContext();
-			if (editorContext.trim()) {
+			const [editorContext, gitSnapshot] = await Promise.all([this.getEditorContext(), this.getGitSnapshot()]);
+			const ambient = [gitSnapshot, editorContext.trim() ? editorContext : undefined].filter(Boolean).join('\n');
+			if (ambient) {
 				currentContent.push({
 					type: 'text',
-					value: `# CURRENT EDITOR CONTEXT (ambient reference only - the user's request below is the task)\n${editorContext}`
+					value: `# CURRENT EDITOR CONTEXT (ambient reference only - the user's request below is the task)\n${ambient}`
 				});
 			}
 		}
