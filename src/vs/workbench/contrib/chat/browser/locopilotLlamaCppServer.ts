@@ -21,7 +21,7 @@ const LLAMA_CPP_REL_BIN = ['llama.cpp', 'build', 'bin'];
  * (e.g. 'darwin-arm64', 'win32-x64', 'linux-x64'). Matches resources/bin/<key>/ produced by
  * scripts/fetch-llama-binaries.mjs and selected per-build in build/gulpfile.vscode.ts.
  */
-function getBundledPlatformArch(): string {
+export function getBundledPlatformArch(): string {
 	const plat = isWindows ? 'win32' : (isMacintosh ? 'darwin' : 'linux');
 	const nodeProcess = (globalThis as { vscode?: { process?: { arch?: string } }; process?: { arch?: string } }).vscode?.process
 		?? (typeof (globalThis as { process?: { arch?: string } }).process !== 'undefined' ? (globalThis as { process: { arch?: string } }).process : undefined);
@@ -544,7 +544,10 @@ export function getLlamaCppServerCommand(modelPath: string, backend: LlamaBacken
 		// Speculative decoding with a SEPARATE small draft model: the small model proposes tokens and the
 		// big model verifies them in one batch, so when they agree we generate several tokens per big-model
 		// pass. Only used when MTP (embedded draft head) is off, since both drive --model-draft.
-		args.push('--model-draft', tuning.draftModelPath.trim());
+		// `--spec-type draft-simple` is required on current llama.cpp builds, where the spec type defaults
+		// to `none` (a bare --model-draft no longer implies speculation). Old builds that predate --spec-type
+		// reject the flag and fail to start; the runner detects that crash and relaunches without speculation.
+		args.push('--model-draft', tuning.draftModelPath.trim(), '--spec-type', 'draft-simple');
 		if (tuning.draftGpuLayers !== undefined && tuning.draftGpuLayers > 0) {
 			args.push('--gpu-layers-draft', String(Math.floor(tuning.draftGpuLayers)));
 		}
@@ -558,7 +561,10 @@ export function getLlamaCppServerCommand(modelPath: string, backend: LlamaBacken
 
 	// Prompt-lookup / n-gram speculative decoding (build-specific, opt-in). No separate model; drafts from
 	// the context itself. Flags are configurable because their names differ across llama.cpp builds.
-	if (tuning.promptLookup) {
+	// Skipped whenever a draft-based speculation is active: both emit `--spec-type`, and the server takes
+	// exactly one speculation strategy - a duplicated flag would override or reject the draft setup.
+	const draftSpecActive = !!tuning.multiTokenPrediction || !!(tuning.draftModelPath && tuning.draftModelPath.trim());
+	if (tuning.promptLookup && !draftSpecActive) {
 		const lookupArgs = (tuning.promptLookupArgs && tuning.promptLookupArgs.trim()) ? tuning.promptLookupArgs.trim() : '--spec-type ngram-cache';
 		args.push(...lookupArgs.split(/\s+/));
 	}

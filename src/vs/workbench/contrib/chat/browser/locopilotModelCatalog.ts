@@ -76,6 +76,19 @@ export interface ICatalogModel {
 	 * image is rejected and the runtime auto-disables vision (the user can re-enable it from the toggle).
 	 */
 	readonly supportsVision?: boolean;
+	/**
+	 * HuggingFace repo of a small same-family model used as the **speculative-decoding draft** for this entry
+	 * (llama.cpp `--model-draft`, mlx-lm `--draft-model`). The draft is downloaded silently alongside the main
+	 * weights and enabled automatically when the machine's memory budget fits both; when it doesn't (or the
+	 * pairing is absent) the runner falls back to n-gram speculation, so a pairing is an upgrade, never a
+	 * requirement. PAIR ONLY VOCAB-COMPATIBLE FAMILIES: llama.cpp refuses to start when the draft's tokenizer
+	 * does not match the target's (the runner then self-heals by relaunching without the draft, but the pairing
+	 * is wasted). Prefer drafts <= ~1.5 GB; below ~8x target/draft size ratio the speedup stops being worth the RAM.
+	 * MTP entries need no pairing - their draft head is embedded (self-draft), which beats an external draft.
+	 */
+	readonly draftRepoId?: string;
+	/** Download format for the draft (GGUF quant like 'Q8_0', or 'mlx'). Must match the draft repo's contents. */
+	readonly draftFormat?: string;
 }
 
 const GB = 1024 * 1024 * 1024;
@@ -364,6 +377,9 @@ export const LOCOPILOT_DEFAULT_CATALOG: readonly ICatalogModel[] = [
 		minRamGB: 32,
 		tier: '32 GB+',
 		contextWindow: 262144,
+		// Qwen3 tokenizer family: the 0.6B sibling is the canonical draft (Q8_0 ~0.6 GB, ~50x size ratio).
+		draftRepoId: 'unsloth/Qwen3-0.6B-GGUF',
+		draftFormat: 'Q8_0',
 	},
 	{
 		catalogId: 'granite-4_1-8b-gguf',
@@ -523,6 +539,9 @@ export const LOCOPILOT_DEFAULT_CATALOG: readonly ICatalogModel[] = [
 		tier: '16 GB',
 		useNativeTools: false,
 		contextWindow: 131072,
+		// Same distill family (Qwen2.5 tokenizer): the 1.5B distill drafts for the 14B/32B targets.
+		draftRepoId: 'unsloth/DeepSeek-R1-Distill-Qwen-1.5B-GGUF',
+		draftFormat: 'Q4_K_M',
 	},
 
 	// ---- Tier 3: 32 GB+ (power users) ----
@@ -586,6 +605,8 @@ export const LOCOPILOT_DEFAULT_CATALOG: readonly ICatalogModel[] = [
 		tier: '32 GB+',
 		useNativeTools: false,
 		contextWindow: 131072,
+		draftRepoId: 'unsloth/DeepSeek-R1-Distill-Qwen-1.5B-GGUF',
+		draftFormat: 'Q4_K_M',
 	},
 
 	// ---- Tier 4: prior-gen Qwen3 MoE (fast, only ~3B active) - both formats ----
@@ -651,6 +672,9 @@ export const LOCOPILOT_DEFAULT_CATALOG: readonly ICatalogModel[] = [
 		tier: '32 GB+',
 		requiresAppleSilicon: true,
 		contextWindow: 262144,
+		// Qwen3 tokenizer family: 0.6B MLX build drafts for the big coder via mlx-lm --draft-model.
+		draftRepoId: 'mlx-community/Qwen3-0.6B-4bit',
+		draftFormat: 'mlx',
 	},
 
 	// =========================================================================================
@@ -831,4 +855,19 @@ export function findCatalogEntry(repoId: string | undefined, format: string | un
 	}
 	const fmt = (format ?? '').trim().toLowerCase();
 	return LOCOPILOT_DEFAULT_CATALOG.find(e => e.repoId === repoId && e.format.toLowerCase() === fmt);
+}
+
+/**
+ * The speculative-decoding draft pairing for a stored model, or undefined when its catalog entry has none.
+ * Matched by repo id ALONE (not format): post-download enrichment rewrites a model's `format` from the
+ * catalog quant (e.g. 'Q4_K_M') to the family ('gguf'), which would make the exact-format lookup miss.
+ * When a repo appears in multiple entries, the first with a draft pairing wins (pairings are per-family,
+ * so any twin entry's pairing is equally valid).
+ */
+export function findDraftPairing(repoId: string | undefined): { draftRepoId: string; draftFormat: string } | undefined {
+	if (!repoId) {
+		return undefined;
+	}
+	const entry = LOCOPILOT_DEFAULT_CATALOG.find(e => e.repoId === repoId && !!e.draftRepoId);
+	return entry?.draftRepoId ? { draftRepoId: entry.draftRepoId, draftFormat: entry.draftFormat ?? '' } : undefined;
 }

@@ -32,6 +32,9 @@ import { CancellationError, isCancellationError } from '../../../../base/common/
 import { ICommandService } from '../../../../platform/commands/common/commands.js';
 import { LOCOPILOT_SETTINGS_SECTION_LIST_MODELS } from './chatManagement/locopilotSettingsEditorInput.js';
 import { usableSystemMemoryBytes } from './locopilotLlamaCppServer.js';
+import { IConfigurationService } from '../../../../platform/configuration/common/configuration.js';
+import { ChatConfiguration } from '../common/constants.js';
+import { findDraftPairing } from './locopilotModelCatalog.js';
 
 const HF_API_BASE = 'https://huggingface.co';
 const HF_RESOLVE = `${HF_API_BASE}`;
@@ -101,6 +104,15 @@ export function pickBestGgufForBudget(files: readonly { path: string; size?: num
 
 /** Model format priority list. */
 const FORMAT_PRIORITY = ['gguf', 'mlx', 'transformers', 'safetensors'];
+
+/**
+ * Directory name (under `<cacheHome>/locopilot-models/`) where a HuggingFace repo's files are installed.
+ * Shared with the local-model runner, which uses it to locate a paired speculative-decoding draft model
+ * on disk without any stored-model record.
+ */
+export function modelDownloadDirName(repoId: string): string {
+	return repoId.replace(/\//g, '_');
+}
 
 function pickBestGGUFFile(paths: string[], preferredQuant?: string): string | undefined {
 	const gguf = paths.filter(p => p.toLowerCase().endsWith('.gguf'));
@@ -249,6 +261,8 @@ export class LoCoPilotModelDownloadService extends Disposable implements IWorkbe
 
 	/** One active download per model; Stop download cancels the token. */
 	private readonly _downloadTokens = new Map<string, CancellationTokenSource>();
+	/** Draft repos currently being fetched, so concurrent triggers (post-download + launch) don't double-download. */
+	private readonly _draftDownloadsInFlight = new Set<string>();
 
 	constructor(
 		@ICustomLanguageModelsService private readonly customLanguageModelsService: ICustomLanguageModelsService,
@@ -262,6 +276,7 @@ export class LoCoPilotModelDownloadService extends Disposable implements IWorkbe
 		@ILoCoPilotOllamaService private readonly ollamaService: ILoCoPilotOllamaService,
 		@ILoCoPilotSystemInfoService private readonly systemInfoService: ILoCoPilotSystemInfoService,
 		@INativeHostService private readonly nativeHostService: INativeHostService,
+		@IConfigurationService private readonly configurationService: IConfigurationService,
 	) {
 		super();
 		this._registerCommands();
@@ -292,6 +307,19 @@ export class LoCoPilotModelDownloadService extends Disposable implements IWorkbe
 					focusModelId: modelId,
 				});
 				await self.downloadModel(modelId);
+			}
+		});
+		// Fired by the local-model runner when a model launches whose catalog pairing has a draft that is
+		// not on disk yet (e.g. the model was downloaded before draft pairing existed). Fetches in the
+		// background; the draft is picked up on the model's NEXT start.
+		registerAction2(class extends Action2 {
+			constructor() {
+				super({ id: 'locopilot.ensureDraftModel', title: 'Ensure Speculative Draft Model' });
+			}
+			async run(_accessor: ServicesAccessor, mainRepoId?: string, hfToken?: string): Promise<void> {
+				if (mainRepoId) {
+					await self._ensureDraftForRepo(mainRepoId, hfToken);
+				}
 			}
 		});
 		registerAction2(class extends Action2 {
@@ -757,6 +785,11 @@ export class LoCoPilotModelDownloadService extends Disposable implements IWorkbe
 
 			// Enrich format/context window from HF now that the files are on disk (best-effort, never blocks completion).
 			await this._enrichHuggingFaceMetadata(model, toDownload, cancel);
+
+			// Fetch the paired speculative-decoding draft model in the background (small, few hundred MB).
+			// Fire-and-forget: the main model is fully usable without it; the runner simply enables the
+			// draft on the first launch after it lands. Never blocks or fails the main download.
+			this._ensureDraftForRepo(repoId, token).catch(e => this._log(`[LoCoPilot Download] Draft fetch for ${repoId} failed (ignored): ${e}`));
 		} catch (e) {
 			this._log(`[LoCoPilot Download] Error downloading ${repoId}: ${e}`);
 			await this.customLanguageModelsService.updateCustomModel(modelId, { isDownloading: false });
@@ -775,6 +808,95 @@ export class LoCoPilotModelDownloadService extends Disposable implements IWorkbe
 				`Failed to download model "${repoId}": ${message}. Check the model name (use format org/model-name), token for gated repos, and network.`
 			);
 			throw e;
+		}
+	}
+
+	/**
+	 * Downloads the speculative-decoding draft model paired (in the catalog) with `mainRepoId`, if any.
+	 * Silent and best-effort: no progress UI, no stored-model record - the draft lands in the same
+	 * `locopilot-models/` layout ({@link modelDownloadDirName}) where the runner looks it up at launch.
+	 * Skipped when the relevant auto setting is off, the draft is already on disk, or the machine's memory
+	 * budget clearly can't hold main weights + draft together (the launch-time gate is authoritative;
+	 * this only avoids downloading something that could never be used).
+	 */
+	private async _ensureDraftForRepo(mainRepoId: string, hfToken?: string): Promise<void> {
+		const pairing = findDraftPairing(mainRepoId);
+		if (!pairing) {
+			return;
+		}
+		const isMlxDraft = pairing.draftFormat.toLowerCase() === 'mlx';
+		const autoKey = isMlxDraft ? ChatConfiguration.LocopilotMlxAutoTune : ChatConfiguration.LocopilotLlamaCppAutoSpeculative;
+		if (this.configurationService.getValue<boolean>(autoKey) === false) {
+			return;
+		}
+		if (this._draftDownloadsInFlight.has(pairing.draftRepoId)) {
+			return;
+		}
+		const draftDir = joinPath(this.environmentService.cacheHome, LoCoPilotModelDownloadService.MODELS_DIR, modelDownloadDirName(pairing.draftRepoId));
+		// Already installed? (any .gguf for GGUF drafts; config.json for MLX weight dirs)
+		try {
+			const resolved = await this.fileService.resolve(draftDir);
+			const names = (resolved.children ?? []).filter(c => c.isFile).map(c => c.name.toLowerCase());
+			if (isMlxDraft ? names.includes('config.json') : names.some(n => n.endsWith('.gguf'))) {
+				return;
+			}
+		} catch {
+			// dir missing -> proceed to download
+		}
+
+		this._draftDownloadsInFlight.add(pairing.draftRepoId);
+		try {
+			const cancel = CancellationToken.None;
+			const sizes = new Map<string, number>();
+			const allPaths = await this.listRepoFiles(pairing.draftRepoId, hfToken, cancel, sizes);
+			const toDownload = filterPathsByFormat(allPaths, pairing.draftFormat);
+			if (toDownload.length === 0) {
+				this._log(`[LoCoPilot Download] Draft ${pairing.draftRepoId}: no files match format "${pairing.draftFormat}"; skipping.`);
+				return;
+			}
+			const draftBytes = toDownload.reduce((sum, p) => sum + (sizes.get(p) ?? 0), 0);
+			const budget = await this._memoryBudgetForDownload();
+			// A draft only ever runs ALONGSIDE the main weights; if it alone would eat >15% of the whole
+			// budget it will never pass the launch-time fit gate, so don't waste the bandwidth/disk.
+			if (budget > 0 && draftBytes > budget * 0.15) {
+				this._log(`[LoCoPilot Download] Draft ${pairing.draftRepoId} (~${Math.round(draftBytes / 1e6)}MB) is too large for this machine's ~${Math.round(budget / 1e9)}GB budget; skipping.`);
+				return;
+			}
+			this._log(`[LoCoPilot Download] Fetching speculative draft ${pairing.draftRepoId} (${pairing.draftFormat}, ~${Math.round(draftBytes / 1e6)}MB) for ${mainRepoId}.`);
+			await this.fileService.createFolder(draftDir);
+			const repoPathEnc = pairing.draftRepoId.split('/').map(encodeURIComponent).join('/');
+			for (const relPath of toDownload) {
+				const filePathEnc = relPath.split('/').map(encodeURIComponent).join('/');
+				const fileUrl = `${HF_RESOLVE}/${repoPathEnc}/resolve/main/${filePathEnc}`;
+				const headers: Record<string, string> = {};
+				if (hfToken) headers['Authorization'] = `Bearer ${hfToken}`;
+				const segments = relPath.split('/').filter(Boolean);
+				const fileUri = segments.length > 1 ? joinPath(draftDir, ...segments) : joinPath(draftDir, relPath);
+				if (segments.length > 1) {
+					await this.fileService.createFolder(joinPath(draftDir, ...segments.slice(0, -1)));
+				}
+				if (this.requestService.requestToFile) {
+					const res = await this.requestService.requestToFile({ type: 'GET', url: fileUrl, headers }, fileUri.fsPath, cancel, generateUuid());
+					if (res.res.statusCode !== 200) {
+						throw new Error(`Draft download failed for ${relPath}: ${res.res.statusCode}`);
+					}
+				} else {
+					const res = await this.requestService.request({ type: 'GET', url: fileUrl, headers }, cancel);
+					if (res.res.statusCode !== 200) {
+						throw new Error(`Draft download failed for ${relPath}: ${res.res.statusCode}`);
+					}
+					await this.fileService.writeFile(fileUri, res.stream);
+				}
+			}
+			this._log(`[LoCoPilot Download] Speculative draft ${pairing.draftRepoId} ready in ${draftDir.fsPath}; it will be used on the next start of ${mainRepoId}.`);
+		} catch (e) {
+			// Best-effort: remove a partial draft install so the next trigger retries cleanly.
+			this._log(`[LoCoPilot Download] Draft ${pairing.draftRepoId} download failed: ${e}`);
+			try {
+				await this.fileService.del(draftDir, { recursive: true });
+			} catch { /* ignore */ }
+		} finally {
+			this._draftDownloadsInFlight.delete(pairing.draftRepoId);
 		}
 	}
 

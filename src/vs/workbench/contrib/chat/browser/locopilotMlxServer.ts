@@ -49,10 +49,33 @@ export function getMlxServerBaseUrl(port: number): string {
 }
 
 /**
+ * Optional performance tuning for `mlx_lm.server`. All fields are OFF by default and only emitted when set,
+ * because their flags are newer than the base command: an older bundled mlx-lm rejects unknown args
+ * (argparse "unrecognized arguments" -> immediate exit), which the runner detects to relaunch without them.
+ */
+export interface MlxServerTuning {
+	/**
+	 * Directory of a small same-family MLX model for speculative decoding (`--draft-model`). The draft
+	 * proposes tokens the big model verifies in one pass - same 1.5-2x decode win as llama.cpp's
+	 * `--model-draft`. Must be tokenizer-compatible with the main model.
+	 */
+	draftModelDir?: string;
+	/** Tokens to draft per step (`--num-draft-tokens`). Emitted only alongside `draftModelDir`; server default 3. */
+	numDraftTokens?: number;
+	/**
+	 * Byte cap for the server's LRU prompt (KV) cache across requests (`--prompt-cache-bytes`). Unbounded by
+	 * default upstream, which on a small-RAM machine lets cached KV from previous prompts crowd out the
+	 * working set; sized from total RAM by the runner.
+	 */
+	promptCacheBytes?: number;
+}
+
+/**
  * Command to run `mlx_lm.server` for a local model directory (Hugging Face-style MLX weights).
  * pythonCmd: full path or `python3` / `python` from PATH or a venv interpreter.
+ * tuning: optional flags (speculative draft, prompt-cache cap); see {@link MlxServerTuning}.
  */
-export function getMlxLmServerCommand(modelDir: string, port: number, pythonCmd: string): { command: string; args: string[] } {
+export function getMlxLmServerCommand(modelDir: string, port: number, pythonCmd: string, tuning: MlxServerTuning = {}): { command: string; args: string[] } {
 	const cmd = pythonCmd.trim() || 'python3';
 	// Fail fast on a blank model path: building `--model ''` makes mlx_lm.server start with no model, which
 	// either errors with a cryptic traceback or hangs serving GET /v1/models while every chat request blocks.
@@ -66,6 +89,15 @@ export function getMlxLmServerCommand(modelDir: string, port: number, pythonCmd:
 	}
 	// `python -m mlx_lm server` (mlx-lm >= 0.20): `python -m mlx_lm.server` is deprecated.
 	const args = ['-m', 'mlx_lm', 'server', '--model', dir, '--host', '127.0.0.1', '--port', String(port)];
+	if (tuning.draftModelDir && tuning.draftModelDir.trim()) {
+		args.push('--draft-model', tuning.draftModelDir.trim());
+		if (tuning.numDraftTokens && tuning.numDraftTokens > 0) {
+			args.push('--num-draft-tokens', String(Math.floor(tuning.numDraftTokens)));
+		}
+	}
+	if (tuning.promptCacheBytes && tuning.promptCacheBytes > 0) {
+		args.push('--prompt-cache-bytes', String(Math.floor(tuning.promptCacheBytes)));
+	}
 	return { command: cmd, args };
 }
 

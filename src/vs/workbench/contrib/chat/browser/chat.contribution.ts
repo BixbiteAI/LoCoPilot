@@ -759,6 +759,27 @@ configurationRegistry.registerConfiguration({
 			markdownDescription: nls.localize('locopilot.llamaCpp.extraArgs.description', "Extra command-line arguments appended verbatim to the local `llama-server` command (advanced). Example: `--threads 8 --batch-size 2048`. Invalid flags for your build may prevent the server from starting."),
 			default: '',
 		},
+		[ChatConfiguration.LocopilotLlamaCppAutoSpeculative]: {
+			type: 'boolean',
+			markdownDescription: nls.localize('locopilot.llamaCpp.autoSpeculative.description', "Speed up local GGUF models with **automatic speculative decoding**. When a small same-family draft model is available for the selected model (downloaded alongside it), it fits your RAM, and a GPU/Metal backend is active, it is used to draft tokens the main model verifies in one pass (typically 1.5-2x faster generation). Otherwise - including on CPU-only machines, where a second model would compete for the same cores - n-gram drafting from the prompt itself is used (no extra memory; fastest on repetitive output like code edits). Skipped automatically for MTP models (they self-draft), when you set `#locopilot.llamaCpp.draftModelPath#` or `#locopilot.llamaCpp.promptLookup#` manually, and on llama.cpp builds that don't support speculation (detected at launch; the server is relaunched without it)."),
+			default: true,
+		},
+		[ChatConfiguration.LocopilotLlamaCppCudaEngine]: {
+			type: 'string',
+			enum: ['auto', 'on', 'off'],
+			enumDescriptions: [
+				nls.localize('locopilot.llamaCpp.cudaEngine.auto', "Offer to download the CUDA engine once when an NVIDIA GPU is detected; use it whenever installed (recommended)."),
+				nls.localize('locopilot.llamaCpp.cudaEngine.on', "Download the CUDA engine automatically (no prompt) when an NVIDIA GPU is detected, and use it."),
+				nls.localize('locopilot.llamaCpp.cudaEngine.off', "Never download or use the CUDA engine (the bundled Vulkan/CPU engines are used instead)."),
+			],
+			markdownDescription: nls.localize('locopilot.llamaCpp.cudaEngine.description', "On Windows with an NVIDIA GPU, LoCoPilot can download the official llama.cpp **CUDA** engine (~650 MB, from the llama.cpp GitHub releases) for much faster prompt processing than the bundled Vulkan engine - often several times faster time-to-first-token on long prompts. The download happens once; the engine is stored locally and used for every local GGUF model start. Ignored on macOS/Linux and when `#locopilot.llamaCpp.serverPath#` points at your own build."),
+			default: 'auto',
+		},
+		[ChatConfiguration.LocopilotMlxAutoTune]: {
+			type: 'boolean',
+			markdownDescription: nls.localize('locopilot.mlx.autoTune.description', "Automatically tune the local MLX server (Apple Silicon): use a small same-family draft model for **speculative decoding** when one is available and fits your RAM (typically 1.5-2x faster generation), and cap the server's cross-request prompt cache to a sensible fraction of total RAM so cached prompts never crowd out the working set. If the installed mlx-lm version doesn't support these options, the server is relaunched without them automatically."),
+			default: true,
+		},
 		[ChatConfiguration.LocopilotOllamaKeepAlive]: {
 			type: 'string',
 			markdownDescription: nls.localize('locopilot.ollama.keepAlive.description', "How long Ollama keeps a model loaded in memory after use (`ollama run --keepalive`), e.g. `30m`, `1h`, or `-1` to keep it loaded indefinitely. Keeping the model resident avoids the cold-start reload between requests. Leave empty to use Ollama's default."),

@@ -19,6 +19,7 @@ import {
 	getRecommendedBackend,
 	getDefaultLlamaServerPaths,
 	getBundledLlamaServerPath,
+	getBundledPlatformArch,
 	getLlamaCppServerCommand,
 	getLlamaServerBaseUrl,
 	getLlamaServerHealthUrl,
@@ -49,7 +50,13 @@ import {
 	hfModelLooksLikeMlx,
 	isAppleSiliconMac,
 	shouldUseMlxServerForHfModel,
+	type MlxServerTuning,
 } from './locopilotMlxServer.js';
+import { findDraftPairing } from './locopilotModelCatalog.js';
+import { LoCoPilotModelDownloadService, modelDownloadDirName } from './locopilotModelDownloadService.js';
+import { joinPath } from '../../../../base/common/resources.js';
+import { streamToBuffer } from '../../../../base/common/buffer.js';
+import { generateUuid } from '../../../../base/common/uuid.js';
 import { IPathService } from '../../../services/path/common/pathService.js';
 import { ILifecycleService, LifecyclePhase } from '../../../services/lifecycle/common/lifecycle.js';
 import { ITerminalService, ITerminalInstance } from '../../terminal/browser/terminal.js';
@@ -190,6 +197,22 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 	private _hardwareInfo: Promise<ISystemHardwareInfo | undefined> | undefined;
 	/** Cache of GGUF model info (layer count, expert count, context length) keyed by resolved model file path. */
 	private readonly _modelInfoCache = new Map<string, IGgufModelInfo>();
+	/**
+	 * True once a llama-server launch crashed because the binary rejected the speculative-decoding flags
+	 * (`--spec-type` / `--model-draft`), e.g. an old user-provided build. Auto-speculation is then disabled
+	 * for the rest of the session and the failed launch is retried once without the flags (self-healing).
+	 */
+	private _specFlagsUnsupported = false;
+	/** Model ids whose LAST llama-server launch included speculative flags; consulted by the crash fallback. */
+	private readonly _launchedWithSpecFlags = new Set<string>();
+	/** Same self-healing for mlx_lm.server: set when it rejects the optional tuning flags (old mlx-lm argparse). */
+	private _mlxExtraFlagsUnsupported = false;
+	/** Draft repos we already asked the download service to fetch this session (avoid re-firing per launch). */
+	private readonly _draftFetchRequested = new Set<string>();
+	/** Whether the one-time "download the CUDA engine?" offer was already shown this session. */
+	private _cudaOfferedThisSession = false;
+	/** Guards against parallel CUDA engine downloads. */
+	private _cudaDownloadInFlight = false;
 
 	constructor(
 		@ICustomLanguageModelsService private readonly customLanguageModelsService: ICustomLanguageModelsService,
@@ -363,6 +386,19 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 
 		// 3. Windows/Linux: choose CPU vs bundled Vulkan, honoring the user's engine preference.
 		const engine = this.configurationService.getValue<'auto' | 'cpu' | 'gpu'>(ChatConfiguration.LocopilotLlamaCppEngine) ?? 'auto';
+
+		// 3a. Windows x64 + NVIDIA GPU: prefer the on-demand **CUDA** engine when installed - prompt
+		// processing (time-to-first-token on long agent prompts) is several times faster than Vulkan there.
+		// When not installed, this offers/starts the one-time download in the background and this launch
+		// proceeds with Vulkan/CPU as before; the CUDA engine is picked up from the next start onward.
+		if (engine !== 'cpu') {
+			const cudaPath = await this._maybeUseCudaEngine();
+			if (cudaPath) {
+				this._log(`[LoCoPilot Runner] Using downloaded CUDA engine: ${cudaPath}`);
+				return { serverPath: cudaPath, backend: 'cuda' };
+			}
+		}
+
 		if (engine !== 'cpu') {
 			const hw = await this._getHardwareInfo();
 			// 'gpu' forces Vulkan regardless of how capable the GPU looks; 'auto' gates on shouldUseBundledVulkan.
@@ -380,6 +416,220 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 
 		// 4. CPU fallback (bundled CPU binary, then conventional install locations).
 		return { serverPath: await this.resolveServerPath(), backend: 'cpu' };
+	}
+
+	/**
+	 * Local install dir for the on-demand CUDA engine, or undefined off Windows x64. Lives under the same
+	 * cache root as downloaded models, so uninstall/cache cleanup treats engine and models alike.
+	 */
+	private _cudaEngineDir(): URI | undefined {
+		if (!isWindows || getBundledPlatformArch() !== 'win32-x64') {
+			return undefined;
+		}
+		return joinPath(this.environmentService.cacheHome, 'locopilot-engines', 'win32-x64-cuda');
+	}
+
+	/** Finds `name` (case-insensitive) under `dir`, descending at most `depth` directory levels. */
+	private async _findFileRecursive(dir: URI, name: string, depth: number): Promise<string | undefined> {
+		try {
+			const resolved = await this.fileService.resolve(dir);
+			for (const c of resolved.children ?? []) {
+				if (c.isFile && c.name.toLowerCase() === name) {
+					return c.resource.fsPath;
+				}
+			}
+			if (depth > 0) {
+				for (const c of resolved.children ?? []) {
+					if (c.isDirectory) {
+						const found = await this._findFileRecursive(c.resource, name, depth - 1);
+						if (found) {
+							return found;
+						}
+					}
+				}
+			}
+		} catch {
+			// dir missing/unreadable -> not installed
+		}
+		return undefined;
+	}
+
+	/** Full path to the installed CUDA llama-server.exe, or undefined when not (yet) downloaded. */
+	private async _installedCudaServerPath(): Promise<string | undefined> {
+		const dir = this._cudaEngineDir();
+		return dir ? this._findFileRecursive(dir, 'llama-server.exe', 2) : undefined;
+	}
+
+	/**
+	 * CUDA engine decision for a launch on Windows: returns the installed CUDA llama-server path when this
+	 * machine has an NVIDIA GPU and the engine was downloaded; otherwise (still honoring the
+	 * `locopilot.llamaCpp.cudaEngine` setting) starts or offers the one-time background download and returns
+	 * undefined so the current launch proceeds on Vulkan/CPU.
+	 */
+	private async _maybeUseCudaEngine(): Promise<string | undefined> {
+		if (!this._cudaEngineDir()) {
+			return undefined; // not Windows x64
+		}
+		const setting = this.configurationService.getValue<'auto' | 'on' | 'off'>(ChatConfiguration.LocopilotLlamaCppCudaEngine) ?? 'auto';
+		if (setting === 'off') {
+			return undefined;
+		}
+		const hw = await this._getHardwareInfo();
+		if (!hw?.gpus.some(g => g.vendor === 'nvidia')) {
+			return undefined; // CUDA only helps NVIDIA; AMD/Intel stay on Vulkan
+		}
+		const installed = await this._installedCudaServerPath();
+		if (installed) {
+			return installed;
+		}
+		if (setting === 'on') {
+			void this._downloadCudaEngine(false);
+		} else if (!this._cudaOfferedThisSession) {
+			this._cudaOfferedThisSession = true;
+			this.notificationService.prompt(
+				Severity.Info,
+				'An NVIDIA GPU was detected. Download the CUDA engine (~650 MB, one time) to make local models respond much faster on long prompts?',
+				[
+					{ label: 'Download', run: () => { void this._downloadCudaEngine(true); } },
+					{
+						label: 'Don\'t Ask Again',
+						run: () => { void this.configurationService.updateValue(ChatConfiguration.LocopilotLlamaCppCudaEngine, 'off'); }
+					},
+				]
+			);
+		}
+		return undefined;
+	}
+
+	/**
+	 * Picks the newest llama.cpp release that ships BOTH Windows CUDA zips: the engine build and the matching
+	 * CUDA runtime (cudart) DLLs. CUDA 12.x is chosen over 13.x for driver compatibility (12.x runs on any
+	 * driver from R525 up; 13.x needs much newer drivers). The very latest tag is sometimes still uploading
+	 * assets, so several releases are scanned.
+	 */
+	private async _findCudaRelease(): Promise<{ tag: string; engineUrl: string; cudartUrl: string } | undefined> {
+		const res = await this.requestService.request({
+			type: 'GET',
+			url: 'https://api.github.com/repos/ggml-org/llama.cpp/releases?per_page=10',
+			headers: { 'Accept': 'application/vnd.github+json' },
+		}, CancellationToken.None);
+		if ((res.res.statusCode ?? 0) !== 200) {
+			return undefined;
+		}
+		const raw = await streamToBuffer(res.stream).then(b => b.toString());
+		const releases = JSON.parse(raw) as { tag_name: string; assets?: { name: string; browser_download_url: string }[] }[];
+		for (const r of releases) {
+			const engineAsset = (r.assets ?? []).find(a => /^llama-.*-bin-win-cuda-12\.\d+-x64\.zip$/.test(a.name));
+			const cudartAsset = (r.assets ?? []).find(a => /^cudart-.*-cuda-12\.\d+-x64\.zip$/.test(a.name));
+			if (engineAsset && cudartAsset) {
+				return { tag: r.tag_name, engineUrl: engineAsset.browser_download_url, cudartUrl: cudartAsset.browser_download_url };
+			}
+		}
+		return undefined;
+	}
+
+	/**
+	 * Extracts a zip on Windows via PowerShell's built-in Expand-Archive in a hidden transient terminal
+	 * (the workbench renderer has no zip library, and PowerShell is always present on Windows). Resolves
+	 * to the process exit code (0 = success).
+	 */
+	private async _extractZipWithPowerShell(zipFsPath: string, destFsPath: string): Promise<number | undefined> {
+		const terminal = await this.terminalService.createTerminal({
+			config: {
+				name: 'LoCoPilot Engine Setup',
+				executable: 'powershell.exe',
+				args: ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command',
+					`Expand-Archive -LiteralPath "${zipFsPath}" -DestinationPath "${destFsPath}" -Force`],
+				isTransient: true,
+				hideFromUser: true,
+			}
+		});
+		try {
+			return await new Promise<number | undefined>(resolve => {
+				const d = terminal.onExit(code => {
+					d.dispose();
+					resolve(typeof code === 'number' ? code : undefined);
+				});
+			});
+		} finally {
+			terminal.dispose();
+		}
+	}
+
+	/**
+	 * One-time background download + install of the llama.cpp CUDA engine (engine zip + cudart DLL zip,
+	 * ~650 MB total) into {@link _cudaEngineDir}. Both zips extract into the SAME directory so llama-server.exe
+	 * finds the CUDA runtime DLLs beside it (Windows loads DLLs from the exe's own directory). Never touches a
+	 * running server; the engine is picked up by the next `_resolveServerLaunch`.
+	 * `interactive`: true when the user just clicked Download (surface errors as notifications, not only logs).
+	 */
+	private async _downloadCudaEngine(interactive: boolean): Promise<void> {
+		if (this._cudaDownloadInFlight) {
+			return;
+		}
+		const dir = this._cudaEngineDir();
+		if (!dir) {
+			return;
+		}
+		this._cudaDownloadInFlight = true;
+		try {
+			if (interactive) {
+				this.notificationService.info('Downloading the CUDA engine (~650 MB) in the background. You can keep working - it will be used the next time a local model starts.');
+			}
+			const release = await this._findCudaRelease();
+			if (!release) {
+				throw new Error('No llama.cpp release with Windows CUDA assets was found (network or GitHub API issue).');
+			}
+			this._log(`[LoCoPilot Runner] Downloading CUDA engine ${release.tag}: ${release.engineUrl} + ${release.cudartUrl}`);
+			await this.fileService.createFolder(dir);
+			const zips: [string, URI][] = [
+				[release.engineUrl, joinPath(dir, '_tmp-engine.zip')],
+				[release.cudartUrl, joinPath(dir, '_tmp-cudart.zip')],
+			];
+			for (const [url, target] of zips) {
+				if (this.requestService.requestToFile) {
+					const res = await this.requestService.requestToFile({ type: 'GET', url }, target.fsPath, CancellationToken.None, generateUuid());
+					if ((res.res.statusCode ?? 0) !== 200) {
+						throw new Error(`Download failed (${res.res.statusCode}): ${url}`);
+					}
+				} else {
+					const res = await this.requestService.request({ type: 'GET', url }, CancellationToken.None);
+					if ((res.res.statusCode ?? 0) !== 200) {
+						throw new Error(`Download failed (${res.res.statusCode}): ${url}`);
+					}
+					await this.fileService.writeFile(target, res.stream);
+				}
+			}
+			for (const [, target] of zips) {
+				const exit = await this._extractZipWithPowerShell(target.fsPath, dir.fsPath);
+				if (exit !== 0) {
+					throw new Error(`Extracting ${target.fsPath} failed (exit ${exit ?? 'unknown'}).`);
+				}
+			}
+			for (const [, target] of zips) {
+				try {
+					await this.fileService.del(target);
+				} catch { /* leftover zip is harmless */ }
+			}
+			const bin = await this._installedCudaServerPath();
+			if (!bin) {
+				throw new Error('llama-server.exe was not found after extraction.');
+			}
+			this._log(`[LoCoPilot Runner] CUDA engine ${release.tag} installed at ${bin}.`);
+			this.notificationService.info('The CUDA engine is ready. It will be used the next time a local model starts.');
+		} catch (e) {
+			this._log(`[LoCoPilot Runner] CUDA engine download failed: ${e}`);
+			// Remove a partial install so the next attempt starts clean and _installedCudaServerPath can't
+			// pick up a half-extracted engine.
+			try {
+				await this.fileService.del(dir, { recursive: true });
+			} catch { /* ignore */ }
+			if (interactive) {
+				this.notificationService.error(`Couldn't download the CUDA engine: ${e}. The bundled engine keeps working; you can retry from the next launch prompt or set "locopilot.llamaCpp.cudaEngine" to "on".`);
+			}
+		} finally {
+			this._cudaDownloadInFlight = false;
+		}
 	}
 
 	/**
@@ -697,9 +947,19 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 		if (kind === 'llama') {
 			runtime += 2 * GB; // conservative slice of llama.cpp's host-RAM prompt cache (default --cache-ram 8 GiB).
 			const tuning = this._getLlamaTuning(model);
-			const draftActive = !!tuning.multiTokenPrediction || !!(tuning.draftModelPath && tuning.draftModelPath.trim());
-			if (draftActive) {
-				runtime += weightBytes; // self-draft (MTP) or a same-size draft model roughly doubles weights.
+			const sepDraft = tuning.draftModelPath?.trim();
+			if (tuning.multiTokenPrediction) {
+				runtime += weightBytes; // self-draft (MTP) loads a second copy of the same weights.
+			} else if (sepDraft) {
+				// A separate draft costs its own (much smaller) file; full weights only when it can't be statted.
+				runtime += (await this._fileBytes(sepDraft)) || weightBytes;
+			} else {
+				// Auto-paired draft (enabled at launch when downloaded + fits): count it when it's on disk.
+				// triggerFetch=false: cost estimation must never kick off a download.
+				const draft = await this._resolvePairedDraft(model, 'gguf', false).catch(() => undefined);
+				if (draft) {
+					runtime += draft.bytes;
+				}
 			}
 			// The mmproj projector is only loaded when vision is explicitly enabled (see customModelVisionEnabled).
 			if (model.localPath && customModelVisionEnabled(model)) {
@@ -791,6 +1051,26 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 		const tail = logs.slice(-60).join('\n');
 		const code = exitCode ?? 'unknown';
 		this._log(`[LoCoPilot Runner] llama-server for "${modelName}" exited before serving (exit ${code}). Last output:\n${tail}`);
+
+		// Self-healing for speculative decoding: when THIS launch carried spec flags and the output shows the
+		// build rejected them (old build without --spec-type) or the draft/target pair is incompatible
+		// (tokenizer mismatch), disable speculation for the session and retry once WITHOUT the flags instead
+		// of surfacing a scary crash for something that runs fine unspeculated.
+		const specRejected = /invalid argument|unrecognized (?:argument|option)|unknown (?:argument|option)|not compatible with the target model|draft.*vocab|vocab.*draft/i.test(tail);
+		if (this._launchedWithSpecFlags.has(modelId) && !this._specFlagsUnsupported && specRejected) {
+			this._specFlagsUnsupported = true;
+			this._launchedWithSpecFlags.delete(modelId);
+			this._log(`[LoCoPilot Runner] llama-server rejected the speculative-decoding flags; disabling speculation for this session and relaunching "${modelName}" without it.`);
+			this._endStarting(modelId);
+			// Wait out the original launch's in-flight window (its startup wait may still be pending) so the
+			// retry starts a genuinely fresh launch instead of being coalesced into the crashed one.
+			timeout(6000).then(() => {
+				if (!this.runningServers.has(modelId) && !this.startingServers.has(modelId)) {
+					this.startServerInTerminal(modelId).catch(e => this._log(`[LoCoPilot Runner] Relaunch without speculation failed: ${e}`));
+				}
+			});
+			return;
+		}
 
 		const actions: { label: string; run: () => void }[] = [];
 
@@ -997,31 +1277,19 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 	}
 
 	/**
-	 * Pre-flight fit check. Returns true when the model can plausibly run on this machine; returns false -
-	 * after showing a clear, actionable notification - when it cannot fit even at the minimum context. This
-	 * is the guard that stops an oversized model from launching straight into the swap/OOM death spiral
-	 * (UI freeze -> 100% GPU -> heat -> thermal shutdown) that a too-big GGUF causes on a memory-tight machine.
-	 *
-	 * Honest-but-lenient: we only block when even the SMALLEST viable footprint (weights + a minimum KV cache
-	 * + a runtime slice) exceeds usable memory, so a model that merely needs context/offload tuning still
-	 * launches (the budget/clamp logic handles it). Any missing input (unknown weight size, no RAM stats, web)
-	 * returns true so we never block a launch we can't reason about.
-	 *
-	 * `discreteVramBytes`: dedicated VRAM (CUDA/Vulkan) that can hold offloaded weights ON TOP of system RAM;
-	 * undefined on unified-memory (Metal) / CPU, where weights live in system RAM regardless of any offload.
+	 * Minimum resident footprint vs usable memory for running `modelPath` on `backend`, or undefined when a
+	 * required figure (weight size, RAM stats) is unknown - callers treat undefined as "fits" so we never
+	 * block or degrade a launch we can't reason about. Shared by the pre-flight fit gate and the
+	 * auto-speculation draft gate, so both answer "does X more resident bytes still fit?" identically.
 	 */
-	private async _checkModelFitsOrNotify(modelId: string, modelPath: string, backend: LlamaBackend, discreteVramBytes: number | undefined, extraResidentBytes: number = 0): Promise<boolean> {
-		const model = this.customLanguageModelsService.getCustomModels().find(m => m.id === modelId);
-		if (!model) {
-			return true;
-		}
+	private async _computeFit(modelPath: string, backend: LlamaBackend, discreteVramBytes: number | undefined, extraResidentBytes: number = 0): Promise<{ requiredBytes: number; usableBytes: number } | undefined> {
 		const weightBytes = await this._weightBytesOnDisk(modelPath);
 		if (weightBytes <= 0) {
-			return true; // unknown size -> can't reason about it, don't block.
+			return undefined; // unknown size -> can't reason about it.
 		}
 		const mem = await this._getSystemMemory();
 		if (!mem?.totalmem) {
-			return true; // no RAM stats (e.g. web) -> don't block.
+			return undefined; // no RAM stats (e.g. web).
 		}
 
 		// Minimum resident footprint: weights + the smallest KV cache we'd ever allocate + a runtime slice.
@@ -1050,12 +1318,88 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 		const usableBytes = backend === 'metal'
 			? metalOffloadBudgetBytes(mem.totalmem)
 			: usableSystemMemoryBytes(mem.totalmem) + (discreteVramBytes && discreteVramBytes > 0 ? discreteVramBytes : 0);
-		if (requiredBytes <= usableBytes) {
+		return { requiredBytes, usableBytes };
+	}
+
+	/**
+	 * Whether the model would STILL fit this machine with `extraResidentBytes` more loaded alongside it
+	 * (e.g. a speculative draft model). Unknown inputs count as "fits" - consistent with the pre-flight gate.
+	 */
+	private async _extrasFitBudget(modelPath: string, backend: LlamaBackend, discreteVramBytes: number | undefined, extraResidentBytes: number): Promise<boolean> {
+		const fit = await this._computeFit(modelPath, backend, discreteVramBytes, extraResidentBytes);
+		return !fit || fit.requiredBytes <= fit.usableBytes;
+	}
+
+	/**
+	 * Resolves the on-disk speculative-decoding draft paired with this model in the catalog, filtered to the
+	 * engine that will run it (`gguf` -> a .gguf file for llama.cpp, `mlx` -> a weights directory for mlx-lm).
+	 * When the pairing exists but the draft is not downloaded yet, kicks off a background fetch (once per
+	 * session) so the NEXT launch gets it, and returns undefined - a launch never waits on a draft download.
+	 */
+	private async _resolvePairedDraft(model: ICustomLanguageModel, engine: 'gguf' | 'mlx', triggerFetch: boolean = true): Promise<{ path: string; bytes: number; repoId: string } | undefined> {
+		const pairing = findDraftPairing(model.modelName);
+		if (!pairing) {
+			return undefined;
+		}
+		const isMlxPairing = pairing.draftFormat.toLowerCase() === 'mlx';
+		if ((engine === 'mlx') !== isMlxPairing) {
+			return undefined; // pairing targets the other engine (e.g. GGUF draft for an MLX run)
+		}
+		const draftDir = joinPath(this.environmentService.cacheHome, LoCoPilotModelDownloadService.MODELS_DIR, modelDownloadDirName(pairing.draftRepoId));
+		if (engine === 'gguf') {
+			const filePath = await this.resolveModelFilePath(draftDir.fsPath);
+			if (filePath.toLowerCase().endsWith('.gguf')) {
+				const bytes = await this._fileBytes(filePath);
+				if (bytes > 0) {
+					return { path: filePath, bytes, repoId: pairing.draftRepoId };
+				}
+			}
+		} else {
+			const invalid = await this._validateMlxModelPath(draftDir.fsPath);
+			if (!invalid) {
+				const bytes = await this._weightBytesOnDisk(draftDir.fsPath);
+				if (bytes > 0) {
+					return { path: draftDir.fsPath, bytes, repoId: pairing.draftRepoId };
+				}
+			}
+		}
+		// Paired but not on disk: fetch in the background so a future launch benefits. Never block this one.
+		if (triggerFetch && !this._draftFetchRequested.has(pairing.draftRepoId)) {
+			this._draftFetchRequested.add(pairing.draftRepoId);
+			this._log(`[LoCoPilot Runner] Draft ${pairing.draftRepoId} for ${model.modelName} is not downloaded yet; fetching in the background.`);
+			this.commandService.executeCommand('locopilot.ensureDraftModel', model.modelName, model.token)
+				.then(undefined, e => this._log(`[LoCoPilot Runner] Background draft fetch failed (ignored): ${e}`));
+		}
+		return undefined;
+	}
+
+	/**
+	 * Pre-flight fit check. Returns true when the model can plausibly run on this machine; returns false -
+	 * after showing a clear, actionable notification - when it cannot fit even at the minimum context. This
+	 * is the guard that stops an oversized model from launching straight into the swap/OOM death spiral
+	 * (UI freeze -> 100% GPU -> heat -> thermal shutdown) that a too-big GGUF causes on a memory-tight machine.
+	 *
+	 * Honest-but-lenient: we only block when even the SMALLEST viable footprint (weights + a minimum KV cache
+	 * + a runtime slice) exceeds usable memory, so a model that merely needs context/offload tuning still
+	 * launches (the budget/clamp logic handles it). Any missing input (unknown weight size, no RAM stats, web)
+	 * returns true so we never block a launch we can't reason about.
+	 *
+	 * `discreteVramBytes`: dedicated VRAM (CUDA/Vulkan) that can hold offloaded weights ON TOP of system RAM;
+	 * undefined on unified-memory (Metal) / CPU, where weights live in system RAM regardless of any offload.
+	 */
+	private async _checkModelFitsOrNotify(modelId: string, modelPath: string, backend: LlamaBackend, discreteVramBytes: number | undefined, extraResidentBytes: number = 0): Promise<boolean> {
+		const model = this.customLanguageModelsService.getCustomModels().find(m => m.id === modelId);
+		if (!model) {
+			return true;
+		}
+		const fit = await this._computeFit(modelPath, backend, discreteVramBytes, extraResidentBytes);
+		if (!fit || fit.requiredBytes <= fit.usableBytes) {
 			return true;
 		}
 
-		const needGb = Math.ceil(requiredBytes / GB);
-		const haveGb = Math.max(1, Math.round(usableBytes / GB));
+		const GB = 1024 * 1024 * 1024;
+		const needGb = Math.ceil(fit.requiredBytes / GB);
+		const haveGb = Math.max(1, Math.round(fit.usableBytes / GB));
 		this._log(`[LoCoPilot Runner] Refusing to start ${modelId}: needs ~${needGb}GB but only ~${haveGb}GB is usable on this machine.`);
 		const name = model.displayName || model.modelName;
 		const message = `"${name}" needs about ${needGb} GB of memory to run, but only about ${haveGb} GB is available on this machine. Please choose a smaller model.`;
@@ -1478,11 +1822,53 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 				this._log(`[LoCoPilot Runner] Vision enabled for ${modelId}: using projector ${mmprojPath} (~${Math.round(mmprojBytes / 1e6)}MB).`);
 			}
 		}
-		// A draft/MTP model loads a second copy of the weights (self-draft) or a same-size sidecar, so it
-		// roughly doubles the weight footprint. mmprojBytes is the projector when vision is on.
-		const draftActive = !!baseTuning.multiTokenPrediction || !!(baseTuning.draftModelPath && baseTuning.draftModelPath.trim());
+		// Resident extras beyond weights+KV: the vision projector plus whatever draft model speculation loads.
+		// MTP self-drafts from the same GGUF (~doubles weights); a user-configured separate draft costs its own
+		// file size (fall back to a full weights-worth when it can't be statted - the safe direction).
 		const weightBytesForBudget = await this._weightBytesOnDisk(modelPath);
-		const extraResidentBytes = (draftActive ? weightBytesForBudget : 0) + mmprojBytes;
+		let extraResidentBytes = mmprojBytes;
+		const userDraftPath = baseTuning.draftModelPath?.trim();
+		if (baseTuning.multiTokenPrediction) {
+			extraResidentBytes += weightBytesForBudget;
+		} else if (userDraftPath) {
+			extraResidentBytes += (await this._fileBytes(userDraftPath)) || weightBytesForBudget;
+		}
+
+		// Automatic speculative decoding (default on): when the user configured nothing themselves, use the
+		// catalog-paired small draft model when it is downloaded AND the machine still fits with it loaded;
+		// otherwise fall back to n-gram drafting (zero extra memory). Skipped for MTP models (self-draft is
+		// better) and for the rest of the session once a build rejected the speculative flags.
+		const autoSpec = this.configurationService.getValue<boolean>(ChatConfiguration.LocopilotLlamaCppAutoSpeculative) !== false
+			&& !this._specFlagsUnsupported;
+		// Paired drafts are GPU/Metal-only: on a pure CPU backend the draft model competes with the target
+		// for the same cores, so speculation can end up *slower* than plain decode. CPU machines keep the
+		// n-gram fallback below, which drafts from the context with no second model and near-zero overhead.
+		if (autoSpec && backend !== 'cpu' && !baseTuning.multiTokenPrediction && !userDraftPath) {
+			const draft = await this._resolvePairedDraft(model, 'gguf');
+			if (draft && await this._extrasFitBudget(modelPath, backend, discreteVramBytes, extraResidentBytes + draft.bytes)) {
+				baseTuning.draftModelPath = draft.path;
+				extraResidentBytes += draft.bytes;
+				this._log(`[LoCoPilot Runner] Auto speculative decoding: drafting with ${draft.repoId} (~${Math.round(draft.bytes / 1e6)}MB).`);
+			} else if (draft) {
+				this._log(`[LoCoPilot Runner] Auto speculative decoding: draft ${draft.repoId} skipped (would exceed the memory budget); using n-gram drafting instead.`);
+			}
+		}
+		if (autoSpec && !baseTuning.multiTokenPrediction && !(baseTuning.draftModelPath && baseTuning.draftModelPath.trim()) && !baseTuning.promptLookup) {
+			// ngram-mod: drafts long runs (48-64 tokens) by matching n-grams already in the context. No extra
+			// model, no extra memory; strongest on repetitive output (code edits, file rewrites).
+			baseTuning.promptLookup = true;
+			baseTuning.promptLookupArgs = '--spec-type ngram-mod';
+			this._log('[LoCoPilot Runner] Auto speculative decoding: n-gram drafting enabled (--spec-type ngram-mod).');
+		}
+		// A build that already rejected speculative flags gets them stripped so the relaunch (and every
+		// launch after) starts cleanly. This also drops MTP: same --spec-type mechanism, same rejection.
+		if (this._specFlagsUnsupported && (baseTuning.multiTokenPrediction || baseTuning.draftModelPath?.trim() || baseTuning.promptLookup)) {
+			this._log('[LoCoPilot Runner] This llama.cpp build does not support speculative decoding flags; launching without them.');
+			baseTuning.multiTokenPrediction = false;
+			baseTuning.draftModelPath = undefined;
+			baseTuning.promptLookup = false;
+			extraResidentBytes = mmprojBytes;
+		}
 
 		if (!await this._checkModelFitsOrNotify(modelId, modelPath, backend, discreteVramBytes, extraResidentBytes)) {
 			return;
@@ -1491,6 +1877,13 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 		const port = await this.findAvailablePort(LOCOPILOT_LLAMA_SERVER_PORT);
 		const tuning = await this._augmentTuningWithHardware(modelPath, backend, baseTuning, extraResidentBytes);
 		const { command, args } = getLlamaCppServerCommand(modelPath, backend, serverPath, port, tuning);
+		// Remember whether this launch carries speculative flags, so a crash caused by an old build rejecting
+		// them can be told apart from a real failure and self-healed (relaunch without speculation).
+		if (args.includes('--spec-type') || args.includes('--model-draft')) {
+			this._launchedWithSpecFlags.add(modelId);
+		} else {
+			this._launchedWithSpecFlags.delete(modelId);
+		}
 		this._log(`[LoCoPilot Runner] Starting llama.cpp server for model ${modelId} on port ${port} with backend: ${backend}`);
 
 		// Launch the binary DIRECTLY as the terminal's process (executable + args[]), NOT by typing a
@@ -1853,7 +2246,30 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 		const modelDir = await this.getMlxModelRootPath(localPath!);
 		const port = await this.findAvailablePort(LOCOPILOT_MLX_SERVER_PORT);
 		const pythonCmd = await this.resolveMlxPython();
-		const { command, args } = getMlxLmServerCommand(modelDir, port, pythonCmd);
+
+		// Automatic mlx-lm tuning (default on): cap the server's cross-request prompt cache to a slice of
+		// total RAM (upstream default is unbounded, which lets cached KV crowd out a small machine), and use
+		// the catalog-paired small draft model for speculative decoding when it is downloaded and fits.
+		// Skipped for the session once an older mlx-lm rejected the flags (argparse exits on unknown args;
+		// detected below and relaunched without them).
+		const mlxTuning: MlxServerTuning = {};
+		const mlxAutoTune = this.configurationService.getValue<boolean>(ChatConfiguration.LocopilotMlxAutoTune) !== false
+			&& !this._mlxExtraFlagsUnsupported;
+		if (mlxAutoTune) {
+			const mem = await this._getSystemMemory();
+			if (mem?.totalmem && mem.totalmem > 0) {
+				mlxTuning.promptCacheBytes = Math.floor(mem.totalmem * 0.15);
+			}
+			const draft = await this._resolvePairedDraft(model, 'mlx');
+			if (draft && await this._extrasFitBudget(modelDir, 'metal', undefined, draft.bytes)) {
+				mlxTuning.draftModelDir = draft.path;
+				this._log(`[LoCoPilot Runner] Auto speculative decoding (MLX): drafting with ${draft.repoId} (~${Math.round(draft.bytes / 1e6)}MB).`);
+			} else if (draft) {
+				this._log(`[LoCoPilot Runner] Auto speculative decoding (MLX): draft ${draft.repoId} skipped (would exceed the memory budget).`);
+			}
+		}
+		const mlxExtraFlagsUsed = !!(mlxTuning.promptCacheBytes || mlxTuning.draftModelDir);
+		const { command, args } = getMlxLmServerCommand(modelDir, port, pythonCmd, mlxTuning);
 		const q = (p: string) => (p.includes(' ') || p.includes('"') ? `"${p.replace(/"/g, '\\"')}"` : p);
 		const argsQuoted = args.map(a => (a === modelDir || a.includes(' ') ? q(a) : a));
 		const cmdLine = [command, ...argsQuoted].join(' ');
@@ -1875,32 +2291,26 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 			// Claim launch ownership so the resident budget can cancel this in-flight launch (and the promotion
 			// guard below can detect that cancellation) just like the llama path.
 			this._activeLaunchTerminals.set(modelId, terminal);
-			await new Promise<void>(resolve => setTimeout(resolve, 400));
-			await terminal.sendText(cmdLine, true);
 
-			await timeout(5000);
-
-			// The resident budget may have cancelled this launch while we waited (user selected another model).
-			// Don't promote a disposed terminal into runningServers - that produced two "running" models at once.
-			if (this._activeLaunchTerminals.get(modelId) !== terminal) {
-				this._releaseReservedPort(port);
-				this.startingServers.delete(modelId);
-				this._log(`[LoCoPilot Runner] MLX launch for ${modelId} was superseded/cancelled during startup; not promoting to running.`);
-				return;
-			}
-
+			// Register the log listener BEFORE the command runs: an old mlx-lm rejects unknown optional flags
+			// via argparse within the first ~1-2s ("unrecognized arguments: ..."), which is inside the startup
+			// wait below - a listener registered only after promotion would miss it entirely.
 			const logs: string[] = [];
-			this.startingServers.delete(modelId);
-			this.runningServers.set(modelId, { port, terminal, kind: 'mlx', servedModelId: modelDir, logs, lastUsedAt: Date.now(), ready: false });
-			this._releaseReservedPort(port); // now tracked via runningServers; reservation no longer needed
-			this._onDidServerStateChange.fire(modelId);
-
+			let mlxRejectedExtraFlags = false;
 			this._register(terminal.onLineData(line => {
 				logs.push(line);
 				if (logs.length > LoCoPilotLocalModelRunner.MAX_LOG_LINES) {
 					logs.splice(0, logs.length - LoCoPilotLocalModelRunner.MAX_LOG_LINES);
 				}
 				this._onDidLogUpdate.fire(modelId);
+
+				// Optional-tuning-flag rejection (argparse): remember for the session and let the post-wait
+				// logic below relaunch without the flags.
+				if (mlxExtraFlagsUsed && !mlxRejectedExtraFlags && /unrecognized arguments/i.test(line)) {
+					mlxRejectedExtraFlags = true;
+					this._mlxExtraFlagsUnsupported = true;
+					this._log(`[LoCoPilot Runner] mlx_lm.server rejected the optional tuning flags (old mlx-lm); they stay off for this session: ${line}`);
+				}
 
 				// mlx_lm loads the weights on a background worker thread; if that load throws (e.g. an
 				// unsupported / multimodal architecture), the worker thread dies but the HTTP thread stays
@@ -1922,6 +2332,39 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 					}
 				}
 			}));
+
+			await new Promise<void>(resolve => setTimeout(resolve, 400));
+			await terminal.sendText(cmdLine, true);
+
+			await timeout(5000);
+
+			// Old mlx-lm rejected the optional flags -> the process is already dead. Tear this launch down and
+			// retry once WITHOUT them (the session flag set above makes the retry build a plain command line).
+			if (mlxRejectedExtraFlags && this._activeLaunchTerminals.get(modelId) === terminal) {
+				this._releaseReservedPort(port);
+				this._cancelStartingServer(modelId);
+				this._log(`[LoCoPilot Runner] Relaunching MLX server for ${modelId} without the optional tuning flags.`);
+				timeout(1000).then(() => {
+					if (!this.runningServers.has(modelId) && !this.startingServers.has(modelId)) {
+						this.startServerInTerminal(modelId).catch(e => this._log(`[LoCoPilot Runner] MLX relaunch without tuning flags failed: ${e}`));
+					}
+				});
+				return;
+			}
+
+			// The resident budget may have cancelled this launch while we waited (user selected another model).
+			// Don't promote a disposed terminal into runningServers - that produced two "running" models at once.
+			if (this._activeLaunchTerminals.get(modelId) !== terminal) {
+				this._releaseReservedPort(port);
+				this.startingServers.delete(modelId);
+				this._log(`[LoCoPilot Runner] MLX launch for ${modelId} was superseded/cancelled during startup; not promoting to running.`);
+				return;
+			}
+
+			this.startingServers.delete(modelId);
+			this.runningServers.set(modelId, { port, terminal, kind: 'mlx', servedModelId: modelDir, logs, lastUsedAt: Date.now(), ready: false });
+			this._releaseReservedPort(port); // now tracked via runningServers; reservation no longer needed
+			this._onDidServerStateChange.fire(modelId);
 
 			this._register(terminal.onDisposed(() => {
 				this._releaseReservedPort(port);

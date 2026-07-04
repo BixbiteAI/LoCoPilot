@@ -22,6 +22,7 @@ import {
 	MIN_CLAMPED_CONTEXT,
 	type GpuLike,
 } from '../../browser/locopilotLlamaCppServer.js';
+import { getMlxLmServerCommand } from '../../browser/locopilotMlxServer.js';
 
 suite('LoCoPilot llama.cpp server', () => {
 	ensureNoDisposablesAreLeakedInTestSuite();
@@ -233,6 +234,19 @@ suite('LoCoPilot llama.cpp server', () => {
 			assert.strictEqual(argValue(args, '--gpu-layers-draft'), '99');
 		});
 
+		test('separate draft model also emits --spec-type draft-simple (required on current builds)', () => {
+			const { args } = getLlamaCppServerCommand('/m.gguf', 'metal', undefined, 1234, { draftModelPath: '/draft.gguf' });
+			assert.strictEqual(argValue(args, '--spec-type'), 'draft-simple');
+		});
+
+		test('promptLookup is suppressed while a draft-based speculation is active (single --spec-type)', () => {
+			const withDraft = getLlamaCppServerCommand('/m.gguf', 'metal', undefined, 1234, { draftModelPath: '/draft.gguf', promptLookup: true, promptLookupArgs: '--spec-type ngram-mod' });
+			assert.strictEqual(withDraft.args.filter(a => a === '--spec-type').length, 1, 'only the draft spec-type is emitted');
+			assert.strictEqual(argValue(withDraft.args, '--spec-type'), 'draft-simple');
+			const withMtp = getLlamaCppServerCommand('/m.gguf', 'metal', undefined, 1234, { multiTokenPrediction: true, promptLookup: true });
+			assert.strictEqual(withMtp.args.filter(a => a === '--spec-type').length, 1, 'MTP wins over promptLookup');
+		});
+
 		test('MTP takes precedence over a separate draft model', () => {
 			const { args } = getLlamaCppServerCommand('/m.gguf', 'metal', undefined, 1234, { multiTokenPrediction: true, draftModelPath: '/draft.gguf' });
 			assert.strictEqual(argValue(args, '--model-draft'), '/m.gguf', 'MTP points --model-draft at the main model');
@@ -264,6 +278,30 @@ suite('LoCoPilot llama.cpp server', () => {
 			assert.strictEqual(off.args.indexOf('--threads'), -1);
 			const on = getLlamaCppServerCommand('/m.gguf', 'metal', undefined, 1234, { threads: 8 });
 			assert.strictEqual(argValue(on.args, '--threads'), '8');
+		});
+	});
+
+	suite('getMlxLmServerCommand tuning', () => {
+		test('no tuning -> plain command (safe for any mlx-lm version)', () => {
+			const { args } = getMlxLmServerCommand('/models/qwen', 38462, 'python3');
+			assert.strictEqual(args.indexOf('--draft-model'), -1);
+			assert.strictEqual(args.indexOf('--prompt-cache-bytes'), -1);
+		});
+
+		test('draft model + num draft tokens + prompt cache cap emitted when tuned', () => {
+			const { args } = getMlxLmServerCommand('/models/qwen', 38462, 'python3', {
+				draftModelDir: '/models/qwen-draft',
+				numDraftTokens: 3,
+				promptCacheBytes: 1024,
+			});
+			assert.strictEqual(argValue(args, '--draft-model'), '/models/qwen-draft');
+			assert.strictEqual(argValue(args, '--num-draft-tokens'), '3');
+			assert.strictEqual(argValue(args, '--prompt-cache-bytes'), '1024');
+		});
+
+		test('num draft tokens only emitted alongside a draft model', () => {
+			const { args } = getMlxLmServerCommand('/models/qwen', 38462, 'python3', { numDraftTokens: 3 });
+			assert.strictEqual(args.indexOf('--num-draft-tokens'), -1);
 		});
 	});
 });

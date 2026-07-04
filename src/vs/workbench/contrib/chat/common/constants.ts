@@ -90,6 +90,12 @@ export enum ChatConfiguration {
 	LocopilotLlamaCppSlotSavePath = 'locopilot.llamaCpp.slotSavePath',
 	/** Extra raw args appended to the llama-server command line (power users). */
 	LocopilotLlamaCppExtraArgs = 'locopilot.llamaCpp.extraArgs',
+	/** Automatic speculative decoding: paired draft model when downloaded + RAM fits, else n-gram drafting. On by default. */
+	LocopilotLlamaCppAutoSpeculative = 'locopilot.llamaCpp.autoSpeculative',
+	/** Bundled CUDA engine for NVIDIA GPUs on Windows: 'auto' (offer once when detected), 'on' (download+use silently), 'off'. */
+	LocopilotLlamaCppCudaEngine = 'locopilot.llamaCpp.cudaEngine',
+	/** Automatic mlx-lm server tuning (speculative draft model + prompt-cache byte cap sized from RAM). On by default. */
+	LocopilotMlxAutoTune = 'locopilot.mlx.autoTune',
 	/** How long Ollama keeps a model loaded in memory (`ollama run --keepalive`). Reduces cold starts. */
 	LocopilotOllamaKeepAlive = 'locopilot.ollama.keepAlive',
 	/** Auto-start a local GGUF/MLX server when a message is sent to a model whose server is not running. */
