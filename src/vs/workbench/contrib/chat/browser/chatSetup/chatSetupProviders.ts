@@ -44,6 +44,8 @@ import { basename, relativePath } from '../../../../../base/common/resources.js'
 import { VSBuffer } from '../../../../../base/common/buffer.js';
 import { IEditorService } from '../../../../services/editor/common/editorService.js';
 import { ICodeEditorService } from '../../../../../editor/browser/services/codeEditorService.js';
+import { ITextFileService } from '../../../../services/textfile/common/textfiles.js';
+import { LiveEditStreamer } from '../agents/liveEditStreamer.js';
 import { CHAT_OPEN_ACTION_ID, CHAT_SETUP_ACTION_ID } from '../actions/chatActions.js';
 import { IChatWidgetService } from '../chat.js';
 import { ILoCoPilotFileLog } from '../locopilotFileLog.js';
@@ -1093,13 +1095,24 @@ export class LoCoPilotBuiltInAgent extends Disposable implements IChatAgentImple
 		@IWorkspaceContextService private readonly workspaceService: IWorkspaceContextService,
 		@IEditorService private readonly editorService: IEditorService,
 		@ICodeEditorService private readonly codeEditorService: ICodeEditorService,
+		@ITextFileService private readonly textFileService: ITextFileService,
 		@ILoCoPilotFileLog private readonly locopilotFileLog: ILoCoPilotFileLog,
 		@ILoCoPilotAgentSettingsService private readonly agentSettingsService: ILoCoPilotAgentSettingsService,
 		@ILoCoPilotProjectMemoryService private readonly projectMemoryService: ILoCoPilotProjectMemoryService,
 	) {
 		super();
 		const maxIterations = this.agentSettingsService.getMaxIterationsPerRequest();
-		this.unifiedAgent = new UnifiedAgent(this.languageModelsService, this.toolsService, this.logService, this.workspaceService, this.locopilotFileLog, maxIterations);
+		// Live "typing into the editor" preview for streaming modifyFile calls.
+		const liveEditStreamer = new LiveEditStreamer(
+			this.fileService,
+			this.textModelService,
+			this.textFileService,
+			this.editorService,
+			this.codeEditorService,
+			this.workspaceService,
+			msg => { this.logService.info(msg); this.locopilotFileLog.log(msg); }
+		);
+		this.unifiedAgent = new UnifiedAgent(this.languageModelsService, this.toolsService, this.logService, this.workspaceService, this.locopilotFileLog, maxIterations, liveEditStreamer);
 
 		// Warm the model's stable system+tools prefix ahead of the user's first message so that first
 		// message isn't stuck behind a cold, multi-thousand-token prompt-eval. Fire once for whatever
@@ -2058,8 +2071,11 @@ Message: ${firstMessage.substring(0, 500)}`;
 					return {};
 				}
 
-				// Main agentic loop - handle tool calls iteratively
-				return this.unifiedAgent.run(request, progress, messages, modelId, token);
+				// Main agentic loop - handle tool calls iteratively. The live editor preview mirrors
+				// the tool's own policy: file edits are refused in Ask mode, so no preview there either.
+				return this.unifiedAgent.run(request, progress, messages, modelId, token, {
+					allowLiveEditPreview: modeInfo?.kind !== ChatModeKind.Ask
+				});
 			} catch (e) {
 				this.logService.error(`[LoCoPilot] Failed to call model ${modelId}: ${e}`);
 				this.locopilotFileLog.log(`[LoCoPilot] Failed to call model ${modelId}: ${e}`);

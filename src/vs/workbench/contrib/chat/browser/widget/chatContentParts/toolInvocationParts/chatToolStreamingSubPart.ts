@@ -65,6 +65,8 @@ export class ChatToolStreamingSubPart extends BaseChatToolInvocationSubPart {
 
 	private createStreamingPart(): HTMLElement {
 		const container = document.createElement('div');
+		// Hook for the shimmer/preview styling in chatToolStreamingPreview.css
+		container.classList.add('chat-tool-streaming-part');
 
 		if (this.toolInvocation.kind !== 'toolInvocation') {
 			return container;

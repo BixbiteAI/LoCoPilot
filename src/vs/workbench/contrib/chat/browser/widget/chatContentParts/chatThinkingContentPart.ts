@@ -3,7 +3,7 @@
  *  Licensed under the MIT License. See License.txt in the project root for license information.
  *--------------------------------------------------------------------------------------------*/
 
-import { $, addDisposableListener, clearNode, hide } from '../../../../../../base/browser/dom.js';
+import { $, addDisposableListener, clearNode, DisposableResizeObserver, hide } from '../../../../../../base/browser/dom.js';
 import { alert } from '../../../../../../base/browser/ui/aria/aria.js';
 import { DomScrollableElement } from '../../../../../../base/browser/ui/scrollbar/scrollableElement.js';
 import { ScrollbarVisibility } from '../../../../../../base/common/scrollable.js';
@@ -1185,6 +1185,17 @@ export class ChatThinkingContentPart extends ChatCollapsibleContentPart implemen
 
 		// Keep the thinking block pinned to the newest item (tool call / edit) as it streams in.
 		this.scrollActiveViewToBottom();
+
+		// Appended items can keep GROWING after insertion (a streaming tool card ticking its line
+		// count / content tail, terminal output, ...). One pin at append time isn't enough - the
+		// growing item slides below the box's scroll window and looks like auto-scroll stopped.
+		// Re-pin on every size change while the response is still streaming.
+		const growObserver = this._register(new DisposableResizeObserver(() => {
+			if (!this.streamingCompleted) {
+				this.scrollActiveViewToBottom();
+			}
+		}));
+		this._register(growObserver.observe(itemWrapper));
 	}
 
 	private materializeLazyItem(item: ILazyItem): void {
