@@ -19,7 +19,6 @@ import { ChatImageMimeType, ChatMessageRole, IChatMessage, IChatMessageImagePart
 import { ILanguageModelToolsService, IToolData, toolMatchesModel } from '../../common/tools/languageModelToolsService.js';
 import { parsePartialJsonObject } from '../../common/tools/partialJsonInput.js';
 import { ContextManager } from './contextManager.js';
-import { LiveEditStreamer } from './liveEditStreamer.js';
 /**
  * Unified agent that runs the language model with the given messages and streams progress.
  * This implements a full agentic loop with tool calling support.
@@ -68,17 +67,10 @@ const TOOL_STREAM_UPDATE_INTERVAL_MS = 100;
  */
 interface IStreamingToolCard {
 	invocation: IChatToolInvocation | undefined;
-	/** Real (unsanitized) tool id the streamed call maps to. */
-	realToolId: string;
-	/** Whether this call may drive the live editor preview (disabled in Ask mode). */
-	liveEdit: boolean;
 	/** Latest full raw argument text waiting to be pushed to the card (coalesces bursts of deltas). */
 	pendingArgs?: string;
 	flushing: boolean;
 }
-
-/** Tool whose streaming input additionally drives the live editor preview. */
-const LIVE_EDIT_PREVIEW_TOOL_ID = 'modifyFile';
 
 const PARALLELIZABLE_TOOL_IDS = new Set<string>([
 	'semanticSearch',
@@ -104,9 +96,7 @@ export class UnifiedAgent {
 		private readonly logService: ILogService,
 		_workspaceService: IWorkspaceContextService,
 		private readonly locopilotFileLog: ILoCoPilotFileLog,
-		maxIterations: number = DEFAULT_MAX_ITERATIONS,
-		/** Optional live "typing into the editor" preview for streaming modifyFile calls. */
-		private readonly liveEditStreamer?: LiveEditStreamer
+		maxIterations: number = DEFAULT_MAX_ITERATIONS
 	) {
 		// Honor the user's "Max iterations per request" setting, which the settings UI allows up to 500.
 		// (Previously capped at 100 here, silently overriding higher user-chosen values.)
@@ -127,13 +117,8 @@ export class UnifiedAgent {
 		progress: (parts: IChatProgress[]) => void,
 		messages: IChatMessage[],
 		modelId: string,
-		token: CancellationToken,
-		opts?: {
-			/** Allow the live "typing into the editor" preview (pass false in Ask mode, where edits are refused). */
-			allowLiveEditPreview?: boolean;
-		}
+		token: CancellationToken
 	): Promise<IChatAgentResult> {
-		const allowLiveEditPreview = opts?.allowLiveEditPreview === true && !!this.liveEditStreamer;
 		this._log(`[LoCoPilot] UnifiedAgent.run starting - modelId=${modelId}, initialMessages=${messages.length}`);
 
 		let iterationCount = 0;
@@ -270,7 +255,7 @@ export class UnifiedAgent {
 								chatRequestId: request.requestId,
 								sessionResource: request.sessionResource
 							});
-							streamingToolCards.set(p.toolCallId, { invocation, realToolId, liveEdit: allowLiveEditPreview, flushing: false });
+							streamingToolCards.set(p.toolCallId, { invocation, flushing: false });
 							if (invocation) {
 								this._log(`[LoCoPilot] Tool call streaming started: ${p.name} (id: ${p.toolCallId})`);
 							}
@@ -395,14 +380,6 @@ export class UnifiedAgent {
 			// ...then the (potentially mutating) calls one at a time, preserving order.
 			for (const i of sequentialIndexes) {
 				results[i] = await this.executeToolCall(toolCalls[i], request, token, idByLlmName);
-			}
-
-			// Live editor previews: the real writes have landed, so reconcile each streamed call's
-			// preview (discard the scratch buffer, open the final file). Display-only, fire-and-forget.
-			for (const tc of toolCalls) {
-				if (streamingToolCards.has(tc.toolCallId)) {
-					void this.liveEditStreamer?.finalize(tc.toolCallId, true);
-				}
 			}
 
 			const toolResults: any[] = [];
@@ -578,9 +555,6 @@ export class UnifiedAgent {
 				const partialInput = parsePartialJsonObject(argsText);
 				if (partialInput) {
 					await this.toolsService.updateToolStream(toolCallId, partialInput, token);
-					if (card.liveEdit && this.liveEditStreamer && card.realToolId === LIVE_EDIT_PREVIEW_TOOL_ID) {
-						await this.liveEditStreamer.update(toolCallId, partialInput, argsText, token);
-					}
 				}
 				// Pace repaints and let more argument tokens coalesce before the next update.
 				await timeout(TOOL_STREAM_UPDATE_INTERVAL_MS);
@@ -603,8 +577,6 @@ export class UnifiedAgent {
 				continue;
 			}
 			card.pendingArgs = undefined;
-			// Discard any live editor preview (scratch buffer) for the never-invoked call.
-			void this.liveEditStreamer?.finalize(callId, false);
 			const invocation = card.invocation;
 			if (invocation instanceof ChatToolInvocation && IChatToolInvocation.isStreaming(invocation)) {
 				this._log(`[LoCoPilot] Finalizing dangling streamed tool call (id: ${callId})`);
@@ -630,13 +602,6 @@ export class UnifiedAgent {
 		const realToolId = idByLlmName.get(toolCall.name) ?? toolCall.name;
 		try {
 			this._log(`[LoCoPilot] Executing tool: ${toolCall.name} (id: ${realToolId})`);
-
-			// Live editor preview handoff: write the FINAL arguments into the previewed buffer and
-			// save it, so modifyFile finds disk content that already equals its newString and takes
-			// its no-op fast path (no editing-session vs dirty-buffer clash). No-op without a session.
-			if (realToolId === LIVE_EDIT_PREVIEW_TOOL_ID) {
-				await this.liveEditStreamer?.prepareForInvoke(toolCall.toolCallId, toolCall.parameters);
-			}
 
 			// Tool display uses existing formats only: invokeTool appends toolInvocation via appendProgress when context is set; chat renders via ChatToolInvocationPart (no custom progress text here).
 			const result = await this.toolsService.invokeTool(

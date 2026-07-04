@@ -289,17 +289,6 @@ export class ModifyFileTool implements IToolImpl {
 
 			// --- File exists ---
 			if (isEmptyOld) {
-				// Fast path: the file already holds exactly this content. This is how the live editor
-				// preview hands off (LiveEditStreamer types + saves the streamed content before the
-				// tool runs), and it also covers a genuine no-op overwrite. Skipping the edit
-				// machinery avoids re-writing identical content through the editing session.
-				if (currentContent === params.newString) {
-					const lineCount = params.newString.split('\n').length;
-					const successResult: IToolResult = { content: [{ kind: 'text', value: `Successfully wrote file "${params.path}" (${lineCount} lines). Proceed to the next step or goal.` }] };
-					const lintFailure = await this.getLintFailureAfterEdit(fileUri, params.path);
-					if (lintFailure) { return lintFailure; }
-					return successResult;
-				}
 				// Replace entire file with newString
 				progress.report({ message: buildFileLinkInvocationMessage(localize('modifyFile.replacingEntire', "Replacing entire file {0}", '{0}'), fileName, fileUri) });
 				const newContent = params.newString;
