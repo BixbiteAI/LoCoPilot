@@ -229,6 +229,33 @@ export function usableSystemMemoryBytes(totalmemBytes: number): number {
 }
 
 /**
+ * Flat allowance (bytes) for the engine's non-weight, non-KV runtime cost: host buffers, compute scratch,
+ * tokenizer, CUDA/Metal context. Shared by the pre-flight fit gate and the KV-budget sizing so the two
+ * answer "does it fit?" with the same arithmetic.
+ */
+export const RUNTIME_OVERHEAD_BYTES = Math.round(1.5 * 1024 * 1024 * 1024);
+
+/**
+ * KV-cache byte allowance for the context clamp, sized so that weights + KV + runtime overhead stay inside
+ * the memory budget: at most {@link KV_BUDGET_FRACTION} of the budget, and never more than what actually
+ * remains after the weights that will reside in the same pool. Without the second bound, a model whose
+ * weights already fill most of the budget still got a full 25% KV allowance on top - which is exactly how
+ * a launch that passed the pre-flight gate could still bust the Metal wired ceiling at decode.
+ *
+ * `residentWeightBytes` is the weight bytes living in the budget's pool: full weights on Metal/CPU (one
+ * unified/system pool), or `min(weights, offload budget)` on a discrete GPU where partial offload caps
+ * what lands in VRAM. Returns 0 when nothing is left - callers floor the context at MIN_CLAMPED_CONTEXT,
+ * matching the minimum-KV footprint the pre-flight gate already required to fit.
+ */
+export function computeKvBudgetBytes(budgetBytes: number, residentWeightBytes: number, overheadBytes: number = RUNTIME_OVERHEAD_BYTES): number {
+	if (budgetBytes <= 0) {
+		return 0;
+	}
+	const remaining = budgetBytes - Math.max(0, residentWeightBytes) - Math.max(0, overheadBytes);
+	return Math.max(0, Math.min(Math.floor(budgetBytes * KV_BUDGET_FRACTION), remaining));
+}
+
+/**
  * Resolves the concrete KV cache type to use. 'auto' chooses q8_0 once the context window reaches
  * {@link KV_AUTO_QUANT_CONTEXT_THRESHOLD}, else f16. A fixed type is returned unchanged.
  */
@@ -277,9 +304,9 @@ export function clampContextSize(inputs: ContextClampInputs): number {
 			? inputs.kvBytesPerTokenPerLayer
 			: 4096; // f16 k+v for a typical GQA model (8 kv-heads x 128 dim x 2); conservative when unknown.
 		const maxTokens = Math.floor(inputs.kvBudgetBytes / (perTokenPerLayer * inputs.layerCount));
-		if (maxTokens > 0) {
-			ctx = Math.min(ctx, maxTokens);
-		}
+		// Clamp even when the budget holds ~0 tokens: the MIN_CLAMPED_CONTEXT floor below keeps the model
+		// usable, and skipping the clamp here (the old behavior) let a near-full budget escape unclamped.
+		ctx = Math.min(ctx, Math.max(0, maxTokens));
 	}
 	// Round down to a 1024 multiple and never go below the floor.
 	ctx = Math.floor(ctx / 1024) * 1024;
@@ -315,6 +342,13 @@ export interface LlamaServerTuning {
 	 * prefixes (e.g. the system prompt in agent loops) skip reprocessing. Defaults to 256; 0 disables.
 	 */
 	cacheReuse?: number;
+	/**
+	 * Cap (MiB) for the server's host-RAM prompt cache (`--cache-ram`). The build default is 8192 MiB,
+	 * which is a large silent claim on an 8-16GB machine - and it was the gap between our footprint
+	 * estimate (which books ~2GB for this cache) and what the server could actually hold. The runner
+	 * sizes this from total RAM. 0 disables the cache; undefined emits no flag (build default).
+	 */
+	cacheRamMiB?: number;
 	/**
 	 * Path to a separate, smaller GGUF draft model for speculative decoding (`--model-draft`). The big
 	 * model verifies tokens the small one drafts, giving 1.5-2.5x faster generation when they agree.
@@ -593,6 +627,12 @@ export function getLlamaCppServerCommand(modelPath: string, backend: LlamaBacken
 	const cacheReuse = tuning.cacheReuse !== undefined ? tuning.cacheReuse : 256;
 	if (cacheReuse > 0) {
 		args.push('--cache-reuse', String(Math.floor(cacheReuse)));
+	}
+
+	// Cap the host-RAM prompt cache so its real size matches what the memory accounting books for it
+	// (the build default is 8192 MiB). 0 is meaningful (disable); undefined leaves the build default.
+	if (tuning.cacheRamMiB !== undefined && tuning.cacheRamMiB >= 0) {
+		args.push('--cache-ram', String(Math.floor(tuning.cacheRamMiB)));
 	}
 
 	// Optional CPU/batch tuning. Emit only when set; the build's auto/default values are otherwise good.

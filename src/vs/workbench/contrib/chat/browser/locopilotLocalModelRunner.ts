@@ -25,11 +25,13 @@ import {
 	getLlamaServerHealthUrl,
 	computeGpuLayers,
 	computeCpuMoeLayers,
+	computeKvBudgetBytes,
 	clampContextSize,
 	shouldUseBundledVulkan,
 	metalOffloadBudgetBytes,
 	usableSystemMemoryBytes,
 	KV_BUDGET_FRACTION,
+	RUNTIME_OVERHEAD_BYTES,
 	DEFAULT_LLAMA_CONTEXT_SIZE,
 	MIN_CLAMPED_CONTEXT,
 	LOCOPILOT_LLAMA_SERVER_PORT,
@@ -205,6 +207,14 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 	private _specFlagsUnsupported = false;
 	/** Model ids whose LAST llama-server launch included speculative flags; consulted by the crash fallback. */
 	private readonly _launchedWithSpecFlags = new Set<string>();
+	/**
+	 * True once a llama-server launch crashed because the binary rejected `--cache-ram` (older builds predate
+	 * it). The cap is then skipped for the session and the failed launch retried once without it - same
+	 * self-healing shape as the speculative flags.
+	 */
+	private _cacheRamUnsupported = false;
+	/** Model ids whose LAST llama-server launch included --cache-ram; consulted by the crash fallback. */
+	private readonly _launchedWithCacheRam = new Set<string>();
 	/** Same self-healing for mlx_lm.server: set when it rejects the optional tuning flags (old mlx-lm argparse). */
 	private _mlxExtraFlagsUnsupported = false;
 	/** Draft repos we already asked the download service to fetch this session (avoid re-firing per launch). */
@@ -1052,6 +1062,23 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 		const code = exitCode ?? 'unknown';
 		this._log(`[LoCoPilot Runner] llama-server for "${modelName}" exited before serving (exit ${code}). Last output:\n${tail}`);
 
+		// Self-healing for --cache-ram: an older build rejects the flag by name at argument parsing. Checked
+		// BEFORE the generic spec-flag heuristic because that regex also matches "invalid argument" - without
+		// the name check a cache-ram rejection would wrongly disable speculation (and then crash again).
+		const cacheRamRejected = /cache-ram/i.test(tail) && /invalid argument|unrecognized (?:argument|option)|unknown (?:argument|option)/i.test(tail);
+		if (this._launchedWithCacheRam.has(modelId) && !this._cacheRamUnsupported && cacheRamRejected) {
+			this._cacheRamUnsupported = true;
+			this._launchedWithCacheRam.delete(modelId);
+			this._log(`[LoCoPilot Runner] llama-server rejected --cache-ram (older build); skipping the prompt-cache cap for this session and relaunching "${modelName}" without it.`);
+			this._endStarting(modelId);
+			timeout(6000).then(() => {
+				if (!this.runningServers.has(modelId) && !this.startingServers.has(modelId)) {
+					this.startServerInTerminal(modelId).catch(e => this._log(`[LoCoPilot Runner] Relaunch without --cache-ram failed: ${e}`));
+				}
+			});
+			return;
+		}
+
 		// Self-healing for speculative decoding: when THIS launch carried spec flags and the output shows the
 		// build rejected them (old build without --spec-type) or the draft/target pair is incompatible
 		// (tokenizer mismatch), disable speculation for the session and retry once WITHOUT the flags instead
@@ -1163,19 +1190,22 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 	 *    fraction of total RAM - NOT raw total. macOS caps a Metal app's working set at ~70% of RAM; sizing
 	 *    the offload/KV budget off raw total (the old bug) let us wire weights + a large KV past that limit,
 	 *    which paged to SSD and hung/overheated the machine into a thermal shutdown.
-	 *  - cpu: undefined (the resident-budget/eviction path handles RAM pressure instead).
+	 *  - cpu: the usable system-RAM budget ({@link usableSystemMemoryBytes}). Weights and KV live in system
+	 *    RAM here, so without a budget the context clamp never ran on CPU backends and a user-set long
+	 *    context could allocate an unclamped KV cache straight into swap. Eviction still handles pressure
+	 *    from OTHER models; this budget sizes the KV of the one being launched.
 	 */
 	private async _memoryBudgetBytes(backend: LlamaBackend, hw: ISystemHardwareInfo): Promise<number | undefined> {
 		if (backend === 'cuda' || backend === 'vulkan') {
 			const vram = hw.gpus.map(g => g.totalVramBytes).filter(v => v > 0);
 			return vram.length ? Math.max(...vram) : undefined;
 		}
-		if (backend === 'metal') {
-			const mem = await this._getSystemMemory();
-			const budget = mem?.totalmem ? metalOffloadBudgetBytes(mem.totalmem) : 0;
-			return budget > 0 ? budget : undefined;
+		const mem = await this._getSystemMemory();
+		if (!mem?.totalmem) {
+			return undefined;
 		}
-		return undefined;
+		const budget = backend === 'metal' ? metalOffloadBudgetBytes(mem.totalmem) : usableSystemMemoryBytes(mem.totalmem);
+		return budget > 0 ? budget : undefined;
 	}
 
 	/**
@@ -1219,9 +1249,9 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 		// Size the offload off the budget MINUS the KV reserve: weights and the KV cache share the same
 		// device memory, so a model whose weights nearly fill the budget must still offload enough to leave
 		// room for KV - otherwise we wire full weights PLUS a large KV past the limit and page/OOM.
+		const modelBytes = await this._weightBytesOnDisk(modelPath);
+		const offloadBudget = budget && budget > 0 ? Math.floor(budget * (1 - KV_BUDGET_FRACTION)) : 0;
 		if (backend !== 'cpu' && budget && budget > 0) {
-			const offloadBudget = Math.floor(budget * (1 - KV_BUDGET_FRACTION));
-			const modelBytes = await this._weightBytesOnDisk(modelPath);
 			if (isMoeModelInfo(info) && tuning.cpuMoeLayers === undefined) {
 				const moe = computeCpuMoeLayers({ backend, modelBytes, layerCount: info.layerCount, expertCount: info.expertCount, memoryBudgetBytes: offloadBudget });
 				if (moe !== undefined) {
@@ -1238,24 +1268,49 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 		}
 
 		// #5 Context clamp: never request more than the model supports, nor more than the KV budget can hold.
-		// Use KV_BUDGET_FRACTION of the memory budget as the KV-cache allowance (weights take the rest); this
-		// matches the reserve carved out of the offload budget above so the two decisions stay consistent.
+		// The KV allowance is weight-aware (computeKvBudgetBytes): at most KV_BUDGET_FRACTION of the budget,
+		// and never more than what remains after the weights RESIDENT IN THE SAME POOL plus runtime overhead.
+		// The fraction-only allowance (the old behavior) let a dense Metal model whose weights already filled
+		// ~85% of the wired budget still claim a full 25% KV on top - past the ceiling, straight into paging.
 		if (tuning.contextSize && tuning.contextSize > 0) {
 			// Estimate KV bytes/token/layer from the model's attention geometry (f16 - conservative, since
 			// large windows actually run q8_0 which is ~half). Falls back to clampContextSize's own default
 			// when the GGUF lacks the attention keys. Without this the default under-estimates KV by ~25x and
 			// a 256K-trained model would never get clamped on a 16GB machine.
 			const perTokenPerLayer = kvBytesPerTokenPerLayer(info, 2);
+			let kvBudgetBytes: number | undefined;
+			if (budget && budget > 0) {
+				// Discrete GPUs: partial offload caps the weights that land in VRAM at the offload budget;
+				// Metal/CPU: the full weights share the one unified/system pool with the KV cache.
+				const residentWeights = (backend === 'cuda' || backend === 'vulkan') ? Math.min(modelBytes, offloadBudget) : modelBytes;
+				// Unknown weight size (0) degrades to the plain fraction allowance. Floor at 1 byte so a
+				// zero-remainder budget still CLAMPS to the minimum context instead of skipping the clamp
+				// (clampContextSize treats 0/undefined as "no budget known").
+				kvBudgetBytes = modelBytes > 0
+					? Math.max(1, computeKvBudgetBytes(budget, residentWeights))
+					: budget * KV_BUDGET_FRACTION;
+			}
 			const clamped = clampContextSize({
 				requestedContext: tuning.contextSize,
 				modelContextLength: info.contextLength,
-				kvBudgetBytes: budget ? budget * KV_BUDGET_FRACTION : undefined,
+				kvBudgetBytes,
 				layerCount: info.layerCount,
 				kvBytesPerTokenPerLayer: perTokenPerLayer,
 			});
 			if (clamped < tuning.contextSize) {
 				this._log(`[LoCoPilot Runner] Clamped context ${tuning.contextSize} -> ${clamped} to fit the model/memory budget (KV ~${perTokenPerLayer ?? 'default'} B/tok/layer).`);
 				tuning.contextSize = clamped;
+			}
+		}
+
+		// #2 Host prompt-cache cap: without an explicit --cache-ram the server claims up to the build default
+		// (8 GiB) of host RAM for its prompt cache - far more than the footprint accounting books for it.
+		// Cap it at min(2 GiB, 10% of RAM). Skipped when a build already rejected the flag this session.
+		if (tuning.cacheRamMiB === undefined && !this._cacheRamUnsupported) {
+			const mem = await this._getSystemMemory();
+			if (mem?.totalmem && mem.totalmem > 0) {
+				const MiB = 1024 * 1024;
+				tuning.cacheRamMiB = Math.min(2048, Math.floor((mem.totalmem * 0.10) / MiB));
 			}
 		}
 
@@ -1302,9 +1357,8 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 		}
 		const perTokenPerLayer = (info && kvBytesPerTokenPerLayer(info, 2)) || 4096;
 		const layerCount = info?.layerCount && info.layerCount > 0 ? info.layerCount : 32;
-		const GB = 1024 * 1024 * 1024;
 		const kvMinBytes = MIN_CLAMPED_CONTEXT * perTokenPerLayer * layerCount;
-		const runtimeOverhead = Math.round(1.5 * GB); // host buffers / compute scratch; conservative.
+		const runtimeOverhead = RUNTIME_OVERHEAD_BYTES; // host buffers / compute scratch; shared with the KV-budget sizing.
 		// extraResidentBytes covers a draft/MTP model (a second copy of the weights) and the mmproj projector
 		// when vision is enabled - both are loaded ON TOP of the weights+KV and previously went uncounted here,
 		// so an MTP + vision model passed this gate and then OOM-ed the GPU at decode.
@@ -1884,6 +1938,12 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 		} else {
 			this._launchedWithSpecFlags.delete(modelId);
 		}
+		// Same bookkeeping for --cache-ram, so an old build's rejection of it can be told apart and self-healed.
+		if (args.includes('--cache-ram')) {
+			this._launchedWithCacheRam.add(modelId);
+		} else {
+			this._launchedWithCacheRam.delete(modelId);
+		}
 		this._log(`[LoCoPilot Runner] Starting llama.cpp server for model ${modelId} on port ${port} with backend: ${backend}`);
 
 		// Launch the binary DIRECTLY as the terminal's process (executable + args[]), NOT by typing a
@@ -2259,6 +2319,15 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 			const mem = await this._getSystemMemory();
 			if (mem?.totalmem && mem.totalmem > 0) {
 				mlxTuning.promptCacheBytes = Math.floor(mem.totalmem * 0.15);
+				// Cap MLX's total Metal allocation at the same wired budget the llama.cpp path uses. MLX's own
+				// default is ~95% of unified RAM - far past the wired ceiling - and mlx_lm.server only pins the
+				// wired limit, so nothing upstream stops a long prompt's KV growth from paging the machine.
+				// Applied via the -c bootstrap in getMlxLmServerCommand (no CLI flag exists); soft cap - MLX
+				// throttles allocation instead of hard-failing. Also cap the freed-buffer reuse cache, which
+				// otherwise defaults to the memory limit and can hoard GBs after a big prefill.
+				mlxTuning.memoryLimitBytes = metalOffloadBudgetBytes(mem.totalmem);
+				mlxTuning.cacheLimitBytes = Math.floor(mem.totalmem * 0.10);
+				this._log(`[LoCoPilot Runner] MLX memory limits: mx.set_memory_limit ~${Math.round(mlxTuning.memoryLimitBytes / 1e9)}GB (wired budget), mx.set_cache_limit ~${Math.round(mlxTuning.cacheLimitBytes / 1e9)}GB.`);
 			}
 			const draft = await this._resolvePairedDraft(model, 'mlx');
 			if (draft && await this._extrasFitBudget(modelDir, 'metal', undefined, draft.bytes)) {

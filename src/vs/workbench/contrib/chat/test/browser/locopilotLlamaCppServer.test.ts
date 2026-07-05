@@ -8,6 +8,7 @@ import { ensureNoDisposablesAreLeakedInTestSuite } from '../../../../../base/tes
 import {
 	computeGpuLayers,
 	computeCpuMoeLayers,
+	computeKvBudgetBytes,
 	clampContextSize,
 	getBundledLlamaServerPath,
 	getLlamaCppServerCommand,
@@ -18,11 +19,13 @@ import {
 	METAL_WIRED_MEMORY_FRACTION,
 	USABLE_SYSTEM_MEMORY_FRACTION,
 	KV_AUTO_QUANT_CONTEXT_THRESHOLD,
+	KV_BUDGET_FRACTION,
+	RUNTIME_OVERHEAD_BYTES,
 	VULKAN_MIN_DEDICATED_VRAM_BYTES,
 	MIN_CLAMPED_CONTEXT,
 	type GpuLike,
 } from '../../browser/locopilotLlamaCppServer.js';
-import { getMlxLmServerCommand } from '../../browser/locopilotMlxServer.js';
+import { getMlxLmServerCommand, MLX_MEMORY_LIMIT_BOOTSTRAP } from '../../browser/locopilotMlxServer.js';
 
 suite('LoCoPilot llama.cpp server', () => {
 	ensureNoDisposablesAreLeakedInTestSuite();
@@ -152,11 +155,44 @@ suite('LoCoPilot llama.cpp server', () => {
 			assert.strictEqual(ctx, MIN_CLAMPED_CONTEXT);
 		});
 
+		test('a budget too small for even one token still clamps to the floor (not unclamped)', () => {
+			// Old behavior skipped the clamp when maxTokens computed to 0, letting a near-full budget
+			// escape with the full requested window. Now it clamps and the floor keeps the model usable.
+			const ctx = clampContextSize({ requestedContext: 131072, kvBudgetBytes: 1, layerCount: 32, kvBytesPerTokenPerLayer: 4096 });
+			assert.strictEqual(ctx, MIN_CLAMPED_CONTEXT);
+		});
+
 		test('emits --n-cpu-moe and --slot-save-path when tuned', () => {
 			const { args } = getLlamaCppServerCommand('/m.gguf', 'metal', undefined, 38452, { cpuMoeLayers: 12, slotSavePath: '/tmp/kv', promptLookup: true });
 			assert.strictEqual(argValue(args, '--n-cpu-moe'), '12');
 			assert.strictEqual(argValue(args, '--slot-save-path'), '/tmp/kv');
 			assert.ok(args.includes('--spec-type') && args.includes('ngram-cache'));
+		});
+	});
+
+	suite('computeKvBudgetBytes', () => {
+		const GB = 1024 * 1024 * 1024;
+
+		test('small weights -> full fraction allowance', () => {
+			// 11.2GB budget (16GB Mac wired), 4GB weights: remaining 5.7GB > 25% fraction (2.8GB) -> fraction wins.
+			const budget = Math.floor(16 * GB * METAL_WIRED_MEMORY_FRACTION);
+			assert.strictEqual(computeKvBudgetBytes(budget, 4 * GB), Math.floor(budget * KV_BUDGET_FRACTION));
+		});
+
+		test('weights near the budget -> only the true remainder, not the fraction', () => {
+			// 11.2GB budget, 9GB weights: remaining = 11.2 - 9 - 1.5 = ~0.7GB < 2.8GB fraction.
+			const budget = Math.floor(16 * GB * METAL_WIRED_MEMORY_FRACTION);
+			const expected = budget - 9 * GB - RUNTIME_OVERHEAD_BYTES;
+			assert.strictEqual(computeKvBudgetBytes(budget, 9 * GB), expected);
+			assert.ok(expected < budget * KV_BUDGET_FRACTION);
+		});
+
+		test('weights beyond the budget -> 0 (caller floors context at the minimum)', () => {
+			assert.strictEqual(computeKvBudgetBytes(10 * GB, 12 * GB), 0);
+		});
+
+		test('unknown/zero budget -> 0', () => {
+			assert.strictEqual(computeKvBudgetBytes(0, 4 * GB), 0);
 		});
 	});
 
@@ -273,6 +309,15 @@ suite('LoCoPilot llama.cpp server', () => {
 			assert.strictEqual(args.indexOf('-cb'), -1);
 		});
 
+		test('cache-ram cap emitted when set, 0 disables, undefined leaves the build default', () => {
+			const capped = getLlamaCppServerCommand('/m.gguf', 'metal', undefined, 38452, { cacheRamMiB: 1638 });
+			assert.strictEqual(argValue(capped.args, '--cache-ram'), '1638');
+			const disabled = getLlamaCppServerCommand('/m.gguf', 'metal', undefined, 38452, { cacheRamMiB: 0 });
+			assert.strictEqual(argValue(disabled.args, '--cache-ram'), '0');
+			const unset = getLlamaCppServerCommand('/m.gguf', 'metal', undefined, 38452, {});
+			assert.strictEqual(unset.args.indexOf('--cache-ram'), -1);
+		});
+
 		test('threads emitted only when > 0', () => {
 			const off = getLlamaCppServerCommand('/m.gguf', 'metal', undefined, 1234, {});
 			assert.strictEqual(off.args.indexOf('--threads'), -1);
@@ -302,6 +347,31 @@ suite('LoCoPilot llama.cpp server', () => {
 		test('num draft tokens only emitted alongside a draft model', () => {
 			const { args } = getMlxLmServerCommand('/models/qwen', 38462, 'python3', { numDraftTokens: 3 });
 			assert.strictEqual(args.indexOf('--num-draft-tokens'), -1);
+		});
+
+		test('memory/cache limits switch to the -c bootstrap with limits as the first two argv entries', () => {
+			const { args } = getMlxLmServerCommand('/models/qwen', 38462, 'python3', {
+				memoryLimitBytes: 11 * 1024 * 1024 * 1024,
+				cacheLimitBytes: 2 * 1024 * 1024 * 1024,
+				promptCacheBytes: 1024,
+			});
+			assert.strictEqual(args[0], '-c');
+			assert.strictEqual(args[1], MLX_MEMORY_LIMIT_BOOTSTRAP);
+			assert.strictEqual(args[2], String(11 * 1024 * 1024 * 1024));
+			assert.strictEqual(args[3], String(2 * 1024 * 1024 * 1024));
+			assert.strictEqual(args[4], 'server');
+			// Server flags still present after the subcommand, and no -m form in this shape.
+			assert.strictEqual(argValue(args, '--prompt-cache-bytes'), '1024');
+			assert.strictEqual(args.indexOf('-m'), -1);
+			// The bootstrap must stay shell-safe under the runner's double-quote wrapping: single quotes only.
+			assert.strictEqual(MLX_MEMORY_LIMIT_BOOTSTRAP.indexOf('"'), -1);
+		});
+
+		test('no memory/cache limits -> classic -m mlx_lm server form', () => {
+			const { args } = getMlxLmServerCommand('/models/qwen', 38462, 'python3', { promptCacheBytes: 1024 });
+			assert.strictEqual(args[0], '-m');
+			assert.strictEqual(args[1], 'mlx_lm');
+			assert.strictEqual(args[2], 'server');
 		});
 	});
 });

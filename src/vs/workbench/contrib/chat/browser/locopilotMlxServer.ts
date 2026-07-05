@@ -68,7 +68,36 @@ export interface MlxServerTuning {
 	 * working set; sized from total RAM by the runner.
 	 */
 	promptCacheBytes?: number;
+	/**
+	 * Cap (bytes) for MLX's total Metal allocation (`mx.set_memory_limit`). MLX's own default is ~95% of
+	 * unified RAM - far above the wired working-set ceiling (~70-74%) - so a long prompt on a model near
+	 * the limit grows the KV cache straight into swap-thrash territory. mlx_lm.server exposes no CLI flag
+	 * for this, so when set, the launch runs through a tiny `python -c` bootstrap that applies the limit
+	 * before starting the server (see {@link getMlxLmServerCommand}). Soft cap: MLX waits for outstanding
+	 * work when it would exceed it, throttling instead of paging. Sized off the Metal wired budget.
+	 */
+	memoryLimitBytes?: number;
+	/**
+	 * Cap (bytes) for MLX's freed-buffer reuse cache (`mx.set_cache_limit`), applied by the same bootstrap.
+	 * Defaults to the memory limit upstream (effectively unbounded), which lets buffers freed after a big
+	 * prefill sit around holding GBs. A modest slice of RAM keeps the reuse win without hoarding.
+	 */
+	cacheLimitBytes?: number;
 }
+
+/**
+ * One-line Python bootstrap that applies MLX memory limits, then hands over to `mlx_lm` exactly as
+ * `python -m mlx_lm <args>` would. Invoked as: `python -c BOOTSTRAP <memLimit> <cacheLimit> server ...`.
+ * `getattr` fallbacks make renamed/missing APIs a silent no-op (the server still starts) instead of a
+ * crash, and the source uses single quotes ONLY so the runner's shell quoting (double quotes around an
+ * arg with spaces) never needs escaping.
+ */
+export const MLX_MEMORY_LIMIT_BOOTSTRAP =
+	'import mlx.core as mx, runpy, sys; ' +
+	'getattr(mx, \'set_memory_limit\', lambda *_: None)(int(sys.argv[1])); ' +
+	'getattr(mx, \'set_cache_limit\', lambda *_: None)(int(sys.argv[2])); ' +
+	'sys.argv = [\'mlx_lm\'] + sys.argv[3:]; ' +
+	'runpy.run_module(\'mlx_lm\', run_name=\'__main__\')';
 
 /**
  * Command to run `mlx_lm.server` for a local model directory (Hugging Face-style MLX weights).
@@ -87,18 +116,30 @@ export function getMlxLmServerCommand(modelDir: string, port: number, pythonCmd:
 	if (!(port > 0)) {
 		throw new Error(`Cannot start MLX server: invalid port "${port}".`);
 	}
-	// `python -m mlx_lm server` (mlx-lm >= 0.20): `python -m mlx_lm.server` is deprecated.
-	const args = ['-m', 'mlx_lm', 'server', '--model', dir, '--host', '127.0.0.1', '--port', String(port)];
+	// Server args shared by both launch shapes (everything after the `server` subcommand).
+	const serverArgs = ['--model', dir, '--host', '127.0.0.1', '--port', String(port)];
 	if (tuning.draftModelDir && tuning.draftModelDir.trim()) {
-		args.push('--draft-model', tuning.draftModelDir.trim());
+		serverArgs.push('--draft-model', tuning.draftModelDir.trim());
 		if (tuning.numDraftTokens && tuning.numDraftTokens > 0) {
-			args.push('--num-draft-tokens', String(Math.floor(tuning.numDraftTokens)));
+			serverArgs.push('--num-draft-tokens', String(Math.floor(tuning.numDraftTokens)));
 		}
 	}
 	if (tuning.promptCacheBytes && tuning.promptCacheBytes > 0) {
-		args.push('--prompt-cache-bytes', String(Math.floor(tuning.promptCacheBytes)));
+		serverArgs.push('--prompt-cache-bytes', String(Math.floor(tuning.promptCacheBytes)));
 	}
-	return { command: cmd, args };
+
+	// With a memory/cache limit, launch through the bootstrap (mlx_lm.server has no CLI flag for these);
+	// otherwise keep the plain `-m mlx_lm server` form, safe for any mlx-lm/mlx version.
+	if ((tuning.memoryLimitBytes && tuning.memoryLimitBytes > 0) || (tuning.cacheLimitBytes && tuning.cacheLimitBytes > 0)) {
+		const memLimit = tuning.memoryLimitBytes && tuning.memoryLimitBytes > 0 ? Math.floor(tuning.memoryLimitBytes) : 0;
+		const cacheLimit = tuning.cacheLimitBytes && tuning.cacheLimitBytes > 0 ? Math.floor(tuning.cacheLimitBytes) : 0;
+		// 0 = leave that limit at the MLX default (the bootstrap's set-call with 0 would break allocation,
+		// so substitute the other limit's "no-op" by passing the default-preserving sentinel via max()).
+		const memArg = memLimit > 0 ? memLimit : Number.MAX_SAFE_INTEGER;
+		const cacheArg = cacheLimit > 0 ? cacheLimit : Number.MAX_SAFE_INTEGER;
+		return { command: cmd, args: ['-c', MLX_MEMORY_LIMIT_BOOTSTRAP, String(memArg), String(cacheArg), 'server', ...serverArgs] };
+	}
+	return { command: cmd, args: ['-m', 'mlx_lm', 'server', ...serverArgs] };
 }
 
 /**
