@@ -1233,7 +1233,13 @@ export class LoCoPilotLanguageModelProvider extends Disposable implements ILangu
 			// `timings_per_token` makes llama.cpp attach its `timings` block (predicted_n, predicted_per_second)
 			// to every SSE chunk; `stream_options.include_usage` guarantees a final OpenAI `usage` block.
 			timings_per_token: true,
-			stream_options: { include_usage: true }
+			stream_options: { include_usage: true },
+			// Keep the processed prompt in the slot's KV cache so the next request only prefills the tokens
+			// after the longest common prefix (system + tools + prior turns) instead of the whole prompt.
+			// Recent llama.cpp builds default this to true, but older/user-provided builds default to FALSE -
+			// which silently re-processes the entire conversation on every turn. Explicit is cheap insurance;
+			// servers that don't know the field (mlx_lm, Ollama's compat layer) ignore it.
+			cache_prompt: true
 		};
 		this._applyOpenAiReasoningEffort(body, servedModelId, true /* local */, options);
 		// Only the foreground panel turn drives the timer bar's token/rate display. Background/auxiliary calls
@@ -1701,7 +1707,10 @@ export class LoCoPilotLanguageModelProvider extends Disposable implements ILangu
 			max_tokens: maxOutputTokens,
 			// Real token counts + measured rate (ignored by servers that don't support them). See _callLocalModel.
 			timings_per_token: true,
-			stream_options: { include_usage: true }
+			stream_options: { include_usage: true },
+			// Reuse the server-side prompt cache across turns (see _callLocalModel). Localhost endpoints are
+			// commonly llama.cpp/LM Studio, where older builds default this to false; unknown-field-safe.
+			cache_prompt: true
 		};
 		this._applyOpenAiReasoningEffort(body, openAiModel, true /* local */, options);
 		// Only the foreground panel turn drives the timer bar (see _callLocalModel).

@@ -1469,16 +1469,30 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 	}
 
 	/**
-	 * Best-effort warm-up: poll the server's /health until it is ready, then fire a tiny 1-token
-	 * request so GPU kernels are compiled and the cache is primed before the user's first message.
-	 * Fire-and-forget; all failures are swallowed (the server may simply still be loading).
+	 * Best-effort warm-up for a just-launched local server (llama.cpp or mlx-lm): poll until the HTTP
+	 * endpoint answers, then fire a tiny 1-token request so GPU/Metal kernels are compiled and the prompt
+	 * cache is primed before the user's first message. Fire-and-forget; all failures are swallowed (the
+	 * server may simply still be loading).
+	 *
+	 * For MLX this ping matters even more than for llama.cpp: mlx_lm.server answers GET /v1/models 200
+	 * while the weights are still loading on its worker thread, so the endpoint probe alone is optimistic -
+	 * the 1-token request is the first thing that actually blocks until the model is usable. Its completion
+	 * is therefore the real "weights loaded" signal, and we flip the record to ready on it.
+	 *
+	 * `requestModel` must be what the server was loaded with (llama.cpp ignores it; mlx_lm tries to load a
+	 * DIFFERENT model when it mismatches, so pass the served model dir there - see getServedModelId).
 	 */
-	private async _warmUpLlamaServer(modelId: string, port: number, modelName: string): Promise<void> {
-		const healthUrl = getLlamaServerHealthUrl(port);
+	private async _warmUpLocalServer(modelId: string, port: number, kind: 'llama' | 'mlx', requestModel: string): Promise<void> {
+		// llama-server has a dedicated /health; mlx_lm.server only exposes the OpenAI surface, so probe /models.
+		const probeUrl = kind === 'llama' ? getLlamaServerHealthUrl(port) : `${getMlxServerBaseUrl(port)}/models`;
+		const baseUrl = kind === 'llama' ? getLlamaServerBaseUrl(port) : getMlxServerBaseUrl(port);
 		const token = CancellationToken.None;
-		// Poll readiness for up to ~2 minutes (large models can take a while to load).
-		let ready = false;
-		for (let attempt = 0; attempt < 120; attempt++) {
+		// Poll fast at first (a small model is up in ~1-2s; 1s granularity wasted most of that), then back
+		// off to 1s. Total window ~2 minutes (large models on a cold disk cache take a while).
+		const FAST_ATTEMPTS = 20; // 20 x 250ms = first 5 seconds
+		const MAX_ATTEMPTS = FAST_ATTEMPTS + 115;
+		let up = false;
+		for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
 			// Stop immediately if the server crashed or was stopped/evicted - otherwise we'd keep hitting a
 			// dead port with ERR_CONNECTION_REFUSED for the full 2 minutes.
 			if (this._crashedBeforeReady.has(modelId) || !this.runningServers.has(modelId)) {
@@ -1486,35 +1500,44 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 				return;
 			}
 			try {
-				const res = await this.requestService.request({ type: 'GET', url: healthUrl }, token);
+				const res = await this.requestService.request({ type: 'GET', url: probeUrl }, token);
 				const status = res.res.statusCode ?? 0;
 				if (status === 200) {
-					ready = true;
+					up = true;
 					break;
 				}
 			} catch {
 				// not up yet
 			}
-			await timeout(1000);
+			await timeout(attempt < FAST_ATTEMPTS ? 250 : 1000);
 		}
-		if (!ready) {
+		if (!up) {
 			this._log(`[LoCoPilot Runner] Warm-up skipped: server on port ${port} did not become ready in time.`);
 			return;
 		}
 		try {
 			const body = JSON.stringify({
-				model: modelName,
+				model: requestModel,
 				messages: [{ role: 'user', content: 'ping' }],
 				max_tokens: 1,
 				stream: false,
 			});
 			await this.requestService.request({
 				type: 'POST',
-				url: `${getLlamaServerBaseUrl(port)}/chat/completions`,
+				url: `${baseUrl}/chat/completions`,
 				headers: { 'Content-Type': 'application/json' },
 				data: body,
 			}, token);
-			this._log(`[LoCoPilot Runner] Warm-up request completed for server on port ${port}.`);
+			this._log(`[LoCoPilot Runner] Warm-up request completed for ${kind} server on port ${port}.`);
+			// A completed generation is the strongest readiness signal there is (for MLX it is the ONLY
+			// reliable one - see above). Flip the phase so the UI turns green without waiting for a real
+			// request to run through ensureServerForModel.
+			const rec = this.runningServers.get(modelId);
+			if (rec && !rec.ready) {
+				rec.ready = true;
+				rec.loadProgress = undefined;
+				this._onDidServerStateChange.fire(modelId);
+			}
 		} catch (e) {
 			this._log(`[LoCoPilot Runner] Warm-up request failed (ignored): ${e}`);
 		}
@@ -2050,12 +2073,17 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 				}
 			}));
 
-			// Wait for the server process to initialise before switching the UI to running state.
-			await timeout(5000);
+			// Promote to runningServers immediately (ready=false, phase 'loading') instead of sleeping a fixed
+			// 5 seconds first. The old wait added a hard 5s floor to EVERY cold start - even a small model
+			// that loads in ~1s - purely as a window for an early crash to happen before promotion. That
+			// protection is event-driven anyway: onExit deletes the record and sets _crashedBeforeReady
+			// (which readiness polling and warm-up both bail on), so a crashed launch can never stay
+			// "running". Promoting now also lets onLineData capture load progress from the very first line
+			// (previously dropped while the record didn't exist) and lets ensureServerForModel begin its
+			// readiness poll right away.
 
-			// If the process already died during this window (onExit set _crashedBeforeReady and reported it),
-			// do NOT flip to "running" or start warm-up. Doing so was the cause of the endless /health retry
-			// against a dead server and the list showing a crashed model as running.
+			// The process may already have died while we awaited terminal creation (onExit set
+			// _crashedBeforeReady and reported it) - do NOT promote a dead process or start warm-up.
 			if (this._crashedBeforeReady.has(modelId)) {
 				this._releaseReservedPort(port);
 				this.startingServers.delete(modelId);
@@ -2063,9 +2091,10 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 				return;
 			}
 
-			// The resident budget may have cancelled this launch while we waited (e.g. the user selected another
-			// model). _cancelStartingServer dropped our ownership and disposed the terminal, so do NOT promote a
-			// dead terminal into runningServers - that was how two models ended up "running" at once.
+			// The resident budget may have cancelled this launch while we awaited terminal creation (e.g. the
+			// user selected another model). _cancelStartingServer dropped our ownership and disposed the
+			// terminal, so do NOT promote a dead terminal into runningServers - that was how two models ended
+			// up "running" at once.
 			if (this._activeLaunchTerminals.get(modelId) !== terminal) {
 				this._releaseReservedPort(port);
 				this.startingServers.delete(modelId);
@@ -2080,7 +2109,7 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 
 			// Warm up in the background so the first real message has no kernel-JIT / cache lag.
 			if (this.configurationService.getValue<boolean>(ChatConfiguration.LocopilotLlamaCppWarmup) !== false) {
-				this._warmUpLlamaServer(modelId, port, model.modelName);
+				this._warmUpLocalServer(modelId, port, 'llama', model.modelName);
 			}
 
 			this._log(`[LoCoPilot Runner] Terminal started with: ${cmdLineForLog}`);
@@ -2236,7 +2265,10 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 		// Large models on a cold cache can take several minutes to load into memory; poll for up to ~5
 		// minutes. We only give up early when the process actually crashes (checked below), so the wait is
 		// bounded by real readiness, not an arbitrary short timeout that surfaced a false "could not start".
-		const maxAttempts = 300;
+		// Poll fast (250ms) for the first 5 seconds so a small model that's ready in ~1-2s doesn't pay a
+		// full extra second of 1s-granularity polling, then back off to 1s for the long tail.
+		const fastAttempts = 20; // 20 x 250ms = first 5 seconds
+		const maxAttempts = fastAttempts + 295;
 		for (let attempt = 0; attempt < maxAttempts; attempt++) {
 			if (token.isCancellationRequested) {
 				return false;
@@ -2254,7 +2286,7 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 			} catch {
 				// not up yet
 			}
-			await timeout(1000);
+			await timeout(attempt < fastAttempts ? 250 : 1000);
 		}
 		this._log(`[LoCoPilot Runner] Server at ${baseUrl} did not become ready in time.`);
 		return false;
@@ -2373,12 +2405,30 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 				}
 				this._onDidLogUpdate.fire(modelId);
 
-				// Optional-tuning-flag rejection (argparse): remember for the session and let the post-wait
-				// logic below relaunch without the flags.
+				// Optional-tuning-flag rejection (argparse): an old mlx-lm exits immediately on unknown args,
+				// so this launch is already dead. Remember for the session, tear the launch down right here
+				// (it may or may not have been promoted to runningServers yet), and retry once WITHOUT the
+				// flags - the session flag makes the retry build a plain command line.
 				if (mlxExtraFlagsUsed && !mlxRejectedExtraFlags && /unrecognized arguments/i.test(line)) {
 					mlxRejectedExtraFlags = true;
 					this._mlxExtraFlagsUnsupported = true;
 					this._log(`[LoCoPilot Runner] mlx_lm.server rejected the optional tuning flags (old mlx-lm); they stay off for this session: ${line}`);
+					this._releaseReservedPort(port);
+					if (this.runningServers.get(modelId)?.terminal === terminal) {
+						this.stopServer(modelId);
+					} else if (this._activeLaunchTerminals.get(modelId) === terminal) {
+						this._cancelStartingServer(modelId);
+					}
+					if (this._activeLaunchTerminals.get(modelId) === terminal) {
+						this._activeLaunchTerminals.delete(modelId);
+					}
+					this._log(`[LoCoPilot Runner] Relaunching MLX server for ${modelId} without the optional tuning flags.`);
+					timeout(1000).then(() => {
+						if (!this.runningServers.has(modelId) && !this.startingServers.has(modelId)) {
+							this.startServerInTerminal(modelId).catch(e => this._log(`[LoCoPilot Runner] MLX relaunch without tuning flags failed: ${e}`));
+						}
+					});
+					return;
 				}
 
 				// mlx_lm loads the weights on a background worker thread; if that load throws (e.g. an
@@ -2405,24 +2455,16 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 			await new Promise<void>(resolve => setTimeout(resolve, 400));
 			await terminal.sendText(cmdLine, true);
 
-			await timeout(5000);
+			// Promote immediately (ready=false) instead of sleeping a fixed 5 seconds - same rationale as the
+			// llama path above. The old wait existed to observe an argparse flag rejection before promotion;
+			// that detection now lives in the onLineData handler (which tears down and relaunches whether the
+			// rejection lands before or after promotion), so nothing needs the fixed window anymore. Promoting
+			// now also means the load-failure detection in onLineData (which gates on the runningServers
+			// record) covers tracebacks printed in the first seconds, which previously fell into the gap.
 
-			// Old mlx-lm rejected the optional flags -> the process is already dead. Tear this launch down and
-			// retry once WITHOUT them (the session flag set above makes the retry build a plain command line).
-			if (mlxRejectedExtraFlags && this._activeLaunchTerminals.get(modelId) === terminal) {
-				this._releaseReservedPort(port);
-				this._cancelStartingServer(modelId);
-				this._log(`[LoCoPilot Runner] Relaunching MLX server for ${modelId} without the optional tuning flags.`);
-				timeout(1000).then(() => {
-					if (!this.runningServers.has(modelId) && !this.startingServers.has(modelId)) {
-						this.startServerInTerminal(modelId).catch(e => this._log(`[LoCoPilot Runner] MLX relaunch without tuning flags failed: ${e}`));
-					}
-				});
-				return;
-			}
-
-			// The resident budget may have cancelled this launch while we waited (user selected another model).
-			// Don't promote a disposed terminal into runningServers - that produced two "running" models at once.
+			// The resident budget (or the flag-rejection teardown above) may have cancelled this launch while
+			// we awaited the terminal. Don't promote a disposed terminal into runningServers - that produced
+			// two "running" models at once.
 			if (this._activeLaunchTerminals.get(modelId) !== terminal) {
 				this._releaseReservedPort(port);
 				this.startingServers.delete(modelId);
@@ -2434,6 +2476,15 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 			this.runningServers.set(modelId, { port, terminal, kind: 'mlx', servedModelId: modelDir, logs, lastUsedAt: Date.now(), ready: false });
 			this._releaseReservedPort(port); // now tracked via runningServers; reservation no longer needed
 			this._onDidServerStateChange.fire(modelId);
+
+			// Warm up in the background: mlx_lm.server answers /v1/models 200 while the weights are still
+			// loading, so this 1-token ping is the first thing that truly waits for the model to be usable -
+			// it absorbs the load + Metal kernel compile ahead of the user's first message and flips the
+			// phase to ready when it completes. The request's `model` must be the served model dir (mlx_lm
+			// is per-request model-aware; a mismatched id makes it try to load a different model).
+			if (this.configurationService.getValue<boolean>(ChatConfiguration.LocopilotLlamaCppWarmup) !== false) {
+				this._warmUpLocalServer(modelId, port, 'mlx', modelDir);
+			}
 
 			this._register(terminal.onDisposed(() => {
 				this._releaseReservedPort(port);
