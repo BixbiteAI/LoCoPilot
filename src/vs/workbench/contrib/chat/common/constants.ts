@@ -80,6 +80,8 @@ export enum ChatConfiguration {
 	LocopilotLlamaCppWarmup = 'locopilot.llamaCpp.warmup',
 	/** Lock model weights in RAM (`--mlock`) to avoid paging. Opt-in: can fail without privileges/RAM. */
 	LocopilotLlamaCppMlock = 'locopilot.llamaCpp.mlock',
+	/** Full-size SWA KV cache (`--swa-full`) for sliding-window models (Gemma etc.): 'auto' (on when SWA + fits budget), 'on', 'off'. */
+	LocopilotLlamaCppSwaFull = 'locopilot.llamaCpp.swaFull',
 	/** MoE expert CPU offload (`--n-cpu-moe`). -1 = auto (size from VRAM/RAM), 0 = off, N = offload N blocks. */
 	LocopilotLlamaCppCpuMoeLayers = 'locopilot.llamaCpp.cpuMoeLayers',
 	/** Prompt-lookup / n-gram speculative decoding (build-specific, opt-in). */

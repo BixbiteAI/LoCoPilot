@@ -227,6 +227,14 @@ export interface IGgufModelInfo {
 	readonly keyLength: number | undefined;
 	/** `<arch>.attention.value_length` - per-head value dimension; preferred head dim for the KV estimate. */
 	readonly valueLength: number | undefined;
+	/**
+	 * `<arch>.attention.sliding_window` - the SWA window size in tokens. Present and > 0 only for models
+	 * that use Sliding-Window Attention (Gemma 2/3, some others). For these, llama.cpp keeps only a
+	 * window-sized KV cache for the SWA layers by default, which invalidates prompt-cache checkpoints and
+	 * forces a full prompt re-process every turn - the `--swa-full` flag trades memory to keep the full KV
+	 * and restore cross-turn reuse. See {@link isSwaModelInfo}.
+	 */
+	readonly slidingWindow: number | undefined;
 }
 
 /**
@@ -263,6 +271,14 @@ export function isMoeModelInfo(info: IGgufModelInfo): boolean {
 }
 
 /**
+ * True when the GGUF metadata indicates a Sliding-Window Attention model (Gemma 2/3, etc.). These need
+ * `--swa-full` to keep a reusable prompt cache across turns (see {@link IGgufModelInfo.slidingWindow}).
+ */
+export function isSwaModelInfo(info: IGgufModelInfo): boolean {
+	return (info.slidingWindow ?? 0) > 0;
+}
+
+/**
  * Single-pass GGUF header read returning {@link IGgufModelInfo}. Stops as soon as all three keys are
  * found (or the metadata block ends). Only the header is read - never the multi-GB tensor data.
  */
@@ -275,17 +291,18 @@ export async function readGgufModelInfo(fileService: IFileService, filePath: str
 	let embeddingLength: number | undefined;
 	let keyLength: number | undefined;
 	let valueLength: number | undefined;
+	let slidingWindow: number | undefined;
 	try {
 		const uri = URI.file(filePath);
 		const cursor = new GgufCursor(fileService, uri);
 
 		const magic = await cursor.u32();
 		if (magic !== GGUF_MAGIC) {
-			return { layerCount, expertCount, contextLength, kvHeadCount, headCount, embeddingLength, keyLength, valueLength }; // not a GGUF file
+			return { layerCount, expertCount, contextLength, kvHeadCount, headCount, embeddingLength, keyLength, valueLength, slidingWindow }; // not a GGUF file
 		}
 		const version = await cursor.u32();
 		if (version < 2) {
-			return { layerCount, expertCount, contextLength, kvHeadCount, headCount, embeddingLength, keyLength, valueLength }; // v1 used uint32 length prefixes; not supported
+			return { layerCount, expertCount, contextLength, kvHeadCount, headCount, embeddingLength, keyLength, valueLength, slidingWindow }; // v1 used uint32 length prefixes; not supported
 		}
 		await cursor.u64(); // tensor_count (unused)
 		const kvCount = await cursor.u64();
@@ -293,6 +310,14 @@ export async function readGgufModelInfo(fileService: IFileService, filePath: str
 		for (let i = 0; i < kvCount; i++) {
 			const key = await cursor.str();
 			const valueType = await cursor.u32() as GgufType;
+			// The tokenizer metadata (giant token/merge arrays) always follows the architecture keys. Reaching
+			// the first `tokenizer.` key therefore means every arch key - including the optional, order-late
+			// `attention.sliding_window` (which decides SWA) - has already been seen. Stop here WITHOUT decoding
+			// this key's (potentially multi-MB) array: it lets a non-SWA model conclude "not SWA" cheaply
+			// instead of scanning the whole vocab, while a SWA model has already captured its window above.
+			if (key.startsWith('tokenizer.')) {
+				break;
+			}
 			// Scalar numeric keys we care about; everything else is skipped without decoding.
 			const isScalar = scalarSize(valueType) !== undefined;
 			if (isScalar && key.endsWith('.block_count')) {
@@ -319,18 +344,19 @@ export async function readGgufModelInfo(fileService: IFileService, filePath: str
 			} else if (isScalar && key.endsWith('.attention.value_length')) {
 				const n = await cursor.scalar(valueType);
 				valueLength = Number.isFinite(n) && n > 0 ? Math.floor(n) : undefined;
+			} else if (isScalar && key.endsWith('.attention.sliding_window')) {
+				const n = await cursor.scalar(valueType);
+				slidingWindow = Number.isFinite(n) && n > 0 ? Math.floor(n) : undefined;
 			} else {
 				await cursor.skipValue(valueType);
 			}
-			// Early-out once we have the core sizing keys (expert/key/value lengths are optional and not all
-			// models emit them). headCount + embeddingLength let us derive head dim when key/value are absent.
-			if (layerCount !== undefined && contextLength !== undefined && kvHeadCount !== undefined
-				&& headCount !== undefined && embeddingLength !== undefined) {
-				break;
-			}
+			// No core-key early-out here: `attention.sliding_window` (the SWA signal) is emitted AFTER the core
+			// sizing keys, so stopping as soon as those were seen would miss it. Instead we run through the
+			// (small, scalar) architecture keys and stop at the tokenizer boundary above - which is where the
+			// expensive arrays begin - so SWA is always resolved without ever scanning the vocab.
 		}
 	} catch {
 		// any failure -> return whatever we gathered (callers treat undefined as "use defaults")
 	}
-	return { layerCount, expertCount, contextLength, kvHeadCount, headCount, embeddingLength, keyLength, valueLength };
+	return { layerCount, expertCount, contextLength, kvHeadCount, headCount, embeddingLength, keyLength, valueLength, slidingWindow };
 }

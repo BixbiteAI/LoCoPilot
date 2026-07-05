@@ -40,7 +40,7 @@ import {
 	type FlashAttentionMode,
 	type KvCacheType
 } from './locopilotLlamaCppServer.js';
-import { readGgufModelInfo, isMoeModelInfo, kvBytesPerTokenPerLayer, type IGgufModelInfo } from './locopilotGgufMetadata.js';
+import { readGgufModelInfo, isMoeModelInfo, isSwaModelInfo, kvBytesPerTokenPerLayer, type IGgufModelInfo } from './locopilotGgufMetadata.js';
 import { ILoCoPilotSystemInfoService, type ISystemHardwareInfo } from '../../../../platform/locopilotSystemInfo/common/locopilotSystemInfo.js';
 import { dirname } from '../../../../base/common/path.js';
 import { isWindows, isMacintosh } from '../../../../base/common/platform.js';
@@ -215,6 +215,14 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 	private _cacheRamUnsupported = false;
 	/** Model ids whose LAST llama-server launch included --cache-ram; consulted by the crash fallback. */
 	private readonly _launchedWithCacheRam = new Set<string>();
+	/**
+	 * True once a llama-server launch crashed because the binary rejected `--swa-full` (a newer flag older
+	 * builds predate). It is then skipped for the session and the failed launch retried once without it -
+	 * same self-healing shape as the speculative flags / --cache-ram.
+	 */
+	private _swaFullUnsupported = false;
+	/** Model ids whose LAST llama-server launch included --swa-full; consulted by the crash fallback. */
+	private readonly _launchedWithSwaFull = new Set<string>();
 	/** Same self-healing for mlx_lm.server: set when it rejects the optional tuning flags (old mlx-lm argparse). */
 	private _mlxExtraFlagsUnsupported = false;
 	/** Draft repos we already asked the download service to fetch this session (avoid re-firing per launch). */
@@ -1079,6 +1087,23 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 			return;
 		}
 
+		// Self-healing for --swa-full: an older build rejects the flag by name at argument parsing. Checked
+		// (like --cache-ram) BEFORE the generic spec-flag heuristic, whose regex also matches "invalid
+		// argument" - without the name check a swa-full rejection would wrongly disable speculation instead.
+		const swaFullRejected = /swa-full/i.test(tail) && /invalid argument|unrecognized (?:argument|option)|unknown (?:argument|option)/i.test(tail);
+		if (this._launchedWithSwaFull.has(modelId) && !this._swaFullUnsupported && swaFullRejected) {
+			this._swaFullUnsupported = true;
+			this._launchedWithSwaFull.delete(modelId);
+			this._log(`[LoCoPilot Runner] llama-server rejected --swa-full (older build); skipping it for this session and relaunching "${modelName}" without it.`);
+			this._endStarting(modelId);
+			timeout(6000).then(() => {
+				if (!this.runningServers.has(modelId) && !this.startingServers.has(modelId)) {
+					this.startServerInTerminal(modelId).catch(e => this._log(`[LoCoPilot Runner] Relaunch without --swa-full failed: ${e}`));
+				}
+			});
+			return;
+		}
+
 		// Self-healing for speculative decoding: when THIS launch carried spec flags and the output shows the
 		// build rejected them (old build without --spec-type) or the draft/target pair is incompatible
 		// (tokenizer mismatch), disable speculation for the session and retry once WITHOUT the flags instead
@@ -1300,6 +1325,21 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 			if (clamped < tuning.contextSize) {
 				this._log(`[LoCoPilot Runner] Clamped context ${tuning.contextSize} -> ${clamped} to fit the model/memory budget (KV ~${perTokenPerLayer ?? 'default'} B/tok/layer).`);
 				tuning.contextSize = clamped;
+			}
+		}
+
+		// SWA full cache: sliding-window models (Gemma 2/3) default to a window-sized KV for their SWA layers,
+		// which invalidates the server's prompt-cache checkpoints and forces a full prompt re-process every
+		// turn. `--swa-full` keeps the whole KV so cross-turn reuse works. Our context clamp above already
+		// sized `-c` assuming full KV across ALL layers (it doesn't model the SWA reduction), so a model that
+		// passed the clamp/fit gate already has room for the full cache - enabling it here is memory-consistent.
+		// Setting: 'auto' (on for SWA models when we have a memory budget to reason about), 'on' (force for SWA),
+		// 'off'. Skipped for the session once a build rejected the flag.
+		if (tuning.swaFull === undefined && !this._swaFullUnsupported && isSwaModelInfo(info)) {
+			const mode = this.configurationService.getValue<'auto' | 'on' | 'off'>(ChatConfiguration.LocopilotLlamaCppSwaFull) ?? 'auto';
+			if (mode === 'on' || (mode === 'auto' && budget !== undefined && budget > 0)) {
+				tuning.swaFull = true;
+				this._log(`[LoCoPilot Runner] SWA model (window ${info.slidingWindow}); enabling --swa-full so the prompt cache survives across turns (mode=${mode}).`);
 			}
 		}
 
@@ -1966,6 +2006,12 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 			this._launchedWithCacheRam.add(modelId);
 		} else {
 			this._launchedWithCacheRam.delete(modelId);
+		}
+		// Same bookkeeping for --swa-full (newer flag; old builds reject it) so its rejection can be self-healed.
+		if (args.includes('--swa-full')) {
+			this._launchedWithSwaFull.add(modelId);
+		} else {
+			this._launchedWithSwaFull.delete(modelId);
 		}
 		this._log(`[LoCoPilot Runner] Starting llama.cpp server for model ${modelId} on port ${port} with backend: ${backend}`);
 

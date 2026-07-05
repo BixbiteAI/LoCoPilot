@@ -733,6 +733,17 @@ configurationRegistry.registerConfiguration({
 			markdownDescription: nls.localize('locopilot.llamaCpp.mlock.description', "Lock model weights into RAM (`--mlock`) so they are never paged out. Can speed up inference but may fail to start without sufficient memory or locked-memory privileges, so it is off by default."),
 			default: false,
 		},
+		[ChatConfiguration.LocopilotLlamaCppSwaFull]: {
+			type: 'string',
+			enum: ['auto', 'on', 'off'],
+			enumDescriptions: [
+				nls.localize('locopilot.llamaCpp.swaFull.auto', "Enable the full SWA cache automatically for sliding-window models when it fits your memory budget (recommended)."),
+				nls.localize('locopilot.llamaCpp.swaFull.on', "Always keep the full SWA cache. Faster reuse on Gemma-class models, but uses more memory."),
+				nls.localize('locopilot.llamaCpp.swaFull.off', "Never keep the full SWA cache (llama.cpp default). Lowest memory, but every turn re-processes the whole prompt on these models."),
+			],
+			markdownDescription: nls.localize('locopilot.llamaCpp.swaFull.description', "Keep a **full-size KV cache** for sliding-window attention models (`--swa-full`), such as Gemma 2/3. These models otherwise keep only a small window of KV cache, which makes the local server discard its prompt cache and re-process the entire prompt on every turn - very slow on long agent conversations. `auto` (default) turns the full cache on only for sliding-window models that still fit your memory budget with it; `on` forces it; `off` uses the llama.cpp default. No effect on non-sliding-window models (most Llama/Qwen/Mistral builds). Newer llama.cpp flag - builds that don't support it are detected at launch and relaunched without it."),
+			default: 'auto',
+		},
 		[ChatConfiguration.LocopilotLlamaCppCpuMoeLayers]: {
 			type: 'number',
 			minimum: -1,

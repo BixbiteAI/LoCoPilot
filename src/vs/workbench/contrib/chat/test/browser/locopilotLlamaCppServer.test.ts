@@ -289,6 +289,13 @@ suite('LoCoPilot llama.cpp server', () => {
 			assert.ok(args.includes('--spec-type'));
 		});
 
+		test('swaFull emits --swa-full; unset omits it', () => {
+			const on = getLlamaCppServerCommand('/m.gguf', 'metal', undefined, 1234, { swaFull: true });
+			assert.ok(on.args.includes('--swa-full'), 'swaFull:true adds --swa-full');
+			const off = getLlamaCppServerCommand('/m.gguf', 'metal', undefined, 1234, {});
+			assert.strictEqual(off.args.indexOf('--swa-full'), -1, 'no swaFull -> no flag (llama.cpp default)');
+		});
+
 		test('parallel slots add --parallel and -cb', () => {
 			const { args } = getLlamaCppServerCommand('/m.gguf', 'metal', undefined, 1234, { parallelSlots: 4, continuousBatching: true });
 			assert.strictEqual(argValue(args, '--parallel'), '4');

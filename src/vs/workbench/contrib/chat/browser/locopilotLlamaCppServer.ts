@@ -335,6 +335,15 @@ export interface LlamaServerTuning {
 	mtpArgs?: string;
 	/** Lock weights in RAM (`--mlock`). Can fail without privileges/RAM, so opt-in. */
 	mlock?: boolean;
+	/**
+	 * Keep a FULL-size KV cache for Sliding-Window Attention layers (`--swa-full`). SWA models (Gemma 2/3,
+	 * etc.) default to a window-sized KV for those layers, which invalidates the server's prompt-cache
+	 * checkpoints and forces a full prompt re-process every turn (slow on long agent prompts). Enabling this
+	 * keeps the whole KV so cross-turn prompt reuse works, at the cost of more KV memory - so the runner only
+	 * turns it on for SWA models that still fit the memory budget with the full cache. Flag is newer, so old
+	 * builds reject it (self-healed like the speculative flags). Off/undefined emits nothing.
+	 */
+	swaFull?: boolean;
 	/** GPU layers override; when unset, GPU backends offload all layers (999) and CPU uses 0. */
 	gpuLayers?: number;
 	/**
@@ -649,6 +658,12 @@ export function getLlamaCppServerCommand(modelPath: string, backend: LlamaBacken
 	// Lock weights into RAM to avoid paging. Opt-in because it can fail without privileges or enough memory.
 	if (tuning.mlock) {
 		args.push('--mlock');
+	}
+
+	// Full-size SWA KV cache: restores cross-turn prompt-cache reuse on Sliding-Window Attention models
+	// (Gemma 2/3). The runner only sets this when the model is SWA AND the full cache fits the budget.
+	if (tuning.swaFull) {
+		args.push('--swa-full');
 	}
 
 	// Power-user escape hatch: append any extra build-specific flags verbatim.

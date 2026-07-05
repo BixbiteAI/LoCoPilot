@@ -1109,8 +1109,16 @@ export class LoCoPilotBuiltInAgent extends Disposable implements IChatAgentImple
 		this._maybeWarmSelectedModelPrefix();
 	}
 
-	/** Last model id we kicked off a prefix warm-up for, so list changes don't re-warm the same model. */
-	private _lastWarmedModelId: string | undefined;
+	/**
+	 * Last model id a prefix warm-up was kicked off for. PROCESS-WIDE (static) on purpose: this agent is
+	 * registered once per location+mode (Chat x {Ask,Edit,Agent} + Terminal + Notebook + EditorInline = 6
+	 * instances), and every instance builds the SAME stable Agent system+tools prefix here. With a per-
+	 * instance guard all six saw "not warmed yet" and each fired an identical warm-up - six duplicate
+	 * prefix prefills (one cold, five cache hits) on the same server for every model, on every machine.
+	 * Sharing the guard means the first instance warms and the other five skip; a real switch to a
+	 * different model still re-warms (modelId != last), just once instead of six times.
+	 */
+	private static _lastWarmedModelId: string | undefined;
 
 	/**
 	 * If a downloaded LOCAL model is selected (or is the only chat-ready option), pre-process its
@@ -1120,7 +1128,7 @@ export class LoCoPilotBuiltInAgent extends Disposable implements IChatAgentImple
 	private _maybeWarmSelectedModelPrefix(): void {
 		const modelId = this.customLanguageModelsService.getSelectedCustomModelId()
 			?? this.customLanguageModelsService.getChatSelectableCustomModels()[0]?.id;
-		if (!modelId || modelId === this._lastWarmedModelId) {
+		if (!modelId || modelId === LoCoPilotBuiltInAgent._lastWarmedModelId) {
 			return;
 		}
 		const model = this.customLanguageModelsService.getCustomModels().find(m => m.id === modelId);
@@ -1128,7 +1136,9 @@ export class LoCoPilotBuiltInAgent extends Disposable implements IChatAgentImple
 		if (!model || model.type !== 'local' || needsDownloadOrPullRetry(model) || model.isDownloading) {
 			return;
 		}
-		this._lastWarmedModelId = modelId;
+		// Claim the warm SYNCHRONOUSLY (before the async work below) so the other five agent instances,
+		// whose constructors run right after this one, see the guard already set and skip.
+		LoCoPilotBuiltInAgent._lastWarmedModelId = modelId;
 		// Build the SAME stable agent system prompt a real turn uses: default agent prompt + the stable
 		// workspace context. Volatile editor state is intentionally excluded (it lives in the user turn),
 		// so this prefix matches the real turn's prefix and the cache hits.
