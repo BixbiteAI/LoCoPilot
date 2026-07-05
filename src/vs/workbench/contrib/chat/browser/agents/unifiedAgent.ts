@@ -15,8 +15,9 @@ import { nullExtensionDescription } from '../../../../services/extensions/common
 import { IChatAgentRequest, IChatAgentResult } from '../../common/participants/chatAgents.js';
 import { IChatProgress, IChatToolInvocation } from '../../common/chatService/chatService.js';
 import { ChatToolInvocation } from '../../common/model/chatProgressTypes/chatToolInvocation.js';
-import { ChatImageMimeType, ChatMessageRole, IChatMessage, IChatMessageImagePart, IChatResponseToolUsePart, ILanguageModelsService, LanguageModelPartAudience } from '../../common/languageModels.js';
+import { ChatImageMimeType, ChatMessageRole, IChatMessage, IChatMessageImagePart, IChatMessageToolResultPart, IChatResponseToolUsePart, ILanguageModelsService, LanguageModelPartAudience } from '../../common/languageModels.js';
 import { ILanguageModelToolsService, IToolData, toolMatchesModel } from '../../common/tools/languageModelToolsService.js';
+import { AGENT_LOOP_EXCLUDED_TOOL_IDS, EDIT_TOOL_IDS, isToolExcluded } from '../../common/tools/builtinTools/agentToolPolicy.js';
 import { parsePartialJsonObject } from '../../common/tools/partialJsonInput.js';
 import { ContextManager } from './contextManager.js';
 /**
@@ -30,7 +31,7 @@ const REPEATED_TOOL_CALL_THRESHOLD = 5;
 /** Sliding window size for detecting repeated tool calls. */
 const REPEATED_TOOL_CALL_WINDOW = 6;
 
-const DEFAULT_MAX_ITERATIONS = 25;
+const DEFAULT_MAX_ITERATIONS = 50;
 
 /**
  * Self-correction scaffolding. Small/local models don't reliably form recovery hypotheses from raw
@@ -86,9 +87,29 @@ const PARALLELIZABLE_TOOL_IDS = new Set<string>([
 	'runSubagent',
 ]);
 
+/** Max chat sessions whose transcripts we keep in memory (LRU eviction). */
+const MAX_STORED_TRANSCRIPTS = 20;
+
+/** A session's real conversation (tool calls + results included), stored after each turn. */
+interface IStoredTranscript {
+	/** Non-system messages exactly as the loop left them (post-compaction). */
+	readonly messages: IChatMessage[];
+	/** History length the NEXT request must have for this transcript to still be valid. */
+	readonly expectedHistoryLength: number;
+}
+
 export class UnifiedAgent {
 	private readonly MAX_ITERATIONS: number;
 	private readonly contextManager: ContextManager;
+
+	/**
+	 * Real per-session transcripts (tool_use/tool_result included), keyed by session resource.
+	 * Rebuilding history from rendered markdown loses all tool activity - on turn 2 the model
+	 * would not know which files it edited on turn 1. Keeping the actual messages (already
+	 * compacted by the ContextManager) preserves that knowledge at whatever size the model's
+	 * window allows. In-memory only: after a window reload we fall back to the markdown rebuild.
+	 */
+	private readonly sessionTranscripts = new Map<string, IStoredTranscript>();
 
 	constructor(
 		private readonly languageModelsService: ILanguageModelsService,
@@ -112,12 +133,76 @@ export class UnifiedAgent {
 		this.locopilotFileLog.log(msg, ...args);
 	}
 
+	/**
+	 * The stored transcript for a session, or undefined when none exists or the chat history no
+	 * longer matches (user edited/regenerated/deleted a turn - the transcript would then contain
+	 * responses that no longer exist, so it is discarded and the caller rebuilds from history).
+	 */
+	getStoredTranscript(sessionKey: string, currentHistoryLength: number): IChatMessage[] | undefined {
+		const stored = this.sessionTranscripts.get(sessionKey);
+		if (!stored) {
+			return undefined;
+		}
+		if (stored.expectedHistoryLength !== currentHistoryLength) {
+			this._log(`[LoCoPilot] Stored transcript for session invalidated (expected history ${stored.expectedHistoryLength}, got ${currentHistoryLength})`);
+			this.sessionTranscripts.delete(sessionKey);
+			return undefined;
+		}
+		return stored.messages;
+	}
+
+	/**
+	 * Remove assistant tool_use parts that have no matching tool_result (a cancelled turn can end
+	 * mid-call). Providers like Anthropic reject a replayed tool_use without its result, so the
+	 * stored transcript must never contain an unpaired one.
+	 */
+	private sanitizeTranscript(messages: IChatMessage[]): IChatMessage[] {
+		const resultIds = new Set<string>();
+		for (const m of messages) {
+			for (const p of m.content) {
+				if (p.type === 'tool_result') {
+					resultIds.add((p as IChatMessageToolResultPart).toolCallId);
+				}
+			}
+		}
+		const out: IChatMessage[] = [];
+		for (const m of messages) {
+			if (m.role !== ChatMessageRole.Assistant) {
+				out.push(m);
+				continue;
+			}
+			const content = m.content.filter(p => p.type !== 'tool_use' || resultIds.has((p as IChatResponseToolUsePart).toolCallId));
+			if (content.length > 0) {
+				out.push(content.length === m.content.length ? m : { role: m.role, content });
+			}
+		}
+		return out;
+	}
+
+	private storeTranscript(sessionKey: string, conversationMessages: IChatMessage[], historyLength: number): void {
+		const transcript = this.sanitizeTranscript(conversationMessages.filter(m => m.role !== ChatMessageRole.System));
+		// Re-insert for LRU recency, then evict the oldest entry beyond the cap.
+		this.sessionTranscripts.delete(sessionKey);
+		// Next request's history will include the turn that just finished, hence +1.
+		this.sessionTranscripts.set(sessionKey, { messages: transcript, expectedHistoryLength: historyLength + 1 });
+		if (this.sessionTranscripts.size > MAX_STORED_TRANSCRIPTS) {
+			const oldest = this.sessionTranscripts.keys().next().value;
+			if (oldest !== undefined) {
+				this.sessionTranscripts.delete(oldest);
+			}
+		}
+	}
+
 	async run(
 		request: IChatAgentRequest,
 		progress: (parts: IChatProgress[]) => void,
 		messages: IChatMessage[],
 		modelId: string,
-		token: CancellationToken
+		token: CancellationToken,
+		/** False in read-only modes (Ask / Plan): edit tools are hard-removed from the payload, not just discouraged by the prompt. */
+		allowEdits: boolean = true,
+		/** Chat history length of this request; when provided, the final transcript is stored for reuse on the next turn. */
+		historyLength?: number
 	): Promise<IChatAgentResult> {
 		this._log(`[LoCoPilot] UnifiedAgent.run starting - modelId=${modelId}, initialMessages=${messages.length}`);
 
@@ -139,7 +224,7 @@ export class UnifiedAgent {
 
 		// Get model metadata and available tools
 		const modelMetadata = this.languageModelsService.lookupLanguageModel(modelId);
-		const allTools = await this.getAvailableTools(modelMetadata, request.userSelectedTools);
+		const allTools = await this.getAvailableTools(modelMetadata, request.userSelectedTools, allowEdits);
 
 		// LLM providers (Anthropic/OpenAI) require function names matching ^[a-zA-Z0-9_-]{1,64}$.
 		// Built-in tool ids satisfy this, but MCP/extension tool ids can contain other characters
@@ -339,12 +424,20 @@ export class UnifiedAgent {
 			if (recentToolKeys.length > REPEATED_TOOL_CALL_WINDOW) {
 				recentToolKeys.splice(0, recentToolKeys.length - REPEATED_TOOL_CALL_WINDOW);
 			}
-			const sameKeyCount = thisRoundKeys.length > 0
-				? recentToolKeys.filter(k => k === thisRoundKeys[0]).length
-				: 0;
+			// Check EVERY key issued this round, not just the first - a model that repeats the
+			// second call of a multi-call round used to slip past this guard.
+			let repeatedKey: string | undefined;
+			let sameKeyCount = 0;
+			for (const key of thisRoundKeys) {
+				const count = recentToolKeys.filter(k => k === key).length;
+				if (count > sameKeyCount) {
+					sameKeyCount = count;
+					repeatedKey = key;
+				}
+			}
 			if (sameKeyCount >= REPEATED_TOOL_CALL_THRESHOLD) {
-				this.logService.warn(`[LoCoPilot] Repeated tool call detected (${sameKeyCount}x): ${thisRoundKeys[0]}. Stopping to avoid loop.`);
-				this.locopilotFileLog.log(`[LoCoPilot] Repeated tool call detected (${sameKeyCount}x): ${thisRoundKeys[0]}. Stopping to avoid loop.`);
+				this.logService.warn(`[LoCoPilot] Repeated tool call detected (${sameKeyCount}x): ${repeatedKey}. Stopping to avoid loop.`);
+				this.locopilotFileLog.log(`[LoCoPilot] Repeated tool call detected (${sameKeyCount}x): ${repeatedKey}. Stopping to avoid loop.`);
 				progress([{
 					kind: 'markdownContent',
 					content: new MarkdownString(`\n*Stopped: the same tool was called repeatedly with no progress. If the task is done, you can start a new message.*\n`)
@@ -480,6 +573,16 @@ export class UnifiedAgent {
 					kind: 'markdownContent',
 					content: new MarkdownString('\n\n*Note: Reached maximum number of iterations. The task may be incomplete.*')
 				}]);
+			}
+		}
+
+		// Persist the real transcript (tool calls + results, post-compaction) so the next turn can
+		// continue from what actually happened instead of a markdown reconstruction.
+		if (request.sessionResource && historyLength !== undefined) {
+			try {
+				this.storeTranscript(request.sessionResource.toString(), conversationMessages, historyLength);
+			} catch (e) {
+				this._log(`[LoCoPilot] Failed to store session transcript (ignored): ${e}`);
 			}
 		}
 
@@ -763,18 +866,30 @@ export class UnifiedAgent {
 			`1. Restate the goal in one line${goal ? ` (the user asked: "${goal}")` : ''}.\n` +
 			`2. State the current blocker and its root cause in one line.\n` +
 			`3. Choose ONE concrete next action that is DIFFERENT from what has been failing - e.g. fix filesystem state with run_in_terminal, re-read a file/dir to correct a wrong assumption, or write the target file directly.\n` +
-			`Consider using the todo tool to record what is done vs. remaining so you stop repeating steps.`;
+			`Consider using \`manage_todo_list\` to record what is done vs. remaining so you stop repeating steps.`;
 	}
 
 	/**
 	 * Get available tools for the model, filtered by user selection and model compatibility
 	 */
-	private async getAvailableTools(modelMetadata: any, userSelectedTools: IChatAgentRequest['userSelectedTools']): Promise<IToolData[]> {
+	private async getAvailableTools(modelMetadata: any, userSelectedTools: IChatAgentRequest['userSelectedTools'], allowEdits: boolean = true): Promise<IToolData[]> {
 		const allTools = Array.from(this.toolsService.getTools(undefined));
 		const selected = userSelectedTools || {};
 
 		// Filter tools
 		const availableTools = allTools.filter(tool => {
+			// Tools that never belong in the agent loop (internal VS Code flows, demo/confirmation
+			// helpers, and editFile_internal which overlaps modifyFile). See agentToolPolicy.ts.
+			if (isToolExcluded(tool.id, AGENT_LOOP_EXCLUDED_TOOL_IDS)) {
+				return false;
+			}
+
+			// Read-only modes (Ask/Plan): remove edit tools from the payload entirely so the
+			// prompt's "do not edit" is enforced by the harness, not model discipline.
+			if (!allowEdits && isToolExcluded(tool.id, EDIT_TOOL_IDS)) {
+				return false;
+			}
+
 			// Check if tool matches the model
 			if (!toolMatchesModel(tool, modelMetadata)) {
 				return false;

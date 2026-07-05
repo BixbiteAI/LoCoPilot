@@ -271,6 +271,12 @@ export class ContextManager {
 		return out;
 	}
 
+	/** True for the Tier 2 summary block, which must survive Tier 3 (it replaced the whole middle). */
+	private isSummaryMessage(msg: IChatMessage): boolean {
+		return msg.role === ChatMessageRole.Assistant
+			&& msg.content.some(p => p.type === 'text' && (p as IChatMessageTextPart).value.startsWith('[Earlier context summary'));
+	}
+
 	/** Drop oldest messages just after the pinned prefix until under target, keeping tool pairs intact. */
 	private async dropOldestRecent(
 		modelId: string,
@@ -278,14 +284,53 @@ export class ContextManager {
 		target: number,
 		token: CancellationToken,
 	): Promise<IChatMessage[]> {
-		const pinnedEnd = this.computePinnedPrefixEnd(messages);
+		let pinnedEnd = this.computePinnedPrefixEnd(messages);
 		const working = messages.slice();
-		// Remove from just after the pinned prefix (oldest non-pinned) forward.
-		while (await this.totalTokens(modelId, working, token) > target && working.length > pinnedEnd + 1) {
-			working.splice(pinnedEnd, 1);
+		// The Tier 2 summary (if present) sits right after the pinned prefix. Treat it as pinned:
+		// deleting it first would throw away the one message that stands in for the whole middle.
+		if (pinnedEnd < working.length && this.isSummaryMessage(working[pinnedEnd])) {
+			pinnedEnd++;
+		}
+
+		// The CURRENT task is the most recent plain-text user message (not a tool-results message).
+		// In a multi-turn session the pinned first user message can be a stale earlier task, so the
+		// current one must survive dropping or the model forgets what it is doing right now.
+		let protectedMsg: IChatMessage | undefined;
+		for (let i = working.length - 1; i >= pinnedEnd; i--) {
+			const m = working[i];
+			if (m.role === ChatMessageRole.User && !this.isToolResultMessage(m) && m.content.some(p => partText(p).trim().length > 0)) {
+				protectedMsg = m;
+				break;
+			}
+		}
+
+		// Incremental accounting: price each message once, then subtract as we splice. The old code
+		// re-tokenized the ENTIRE array after every single removal (O(n^2) computeTokenLength calls).
+		const tokens: number[] = [];
+		for (const m of working) {
+			tokens.push(await this.tokensFor(modelId, m, token));
+		}
+		let total = tokens.reduce((a, b) => a + b, 0);
+
+		const removeAt = (idx: number) => {
+			total -= tokens[idx];
+			working.splice(idx, 1);
+			tokens.splice(idx, 1);
+		};
+
+		while (total > target && !token.isCancellationRequested) {
+			// Oldest droppable message: just after the pinned prefix, skipping the protected task.
+			let idx = pinnedEnd;
+			while (idx < working.length && working[idx] === protectedMsg) {
+				idx++;
+			}
+			if (idx >= working.length - 1) {
+				break; // never drop the newest message
+			}
+			removeAt(idx);
 			// Don't leave an orphan tool_result at the new boundary.
-			while (working.length > pinnedEnd && this.isToolResultMessage(working[pinnedEnd])) {
-				working.splice(pinnedEnd, 1);
+			while (idx < working.length - 1 && this.isToolResultMessage(working[idx]) && working[idx] !== protectedMsg) {
+				removeAt(idx);
 			}
 		}
 		return working;

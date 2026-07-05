@@ -99,6 +99,10 @@ export function createModifyFileToolData(): IToolData {
 			replaceAll: {
 				type: 'boolean',
 				description: 'Optional: When doing partial replace (oldString non-empty), if true replaces all occurrences; if false (default) only one match allowed.'
+			},
+			force: {
+				type: 'boolean',
+				description: 'Optional: Required (true) only when intentionally replacing a large existing file with much shorter content. Without it such an overwrite is rejected as likely accidental truncation.'
 			}
 		},
 		required: ['path', 'oldString', 'newString']
@@ -114,7 +118,7 @@ export function createModifyFileToolData(): IToolData {
 		modelDescription: 'Create or modify files in one tool. Params: path, oldString, newString, replaceAll?.\n\n' +
 			'**When oldString is EMPTY ("")**:\n' +
 			'- If file does NOT exist: creates the file with newString as full contents (parent dirs created automatically).\n' +
-			'- If file EXISTS: replaces the entire file with newString.\n\n' +
+			'- If file EXISTS: replaces the entire file with newString. Replacing a large file with much shorter content is rejected unless you resend with force: true (guards against accidentally truncated rewrites - prefer targeted oldString edits for partial changes).\n\n' +
 			'**When oldString is NON-EMPTY**: Same as surgical replace - oldString must match the file exactly (use readFile first and copy exact text). If multiple matches, use replaceAll: true or make oldString unique. On "String not found", use the exact hint from the error as oldString on the next turn.',
 		source: ToolDataSource.Internal,
 		inputSchema: inputSchema,
@@ -128,7 +132,13 @@ interface IModifyFileToolParams {
 	oldString: string;
 	newString: string;
 	replaceAll?: boolean;
+	force?: boolean;
 }
+
+/** Overwrite shrink guard: an existing file this long ... */
+const SHRINK_GUARD_MIN_LINES = 50;
+/** ...replaced by content under this fraction of its size is likely accidental truncation. */
+const SHRINK_GUARD_RATIO = 0.4;
 
 /** Short delay so language servers can publish diagnostics after file write. */
 const LINT_CHECK_DELAY_MS = 150;
@@ -278,17 +288,60 @@ export class ModifyFileTool implements IToolImpl {
 					};
 				}
 				progress.report({ message: buildFileLinkInvocationMessage(localize('modifyFile.creating', "Creating file {0}", '{0}'), fileName, fileUri) });
-				const content = VSBuffer.fromString(params.newString);
-				await this.fileService.createFile(fileUri, content, { overwrite: false });
 				const lineCount = params.newString.split('\n').length;
-				const successResult: IToolResult = { content: [{ kind: 'text', value: `Successfully created file "${params.path}" (${lineCount} lines). Proceed to the next step or goal.` }] };
+				const createSuccess: IToolResult = { content: [{ kind: 'text', value: `Successfully created file "${params.path}" (${lineCount} lines). Proceed to the next step or goal.` }] };
+
+				// Route creation through the chat editing session (same mechanism as the overwrite /
+				// partial-edit branches) so the new file becomes a tracked entry. Without this, a
+				// created file bypassed the editing session entirely and "Restore Checkpoint" could
+				// not remove it - only edits to pre-existing files were reverted. The editing session
+				// records an empty baseline for a not-yet-existing file (NotExistBehavior.Create), so
+				// restoring to before this request deletes the file.
+				const createUri = CellUri.parse(fileUri)?.notebook ?? fileUri;
+				const isNotebookCreate = this.notebookService.hasSupportedNotebooks(createUri) && this.notebookService.getNotebookTextModel(createUri);
+				if (invocation.context && !isNotebookCreate) {
+					const model = this.chatService.getSession(invocation.context.sessionResource) as ChatModel | undefined;
+					const request = model?.getRequests().at(-1);
+					const editSession = model?.editingSession;
+					if (request && editSession) {
+						// Insert the whole content into the (empty) new document.
+						const fullRange: IRange = { startLineNumber: 1, startColumn: 1, endLineNumber: 1, endColumn: 1 };
+						const edits: TextEdit[] = [{ range: fullRange, text: params.newString }];
+						const undoStopId = generateUuid();
+						model.acceptResponseProgress(request, { kind: 'markdownContent', content: new MarkdownString('\n````\n') });
+						model.acceptResponseProgress(request, { kind: 'codeblockUri', uri: createUri, isEdit: true, undoStopId });
+						model.acceptResponseProgress(request, { kind: 'markdownContent', content: new MarkdownString('\n````\n') });
+						model.acceptResponseProgress(request, { kind: 'textEdit', uri: createUri, edits: [] });
+						model.acceptResponseProgress(request, { kind: 'textEdit', uri: createUri, edits });
+						model.acceptResponseProgress(request, { kind: 'textEdit', uri: createUri, edits: [], done: true });
+						const lintFailureCreate = await this.getLintFailureAfterEdit(fileUri, params.path);
+						if (lintFailureCreate) { return lintFailureCreate; }
+						return createSuccess;
+					}
+				}
+
+				// Fallback (no editing session - e.g. non-chat context): write directly. Not
+				// checkpoint-tracked, but still creates the file the caller asked for.
+				await this.fileService.createFile(fileUri, VSBuffer.fromString(params.newString), { overwrite: false });
 				const lintFailure = await this.getLintFailureAfterEdit(fileUri, params.path);
 				if (lintFailure) { return lintFailure; }
-				return successResult;
+				return createSuccess;
 			}
 
 			// --- File exists ---
 			if (isEmptyOld) {
+				// Shrink guard: a small model "rewriting" a big file frequently emits only a fragment
+				// (truncated generation) - silently destroying the rest of the file. Require an explicit
+				// force flag before replacing a large file with dramatically shorter content.
+				const currentLines = currentContent.split('\n').length;
+				if (!params.force
+					&& currentLines >= SHRINK_GUARD_MIN_LINES
+					&& params.newString.length < currentContent.length * SHRINK_GUARD_RATIO) {
+					return {
+						content: [{ kind: 'text', value: `Error: Refusing to replace "${params.path}" (${currentLines} lines) with much shorter content (${params.newString.split('\n').length} lines) - this usually means the new content is accidentally incomplete. Next: If you only need to change part of the file, use a targeted edit (readFile, then modifyFile with the exact oldString). If you genuinely intend to replace the whole file with this shorter content, resend the SAME call with force: true.` }],
+						toolResultError: 'Large-file shrink overwrite refused (missing force)'
+					};
+				}
 				// Replace entire file with newString
 				progress.report({ message: buildFileLinkInvocationMessage(localize('modifyFile.replacingEntire', "Replacing entire file {0}", '{0}'), fileName, fileUri) });
 				const newContent = params.newString;

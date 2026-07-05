@@ -223,10 +223,12 @@ export class RunSubagentTool extends Disposable implements IToolImpl {
 				}
 			};
 
-			if (modeTools) {
-				modeTools[RunSubagentTool.Id] = false;
-				modeTools[ManageTodoListToolToolId] = false;
-			}
+			// Subagents must never spawn subagents (recursion/depth bomb with confused models) and
+			// don't manage the parent's todo list. Previously this only applied when modeTools was
+			// already defined, leaving the default-tools path unguarded.
+			modeTools = { ...(modeTools ?? {}) };
+			modeTools[RunSubagentTool.Id] = false;
+			modeTools[ManageTodoListToolToolId] = false;
 
 			const variableSet = new ChatRequestVariableSet();
 			const computer = this.instantiationService.createInstance(ComputeAutomaticInstructions, mode ?? ChatMode.Agent, modeTools, undefined); // agents can not call subagents

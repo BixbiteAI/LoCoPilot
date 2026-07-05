@@ -26,6 +26,7 @@ import { INotificationService } from '../../../../platform/notification/common/n
 import { IStorageService } from '../../../../platform/storage/common/storage.js';
 import { getReasoningEffort, reasoningBudgetTokens, ReasoningEffort } from '../common/locopilotReasoningEffort.js';
 import { ICustomLanguageModelsService, ICustomLanguageModel, getCustomModelListLabel, deriveTokenLimits, defaultContextWindow, TOOL_FAILURE_DISABLE_THRESHOLD, customModelSupportsVision } from '../common/customLanguageModelsService.js';
+import { AGENT_LOOP_EXCLUDED_TOOL_IDS, LOCAL_MODEL_EXCLUDED_TOOL_IDS, isToolExcluded } from '../common/tools/builtinTools/agentToolPolicy.js';
 import { IChatMessage, ILanguageModelChatInfoOptions, ILanguageModelChatMetadataAndIdentifier, ILanguageModelChatProvider, ILanguageModelChatResponse, ILanguageModelsService, IChatResponsePart, ChatMessageRole } from '../common/languageModels.js';
 import { IWorkbenchContribution } from '../../../common/contributions.js';
 import { LOCOPILOT_SETTINGS_SECTION_LIST_MODELS } from './chatManagement/locopilotSettingsEditorInput.js';
@@ -1246,34 +1247,12 @@ export class LoCoPilotLanguageModelProvider extends Disposable implements ILangu
 		// Fallback logic: if the request is too large for the local context (4096), 
 		// we try to send it without tools to reduce the prompt size.
 		if (options.tools && Array.isArray(options.tools) && options.tools.length > 0) {
-			// Tool exclusion list for local models
-			const excludedTools = [
-				'setup_tools_createNewWorkspace',
-				'inline_chat_exit',
-				'searchExtensions_internal',
-				'get_terminal_confirmation',
-				'get_terminal_output',
-				'await_terminal',
-				'terminal_selection',
-				'terminal_last_command',
-				'create_and_run_task',
-				'fetchWebPage_internal',
-				// 'readFile',
-				// 'listDirectory',
-				// 'readLints',
-				// 'grep',
-				// 'findFiles',
-				// 'webSearch',
-				// 'modifyFile',
-				// 'editFile_internal',
-				'manage_todo_list',
-				'get_confirmation',
-				'runSubagent'
-			];
-
+			// Shared local-model exclusion policy (agentToolPolicy.ts). Prefix-insensitive matching:
+			// the old inline list missed `vscode_`-prefixed names, so e.g. vscode_searchExtensions_internal
+			// leaked into every local request.
 			const filteredTools = options.tools.filter((t: any) => {
 				const name = t.function?.name || t.name;
-				return name && !excludedTools.includes(name);
+				return name && !isToolExcluded(name, LOCAL_MODEL_EXCLUDED_TOOL_IDS) && !isToolExcluded(name, AGENT_LOOP_EXCLUDED_TOOL_IDS);
 			});
 
 			if (filteredTools.length > 0) {
@@ -1298,6 +1277,10 @@ export class LoCoPilotLanguageModelProvider extends Disposable implements ILangu
 				// } else {
 				if (model.useNativeTools) {
 					body.tools = filteredTools;
+					// Explicit tool_choice engages llama.cpp's grammar-constrained tool-call generation
+					// (server runs with --jinja): argument JSON is forced to match the schema, which
+					// eliminates malformed tool calls from small models.
+					body.tool_choice = 'auto';
 					this._log(`[LoCoPilot Provider] Local model request: ${filteredTools.length} tools`);
 				}
 			} else {
@@ -1519,27 +1502,12 @@ export class LoCoPilotLanguageModelProvider extends Disposable implements ILangu
 		const isLocalModel = model.provider === 'huggingface' || model.provider === 'localhost' || model.provider === 'ollama';
 		const { maxOutputTokens } = deriveTokenLimits(model.contextWindow ?? defaultContextWindow(isLocalModel), isLocalModel);
 
-		const excludedTools = [
-			'setup_tools_createNewWorkspace',
-			'inline_chat_exit',
-			'searchExtensions_internal',
-			'get_terminal_confirmation',
-			'get_terminal_output',
-			'await_terminal',
-			'terminal_selection',
-			'terminal_last_command',
-			'create_and_run_task',
-			'fetchWebPage_internal',
-			'manage_todo_list',
-			'get_confirmation',
-			'runSubagent'
-		];
-
+		// Shared local-model exclusion policy (agentToolPolicy.ts), prefix-insensitive.
 		let filteredTools: unknown[] | undefined;
 		if (options.tools && Array.isArray(options.tools) && options.tools.length > 0) {
 			filteredTools = options.tools.filter((t: any) => {
 				const name = t.function?.name || t.name;
-				return name && !excludedTools.includes(name);
+				return name && !isToolExcluded(name, LOCAL_MODEL_EXCLUDED_TOOL_IDS) && !isToolExcluded(name, AGENT_LOOP_EXCLUDED_TOOL_IDS);
 			});
 			if (filteredTools.length === 0) {
 				filteredTools = undefined;
@@ -1577,6 +1545,7 @@ export class LoCoPilotLanguageModelProvider extends Disposable implements ILangu
 
 		if (filteredTools && filteredTools.length > 0 && model.useNativeTools) {
 			body.tools = filteredTools;
+			body.tool_choice = 'auto';
 			this._log(`[LoCoPilot Provider] Ollama OpenAI-compat request: ${filteredTools.length} native tools`);
 		}
 
@@ -1741,34 +1710,10 @@ export class LoCoPilotLanguageModelProvider extends Disposable implements ILangu
 
 		// Add tools if provided
 		if (options.tools && Array.isArray(options.tools) && options.tools.length > 0) {
-			// Tool exclusion list for localhost models
-			const excludedTools = [
-				'setup_tools_createNewWorkspace',
-				'inline_chat_exit',
-				'searchExtensions_internal',
-				'get_terminal_confirmation',
-				'get_terminal_output',
-				'await_terminal',
-				'terminal_selection',
-				'terminal_last_command',
-				'create_and_run_task',
-				'fetchWebPage_internal',
-				// 'readFile',
-				// 'listDirectory',
-				// 'readLints',
-				// 'grep',
-				// 'findFiles',
-				// 'webSearch',
-				// 'modifyFile',
-				// 'editFile_internal',
-				'manage_todo_list',
-				'get_confirmation',
-				'runSubagent'
-			];
-
+			// Shared local-model exclusion policy (agentToolPolicy.ts), prefix-insensitive.
 			const filteredTools = options.tools.filter((t: any) => {
 				const name = t.function?.name || t.name;
-				return name && !excludedTools.includes(name);
+				return name && !isToolExcluded(name, LOCAL_MODEL_EXCLUDED_TOOL_IDS) && !isToolExcluded(name, AGENT_LOOP_EXCLUDED_TOOL_IDS);
 			});
 
 			if (filteredTools.length > 0) {
@@ -1792,6 +1737,7 @@ export class LoCoPilotLanguageModelProvider extends Disposable implements ILangu
 				// } else {
 				if (model.useNativeTools) {
 					body.tools = filteredTools;
+					body.tool_choice = 'auto';
 					this._log(`[LoCoPilot Provider] Localhost model request: ${filteredTools.length} native tools`);
 				}
 			} else {

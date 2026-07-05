@@ -21,7 +21,7 @@ const STORAGE_KEY_PLAN_USE_CODING_SYSTEM_PROMPT = 'locopilot.agentSettings.planU
 const STORAGE_KEY_MAX_ITERATIONS = 'locopilot.agentSettings.maxIterationsPerRequest';
 const STORAGE_KEY_AUTO_RUN_SANDBOX = 'locopilot.agentSettings.autoRunCommandsInSandbox';
 
-export const DEFAULT_MAX_ITERATIONS = 25;
+export const DEFAULT_MAX_ITERATIONS = 50;
 
 export interface ILoCoPilotAgentSettingsService {
 	readonly _serviceBrand: undefined;

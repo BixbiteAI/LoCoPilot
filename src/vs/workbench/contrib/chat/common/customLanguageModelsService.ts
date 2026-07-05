@@ -63,9 +63,16 @@ export const DEFAULT_CONTEXT_WINDOW_CLOUD = 128000;
 /** Default context window for newly added local models. Newer local models (Llama 3.x, Qwen) handle this;
  *  the user must still ensure their llama.cpp/Ollama server is launched with a matching context. */
 export const DEFAULT_CONTEXT_WINDOW_LOCAL = 32000;
-/** Upper bound for a model's output reservation: the real reply cap most chat models honor. */
+/**
+ * Upper bound for a model's output reservation.
+ * - Cloud: 16k is a provider-safety cap, not a guess - e.g. OpenAI gpt-4o rejects max_tokens > 16384
+ *   with a 400. Do not raise this globally; a per-provider table would be the right follow-up.
+ * - Local: llama.cpp/MLX accept any n_predict, so the only real limit is the window itself. The old
+ *   fixed 4000 cap truncated large single-file writes on long-context local models; now output
+ *   scales with the window (25%) up to this generous ceiling.
+ */
 const OUTPUT_CAP_CLOUD = 16000;
-const OUTPUT_CAP_LOCAL = 4000;
+const OUTPUT_CAP_LOCAL = 32768;
 /** Floor so even tiny windows still leave a usable reply length. */
 const OUTPUT_FLOOR = 256;
 

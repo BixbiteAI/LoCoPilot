@@ -67,6 +67,7 @@ import { IDefaultAccountService } from '../../../../../platform/defaultAccount/c
 import { IHostService } from '../../../../services/host/browser/host.js';
 import { UnifiedAgent } from '../agents/unifiedAgent.js';
 import { ILoCoPilotAgentSettingsService } from '../locopilotAgentSettingsService.js';
+import { COMPACT_AGENT_SYSTEM_PROMPT, SMALL_CONTEXT_PROMPT_THRESHOLD_TOKENS, UNIFIED_AGENT_SYSTEM_PROMPT } from '../agents/agentPrompts.js';
 import { ILoCoPilotProjectMemoryService } from '../locopilotProjectMemoryService.js';
 import { IWorkspaceContextService } from '../../../../../platform/workspace/common/workspace.js';
 import { ExtensionIdentifier } from '../../../../../platform/extensions/common/extensions.js';
@@ -1134,6 +1135,12 @@ export class LoCoPilotBuiltInAgent extends Disposable implements IChatAgentImple
 		(async () => {
 			try {
 				let systemPrompt = this.getDefaultSystemPrompt(ChatModeKind.Agent, undefined);
+				// Mirror buildMessages' small-window swap so the warmed prefix matches the real turn.
+				const metadata = this.languageModelsService.lookupLanguageModel(modelId);
+				const warmMaxInput = typeof metadata?.maxInputTokens === 'number' ? metadata.maxInputTokens : undefined;
+				if (systemPrompt === UNIFIED_AGENT_SYSTEM_PROMPT && warmMaxInput !== undefined && warmMaxInput < SMALL_CONTEXT_PROMPT_THRESHOLD_TOKENS) {
+					systemPrompt = COMPACT_AGENT_SYSTEM_PROMPT;
+				}
 				const workspaceContext = await this.getWorkspaceContext();
 				if (workspaceContext) {
 					systemPrompt = systemPrompt + '\n\n' + workspaceContext;
@@ -1797,7 +1804,14 @@ Focus on making the exact changes requested while preserving code structure and 
 		request: IChatAgentRequest,
 		history: IChatAgentHistoryEntry[],
 		modelMetadata: any,
-		modeInfo?: IChatRequestModeInfo
+		modeInfo?: IChatRequestModeInfo,
+		/**
+		 * The session's REAL prior conversation (tool calls + results, post-compaction) stored by
+		 * the agent after the previous turn. When present it replaces the markdown-based history
+		 * reconstruction below, which loses all tool activity (the model would not know which
+		 * files it read/edited last turn).
+		 */
+		priorTranscript?: IChatMessage[]
 	): Promise<IChatMessage[]> {
 		const messages: IChatMessage[] = [];
 
@@ -1818,6 +1832,15 @@ Focus on making the exact changes requested while preserving code structure and 
 			this._log(`[LoCoPilot] Using default system prompt for mode: ${modeInfo?.modeId ?? modeKind} (modeInfo.kind=${modeInfo?.kind}, location=${request.location})`);
 		}
 
+		// Small-window models: swap the built-in agent prompt for the compact variant - on an 8k
+		// window the full prompt + tool schemas would consume most of the usable budget. Only when
+		// the prompt IS the built-in default; a user-customized prompt is never replaced.
+		const maxInput = typeof modelMetadata?.maxInputTokens === 'number' ? modelMetadata.maxInputTokens : undefined;
+		if (systemPrompt === UNIFIED_AGENT_SYSTEM_PROMPT && maxInput !== undefined && maxInput < SMALL_CONTEXT_PROMPT_THRESHOLD_TOKENS) {
+			systemPrompt = COMPACT_AGENT_SYSTEM_PROMPT;
+			this._log(`[LoCoPilot] Using compact agent prompt (window ${maxInput} < ${SMALL_CONTEXT_PROMPT_THRESHOLD_TOKENS})`);
+		}
+
 		// Add workspace context for Agent mode
 		const modeKind = modeInfo?.kind ?? ChatModeKind.Ask;
 		if (modeKind === ChatModeKind.Agent) {
@@ -1834,8 +1857,15 @@ Focus on making the exact changes requested while preserving code structure and 
 			});
 		}
 
-		// 2. Reconstruct history with variables and tool calls
-		for (const h of history) {
+		// 2. Prior turns: prefer the real stored transcript (keeps tool_use/tool_result pairs and
+		// therefore the agent's memory of its own actions); fall back to reconstructing from
+		// rendered markdown when no valid transcript exists (fresh window, edited history, ...).
+		if (priorTranscript && priorTranscript.length > 0) {
+			messages.push(...priorTranscript);
+		}
+
+		// 2b. No stored transcript: reconstruct prior turns from rendered markdown.
+		for (const h of (priorTranscript && priorTranscript.length > 0) ? [] : history) {
 			// User message with variables
 			const userContent: IChatMessage['content'] = [];
 
@@ -2139,16 +2169,31 @@ Message: ${firstMessage.substring(0, 500)}`;
 						variables: allVariables
 					}
 				};
-				// Auto-summarizer: if conversation would exceed 90% of model's max input tokens, summarize old history
+				// Prefer the real stored transcript from the previous turn (tool calls + results,
+				// already compacted by the agent's ContextManager). Falls back to markdown-based
+				// history reconstruction when absent or invalidated (fresh window, edited history).
+				// Subagent runs share the parent's sessionResource but are deliberately isolated
+				// conversations - they must neither consume nor overwrite the session transcript.
+				const isSubagentRun = !!request.subAgentInvocationId;
+				const sessionKey = !isSubagentRun ? request.sessionResource?.toString() : undefined;
+				const priorTranscript = sessionKey ? this.unifiedAgent.getStoredTranscript(sessionKey, history.length) : undefined;
+				if (priorTranscript) {
+					this._log(`[LoCoPilot] Reusing stored session transcript (${priorTranscript.length} messages) instead of markdown history rebuild`);
+				}
+
+				// Auto-summarizer: if conversation would exceed 90% of model's max input tokens, summarize old history.
+				// Skipped when a stored transcript is used - the agent's tiered ContextManager compacts it in-loop.
 				const maxInputTokens = modelMetadata?.maxInputTokens ?? 128000;
 				let historyToUse = history;
-				let messages = await this.buildMessages(requestWithMergedVars, historyToUse, modelMetadata, modeInfo);
-				const totalTokens = await this.computeTotalTokenCount(modelId, messages, token);
-				if (totalTokens >= LoCoPilotBuiltInAgent.AUTO_SUMMARIZE_THRESHOLD * maxInputTokens && history.length > 1) {
-					this._log(`[LoCoPilot] Conversation tokens (${totalTokens}) >= 90% of max input (${maxInputTokens}), triggering auto-summarizer`);
-					historyToUse = await this.getHistoryWithSummarizationIfNeeded(requestWithMergedVars, history, modelId, maxInputTokens, token);
-					messages = await this.buildMessages(requestWithMergedVars, historyToUse, modelMetadata, modeInfo);
-					this._log(`[LoCoPilot] After summarization: ${historyToUse.length} history entries, ${messages.length} messages`);
+				let messages = await this.buildMessages(requestWithMergedVars, historyToUse, modelMetadata, modeInfo, priorTranscript);
+				if (!priorTranscript) {
+					const totalTokens = await this.computeTotalTokenCount(modelId, messages, token);
+					if (totalTokens >= LoCoPilotBuiltInAgent.AUTO_SUMMARIZE_THRESHOLD * maxInputTokens && history.length > 1) {
+						this._log(`[LoCoPilot] Conversation tokens (${totalTokens}) >= 90% of max input (${maxInputTokens}), triggering auto-summarizer`);
+						historyToUse = await this.getHistoryWithSummarizationIfNeeded(requestWithMergedVars, history, modelId, maxInputTokens, token);
+						messages = await this.buildMessages(requestWithMergedVars, historyToUse, modelMetadata, modeInfo);
+						this._log(`[LoCoPilot] After summarization: ${historyToUse.length} history entries, ${messages.length} messages`);
+					}
 				}
 				// Not-downloaded catalog model: show a clickable download prompt with trusted command links.
 				const selectedModel = this.customLanguageModelsService.getCustomModels().find(m => m.id === modelId);
@@ -2158,8 +2203,11 @@ Message: ${firstMessage.substring(0, 500)}`;
 					return {};
 				}
 
-				// Main agentic loop - handle tool calls iteratively
-				return this.unifiedAgent.run(request, progress, messages, modelId, token);
+				// Main agentic loop - handle tool calls iteratively.
+				// Edits are only allowed in real Agent mode; Ask and Plan (which runs on the Agent
+				// kind but with modeId 'plan') get the edit tools hard-removed from the payload.
+				const allowEdits = modeInfo?.kind === ChatModeKind.Agent && modeInfo?.modeId !== 'plan';
+				return this.unifiedAgent.run(request, progress, messages, modelId, token, allowEdits, isSubagentRun ? undefined : history.length);
 			} catch (e) {
 				this.logService.error(`[LoCoPilot] Failed to call model ${modelId}: ${e}`);
 				this.locopilotFileLog.log(`[LoCoPilot] Failed to call model ${modelId}: ${e}`);
