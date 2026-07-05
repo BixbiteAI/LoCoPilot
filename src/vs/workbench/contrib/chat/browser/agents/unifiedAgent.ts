@@ -15,7 +15,7 @@ import { nullExtensionDescription } from '../../../../services/extensions/common
 import { IChatAgentRequest, IChatAgentResult } from '../../common/participants/chatAgents.js';
 import { IChatProgress, IChatToolInvocation } from '../../common/chatService/chatService.js';
 import { ChatToolInvocation } from '../../common/model/chatProgressTypes/chatToolInvocation.js';
-import { ChatImageMimeType, ChatMessageRole, IChatMessage, IChatMessageImagePart, IChatMessageToolResultPart, IChatResponseToolUsePart, ILanguageModelsService, LanguageModelPartAudience } from '../../common/languageModels.js';
+import { ChatImageMimeType, ChatMessageRole, IChatMessage, IChatMessageImagePart, IChatMessageTextPart, IChatMessageToolResultPart, IChatResponseToolUsePart, ILanguageModelsService, LanguageModelPartAudience } from '../../common/languageModels.js';
 import { ILanguageModelToolsService, IToolData, toolMatchesModel } from '../../common/tools/languageModelToolsService.js';
 import { AGENT_LOOP_EXCLUDED_TOOL_IDS, EDIT_TOOL_IDS, isToolExcluded } from '../../common/tools/builtinTools/agentToolPolicy.js';
 import { parsePartialJsonObject } from '../../common/tools/partialJsonInput.js';
@@ -90,9 +90,23 @@ const PARALLELIZABLE_TOOL_IDS = new Set<string>([
 /** Max chat sessions whose transcripts we keep in memory (LRU eviction). */
 const MAX_STORED_TRANSCRIPTS = 20;
 
+/**
+ * Hard cap on the stored cross-turn transcript, in characters (~4k tokens at ~4 chars/token).
+ * This is deliberately an ABSOLUTE cap, not a fraction of the model window: replaying a huge
+ * transcript makes every follow-up turn pay full prompt re-processing on local models (SWA
+ * models like Gemma periodically re-evaluate the ENTIRE prompt - 16k replayed tokens took
+ * ~2.5 minutes on an M3). ~4k tokens keeps follow-up turns as fast as the old markdown rebuild
+ * while still carrying WHAT happened (calls made, files touched, outcomes).
+ */
+const STORED_TRANSCRIPT_MAX_CHARS = 16000;
+/** Per-part cap inside the stored transcript (~200 tokens): results were already acted on. */
+const STORED_PART_MAX_CHARS = 800;
+/** Cap per string argument in a stored tool_use: paths/snippets survive, full file bodies don't. */
+const STORED_TOOL_ARG_MAX_CHARS = 400;
+
 /** A session's real conversation (tool calls + results included), stored after each turn. */
 interface IStoredTranscript {
-	/** Non-system messages exactly as the loop left them (post-compaction). */
+	/** Non-system messages, compacted for storage (large payloads stubbed, total size capped). */
 	readonly messages: IChatMessage[];
 	/** History length the NEXT request must have for this transcript to still be valid. */
 	readonly expectedHistoryLength: number;
@@ -179,8 +193,87 @@ export class UnifiedAgent {
 		return out;
 	}
 
+	/** Approximate size of a message for the storage cap (JSON covers text, args and results). */
+	private messageSizeChars(msg: IChatMessage): number {
+		try {
+			return JSON.stringify(msg.content).length;
+		} catch {
+			return STORED_PART_MAX_CHARS; // circular/unserializable content: assume a stub-sized cost
+		}
+	}
+
+	/**
+	 * Shrink a transcript for cross-turn storage:
+	 *  1. Stub large tool results and text parts (they were already acted on this turn).
+	 *  2. Truncate long string arguments inside tool_use parts (a modifyFile call carries the whole
+	 *     file body in newString - the path and a snippet are enough for memory).
+	 *  3. Enforce an absolute total cap by dropping the OLDEST messages, pair-safe.
+	 * Keeps follow-up turns as cheap as the old markdown history rebuild (see cap docs above).
+	 */
+	private compactForStorage(messages: IChatMessage[]): IChatMessage[] {
+		const compacted: IChatMessage[] = messages.map(m => {
+			let changed = false;
+			const content = m.content.map(part => {
+				if (part.type === 'tool_result') {
+					const tr = part as IChatMessageToolResultPart;
+					const text = tr.value.map(v => v.type === 'text' ? v.value : '').join('');
+					if (text.length > STORED_PART_MAX_CHARS) {
+						changed = true;
+						const stub: IChatMessageToolResultPart = {
+							type: 'tool_result',
+							toolCallId: tr.toolCallId,
+							value: [{ type: 'text', value: `${text.slice(0, STORED_PART_MAX_CHARS)}\n…[rest of tool result omitted from stored history - already acted on]` }],
+							isError: tr.isError,
+						};
+						return stub;
+					}
+				} else if (part.type === 'text') {
+					const tp = part as IChatMessageTextPart;
+					if ((tp.value?.length ?? 0) > STORED_PART_MAX_CHARS) {
+						changed = true;
+						return { ...tp, value: `${tp.value.slice(0, STORED_PART_MAX_CHARS)}\n…[truncated in stored history]` };
+					}
+				} else if (part.type === 'tool_use') {
+					const tu = part as IChatResponseToolUsePart;
+					const params = tu.parameters;
+					if (params && typeof params === 'object') {
+						let paramsChanged = false;
+						const newParams: Record<string, unknown> = { ...(params as Record<string, unknown>) };
+						for (const key of Object.keys(newParams)) {
+							const value = newParams[key];
+							if (typeof value === 'string' && value.length > STORED_TOOL_ARG_MAX_CHARS) {
+								newParams[key] = `${value.slice(0, STORED_TOOL_ARG_MAX_CHARS)}…[truncated]`;
+								paramsChanged = true;
+							}
+						}
+						if (paramsChanged) {
+							changed = true;
+							return { ...tu, parameters: newParams };
+						}
+					}
+				}
+				return part;
+			});
+			return changed ? { role: m.role, content } : m;
+		});
+
+		// Absolute cap: drop oldest messages first, never the final two (latest exchange).
+		let total = compacted.reduce((acc, m) => acc + this.messageSizeChars(m), 0);
+		while (total > STORED_TRANSCRIPT_MAX_CHARS && compacted.length > 2) {
+			total -= this.messageSizeChars(compacted[0]);
+			compacted.shift();
+			// Don't leave an orphaned tool_result at the new front.
+			while (compacted.length > 2 && compacted[0].content.some(p => p.type === 'tool_result')) {
+				total -= this.messageSizeChars(compacted[0]);
+				compacted.shift();
+			}
+		}
+		return compacted;
+	}
+
 	private storeTranscript(sessionKey: string, conversationMessages: IChatMessage[], historyLength: number): void {
-		const transcript = this.sanitizeTranscript(conversationMessages.filter(m => m.role !== ChatMessageRole.System));
+		const transcript = this.compactForStorage(this.sanitizeTranscript(conversationMessages.filter(m => m.role !== ChatMessageRole.System)));
+		this._log(`[LoCoPilot] Stored transcript compacted to ${transcript.length} messages, ~${Math.ceil(transcript.reduce((a, m) => a + this.messageSizeChars(m), 0) / 4)} tokens`);
 		// Re-insert for LRU recency, then evict the oldest entry beyond the cap.
 		this.sessionTranscripts.delete(sessionKey);
 		// Next request's history will include the turn that just finished, hence +1.
