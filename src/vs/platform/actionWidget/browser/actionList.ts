@@ -411,6 +411,21 @@ export class ActionList<T> extends Disposable {
 		this._list.splice(0, this._list.length, this._visibleItems);
 
 		if (this._list.length) {
+			this._focusInitial();
+		}
+	}
+
+	/**
+	 * Focus the currently selected (checked) item when the list first opens, so the hover/focus highlight
+	 * lands on the model the user is already using rather than the top row. Falls back to the first focusable
+	 * item when nothing is checked (e.g. the first open before any selection).
+	 */
+	private _focusInitial(): void {
+		const checkedIndex = this._visibleItems.findIndex(item => item.checked && this.focusCondition(item));
+		if (checkedIndex >= 0) {
+			this._list.setFocus([checkedIndex]);
+			this._list.reveal(checkedIndex);
+		} else {
 			this.focusNext();
 		}
 	}

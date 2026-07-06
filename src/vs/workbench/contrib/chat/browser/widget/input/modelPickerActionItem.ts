@@ -31,6 +31,7 @@ import { LOCOPILOT_SETTINGS_SECTION_LIST_MODELS } from '../../chatManagement/loc
 import { getRecommendedRepoId } from '../../locopilotModelCatalog.js';
 import { ITimerService } from '../../../../../services/timer/browser/timerService.js';
 import { ExtensionIdentifier } from '../../../../../../platform/extensions/common/extensions.js';
+import { ILoCoPilotLocalModelRunner } from '../../locopilotLocalModelRunner.js';
 
 export interface IModelPickerDelegate {
 	readonly currentModel: IObservable<ILanguageModelChatMetadataAndIdentifier | undefined>;
@@ -91,6 +92,65 @@ function selectCustomModelInChat(delegate: IModelPickerDelegate, customLanguageM
 }
 
 /**
+ * A local model is start/stop-able from the picker when it's a downloaded HuggingFace (llama.cpp/MLX) model
+ * with a resolved local path and no download in flight - the same gate the model-list editor uses to decide
+ * whether to render its Run/Stop server controls. Cloud, Ollama, localhost, and not-yet-downloaded catalog
+ * models have no per-model server to manage, so they keep the plain checkmark.
+ */
+function isStartableLocalModel(model: ICustomLanguageModel): boolean {
+	return model.type === 'local' && model.provider === 'huggingface' && !!model.localPath && !model.isDownloading;
+}
+
+/**
+ * Build the state-based start/stop control that REPLACES the selected model's checkmark in the picker.
+ *
+ * Mirrors the model-list editor's server controls, condensed to a single left-slot icon (shown in place of
+ * the checkmark) so the user can start or stop the selected local model directly from the chat model picker:
+ *  - starting/loading -> spinner icon, disabled, "Starting..." tooltip
+ *  - running          -> stop-in-circle icon, click stops the server
+ *  - stopped          -> play icon, click starts the server
+ *
+ * Returns the left-slot `icon`, a `tooltip`, and the `run` handler wired into the selected model's row so a
+ * click anywhere on it toggles the server. Clicking refreshes the list so the icon flips as the server
+ * transitions.
+ */
+function buildStartStopControl(
+	runner: ILoCoPilotLocalModelRunner,
+	actionWidgetService: IActionWidgetService,
+	commandService: ICommandService,
+	modelId: string
+): { icon: ThemeIcon; tooltip: string; run: () => void } {
+	const isRunning = runner.isServerRunning(modelId);
+	const isStarting = runner.isServerStarting(modelId);
+
+	if (isStarting) {
+		return {
+			icon: ThemeIcon.modify(Codicon.loading, 'spin'),
+			tooltip: localize('chat.modelPicker.serverStarting', 'Starting...'),
+			run: () => { }
+		};
+	}
+	if (isRunning) {
+		return {
+			icon: Codicon.stopCircle,
+			tooltip: localize('chat.modelPicker.stopServer', 'Stop server'),
+			run: () => {
+				runner.stopServer(modelId);
+				actionWidgetService.refreshItems();
+			}
+		};
+	}
+	return {
+		icon: Codicon.play,
+		tooltip: localize('chat.modelPicker.startServer', 'Start server'),
+		run: () => {
+			commandService.executeCommand('locopilot.startLlamaServer', modelId);
+			actionWidgetService.refreshItems();
+		}
+	};
+}
+
+/**
  * Detected system RAM in GB (0 if not yet measured). `startupMetrics` throws before the timer service is
  * ready, so the read is guarded; by the time the picker opens it is ready. Mirrors the model-list editor's
  * "Best for you" RAM source so the picker badge and the list badge agree.
@@ -109,7 +169,7 @@ interface IModelPickerState {
 	showHidden: boolean;
 }
 
-function modelDelegateToWidgetActionsProvider(delegate: IModelPickerDelegate, telemetryService: ITelemetryService, customLanguageModelsService: ICustomLanguageModelsService, actionWidgetService: IActionWidgetService, timerService: ITimerService, state: IModelPickerState): IActionWidgetDropdownActionProvider {
+function modelDelegateToWidgetActionsProvider(delegate: IModelPickerDelegate, telemetryService: ITelemetryService, customLanguageModelsService: ICustomLanguageModelsService, actionWidgetService: IActionWidgetService, timerService: ITimerService, state: IModelPickerState, localModelRunner: ILoCoPilotLocalModelRunner, commandService: ICommandService): IActionWidgetDropdownActionProvider {
 	return {
 		getActions: () => {
 			// "Best for you" badges the single curated COMFORTABLE recommendation for this machine (the most
@@ -136,14 +196,26 @@ function modelDelegateToWidgetActionsProvider(delegate: IModelPickerDelegate, te
 				const baseLabel = getCustomModelListLabel(customModel);
 				const kindLabel = customModel.type === 'cloud' ? localize('chat.modelPicker.cloud', 'Cloud') : localize('chat.modelPicker.local', 'Local');
 				const bestTooltip = localize('chat.modelPicker.bestForYou.tooltip', 'Recommended: sized for your system memory.');
+				const isSelected = customModel.id === selectedCustomModelId;
+				// For the SELECTED model, if it's a downloadable local model, replace the checkmark with a
+				// state-based start/stop icon in the left slot. The row's own `run` is repurposed to toggle the
+				// server (the model is already selected, so re-selecting it would be a no-op anyway), which makes
+				// clicking the row start/stop the model. Every other row keeps the plain checkmark behaviour.
+				const startStop = isSelected && isStartableLocalModel(customModel)
+					? buildStartStopControl(localModelRunner, actionWidgetService, commandService, customModel.id)
+					: undefined;
 				return {
 					id: customModel.id,
 					enabled: true,
-					checked: customModel.id === selectedCustomModelId,
+					// Keep the selected row highlighted as before (`checked` drives the option-checked background).
+					// When a start/stop icon is present it's supplied via `icon`, which overrides the checkmark, so
+					// the row stays highlighted but shows the server-state icon instead of the tick.
+					checked: isSelected,
+					icon: startStop?.icon,
 					category: { label: 'Custom Models', order: 100 },
 					class: undefined,
 					description: best ? localize('chat.modelPicker.bestForYou.desc', '{0} - Best for you', kindLabel) : kindLabel,
-					tooltip: best ? `${baseLabel} - ${bestTooltip}` : baseLabel,
+					tooltip: startStop ? startStop.tooltip : (best ? `${baseLabel} - ${bestTooltip}` : baseLabel),
 					label: baseLabel,
 					hover: undefined,
 					toolbarActions: [
@@ -163,10 +235,15 @@ function modelDelegateToWidgetActionsProvider(delegate: IModelPickerDelegate, te
 							}
 						})
 					],
-					run: () => {
-						customLanguageModelsService.setSelectedCustomModelId(customModel.id);
-						selectCustomModelInChat(delegate, customLanguageModelsService, customModel.id);
-					}
+					// Keep the dropdown open when the click toggles the server, so the icon can flip in place;
+					// a plain selection click closes it as usual.
+					keepDropdownOpen: !!startStop,
+					run: startStop
+						? startStop.run
+						: () => {
+							customLanguageModelsService.setSelectedCustomModelId(customModel.id);
+							selectCustomModelInChat(delegate, customLanguageModelsService, customModel.id);
+						}
 				};
 			});
 
@@ -392,6 +469,7 @@ export class ModelPickerActionItem extends ChatInputPickerActionViewItem {
 		@IProductService productService: IProductService,
 		@ICustomLanguageModelsService customLanguageModelsService: ICustomLanguageModelsService,
 		@ITimerService timerService: ITimerService,
+		@ILoCoPilotLocalModelRunner localModelRunner: ILoCoPilotLocalModelRunner,
 	) {
 		// Get initial model name
 		const initialModel = delegate.currentModel.get();
@@ -418,7 +496,7 @@ export class ModelPickerActionItem extends ChatInputPickerActionViewItem {
 		// open. Reset to collapsed on each fresh open via onDropdownVisibilityChanged (see below).
 		const pickerState: IModelPickerState = { showHidden: false };
 		const modelPickerActionWidgetOptions: Omit<IActionWidgetDropdownOptions, 'label' | 'labelRenderer'> = {
-			actionProvider: modelDelegateToWidgetActionsProvider(delegate, telemetryService, customLanguageModelsService, actionWidgetService, timerService, pickerState),
+			actionProvider: modelDelegateToWidgetActionsProvider(delegate, telemetryService, customLanguageModelsService, actionWidgetService, timerService, pickerState, localModelRunner, commandService),
 			actionBarActionProvider: getModelPickerActionBarActionProvider(commandService, chatEntitlementService, productService, customLanguageModelsService, actionWidgetService, pickerState),
 			// Every fresh open starts with hidden models collapsed. Toggling mid-session uses refreshItems(), which
 			// does not call this, so an expanded list is only ever reset on the next open.
@@ -430,6 +508,10 @@ export class ModelPickerActionItem extends ChatInputPickerActionViewItem {
 
 		super(actionWithLabel, widgetOptions ?? modelPickerActionWidgetOptions, pickerOptions, actionWidgetService, keybindingService, contextKeyService, telemetryService);
 		this.currentModel = initialModel;
+
+		// While the picker is open, flip the selected model's start/stop icon as its server transitions
+		// (starting -> running -> stopped). refreshItems() is a no-op when the dropdown is closed.
+		this._register(localModelRunner.onDidServerStateChange(() => actionWidgetService.refreshItems()));
 
 		// Listen for model changes from the delegate and custom models
 		this._register(autorun(t => {

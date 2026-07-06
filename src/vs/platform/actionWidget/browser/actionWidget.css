@@ -136,6 +136,15 @@
 	color: inherit;
 }
 
+/* Start/stop server indicator shown in the left slot in place of the checkmark for the selected local */
+/* model. Render it a touch smaller than the surrounding text icons. Scoped to these three codicons, */
+/* which only appear here as that indicator (selection uses codicon-check). */
+.action-widget .monaco-list-row.action > .icon.codicon-play,
+.action-widget .monaco-list-row.action > .icon.codicon-stop-circle,
+.action-widget .monaco-list-row.action > .icon.codicon-loading {
+	font-size: 11px;
+}
+
 .action-widget .monaco-list-row.action .title {
 	flex: 1 1 auto;
 	min-width: 0;
