@@ -210,7 +210,17 @@ export class UnifiedAgent {
 	 *  3. Enforce an absolute total cap by dropping the OLDEST messages, pair-safe.
 	 * Keeps follow-up turns as cheap as the old markdown history rebuild (see cap docs above).
 	 */
-	private compactForStorage(messages: IChatMessage[]): IChatMessage[] {
+	private compactForStorage(messages: IChatMessage[], budgetChars: number): IChatMessage[] {
+		// Keep the transcript VERBATIM while it still fits the model's context window. The stored transcript
+		// is what the next turn's prompt prefix is rebuilt from, and the local server has that exact prefix in
+		// its KV cache - so stubbing tool results or dropping old messages here rewrites the prefix and forces
+		// the server to re-process the entire conversation (the 90s "full prompt re-processing" stall). Only
+		// once the transcript would genuinely exceed the window do we compact - which is the point at which a
+		// re-process is unavoidable anyway. Small-window models keep the old aggressive cap via budgetChars.
+		const totalChars = messages.reduce((acc, m) => acc + this.messageSizeChars(m), 0);
+		if (totalChars <= budgetChars) {
+			return messages;
+		}
 		const compacted: IChatMessage[] = messages.map(m => {
 			let changed = false;
 			const content = m.content.map(part => {
@@ -257,9 +267,10 @@ export class UnifiedAgent {
 			return changed ? { role: m.role, content } : m;
 		});
 
-		// Absolute cap: drop oldest messages first, never the final two (latest exchange).
+		// Absolute cap: drop oldest messages first, never the final two (latest exchange). Uses the same
+		// window-derived budget as the verbatim gate above, so we only shrink to fit the context window.
 		let total = compacted.reduce((acc, m) => acc + this.messageSizeChars(m), 0);
-		while (total > STORED_TRANSCRIPT_MAX_CHARS && compacted.length > 2) {
+		while (total > budgetChars && compacted.length > 2) {
 			total -= this.messageSizeChars(compacted[0]);
 			compacted.shift();
 			// Don't leave an orphaned tool_result at the new front.
@@ -271,8 +282,15 @@ export class UnifiedAgent {
 		return compacted;
 	}
 
-	private storeTranscript(sessionKey: string, conversationMessages: IChatMessage[], historyLength: number): void {
-		const transcript = this.compactForStorage(this.sanitizeTranscript(conversationMessages.filter(m => m.role !== ChatMessageRole.System)));
+	private storeTranscript(sessionKey: string, conversationMessages: IChatMessage[], historyLength: number, maxInputTokens?: number): void {
+		// Budget for storing the transcript verbatim: a slice of the model's context window (leaving room for
+		// the system+tools prefix, the new user turn, and the reply), floored at the legacy cap so small-window
+		// models keep the old conservative behavior. A large-window local model (e.g. 131k) thus stores the
+		// full conversation and its cached KV keeps hitting; only a genuinely near-window transcript is compacted.
+		const CHARS_PER_TOKEN = 3.5;
+		const windowBudget = maxInputTokens && maxInputTokens > 0 ? Math.floor(maxInputTokens * CHARS_PER_TOKEN * 0.7) : 0;
+		const budgetChars = Math.max(STORED_TRANSCRIPT_MAX_CHARS, windowBudget);
+		const transcript = this.compactForStorage(this.sanitizeTranscript(conversationMessages.filter(m => m.role !== ChatMessageRole.System)), budgetChars);
 		this._log(`[LoCoPilot] Stored transcript compacted to ${transcript.length} messages, ~${Math.ceil(transcript.reduce((a, m) => a + this.messageSizeChars(m), 0) / 4)} tokens`);
 		// Re-insert for LRU recency, then evict the oldest entry beyond the cap.
 		this.sessionTranscripts.delete(sessionKey);
@@ -673,7 +691,7 @@ export class UnifiedAgent {
 		// continue from what actually happened instead of a markdown reconstruction.
 		if (request.sessionResource && historyLength !== undefined) {
 			try {
-				this.storeTranscript(request.sessionResource.toString(), conversationMessages, historyLength);
+				this.storeTranscript(request.sessionResource.toString(), conversationMessages, historyLength, modelMetadata?.maxInputTokens);
 			} catch (e) {
 				this._log(`[LoCoPilot] Failed to store session transcript (ignored): ${e}`);
 			}

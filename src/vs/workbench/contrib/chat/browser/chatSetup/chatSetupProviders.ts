@@ -69,6 +69,7 @@ import { UnifiedAgent } from '../agents/unifiedAgent.js';
 import { ILoCoPilotAgentSettingsService } from '../locopilotAgentSettingsService.js';
 import { COMPACT_AGENT_SYSTEM_PROMPT, SMALL_CONTEXT_PROMPT_THRESHOLD_TOKENS, UNIFIED_AGENT_SYSTEM_PROMPT } from '../agents/agentPrompts.js';
 import { ILoCoPilotProjectMemoryService } from '../locopilotProjectMemoryService.js';
+import { ILoCoPilotLocalModelRunner } from '../locopilotLocalModelRunner.js';
 import { IWorkspaceContextService } from '../../../../../platform/workspace/common/workspace.js';
 import { ExtensionIdentifier } from '../../../../../platform/extensions/common/extensions.js';
 
@@ -1097,28 +1098,36 @@ export class LoCoPilotBuiltInAgent extends Disposable implements IChatAgentImple
 		@ILoCoPilotFileLog private readonly locopilotFileLog: ILoCoPilotFileLog,
 		@ILoCoPilotAgentSettingsService private readonly agentSettingsService: ILoCoPilotAgentSettingsService,
 		@ILoCoPilotProjectMemoryService private readonly projectMemoryService: ILoCoPilotProjectMemoryService,
+		@ILoCoPilotLocalModelRunner private readonly localModelRunner: ILoCoPilotLocalModelRunner,
 	) {
 		super();
 		const maxIterations = this.agentSettingsService.getMaxIterationsPerRequest();
 		this.unifiedAgent = new UnifiedAgent(this.languageModelsService, this.toolsService, this.logService, this.workspaceService, this.locopilotFileLog, maxIterations);
 
 		// Warm the model's stable system+tools prefix ahead of the user's first message so that first
-		// message isn't stuck behind a cold, multi-thousand-token prompt-eval. Fire once for whatever
-		// model is already selected, and again whenever the selection changes to a different local model.
+		// message isn't stuck behind a cold, multi-thousand-token prompt-eval. Fire when the selection
+		// changes, AND - crucially - every time a local server becomes ready (see _onServerStateChange).
+		// The server can be unloaded after idle and restarted with an EMPTY cache; the selection didn't
+		// change, so only the server-ready hook re-warms that fresh cache. Without it the first message on
+		// a restarted server pays the full cold prefill (the ~55s "hi" we saw in the logs).
 		this._register(this.customLanguageModelsService.onDidChangeCustomModels(() => this._maybeWarmSelectedModelPrefix()));
+		this._register(this.localModelRunner.onDidServerStateChange(modelId => this._onServerStateChange(modelId)));
 		this._maybeWarmSelectedModelPrefix();
 	}
 
 	/**
-	 * Last model id a prefix warm-up was kicked off for. PROCESS-WIDE (static) on purpose: this agent is
-	 * registered once per location+mode (Chat x {Ask,Edit,Agent} + Terminal + Notebook + EditorInline = 6
-	 * instances), and every instance builds the SAME stable Agent system+tools prefix here. With a per-
-	 * instance guard all six saw "not warmed yet" and each fired an identical warm-up - six duplicate
-	 * prefix prefills (one cold, five cache hits) on the same server for every model, on every machine.
-	 * Sharing the guard means the first instance warms and the other five skip; a real switch to a
-	 * different model still re-warms (modelId != last), just once instead of six times.
+	 * Model ids whose CURRENT local-server instance has had (or is having) its stable prefix warmed.
+	 * PROCESS-WIDE (static) on purpose: this agent is registered once per location+mode (Chat x
+	 * {Ask,Edit,Agent} + Terminal + Notebook + EditorInline = 6 instances), and all six would otherwise
+	 * fire an identical warm-up on the same server - six duplicate prefills. The first instance to warm a
+	 * model claims it here; the other five skip.
+	 *
+	 * Unlike a plain "warmed once per process" flag, an entry is REMOVED when that model's server stops
+	 * (see _onServerStateChange). A server can be idle-unloaded and later restarted with an EMPTY prompt
+	 * cache; clearing the entry on stop lets the next server-ready re-warm the fresh cache, which is the
+	 * whole point of the server-ready hook.
 	 */
-	private static _lastWarmedModelId: string | undefined;
+	private static readonly _warmedServerModelIds = new Set<string>();
 
 	/**
 	 * If a downloaded LOCAL model is selected (or is the only chat-ready option), pre-process its
@@ -1128,7 +1137,44 @@ export class LoCoPilotBuiltInAgent extends Disposable implements IChatAgentImple
 	private _maybeWarmSelectedModelPrefix(): void {
 		const modelId = this.customLanguageModelsService.getSelectedCustomModelId()
 			?? this.customLanguageModelsService.getChatSelectableCustomModels()[0]?.id;
-		if (!modelId || modelId === LoCoPilotBuiltInAgent._lastWarmedModelId) {
+		if (!modelId) {
+			return;
+		}
+		this._warmModelPrefixIfNeeded(modelId);
+	}
+
+	/**
+	 * Server-lifecycle hook: fired whenever a managed local server changes state. When a server becomes
+	 * READY (its prompt cache is empty) we warm the stable prefix so the user's first message reuses it
+	 * instead of paying a full cold prefill; when it STOPS we drop the dedup entry so a future restart
+	 * re-warms. This is what covers the idle-unload/restart case the selection trigger alone misses.
+	 */
+	private _onServerStateChange(modelId: string): void {
+		const phase = this.localModelRunner.getServerPhase(modelId);
+		if (phase === undefined) {
+			// Server stopped/unloaded/evicted - allow a future ready to warm the fresh (empty) cache.
+			LoCoPilotBuiltInAgent._warmedServerModelIds.delete(modelId);
+			return;
+		}
+		if (phase !== 'ready') {
+			return; // still starting/loading - wait for the ready transition
+		}
+		// Only warm the model the user is actually on, so we don't spend a full prefill warming a server
+		// that is about to be evicted for a different model.
+		const selectedId = this.customLanguageModelsService.getSelectedCustomModelId()
+			?? this.customLanguageModelsService.getChatSelectableCustomModels()[0]?.id;
+		if (modelId !== selectedId) {
+			return;
+		}
+		this._warmModelPrefixIfNeeded(modelId);
+	}
+
+	/**
+	 * Warm `modelId`'s stable prefix once for its current server instance (deduped via
+	 * {@link _warmedServerModelIds} across the 6 agent instances). No-op for non-local/undownloaded models.
+	 */
+	private _warmModelPrefixIfNeeded(modelId: string): void {
+		if (LoCoPilotBuiltInAgent._warmedServerModelIds.has(modelId)) {
 			return;
 		}
 		const model = this.customLanguageModelsService.getCustomModels().find(m => m.id === modelId);
@@ -1136,9 +1182,9 @@ export class LoCoPilotBuiltInAgent extends Disposable implements IChatAgentImple
 		if (!model || model.type !== 'local' || needsDownloadOrPullRetry(model) || model.isDownloading) {
 			return;
 		}
-		// Claim the warm SYNCHRONOUSLY (before the async work below) so the other five agent instances,
-		// whose constructors run right after this one, see the guard already set and skip.
-		LoCoPilotBuiltInAgent._lastWarmedModelId = modelId;
+		// Claim SYNCHRONOUSLY (before the async work) so concurrent callers - the other five agent instances,
+		// or the selection trigger racing the server-ready hook - see it taken and skip.
+		LoCoPilotBuiltInAgent._warmedServerModelIds.add(modelId);
 		// Build the SAME stable agent system prompt a real turn uses: default agent prompt + the stable
 		// workspace context. Volatile editor state is intentionally excluded (it lives in the user turn),
 		// so this prefix matches the real turn's prefix and the cache hits.
@@ -1157,6 +1203,9 @@ export class LoCoPilotBuiltInAgent extends Disposable implements IChatAgentImple
 				}
 				await this.unifiedAgent.warmUp(modelId, systemPrompt, CancellationToken.None);
 			} catch (e) {
+				// Warm failed (server crash, etc.) - drop the claim so a later ready can retry. If the crash
+				// tears the server down, _onServerStateChange also clears it; this covers a plain throw.
+				LoCoPilotBuiltInAgent._warmedServerModelIds.delete(modelId);
 				this._log(`[LoCoPilot] Prefix warm trigger failed (ignored): ${e}`);
 			}
 		})();
@@ -1926,8 +1975,16 @@ Focus on making the exact changes requested while preserving code structure and 
 		// placed before the user's message so the message text is the last thing the model reads (the
 		// task it should focus on). Agent mode only, matching where it was previously surfaced.
 		if (modeKind === ChatModeKind.Agent) {
-			const [editorContext, gitSnapshot] = await Promise.all([this.getEditorContext(), this.getGitSnapshot()]);
-			const ambient = [gitSnapshot, editorContext.trim() ? editorContext : undefined].filter(Boolean).join('\n');
+			// The workspace directory tree is volatile (it changes whenever files are created/edited/deleted),
+			// so it lives HERE in the user turn - not the system prompt - for the same reason as editor/git
+			// state: keeping it out of the cached system+tools prefix is what stops a file change from
+			// invalidating the local server's prompt cache and forcing a full re-process on the next turn.
+			const [editorContext, gitSnapshot, structureTree] = await Promise.all([
+				this.getEditorContext(),
+				this.getGitSnapshot(),
+				this.projectMemoryService.getWorkspaceStructureTree(CancellationToken.None).catch(() => undefined),
+			]);
+			const ambient = [gitSnapshot, structureTree, editorContext.trim() ? editorContext : undefined].filter(Boolean).join('\n\n');
 			if (ambient) {
 				currentContent.push({
 					type: 'text',

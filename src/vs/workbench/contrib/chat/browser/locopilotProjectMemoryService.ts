@@ -34,8 +34,22 @@ export const ILoCoPilotProjectMemoryService = createDecorator<ILoCoPilotProjectM
 export interface ILoCoPilotProjectMemoryService {
 	readonly _serviceBrand: undefined;
 
-	/** Assemble the full PROJECT MEMORY block (all four phases) for injection into the system prompt. */
+	/**
+	 * Assemble the STABLE PROJECT MEMORY block (memory file, auto profile without the directory tree,
+	 * workspace instructions, learned facts) for injection into the system prompt. The result is frozen
+	 * per workspace for the lifetime of the window so that mid-session changes (new learned facts, a
+	 * profile rebuild, file edits) never rewrite the cached system-prompt prefix and force the local
+	 * server to re-process the whole conversation. Volatile structure lives in {@link getWorkspaceStructureTree}.
+	 */
 	getProjectMemoryBlock(token: CancellationToken): Promise<string | undefined>;
+
+	/**
+	 * Volatile 2-level directory sketch for injection into the CURRENT USER TURN (never the cached system
+	 * prefix). Rebuilt each turn on purpose: the tree changes whenever the agent creates/edits/deletes
+	 * files, and keeping it out of the system prompt is what stops those changes from busting the local
+	 * server's prompt cache. Returns undefined when there is no readable workspace tree.
+	 */
+	getWorkspaceStructureTree(token: CancellationToken): Promise<string | undefined>;
 
 	/** True when a workspace folder is open (so per-workspace settings can be stored). */
 	hasWorkspace(): boolean;
@@ -110,6 +124,14 @@ export class LoCoPilotProjectMemoryService implements ILoCoPilotProjectMemorySer
 		@ILogService private readonly logService: ILogService,
 	) { }
 
+	/**
+	 * In-memory freeze of the assembled STABLE project-memory block, keyed by workspace root. Computed once
+	 * per workspace and reused for the window's lifetime so that a learned fact added mid-session, a profile
+	 * rebuild, or a file edit does NOT change the system-prompt prefix and invalidate the local server's KV
+	 * cache. Cleared by {@link invalidateProfileCache} for an explicit refresh.
+	 */
+	private _stableBlockCache: { rootKey: string; block: string | undefined } | undefined;
+
 	private get workspaceRoot(): URI | undefined {
 		return this.workspaceService.getWorkspace().folders[0]?.uri;
 	}
@@ -122,6 +144,14 @@ export class LoCoPilotProjectMemoryService implements ILoCoPilotProjectMemorySer
 		const root = this.workspaceRoot;
 		if (!root) {
 			return undefined;
+		}
+
+		// Freeze per workspace: this block is the cached system-prompt prefix, so it must be byte-stable for
+		// the whole session. Recomputing it each turn (and picking up a new learned fact or a changed tree)
+		// is exactly what invalidated the local server's prompt cache and forced a full re-process.
+		const rootKey = root.toString();
+		if (this._stableBlockCache?.rootKey === rootKey) {
+			return this._stableBlockCache.block;
 		}
 
 		const sections: string[] = [];
@@ -150,11 +180,33 @@ export class LoCoPilotProjectMemoryService implements ILoCoPilotProjectMemorySer
 			sections.push(`## Learned facts (remembered from earlier sessions)\n${factsBlock}`);
 		}
 
-		if (sections.length === 0) {
+		const block = sections.length === 0
+			? undefined
+			: `# PROJECT MEMORY\nWhat you already know about THIS project. Trust this over re-discovery, but verify against the live code before acting on anything that may be stale.\n\n${sections.join('\n\n')}`;
+		this._stableBlockCache = { rootKey, block };
+		return block;
+	}
+
+	async getWorkspaceStructureTree(token: CancellationToken): Promise<string | undefined> {
+		const root = this.workspaceRoot;
+		if (!root) {
 			return undefined;
 		}
-
-		return `# PROJECT MEMORY\nWhat you already know about THIS project. Trust this over re-discovery, but verify against the live code before acting on anything that may be stale.\n\n${sections.join('\n\n')}`;
+		// Mirror the profile's nested-root resolution so the tree points at where the code actually lives
+		// (a wrapper folder whose single subdirectory is the real project).
+		let treeRoot = root;
+		const present = await this.detectSignalFiles(root);
+		if (present.length === 0) {
+			const nested = await this.findNestedProject(root, token);
+			if (nested) {
+				treeRoot = nested.uri;
+			}
+		}
+		const tree = await this.buildDirectoryTree(treeRoot);
+		if (!tree) {
+			return undefined;
+		}
+		return `# WORKSPACE STRUCTURE (live view - reflects the latest files; may change as you edit)\n\`\`\`\n${tree}\n\`\`\``;
 	}
 
 	// ---- Phase 1: memory file ------------------------------------------------
@@ -187,12 +239,14 @@ export class LoCoPilotProjectMemoryService implements ILoCoPilotProjectMemorySer
 
 	invalidateProfileCache(): void {
 		this.storageService.remove(STORAGE_KEY_PROFILE_CACHE, StorageScope.WORKSPACE);
+		this._stableBlockCache = undefined; // force the frozen system-prompt block to be reassembled
 	}
 
 	private async getOrBuildProfile(root: URI, token: CancellationToken): Promise<string | undefined> {
-		// The tree is built first: it is shown in the profile AND participates in the cache
-		// signature, and its top-level dirs double as nested-project probe candidates.
-		const tree = await this.buildDirectoryTree(root);
+		// The profile is the STABLE half of project memory (stack/framework/scripts) and lives in the cached
+		// system prompt, so the volatile directory tree is deliberately NOT part of it anymore - it moved to
+		// the current user turn (getWorkspaceStructureTree). The profile therefore depends only on the signal
+		// files, so it no longer rebuilds every time a file is added/removed.
 
 		// Signal files at the workspace root - or, when the root is just a wrapper folder
 		// (e.g. the real project lives in a single subdirectory), at the nested project root.
@@ -207,10 +261,10 @@ export class LoCoPilotProjectMemoryService implements ILoCoPilotProjectMemorySer
 				present = nested.present;
 			}
 		}
-		if (present.length === 0 && !tree) {
+		if (present.length === 0) {
 			return undefined;
 		}
-		const sig = await this.computeSignature(profileRoot, present, tree, token);
+		const sig = await this.computeSignature(profileRoot, present, token);
 
 		const cachedRaw = this.storageService.get(STORAGE_KEY_PROFILE_CACHE, StorageScope.WORKSPACE);
 		if (cachedRaw) {
@@ -224,7 +278,7 @@ export class LoCoPilotProjectMemoryService implements ILoCoPilotProjectMemorySer
 			}
 		}
 
-		const profile = await this.buildProfile(profileRoot, present, tree, nestedDir);
+		const profile = await this.buildProfile(profileRoot, present, nestedDir);
 		if (profile) {
 			const toStore: ICachedProfile = { sig, profile };
 			this.storageService.store(STORAGE_KEY_PROFILE_CACHE, JSON.stringify(toStore), StorageScope.WORKSPACE, StorageTarget.MACHINE);
@@ -247,10 +301,12 @@ export class LoCoPilotProjectMemoryService implements ILoCoPilotProjectMemorySer
 	}
 
 	/**
-	 * Signature = hash of the contents of the present signal files + the rendered structure tree,
-	 * so the cache busts when either changes.
+	 * Signature = hash of the contents of the present signal files, so the profile cache busts when a
+	 * project config changes. The directory tree is intentionally NOT part of the signature anymore: it
+	 * lives in the volatile per-turn structure block, so the stable profile must not rebuild just because
+	 * a file was added or removed.
 	 */
-	private async computeSignature(root: URI, present: string[], tree: string | undefined, token: CancellationToken): Promise<number> {
+	private async computeSignature(root: URI, present: string[], token: CancellationToken): Promise<number> {
 		const parts: string[] = [];
 		for (const name of present) {
 			if (token.isCancellationRequested) {
@@ -262,9 +318,6 @@ export class LoCoPilotProjectMemoryService implements ILoCoPilotProjectMemorySer
 			} catch {
 				parts.push(`${name}:?`);
 			}
-		}
-		if (tree) {
-			parts.push(`tree:${tree}`);
 		}
 		return hash(parts.join(' '));
 	}
@@ -372,7 +425,7 @@ export class LoCoPilotProjectMemoryService implements ILoCoPilotProjectMemorySer
 		return best;
 	}
 
-	private async buildProfile(root: URI, present: string[], tree: string | undefined, nestedDir: string | undefined): Promise<string | undefined> {
+	private async buildProfile(root: URI, present: string[], nestedDir: string | undefined): Promise<string | undefined> {
 		const lines: string[] = [];
 
 		if (nestedDir) {
@@ -415,11 +468,9 @@ export class LoCoPilotProjectMemoryService implements ILoCoPilotProjectMemorySer
 			}
 		}
 
-		// Structure tree last: it is the biggest section, so if anything gets truncated it's the
-		// tail of the tree rather than the stack/scripts facts above.
-		if (tree) {
-			lines.push(`- **Structure (workspace root, 2 levels, artifacts omitted):**\n\`\`\`\n${tree}\n\`\`\``);
-		}
+		// NOTE: the directory-structure tree used to be appended here, but it is volatile (changes as files
+		// are edited) and this profile is the cached system-prompt prefix. The tree now lives in the current
+		// user turn via getWorkspaceStructureTree, so file changes no longer bust the prompt cache.
 
 		if (lines.length === 0) {
 			return undefined;
