@@ -1185,21 +1185,28 @@ export class LoCoPilotBuiltInAgent extends Disposable implements IChatAgentImple
 		// Claim SYNCHRONOUSLY (before the async work) so concurrent callers - the other five agent instances,
 		// or the selection trigger racing the server-ready hook - see it taken and skip.
 		LoCoPilotBuiltInAgent._warmedServerModelIds.add(modelId);
-		// Build the SAME stable agent system prompt a real turn uses: default agent prompt + the stable
-		// workspace context. Volatile editor state is intentionally excluded (it lives in the user turn),
-		// so this prefix matches the real turn's prefix and the cache hits.
+		// Warm the prefix for the CURRENTLY-SELECTED mode (Agent/Ask/Edit), not a hard-coded Agent, so the
+		// warmed prefix matches what the user's first message will actually send. Defaults to Agent when no
+		// widget is focused yet (startup).
+		const modeKind = this.chatWidgetService.lastFocusedWidget?.input.currentModeKind ?? ChatModeKind.Agent;
+		// Build the SAME stable system prompt a real turn uses for this mode. Volatile editor state is
+		// excluded (it lives in the user turn), so this prefix matches the real turn's prefix and hits cache.
 		(async () => {
 			try {
-				let systemPrompt = this.getDefaultSystemPrompt(ChatModeKind.Agent, undefined);
+				let systemPrompt = this.getDefaultSystemPrompt(modeKind, undefined);
 				// Mirror buildMessages' small-window swap so the warmed prefix matches the real turn.
 				const metadata = this.languageModelsService.lookupLanguageModel(modelId);
 				const warmMaxInput = typeof metadata?.maxInputTokens === 'number' ? metadata.maxInputTokens : undefined;
 				if (systemPrompt === UNIFIED_AGENT_SYSTEM_PROMPT && warmMaxInput !== undefined && warmMaxInput < SMALL_CONTEXT_PROMPT_THRESHOLD_TOKENS) {
 					systemPrompt = COMPACT_AGENT_SYSTEM_PROMPT;
 				}
-				const workspaceContext = await this.getWorkspaceContext();
-				if (workspaceContext) {
-					systemPrompt = systemPrompt + '\n\n' + workspaceContext;
+				// Mirror buildMessages: workspace context is appended only in Agent mode. Appending it in
+				// Ask/Edit would make the warmed prefix diverge from the real turn and miss the cache.
+				if (modeKind === ChatModeKind.Agent) {
+					const workspaceContext = await this.getWorkspaceContext();
+					if (workspaceContext) {
+						systemPrompt = systemPrompt + '\n\n' + workspaceContext;
+					}
 				}
 				await this.unifiedAgent.warmUp(modelId, systemPrompt, CancellationToken.None);
 			} catch (e) {

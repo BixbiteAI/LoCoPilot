@@ -5,11 +5,11 @@
 LoCoPilot by **Bixbite AI** brings AI pair programming to your desktop. Use local language models for private, offline development, or add cloud models when you want. Familiar editor experience, full control—now branded and tuned as LoCoPilot.
 
 <p align="center">
-  <a href="https://youtu.be/2yGY0glkj4E">
-    <img src="https://img.youtube.com/vi/2yGY0glkj4E/maxresdefault.jpg" alt="Watch LoCoPilot demo" width="800"/>
+  <a href="https://youtu.be/GvOHc794Mi8">
+    <img src="https://img.youtube.com/vi/GvOHc794Mi8/maxresdefault.jpg" alt="Watch LoCoPilot demo" width="800"/>
   </a>
   <br/>
-  <a href="https://youtu.be/2yGY0glkj4E">▶ Watch demo on YouTube</a>
+  <a href="https://youtu.be/GvOHc794Mi8">▶ Watch demo on YouTube</a>
 </p>
 
 ---
