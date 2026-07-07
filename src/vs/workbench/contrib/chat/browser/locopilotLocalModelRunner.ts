@@ -76,6 +76,13 @@ import { LOCOPILOT_SETTINGS_SECTION_LIST_MODELS } from './chatManagement/locopil
 export const ILoCoPilotLocalModelRunner = createDecorator<ILoCoPilotLocalModelRunner>('locopilotLocalModelRunner');
 
 /**
+ * Max persisted KV slot caches to keep on disk (one per warmed model+mode prefix). Older ones are
+ * LRU-evicted after each save. Each `.bin` is the full prefix KV (tens to hundreds of MB), so this bounds
+ * the cache dir at a few GB while comfortably covering the user's 2-3 hot models across modes.
+ */
+const MAX_SLOT_CACHE_ENTRIES = 10;
+
+/**
  * Lifecycle phase of a local model server:
  *  - 'starting': process is being launched (no port bound yet).
  *  - 'loading' : process is up but still reading weights into RAM/VRAM (endpoint not 200 yet).
@@ -119,6 +126,18 @@ export interface ILoCoPilotLocalModelRunner {
 	 * Returns the server base URL when ready, or undefined if it could not be started.
 	 */
 	ensureServerForModel(modelId: string, token?: CancellationToken): Promise<string | undefined>;
+	/**
+	 * Restore a previously-saved KV cache slot (the warmed system+tools prefix) from disk into the running
+	 * llama.cpp server so the first real turn reuses it instead of re-prefilling. Returns true only when a
+	 * matching cache file existed and the server loaded it. No-op (false) for MLX/non-llama servers, when
+	 * the server isn't ready, or when slot persistence is disabled.
+	 */
+	restoreSlotCache(modelId: string, key: string, token?: CancellationToken): Promise<boolean>;
+	/**
+	 * Persist the running llama.cpp server's slot-0 KV cache (the warmed prefix) to disk under `key`, so a
+	 * future session can restore it. No-op for MLX/non-llama servers or when slot persistence is disabled.
+	 */
+	saveSlotCache(modelId: string, key: string, token?: CancellationToken): Promise<void>;
 	stopServer(modelId: string): void;
 	/**
 	 * Stops every running llama.cpp/MLX server we manage, except an optional one to keep.
@@ -447,6 +466,36 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 		return joinPath(this.environmentService.cacheHome, 'locopilot-engines', 'win32-x64-cuda');
 	}
 
+	/**
+	 * Directory where llama.cpp persists per-slot KV caches (`--slot-save-path`), so a warmed system+tools
+	 * prefix survives an app restart. Lives under the shared cache root alongside models and engines.
+	 */
+	private _kvCacheDir(): URI {
+		return joinPath(this.environmentService.cacheHome, 'locopilot-kv-cache');
+	}
+
+	/** Memoized best-effort creation of {@link _kvCacheDir}; llama.cpp needs the dir to exist before launch. */
+	private _kvCacheDirReady: Promise<boolean> | undefined;
+	private _ensureKvCacheDir(): Promise<boolean> {
+		if (!this._kvCacheDirReady) {
+			this._kvCacheDirReady = (async () => {
+				try {
+					await this.fileService.createFolder(this._kvCacheDir());
+					return true;
+				} catch (e) {
+					this._log(`[LoCoPilot Runner] Could not create KV cache dir (slot persistence disabled): ${e}`);
+					return false;
+				}
+			})();
+		}
+		return this._kvCacheDirReady;
+	}
+
+	/** Filesystem-safe slot-cache filename for a (model, mode) prefix. */
+	private _slotCacheFileName(key: string): string {
+		return `${key.replace(/[^a-zA-Z0-9._-]/g, '_').slice(0, 200)}.bin`;
+	}
+
 	/** Finds `name` (case-insensitive) under `dir`, descending at most `depth` directory levels. */
 	private async _findFileRecursive(dir: URI, name: string, depth: number): Promise<string | undefined> {
 		try {
@@ -661,6 +710,88 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 				: getLlamaServerBaseUrl(running.port);
 		}
 		return undefined;
+	}
+
+	async restoreSlotCache(modelId: string, key: string, token: CancellationToken = CancellationToken.None): Promise<boolean> {
+		// Only llama.cpp exposes the /slots save/restore API; MLX and unmanaged endpoints have none.
+		const running = this.runningServers.get(modelId);
+		if (!running || running.kind !== 'llama' || !running.ready) {
+			return false;
+		}
+		const filename = this._slotCacheFileName(key);
+		// The file must exist under the slot-save dir, or llama.cpp rejects the restore. Check first so a
+		// cold first-ever run (no cache yet) quietly falls back to warming instead of logging a failure.
+		try {
+			await this.fileService.stat(joinPath(this._kvCacheDir(), filename));
+		} catch {
+			return false;
+		}
+		try {
+			const res = await this.requestService.request({
+				type: 'POST',
+				url: `${getLlamaServerBaseUrl(running.port)}/slots/0?action=restore`,
+				headers: { 'Content-Type': 'application/json' },
+				data: JSON.stringify({ filename }),
+			}, token);
+			const status = res.res.statusCode ?? 0;
+			if (status === 200) {
+				this._log(`[LoCoPilot Runner] Restored KV slot cache "${filename}" for ${modelId}.`);
+				return true;
+			}
+			// A non-200 (e.g. 400 when the saved prefix is incompatible with the current weights/context) just
+			// means we re-warm; drain the body so the connection is freed.
+			this._log(`[LoCoPilot Runner] KV slot restore for ${modelId} returned ${status}; will warm instead.`);
+			return false;
+		} catch (e) {
+			this._log(`[LoCoPilot Runner] KV slot restore failed (ignored) for ${modelId}: ${e}`);
+			return false;
+		}
+	}
+
+	async saveSlotCache(modelId: string, key: string, token: CancellationToken = CancellationToken.None): Promise<void> {
+		const running = this.runningServers.get(modelId);
+		if (!running || running.kind !== 'llama' || !running.ready) {
+			return;
+		}
+		if (!await this._ensureKvCacheDir()) {
+			return;
+		}
+		const filename = this._slotCacheFileName(key);
+		try {
+			await this.requestService.request({
+				type: 'POST',
+				url: `${getLlamaServerBaseUrl(running.port)}/slots/0?action=save`,
+				headers: { 'Content-Type': 'application/json' },
+				data: JSON.stringify({ filename }),
+			}, token);
+			this._log(`[LoCoPilot Runner] Saved KV slot cache "${filename}" for ${modelId}.`);
+			// Keep the KV-cache dir bounded: retain only the most-recently-saved caches, evict the rest (LRU).
+			await this._pruneSlotCaches();
+		} catch (e) {
+			this._log(`[LoCoPilot Runner] KV slot save failed (ignored) for ${modelId}: ${e}`);
+		}
+	}
+
+	/**
+	 * LRU eviction for the persisted KV-cache dir: keep the {@link MAX_SLOT_CACHE_ENTRIES} most-recently
+	 * modified `.bin` files (freshly-saved caches touch their mtime), delete the older ones. Best-effort.
+	 */
+	private async _pruneSlotCaches(): Promise<void> {
+		try {
+			const dir = this._kvCacheDir();
+			const stat = await this.fileService.resolve(dir, { resolveMetadata: true });
+			const caches = (stat.children ?? [])
+				.filter(c => !c.isDirectory && c.name.endsWith('.bin'))
+				.sort((a, b) => b.mtime - a.mtime); // newest first
+			for (const stale of caches.slice(MAX_SLOT_CACHE_ENTRIES)) {
+				try {
+					await this.fileService.del(stale.resource);
+					this._log(`[LoCoPilot Runner] Evicted stale KV slot cache "${stale.name}" (LRU).`);
+				} catch { /* ignore individual delete failures */ }
+			}
+		} catch (e) {
+			this._log(`[LoCoPilot Runner] KV slot cache prune failed (ignored): ${e}`);
+		}
 	}
 
 	getServedModelId(modelId: string): string | undefined {
@@ -1173,7 +1304,9 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 			})(),
 			promptLookup: cfg.getValue<boolean>(ChatConfiguration.LocopilotLlamaCppPromptLookup),
 			promptLookupArgs: cfg.getValue<string>(ChatConfiguration.LocopilotLlamaCppPromptLookupArgs),
-			slotSavePath: cfg.getValue<string>(ChatConfiguration.LocopilotLlamaCppSlotSavePath),
+			// Default to our managed KV-cache dir (created lazily before launch) so slot save/restore works
+			// out of the box for cross-session prefix reuse; an explicit user path still wins.
+			slotSavePath: cfg.getValue<string>(ChatConfiguration.LocopilotLlamaCppSlotSavePath)?.trim() || this._kvCacheDir().fsPath,
 			mlock: cfg.getValue<boolean>(ChatConfiguration.LocopilotLlamaCppMlock),
 			extraArgs: cfg.getValue<string>(ChatConfiguration.LocopilotLlamaCppExtraArgs),
 		};
@@ -1992,6 +2125,9 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 		}
 
 		const port = await this.findAvailablePort(LOCOPILOT_LLAMA_SERVER_PORT);
+		// Make sure the slot-save dir exists before launch: llama.cpp only touches it on save/restore, but
+		// creating it up front keeps the --slot-save-path flag valid for the whole server lifetime.
+		await this._ensureKvCacheDir();
 		const tuning = await this._augmentTuningWithHardware(modelPath, backend, baseTuning, extraResidentBytes);
 		const { command, args } = getLlamaCppServerCommand(modelPath, backend, serverPath, port, tuning);
 		// Remember whether this launch carries speculative flags, so a crash caused by an old build rejecting

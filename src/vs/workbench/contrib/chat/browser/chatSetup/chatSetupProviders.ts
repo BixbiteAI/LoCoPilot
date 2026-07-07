@@ -45,7 +45,7 @@ import { VSBuffer } from '../../../../../base/common/buffer.js';
 import { IEditorService } from '../../../../services/editor/common/editorService.js';
 import { ICodeEditorService } from '../../../../../editor/browser/services/codeEditorService.js';
 import { CHAT_OPEN_ACTION_ID, CHAT_SETUP_ACTION_ID } from '../actions/chatActions.js';
-import { IChatWidgetService } from '../chat.js';
+import { IChatWidget, IChatWidgetService } from '../chat.js';
 import { ILoCoPilotFileLog } from '../locopilotFileLog.js';
 import { ILanguageFeaturesService } from '../../../../../editor/common/services/languageFeatures.js';
 import { CodeAction, CodeActionList, Command, NewSymbolName, NewSymbolNameTriggerKind } from '../../../../../editor/common/languages.js';
@@ -1112,22 +1112,38 @@ export class LoCoPilotBuiltInAgent extends Disposable implements IChatAgentImple
 		// a restarted server pays the full cold prefill (the ~55s "hi" we saw in the logs).
 		this._register(this.customLanguageModelsService.onDidChangeCustomModels(() => this._maybeWarmSelectedModelPrefix()));
 		this._register(this.localModelRunner.onDidServerStateChange(modelId => this._onServerStateChange(modelId)));
+		// Warm on MODE change too: Agent/Ask/Plan send different prefixes, so switching mode means the new
+		// mode's prefix is cold until its first message. Warming it as soon as the user flips the picker (while
+		// they read/type) hides that cost - deduped per (model, mode) so it fires at most once per combo.
+		const hookWidgetModeChanges = (widget: IChatWidget) => {
+			widget.input.onDidChangeCurrentChatMode(() => this._maybeWarmSelectedModelPrefix(), undefined, this._store);
+		};
+		this._register(this.chatWidgetService.onDidAddWidget(hookWidgetModeChanges));
+		if (this.chatWidgetService.lastFocusedWidget) {
+			hookWidgetModeChanges(this.chatWidgetService.lastFocusedWidget);
+		}
 		this._maybeWarmSelectedModelPrefix();
 	}
 
 	/**
-	 * Model ids whose CURRENT local-server instance has had (or is having) its stable prefix warmed.
+	 * Prefix-warm claims for the CURRENT local-server instances, keyed by `${modelId}::${modeKind}`.
 	 * PROCESS-WIDE (static) on purpose: this agent is registered once per location+mode (Chat x
 	 * {Ask,Edit,Agent} + Terminal + Notebook + EditorInline = 6 instances), and all six would otherwise
 	 * fire an identical warm-up on the same server - six duplicate prefills. The first instance to warm a
-	 * model claims it here; the other five skip.
+	 * (model, mode) prefix claims it here; the other five skip.
 	 *
-	 * Unlike a plain "warmed once per process" flag, an entry is REMOVED when that model's server stops
-	 * (see _onServerStateChange). A server can be idle-unloaded and later restarted with an EMPTY prompt
-	 * cache; clearing the entry on stop lets the next server-ready re-warm the fresh cache, which is the
-	 * whole point of the server-ready hook.
+	 * Keyed by mode as well as model because Agent/Ask/Plan send DIFFERENT prefixes (different base prompt,
+	 * and Ask/Plan drop the edit tools) - so switching mode must be able to warm the new mode's prefix even
+	 * though the model already warmed another mode. Entries for a model are REMOVED when its server stops
+	 * (see _onServerStateChange): a server can be idle-unloaded and later restarted with an EMPTY cache, and
+	 * clearing the entries lets the next server-ready re-warm the fresh cache.
 	 */
-	private static readonly _warmedServerModelIds = new Set<string>();
+	private static readonly _warmedPrefixKeys = new Set<string>();
+
+	/** Dedup/claim key for warming a specific (model, mode) prefix. */
+	private static _warmKey(modelId: string, modeKind: ChatModeKind): string {
+		return `${modelId}::${modeKind}`;
+	}
 
 	/**
 	 * If a downloaded LOCAL model is selected (or is the only chat-ready option), pre-process its
@@ -1152,8 +1168,14 @@ export class LoCoPilotBuiltInAgent extends Disposable implements IChatAgentImple
 	private _onServerStateChange(modelId: string): void {
 		const phase = this.localModelRunner.getServerPhase(modelId);
 		if (phase === undefined) {
-			// Server stopped/unloaded/evicted - allow a future ready to warm the fresh (empty) cache.
-			LoCoPilotBuiltInAgent._warmedServerModelIds.delete(modelId);
+			// Server stopped/unloaded/evicted - drop every mode's claim for this model so a future ready can
+			// warm the fresh (empty) cache again.
+			const prefix = `${modelId}::`;
+			for (const key of LoCoPilotBuiltInAgent._warmedPrefixKeys) {
+				if (key.startsWith(prefix)) {
+					LoCoPilotBuiltInAgent._warmedPrefixKeys.delete(key);
+				}
+			}
 			return;
 		}
 		if (phase !== 'ready') {
@@ -1170,11 +1192,21 @@ export class LoCoPilotBuiltInAgent extends Disposable implements IChatAgentImple
 	}
 
 	/**
-	 * Warm `modelId`'s stable prefix once for its current server instance (deduped via
-	 * {@link _warmedServerModelIds} across the 6 agent instances). No-op for non-local/undownloaded models.
+	 * Warm `modelId`'s stable prefix once per (model, CURRENTLY-SELECTED mode) for its current server
+	 * instance (deduped via {@link _warmedPrefixKeys} across the 6 agent instances). No-op for
+	 * non-local/undownloaded models. Fired on selection, on server-ready, and on mode change.
+	 *
+	 * Fast path: if a matching KV slot cache was persisted in an earlier session, restore it from disk
+	 * instead of re-prefilling the prompt - that is the cross-session "don't remove unless required" win.
+	 * Otherwise warm by sending the real prefix, then persist the slot so the NEXT session can restore it.
 	 */
 	private _warmModelPrefixIfNeeded(modelId: string): void {
-		if (LoCoPilotBuiltInAgent._warmedServerModelIds.has(modelId)) {
+		// Warm the prefix for the CURRENTLY-SELECTED mode (Agent/Ask/Edit), not a hard-coded Agent, so the
+		// warmed prefix matches what the user's first message will actually send. Defaults to Agent when no
+		// widget is focused yet (startup).
+		const modeKind = this.chatWidgetService.lastFocusedWidget?.input.currentModeKind ?? ChatModeKind.Agent;
+		const warmKey = LoCoPilotBuiltInAgent._warmKey(modelId, modeKind);
+		if (LoCoPilotBuiltInAgent._warmedPrefixKeys.has(warmKey)) {
 			return;
 		}
 		const model = this.customLanguageModelsService.getCustomModels().find(m => m.id === modelId);
@@ -1184,15 +1216,19 @@ export class LoCoPilotBuiltInAgent extends Disposable implements IChatAgentImple
 		}
 		// Claim SYNCHRONOUSLY (before the async work) so concurrent callers - the other five agent instances,
 		// or the selection trigger racing the server-ready hook - see it taken and skip.
-		LoCoPilotBuiltInAgent._warmedServerModelIds.add(modelId);
-		// Warm the prefix for the CURRENTLY-SELECTED mode (Agent/Ask/Edit), not a hard-coded Agent, so the
-		// warmed prefix matches what the user's first message will actually send. Defaults to Agent when no
-		// widget is focused yet (startup).
-		const modeKind = this.chatWidgetService.lastFocusedWidget?.input.currentModeKind ?? ChatModeKind.Agent;
+		LoCoPilotBuiltInAgent._warmedPrefixKeys.add(warmKey);
 		// Build the SAME stable system prompt a real turn uses for this mode. Volatile editor state is
 		// excluded (it lives in the user turn), so this prefix matches the real turn's prefix and hits cache.
 		(async () => {
 			try {
+				// Try the persisted slot cache first: on a hit the prefix KV is already resident, so we skip
+				// the (multi-thousand-token) prefill entirely. The restore is keyed by (model, mode) so a
+				// different mode never restores the wrong prefix.
+				const restored = await this.localModelRunner.restoreSlotCache(modelId, warmKey, CancellationToken.None);
+				if (restored) {
+					return;
+				}
+
 				let systemPrompt = this.getDefaultSystemPrompt(modeKind, undefined);
 				// Mirror buildMessages' small-window swap so the warmed prefix matches the real turn.
 				const metadata = this.languageModelsService.lookupLanguageModel(modelId);
@@ -1209,10 +1245,12 @@ export class LoCoPilotBuiltInAgent extends Disposable implements IChatAgentImple
 					}
 				}
 				await this.unifiedAgent.warmUp(modelId, systemPrompt, CancellationToken.None);
+				// Persist the freshly-warmed prefix KV so a future session can restore it without re-prefilling.
+				await this.localModelRunner.saveSlotCache(modelId, warmKey, CancellationToken.None);
 			} catch (e) {
 				// Warm failed (server crash, etc.) - drop the claim so a later ready can retry. If the crash
 				// tears the server down, _onServerStateChange also clears it; this covers a plain throw.
-				LoCoPilotBuiltInAgent._warmedServerModelIds.delete(modelId);
+				LoCoPilotBuiltInAgent._warmedPrefixKeys.delete(warmKey);
 				this._log(`[LoCoPilot] Prefix warm trigger failed (ignored): ${e}`);
 			}
 		})();
