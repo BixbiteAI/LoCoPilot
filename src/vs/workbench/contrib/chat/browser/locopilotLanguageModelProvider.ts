@@ -263,8 +263,16 @@ export class LoCoPilotLanguageModelProvider extends Disposable implements ILangu
 		// carries generated text (content or reasoning) lets servers that emit no `usage`/`timings` - e.g. some
 		// mlx_lm builds - still surface a token count + a wall-clock tokens/sec. The service ignores this tally
 		// whenever the server reports real numbers, so llama.cpp is unaffected.
+		//
+		// Tool-call arguments count too: while a tool call streams (`delta.tool_calls`, e.g. the file content
+		// modifyFile is writing) llama.cpp often stops attaching its per-chunk `timings` block, so the server
+		// token count/rate FREEZE for the whole (possibly long) "Preparing file edit" phase. Tallying these
+		// deltas keeps the timer bar's count and rate moving through it; the service surfaces the tally
+		// whenever it runs ahead of the stalled server count, then defers back to the server once it catches up.
 		const delta = chunk?.choices?.[0]?.delta;
-		if (delta && (delta.content || this._reasoningTextFromOpenAiDelta(delta))) {
+		const hasToolCallArgs = Array.isArray(delta?.tool_calls)
+			&& delta!.tool_calls.some((tc: any) => typeof tc?.function?.arguments === 'string' && tc.function.arguments.length > 0);
+		if (delta && (delta.content || this._reasoningTextFromOpenAiDelta(delta) || hasToolCallArgs)) {
 			this.liveStatsService.recordClientToken();
 		}
 	}

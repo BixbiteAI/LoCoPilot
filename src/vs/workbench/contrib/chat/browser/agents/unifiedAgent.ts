@@ -522,6 +522,18 @@ export class UnifiedAgent {
 			// No tool calls: the model has given its final response, stop the loop
 			if (toolCalls.length === 0) {
 				this._log(`[LoCoPilot] Agent completed: no tool calls in response`);
+				// Safety net: if this turn produced no visible assistant text at all (e.g. the model
+				// answered right after a tool call with content that got fully caught by the textual
+				// tool-call suppression, or returned only reasoning), the chat would otherwise end
+				// completely blank. Surface a short message so the turn is never silent.
+				if (!hasEverEmitted) {
+					this._log(`[LoCoPilot] Agent finished with no visible output; emitting fallback message.`);
+					progress([{
+						kind: 'markdownContent',
+						content: new MarkdownString('The model finished without a text response. If the task looks incomplete, try rephrasing or using another model.')
+					}]);
+					hasEverEmitted = true;
+				}
 				break;
 			}
 

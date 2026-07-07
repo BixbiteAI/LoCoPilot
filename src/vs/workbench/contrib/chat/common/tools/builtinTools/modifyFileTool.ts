@@ -188,7 +188,16 @@ export class ModifyFileTool implements IToolImpl {
 	async handleToolStream(context: IToolInvocationStreamContext, _token: CancellationToken): Promise<IStreamedToolInvocation | undefined> {
 		const input = (context.rawInput ?? {}) as Partial<IModifyFileToolParams>;
 		const path = typeof input.path === 'string' && input.path.trim().length > 0 ? input.path : undefined;
+		const newString = typeof input.newString === 'string' ? input.newString : undefined;
 		if (!path) {
+			// The model may stream `newString` (the file content) BEFORE `path` in the argument JSON,
+			// so we can already have content to count while the file name is still unknown. Show the
+			// live line count during this phase too, instead of a static "Preparing file edit", so the
+			// count ticks up in real time from the very first tokens.
+			if (newString !== undefined) {
+				const lineCount = newString.split('\n').length;
+				return { invocationMessage: localize('modifyFile.streaming.preparingLines', "Preparing file edit ({0} lines)", String(lineCount)) };
+			}
 			return { invocationMessage: localize('modifyFile.streaming.preparing', "Preparing file edit") };
 		}
 		const fileName = path.split(/[/\\]/).filter(Boolean).pop() ?? path;
@@ -196,7 +205,6 @@ export class ModifyFileTool implements IToolImpl {
 		// oldString streams before newString: known-empty means full write (create/overwrite), known
 		// non-empty means a targeted edit. While it's still unknown, stay neutral with "Editing".
 		const isFullWrite = typeof input.oldString === 'string' && input.oldString.length === 0;
-		const newString = typeof input.newString === 'string' ? input.newString : undefined;
 		if (newString === undefined) {
 			const template = isFullWrite
 				? localize('modifyFile.streaming.writing', "Writing {0}")

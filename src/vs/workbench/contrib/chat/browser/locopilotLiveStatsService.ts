@@ -85,6 +85,11 @@ export class LoCoPilotLiveStatsService extends Disposable implements ILoCoPilotL
 	private _curClient = 0;
 	/** Wall-clock start of generation for the in-progress call (set on its first streamed token). */
 	private _curGenStart: number | undefined;
+	/** Wall-clock time the server's completion count last advanced; used to detect a stalled server. */
+	private _serverCountChangedAt: number | undefined;
+
+	/** How long the server count may stand still before we treat it as stalled (tool-call streaming phase). */
+	private static readonly SERVER_STALL_MS = 1000;
 
 	reset(): void {
 		this._active = false;
@@ -97,6 +102,7 @@ export class LoCoPilotLiveStatsService extends Disposable implements ILoCoPilotL
 		this._committedClient = 0;
 		this._curClient = 0;
 		this._curGenStart = undefined;
+		this._serverCountChangedAt = undefined;
 	}
 
 	beginCall(): void {
@@ -106,12 +112,17 @@ export class LoCoPilotLiveStatsService extends Disposable implements ILoCoPilotL
 		this._curCompletion = undefined;
 		this._curClient = 0;
 		this._curGenStart = undefined;
+		this._serverCountChangedAt = undefined;
 		// Keep the previous call's prompt/rate/cached visible until the new call reports its own.
 	}
 
 	update(stats: ILoCoPilotServerStatsUpdate): void {
 		this._active = true;
-		if (typeof stats.completionTokens === 'number') { this._curCompletion = stats.completionTokens; this._sawServerCount = true; }
+		if (typeof stats.completionTokens === 'number') {
+			if (stats.completionTokens !== this._curCompletion) { this._serverCountChangedAt = Date.now(); }
+			this._curCompletion = stats.completionTokens;
+			this._sawServerCount = true;
+		}
 		if (typeof stats.promptTokens === 'number') { this._curPrompt = stats.promptTokens; }
 		if (typeof stats.tokensPerSecond === 'number') { this._curRate = stats.tokensPerSecond; }
 		if (typeof stats.cachedTokens === 'number') { this._curCached = stats.cachedTokens; }
@@ -131,15 +142,28 @@ export class LoCoPilotLiveStatsService extends Disposable implements ILoCoPilotL
 		}
 		// Prefer the server's authoritative count; otherwise use the SSE-stream tally.
 		const serverCompletion = this._sawServerCount ? this._committedCompletion + (this._curCompletion ?? 0) : undefined;
-		const completionTokens = serverCompletion ?? (this._committedClient + this._curClient);
+		const clientCompletion = this._committedClient + this._curClient;
+		// A stalled server means its count hasn't advanced for a while even though tokens are still streaming -
+		// the signature of the tool-call phase, where llama.cpp drops its per-chunk `timings`. We only trust the
+		// client tally over the server count in that window; during normal generation the server updates
+		// constantly (never "stalled"), so its exact count/rate are always used and the ~1-per-delta client
+		// drift is ignored.
+		const serverStalled = this._sawServerCount
+			&& this._serverCountChangedAt !== undefined
+			&& (Date.now() - this._serverCountChangedAt) > LoCoPilotLiveStatsService.SERVER_STALL_MS;
+		const clientAhead = serverStalled && serverCompletion !== undefined && clientCompletion > serverCompletion;
+		// When the server stalls mid-turn, keep the count moving with the client tally so it never freezes;
+		// the server figure wins again as soon as it catches up at the final chunk.
+		const completionTokens = (serverCompletion !== undefined && !clientAhead) ? serverCompletion : Math.max(serverCompletion ?? 0, clientCompletion);
 
 		// Rate: the server's measured tokens/sec when given (llama.cpp); otherwise compute it from this call's
-		// tokens over the elapsed generation time (mlx_lm and other servers that emit no `timings`).
-		let tokensPerSecond = this._curRate;
-		let estimated = !this._sawServerCount;
+		// tokens over the elapsed generation time (mlx_lm and other servers that emit no `timings`, or the
+		// tool-call phase where the server goes quiet).
+		let tokensPerSecond = clientAhead ? undefined : this._curRate;
+		let estimated = !this._sawServerCount || clientAhead;
 		if (typeof tokensPerSecond !== 'number') {
 			estimated = true;
-			const curTokens = this._sawServerCount ? (this._curCompletion ?? 0) : this._curClient;
+			const curTokens = (this._sawServerCount && !clientAhead) ? (this._curCompletion ?? 0) : this._curClient;
 			const elapsedSec = this._curGenStart !== undefined ? (Date.now() - this._curGenStart) / 1000 : 0;
 			if (curTokens > 1 && elapsedSec > 0.05) {
 				tokensPerSecond = Math.round(curTokens / elapsedSec);

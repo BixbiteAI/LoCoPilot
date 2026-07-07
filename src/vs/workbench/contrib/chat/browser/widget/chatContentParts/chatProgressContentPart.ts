@@ -3,7 +3,7 @@
  *  Licensed under the MIT License. See License.txt in the project root for license information.
  *--------------------------------------------------------------------------------------------*/
 
-import { $, append } from '../../../../../../base/browser/dom.js';
+import { $, append, clearNode } from '../../../../../../base/browser/dom.js';
 import { FileAccess } from '../../../../../../base/common/network.js';
 import { alert } from '../../../../../../base/browser/ui/aria/aria.js';
 import { Codicon } from '../../../../../../base/common/codicons.js';
@@ -76,24 +76,33 @@ export class ChatProgressContentPart extends Disposable implements IChatContentP
 		this.renderedMessage.value = result;
 	}
 
-	updateMessage(content: MarkdownString): void {
+	updateMessage(content: IMarkdownString): void {
 		if (this.isHidden) {
 			return;
 		}
 
-		// Render the new message
+		this.currentContent = content;
+
+		// Render the new message into a detached element.
 		const result = this._register(this.chatContentMarkdownRenderer.render(content));
 		result.element.classList.add('progress-step');
-		renderFileWidgets(result.element, this.instantiationService, this.chatMarkdownAnchorService, this._store);
 
-		// Replace the old message container with the new one
-		if (this.renderedMessage.value) {
-			this.renderedMessage.value.element.replaceWith(result.element);
+		const existing = this.renderedMessage.value?.element;
+		if (existing) {
+			// Update IN PLACE: move the freshly rendered children into the existing message element
+			// rather than swapping the element itself. This keeps the same DOM node (and therefore any
+			// running CSS animation, e.g. the streaming shimmer wave) alive across rapid updates like
+			// the live "(N lines)" count - replacing the element would restart the animation each tick.
+			clearNode(existing);
+			while (result.element.firstChild) {
+				existing.appendChild(result.element.firstChild);
+			}
+			renderFileWidgets(existing, this.instantiationService, this.chatMarkdownAnchorService, this._store);
 		} else {
+			renderFileWidgets(result.element, this.instantiationService, this.chatMarkdownAnchorService, this._store);
 			this.domNode.appendChild(result.element);
+			this.renderedMessage.value = result;
 		}
-
-		this.renderedMessage.value = result;
 	}
 
 	hasSameContent(other: IChatRendererContent, followingContent: IChatRendererContent[], element: ChatTreeItem): boolean {

@@ -4,6 +4,15 @@
  *--------------------------------------------------------------------------------------------*/
 
 /*
+ * Hide the brand logo loader for the intermediate streaming tool-call loaders ("Preparing file
+ * edit" / "Writing foo.ts (42 lines)"). The shimmering text below already communicates "loading",
+ * so the spinning logo is redundant here (it stays for every other progress message).
+ */
+.interactive-item-container .chat-tool-streaming-part .progress-container > .locopilot-logo-loader {
+	display: none;
+}
+
+/*
  * Shimmer for the streaming tool-call message ("Writing foo.ts (42 lines)") - same wave loader as
  * the "Working" text (keyframes chat-working-shimmer live in chat.css and are global).
  */
@@ -41,7 +50,7 @@
 
 /* Live tail of the file content an in-flight tool call is generating (streaming tool state). */
 .interactive-item-container .chat-tool-streaming-preview {
-	margin: 2px 0 4px 22px; /* aligns under the progress message text, past the codicon column */
+	margin: 2px 0 4px 2px; /* aligns under the progress message text (logo/codicon column is hidden here) */
 	padding: 4px 8px;
 	font-family: var(--monaco-monospace-font);
 	font-size: 11px;

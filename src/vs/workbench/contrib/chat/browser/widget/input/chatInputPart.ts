@@ -2225,6 +2225,13 @@ export class ChatInputPart extends Disposable implements IHistoryNavigationWidge
 				let lastSeenThinkingWords = -1;
 				let lastThinkingChangeAt = 0;
 				let thinkingStartedAt = 0;
+				// Track server-reported generated tokens too. During a streaming tool call the tokens go
+				// into the (structured) tool-call arguments, not into output text or thinking, so neither
+				// word counter moves - yet the model IS actively generating. Watching serverTokens climb
+				// lets us keep showing the real tokens/sec through the tool-call/"Preparing file edit"
+				// phase instead of dropping the rate to 0 while the token count keeps rising.
+				let lastSeenServerTokens = -1;
+				let lastServerTokenChangeAt = 0;
 
 				const update = () => {
 					if (!this._timerBar) { return; }
@@ -2290,11 +2297,19 @@ export class ChatInputPart extends Disposable implements IHistoryNavigationWidge
 					const isThinkingStreaming = !isStreaming && lastThinkingChangeAt > 0 && (now - lastThinkingChangeAt) < RATE_IDLE_TIMEOUT_MS;
 					const thinkingElapsedMs = thinkingStartedAt > 0 ? now - thinkingStartedAt : 0;
 					const thinkingRate = isThinkingStreaming && thinkingElapsedMs > 0 ? Math.round(thinkingTokens / (thinkingElapsedMs / 1000)) : 0;
-					// With a real server rate, use it whenever generation is active (output or reasoning); the
-					// server's measured tokens/sec already covers reasoning tokens. Otherwise fall back to the
-					// phase-specific word-estimate rate.
+					// Server generation activity: tool-call arguments stream as tokens without moving the
+					// output/thinking word counts, so also treat a rising serverTokens count as "generating"
+					// to keep the real rate on screen during the tool-call phase.
+					if (hasServerStats && stats!.serverTokens! !== lastSeenServerTokens) {
+						lastSeenServerTokens = stats!.serverTokens!;
+						lastServerTokenChangeAt = now;
+					}
+					const isServerGenerating = hasServerStats && lastServerTokenChangeAt > 0 && (now - lastServerTokenChangeAt) < RATE_IDLE_TIMEOUT_MS;
+					// With a real server rate, use it whenever generation is active (output, reasoning, or
+					// tool-call token streaming); the server's measured tokens/sec already covers them all.
+					// Otherwise fall back to the phase-specific word-estimate rate.
 					const effectiveRate = hasServerStats
-						? ((isStreaming || isThinkingStreaming) ? rate : 0)
+						? ((isStreaming || isThinkingStreaming || isServerGenerating) ? rate : 0)
 						: (isStreaming ? rate : thinkingRate);
 
 					timeEl.textContent = ChatInputPart.formatElapsed(elapsed);
@@ -2322,7 +2337,12 @@ export class ChatInputPart extends Disposable implements IHistoryNavigationWidge
 
 					// While paused awaiting approval nothing is generating, so a stale rate would
 					// be misleading - hide it until generation resumes.
-					const hasRate = effectiveRate > 0 && !isPaused && (isStreaming || isThinkingStreaming);
+					// isServerGenerating must be included here too: during a streaming tool call
+					// ("Preparing file edit") the tokens go into tool-call arguments, so neither the
+					// output nor the thinking word counter moves and both isStreaming/isThinkingStreaming
+					// are false - yet the model is actively generating and effectiveRate is a real number.
+					// Omitting it hid the tokens/sec for the whole file-edit/tool-stream phase.
+					const hasRate = effectiveRate > 0 && !isPaused && (isStreaming || isThinkingStreaming || isServerGenerating);
 					sep2.style.display = hasRate ? '' : 'none';
 					rateEl.style.display = hasRate ? '' : 'none';
 					if (hasRate) {

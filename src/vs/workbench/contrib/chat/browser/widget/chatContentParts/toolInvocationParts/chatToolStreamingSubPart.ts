@@ -7,6 +7,7 @@ import '../media/chatToolStreamingPreview.css';
 import * as dom from '../../../../../../../base/browser/dom.js';
 import { IMarkdownString, MarkdownString } from '../../../../../../../base/common/htmlContent.js';
 import { autorun } from '../../../../../../../base/common/observable.js';
+import { MutableDisposable } from '../../../../../../../base/common/lifecycle.js';
 import { IMarkdownRenderer } from '../../../../../../../platform/markdown/browser/markdownRenderer.js';
 import { IInstantiationService } from '../../../../../../../platform/instantiation/common/instantiation.js';
 import { IChatProgressMessage, IChatToolInvocation } from '../../../../common/chatService/chatService.js';
@@ -78,12 +79,24 @@ export class ChatToolStreamingSubPart extends BaseChatToolInvocationSubPart {
 			return container;
 		}
 
+		// The shimmer wave (transparent text swept by a moving CSS gradient) only animates if the
+		// message element persists across streamed tokens: recreating it every tick restarts the
+		// animation at 0%, freezing the text at a transparent point (so it looks blank / no wave).
+		// So we keep the message part alive and only rebuild it when the message TEXT changes; the
+		// live content tail below is updated independently.
+		const messagePart = this._register(new MutableDisposable<ChatProgressContentPart>());
+		let lastMessageText: string | undefined;
+		let previewElement: HTMLElement | undefined;
+
 		// Observe streaming message changes
 		this._register(autorun(reader => {
 			const currentState = toolInvocation.state.read(reader);
 			if (currentState.type !== IChatToolInvocation.StateKind.Streaming) {
 				// State changed - clear the container DOM before triggering re-render
 				// This prevents the old streaming message from lingering
+				messagePart.clear();
+				lastMessageText = undefined;
+				previewElement = undefined;
 				dom.clearNode(container);
 				this._onNeedsRerender.fire();
 				return;
@@ -96,40 +109,61 @@ export class ChatToolStreamingSubPart extends BaseChatToolInvocationSubPart {
 			// Don't render anything if there's no meaningful content
 			const messageText = typeof displayMessage === 'string' ? displayMessage : displayMessage.value;
 			if (!messageText || messageText.trim().length === 0) {
+				messagePart.clear();
+				lastMessageText = undefined;
+				previewElement = undefined;
 				dom.clearNode(container);
 				return;
 			}
 
-			const content: IMarkdownString = typeof displayMessage === 'string'
-				? new MarkdownString().appendText(displayMessage)
-				: displayMessage;
+			// Update the message only when its text actually changes. The FIRST message builds the
+			// progress part; later changes (e.g. the ticking "(N lines)" count) update the SAME element
+			// in place via updateMessage, so the shimmer wave keeps running instead of restarting - and
+			// the count updates live rather than only settling once the tool call completes.
+			if (messageText !== lastMessageText) {
+				const content: IMarkdownString = typeof displayMessage === 'string'
+					? new MarkdownString().appendText(displayMessage)
+					: displayMessage;
 
-			const progressMessage: IChatProgressMessage = {
-				kind: 'progressMessage',
-				content
-			};
+				if (messagePart.value) {
+					messagePart.value.updateMessage(content);
+				} else {
+					const progressMessage: IChatProgressMessage = {
+						kind: 'progressMessage',
+						content
+					};
 
-			const part = reader.store.add(this.instantiationService.createInstance(
-				ChatProgressContentPart,
-				progressMessage,
-				this.renderer,
-				this.context,
-				undefined,
-				true,
-				this.getIcon(),
-				toolInvocation
-			));
+					const part = this.instantiationService.createInstance(
+						ChatProgressContentPart,
+						progressMessage,
+						this.renderer,
+						this.context,
+						undefined,
+						true,
+						this.getIcon(),
+						toolInvocation
+					);
+					messagePart.value = part;
+					previewElement = undefined;
+					dom.reset(container, part.domNode);
+				}
+				lastMessageText = messageText;
+			}
 
 			// Live tail of the content being generated (e.g. the file modifyFile is writing), so long
-			// generations show visible progress instead of just a static message.
+			// generations show visible progress instead of just a static message. Update it in place
+			// so the message element (and its shimmer animation) is never disturbed.
 			const previewText = extractStreamingContentPreview(currentState.partialInput.read(reader));
 			if (previewText) {
-				const preview = document.createElement('pre');
-				preview.classList.add('chat-tool-streaming-preview');
-				preview.textContent = previewText;
-				dom.reset(container, part.domNode, preview);
-			} else {
-				dom.reset(container, part.domNode);
+				if (!previewElement) {
+					previewElement = document.createElement('pre');
+					previewElement.classList.add('chat-tool-streaming-preview');
+					container.appendChild(previewElement);
+				}
+				previewElement.textContent = previewText;
+			} else if (previewElement) {
+				previewElement.remove();
+				previewElement = undefined;
 			}
 		}));
 
