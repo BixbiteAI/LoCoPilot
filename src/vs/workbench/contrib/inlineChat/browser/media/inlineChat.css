@@ -7,7 +7,7 @@
 .monaco-workbench .inline-chat {
 	color: inherit;
 	border-radius: 4px;
-	border: 1px solid var(--vscode-inlineChat-border);
+	border: none;
 	box-shadow: 0 2px 4px 0 var(--vscode-widget-shadow);
 	background: var(--vscode-inlineChat-background);
 	padding-top: 3px;
@@ -27,7 +27,8 @@
 }
 
 .monaco-workbench .zone-widget.inline-chat-widget .interactive-session .chat-input-container:focus-within {
-	border-color: var(--vscode-focusBorder);
+	/* Keep the neutral border on focus instead of switching to the blue focus colour. */
+	border-color: var(--vscode-inlineChat-border);
 }
 
 .monaco-workbench .zone-widget.inline-chat-widget .interactive-session .chat-input-container .interactive-input-part {
@@ -57,9 +58,10 @@
 }
 
 .monaco-workbench .zone-widget.inline-chat-widget > .zone-widget-container.busy {
+	/* No animated coloured frame while a request is in progress - the user asked for the border gone. */
 	--inline-chat-frame-progress: 0%;
-	border-image: linear-gradient(90deg, var(--vscode-editorGutter-addedBackground) var(--inline-chat-frame-progress), var(--vscode-button-background)) 1;
-	animation: 3s shift linear infinite;
+	border-image: unset;
+	animation: none;
 }
 
 .monaco-workbench .zone-widget.inline-chat-widget > .zone-widget-container > .inline-chat {

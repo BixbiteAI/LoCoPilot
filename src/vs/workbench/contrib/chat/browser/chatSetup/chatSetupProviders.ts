@@ -31,7 +31,7 @@ import { ChatEntitlement, ChatEntitlementContext, IChatEntitlementService } from
 import { ChatModel, ChatRequestModel, IChatRequestModel, IChatRequestVariableData, IChatRequestModeInfo } from '../../common/model/chatModel.js';
 import { ChatMode } from '../../common/chatModes.js';
 import { ChatRequestAgentPart, ChatRequestToolPart } from '../../common/requestParser/chatParserTypes.js';
-import { IChatProgress, IChatService } from '../../common/chatService/chatService.js';
+import { IChatEditorLocationData, IChatProgress, IChatService } from '../../common/chatService/chatService.js';
 import { IChatRequestToolEntry, IChatRequestVariableEntry, isPromptFileVariableEntry, isPromptTextVariableEntry } from '../../common/attachments/chatVariableEntries.js';
 import { ChatAgentLocation, ChatConfiguration, ChatModeKind } from '../../common/constants.js';
 import { ChatMessageRole, IChatMessage, ILanguageModelsService } from '../../common/languageModels.js';
@@ -2225,6 +2225,16 @@ Message: ${firstMessage.substring(0, 500)}`;
 			}
 
 			try {
+				// Inline editor chat ("Modify selected code" / "Generate code"): the inline widget
+				// deliberately hides plain markdown responses (its filter only surfaces edits/diffs and
+				// pending confirmations), so the normal agent path - which streams markdownContent - looked
+				// like it did nothing even though tokens were flowing. Handle this location with a dedicated
+				// path that turns the model output into a textEdit over the selected range, which the inline
+				// editing session renders as an accept/reject diff in the editor.
+				if (request.location === ChatAgentLocation.EditorInline && request.locationData?.type === ChatAgentLocation.EditorInline) {
+					return await this.runInlineEditRequest(request, request.locationData, progress, modelId, modelMetadata, token);
+				}
+
 				// Get mode info from widget if available
 				const widget = this.chatWidgetService.getWidgetBySessionResource(request.sessionResource);
 				const modeInfo = widget?.input.currentModeInfo;
@@ -2343,4 +2353,163 @@ Message: ${firstMessage.substring(0, 500)}`;
 
 		return {};
 	}
+
+	/**
+	 * Dedicated path for the inline editor chat ("Modify selected code" / "Generate code").
+	 *
+	 * Unlike the panel/terminal chat - which render the model's markdown reply - the inline chat
+	 * widget only shows edits applied to the file (as an accept/reject diff) and pending
+	 * confirmations; it hides plain markdown responses. The normal agent loop streams markdown, so
+	 * inline chat appeared to do nothing even while tokens streamed. Here we instead ask the model
+	 * for the replacement code for the selected range and emit it as a `textEdit`, which the inline
+	 * editing session turns into the diff the user expects.
+	 */
+	private async runInlineEditRequest(
+		request: IChatAgentRequest,
+		locationData: IChatEditorLocationData,
+		progress: (parts: IChatProgress[]) => void,
+		modelId: string,
+		modelMetadata: any,
+		token: CancellationToken
+	): Promise<IChatAgentResult> {
+		const uri = URI.revive(locationData.document);
+
+		// Normalise the selection into a forward range (start <= end). An empty range means the user
+		// opened inline chat without a selection ("Generate code") - we then insert at the cursor.
+		const sel = Selection.liftSelection(locationData.selection);
+		const editRange = new Range(sel.startLineNumber, sel.startColumn, sel.endLineNumber, sel.endColumn);
+
+		let selectedText = '';
+		let contextText = '';
+		let languageId = '';
+		const ref = await this.textModelService.createModelReference(uri);
+		try {
+			const textModel = ref.object.textEditorModel;
+			languageId = textModel.getLanguageId();
+			selectedText = textModel.getValueInRange(editRange);
+
+			// Provide a bounded window of surrounding code as context so the model can match style and
+			// symbols without shipping the whole (possibly huge) file to a small local model.
+			const CONTEXT_LINES = 80;
+			const lineCount = textModel.getLineCount();
+			const fromLine = Math.max(1, editRange.startLineNumber - CONTEXT_LINES);
+			const toLine = Math.min(lineCount, editRange.endLineNumber + CONTEXT_LINES);
+			contextText = textModel.getValueInRange(new Range(fromLine, 1, toLine, textModel.getLineMaxColumn(toLine)));
+		} finally {
+			ref.dispose();
+		}
+
+		const isGenerate = editRange.isEmpty();
+		const systemPrompt = [
+			`You are an expert pair programmer performing an INLINE CODE EDIT inside a ${languageId || 'code'} file.`,
+			isGenerate
+				? `The user's cursor is at a position and they want you to generate code to insert there.`
+				: `The user has selected a region of code and wants it modified.`,
+			`Rules:`,
+			`- Output ONLY the raw ${isGenerate ? 'code to insert' : 'replacement code for the selected region'}.`,
+			`- Do NOT wrap the output in markdown code fences.`,
+			`- Do NOT add explanations, comments about your changes, or any prose before or after the code.`,
+			`- Preserve the surrounding indentation and code style.`,
+		].join('\n');
+
+		const userParts: string[] = [];
+		userParts.push(`Surrounding code for context:\n\`\`\`${languageId}\n${contextText}\n\`\`\``);
+		if (!isGenerate) {
+			userParts.push(`The user selected this code to modify:\n\`\`\`${languageId}\n${selectedText}\n\`\`\``);
+		}
+		userParts.push(`Instruction: ${request.message || (isGenerate ? 'Generate appropriate code here.' : 'Improve the selected code.')}`);
+		userParts.push(isGenerate
+			? `Return ONLY the code to insert.`
+			: `Return ONLY the new code that should replace the selected region.`);
+
+		const messages: IChatMessage[] = [
+			{ role: ChatMessageRole.System, content: [{ type: 'text', value: systemPrompt }] },
+			{ role: ChatMessageRole.User, content: [{ type: 'text', value: userParts.join('\n\n') }] }
+		];
+
+		this._log(`[LoCoPilot] Inline edit (${isGenerate ? 'generate' : 'modify'}) on ${uri.toString()} range ${editRange.toString()} using model ${modelId}`);
+
+		// Signal the start of an edit stream for this file so the editing session wires up the diff UI.
+		progress([{ kind: 'textEdit', uri, edits: [] }]);
+
+		let fullText = '';
+		try {
+			const options: any = { locopilotForegroundTurn: true };
+			const response = await this.languageModelsService.sendChatRequest(
+				modelId,
+				nullExtensionDescription.identifier,
+				messages,
+				options,
+				token
+			);
+			for await (const part of response.stream) {
+				if (token.isCancellationRequested) {
+					break;
+				}
+				const parts = Array.isArray(part) ? part : [part];
+				for (const p of parts) {
+					if (p.type === 'text') {
+						fullText += p.value;
+					}
+				}
+			}
+			await response.result;
+		} catch (e) {
+			this.logService.error(`[LoCoPilot] Inline edit failed for model ${modelId}: ${e}`);
+			this.locopilotFileLog.log(`[LoCoPilot] Inline edit failed for model ${modelId}: ${e}`);
+			progress([{ kind: 'textEdit', uri, edits: [], done: true }]);
+			progress([{
+				kind: 'markdownContent',
+				content: markSystemNotice(new MarkdownString(`**Error calling model:** ${toErrorMessage(e)}`))
+			}]);
+			return {};
+		}
+
+		if (token.isCancellationRequested) {
+			progress([{ kind: 'textEdit', uri, edits: [], done: true }]);
+			return {};
+		}
+
+		const newText = stripCodeFences(fullText);
+		if (!newText.trim()) {
+			// Model produced nothing usable - close the edit stream and surface a hint instead of
+			// silently leaving the file unchanged.
+			progress([{ kind: 'textEdit', uri, edits: [], done: true }]);
+			progress([{
+				kind: 'markdownContent',
+				content: markSystemNotice(new MarkdownString(localize('locopilotInlineNoOutput', "The model did not return any code to apply. Try rephrasing your instruction.")))
+			}]);
+			return {};
+		}
+
+		// Apply the model's output as a single replacement of the selected range, then close the
+		// stream. The inline editing session diffs this against the original and shows keep/undo.
+		progress([{ kind: 'textEdit', uri, edits: [{ range: editRange, text: newText }] }]);
+		progress([{ kind: 'textEdit', uri, edits: [], done: true }]);
+		return {};
+	}
+}
+
+/**
+ * Strip a single leading/trailing markdown code fence from model output. Inline-edit prompts ask the
+ * model to omit fences, but small local models often add them anyway - leaving them in would insert
+ * literal ``` lines into the user's file.
+ */
+function stripCodeFences(raw: string): string {
+	let text = raw.trim();
+	if (!text.startsWith('```')) {
+		return text;
+	}
+	// Drop the opening fence line (``` optionally followed by a language id).
+	const firstNewline = text.indexOf('\n');
+	if (firstNewline === -1) {
+		return '';
+	}
+	text = text.slice(firstNewline + 1);
+	// Drop the closing fence if present.
+	const lastFence = text.lastIndexOf('```');
+	if (lastFence !== -1) {
+		text = text.slice(0, lastFence);
+	}
+	return text.replace(/\n+$/, '');
 }

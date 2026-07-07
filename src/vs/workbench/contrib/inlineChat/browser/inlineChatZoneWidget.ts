@@ -29,8 +29,10 @@ import { EditorBasedInlineChatWidget } from './inlineChatWidget.js';
 export class InlineChatZoneWidget extends ZoneWidget {
 
 	private static readonly _options: IOptions = {
-		showFrame: true,
-		frameWidth: 1,
+		// Drop the full-width coloured frame lines the ZoneWidget draws above/below the widget across
+		// the editor (they showed up blue/orange/yellow depending on theme + focus state).
+		showFrame: false,
+		frameWidth: 0,
 		// frameColor: 'var(--vscode-inlineChat-border)',
 		isResizeable: true,
 		showArrow: false,
