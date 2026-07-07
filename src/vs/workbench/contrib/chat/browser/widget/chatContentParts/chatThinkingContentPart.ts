@@ -100,6 +100,92 @@ function stripTrailingDots(text: string): string {
 	return text.replace(/[\s.\u2026]+$/, '').trimEnd();
 }
 
+/** The coarse action categories we recognize from a tool/reasoning label. */
+type ThinkingActivity = 'create' | 'edit' | 'read' | 'search' | 'run';
+
+/** Precedence when the SAME file shows up under several verbs (a create also emits an "Edited X"
+ * codeblock label): the most significant action wins so one op is never double-counted. */
+const THINKING_ACTIVITY_RANK: Record<ThinkingActivity, number> = { create: 4, edit: 3, run: 2, search: 1, read: 0 };
+
+/**
+ * Classify a tool/reasoning label into a coarse action so both the live header and the finished
+ * summary phrase the same activity the same way. Order matters: "create" (a full write of a new
+ * file) is checked before "edit" so "Writing foo.js" reads as a create, and "edit" before "read"
+ * because an edit message often also contains read-ish words like "check".
+ * Returns undefined when the label doesn't clearly map to one of the known actions.
+ */
+function classifyThinkingActivity(raw: string): ThinkingActivity | undefined {
+	const t = raw.toLowerCase();
+	if (/\b(creat|wrote|writing|written)/.test(t)) { return 'create'; }
+	if (/\b(edit|edited|editing|updat|modif|chang|refactor|replac)/.test(t)) { return 'edit'; }
+	if (/\b(search|searching|grep|look(ed|ing)?\s+up|find|finding)/.test(t)) { return 'search'; }
+	if (/\b(ran|running|execut|terminal|command|\$)/.test(t)) { return 'run'; }
+	if (/\b(read|reading|review|examin|inspect|check)/.test(t)) { return 'read'; }
+	return undefined;
+}
+
+/**
+ * Best-effort extraction of a filename from a label. Only treats a token as a filename when it has
+ * an extension or path separator, so tool names like "modifyFile" are never surfaced as the file.
+ */
+function extractThinkingFileName(raw: string): string | undefined {
+	const candidates = [
+		raw.match(/`([^`]+)`/)?.[1],
+		...(raw.match(/[\w\-./\\]+\.[a-zA-Z0-9]+/g) ?? [])
+	].filter((c): c is string => !!c);
+	for (const c of candidates) {
+		const cleaned = c.replace(/[)\].,]+$/, '');
+		if (/[./\\]/.test(cleaned) && /\.[a-zA-Z0-9]+$/.test(cleaned)) {
+			return cleaned.split(/[/\\]/).pop();
+		}
+	}
+	return undefined;
+}
+
+/**
+ * Turn the freshest action label into a present-tense header ("Editing auth.ts", "Reading 2 files",
+ * "Searching the codebase", "Running a command") so the active block reflects what the model is
+ * actually doing instead of a generic "Thinking". `source` is the latest action; `allTitles` is the
+ * full list of actions seen this block, used to pluralize edit/read when no specific file is known.
+ * Returns undefined when `source` doesn't map to a known action, so the caller can fall back.
+ * No trailing "..." - the header renders its own shimmer/ellipsis animation.
+ */
+function formatActiveActivity(source: string, allTitles: readonly string[]): string | undefined {
+	const action = classifyThinkingActivity(source);
+	if (!action) { return undefined; }
+	const countOf = (a: ThinkingActivity) => allTitles.reduce((n, t) => n + (classifyThinkingActivity(t) === a ? 1 : 0), 0);
+	switch (action) {
+		case 'create': {
+			const file = extractThinkingFileName(source);
+			if (file) { return localize('chat.thinking.active.creatingFile', 'Creating {0}', file); }
+			const n = countOf('create');
+			return n > 1
+				? localize('chat.thinking.active.creatingMany', 'Creating {0} files', n)
+				: localize('chat.thinking.active.creating', 'Creating a file');
+		}
+		case 'edit': {
+			const file = extractThinkingFileName(source);
+			if (file) { return localize('chat.thinking.active.editingFile', 'Editing {0}', file); }
+			const n = countOf('edit');
+			return n > 1
+				? localize('chat.thinking.active.editingMany', 'Editing {0} files', n)
+				: localize('chat.thinking.active.editing', 'Editing a file');
+		}
+		case 'read': {
+			const file = extractThinkingFileName(source);
+			if (file) { return localize('chat.thinking.active.readingFile', 'Reading {0}', file); }
+			const n = countOf('read');
+			return n > 1
+				? localize('chat.thinking.active.readingMany', 'Reading {0} files', n)
+				: localize('chat.thinking.active.reading', 'Reading a file');
+		}
+		case 'search':
+			return localize('chat.thinking.active.searching', 'Searching the codebase');
+		case 'run':
+			return localize('chat.thinking.active.running', 'Running a command');
+	}
+}
+
 interface ILazyToolItem {
 	kind: 'tool';
 	lazy: Lazy<{ domNode: HTMLElement; disposable?: IDisposable }>;
@@ -128,7 +214,7 @@ export class ChatThinkingContentPart extends ChatCollapsibleContentPart implemen
 	private currentThinkingValue: string;
 	private currentTitle: string;
 	private defaultTitle = localize('chat.thinking.header', 'Working');
-	private thinkingTitle = localize('chat.thinking.reasoning', 'Thinking');
+	private thinkingTitle = localize('chat.thinking.reasoning', 'Reasoning');
 	private textContainer!: HTMLElement;
 	private markdownResult: IRenderedMarkdown | undefined;
 	private wrapper!: HTMLElement;
@@ -161,7 +247,7 @@ export class ChatThinkingContentPart extends ChatCollapsibleContentPart implemen
 		const extractedHeader = extractTitleFromThinkingContent(initialText);
 		// No literal "..." here: the animated ellipsis (rendered separately) provides the motion,
 		// and a static "Working..." string would otherwise stick as the finished title.
-		const extractedTitle = extractedHeader ?? localize('chat.thinking.initial', 'Thinking');
+		const extractedTitle = extractedHeader ?? localize('chat.thinking.initial', 'Reasoning');
 
 		super(extractedTitle, context, undefined, hoverService);
 
@@ -436,7 +522,7 @@ export class ChatThinkingContentPart extends ChatCollapsibleContentPart implemen
 				clearNode(this.textContainer);
 				this.textContainer.appendChild(createThinkingIcon(Codicon.circleFilled));
 				const placeholder = $('span.chat-thinking-placeholder');
-				placeholder.textContent = 'Thinking...';
+				placeholder.textContent = 'Reasoning...';
 				this.textContainer.appendChild(placeholder);
 			}
 			return;
@@ -820,10 +906,16 @@ export class ChatThinkingContentPart extends ChatCollapsibleContentPart implemen
 	 */
 	private computeActiveTitle(): string {
 		if (this.lastExtractedTitle) {
-			return stripTrailingDots(this.lastExtractedTitle);
+			// The freshest action label (a tool message like "Editing auth.ts" / "Reading X", or an
+			// extracted reasoning header). Re-phrase it as a present-tense activity so the header shows
+			// what the model is actually doing - the common case where read/edit/search happens "inside
+			// thinking" - instead of a misleading generic "Thinking". Falls back to the raw label when it
+			// doesn't map to a known action (e.g. a custom tool's own message).
+			return formatActiveActivity(this.lastExtractedTitle, this.extractedTitles)
+				?? stripTrailingDots(this.lastExtractedTitle);
 		}
-		// This is a thinking/reasoning block, so default to "Thinking" (not "Working") even
-		// before any reasoning text has streamed in.
+		// Pure reasoning with no action yet: "Reasoning" reads more honestly than "Thinking" and stays
+		// distinct from the "Working" title used elsewhere.
 		return this.thinkingTitle;
 	}
 
@@ -835,13 +927,13 @@ export class ChatThinkingContentPart extends ChatCollapsibleContentPart implemen
 		if (this.streamingCompleted || this.element.isComplete) {
 			return;
 		}
-		// In non-fixed mode the expanded view manages its own title; only drive it here when
-		// collapsed. In fixed mode we always drive it (the content scrolls below the header).
-		if (this.fixedScrollingMode || !this._isExpanded.get()) {
-			const title = this.computeActiveTitle();
-			this.currentTitle = title;
-			super.setTitle(title);
-		}
+		// Always drive the header with the current action while active - in every display mode, whether
+		// collapsed or expanded. The header sits above the (expanded) content, so reflecting the live
+		// action ("Editing calc.py") there is what the user wants; previously, an expanded non-fixed
+		// block left the title stuck on the initial "Reasoning" for the whole turn.
+		const title = this.computeActiveTitle();
+		this.currentTitle = title;
+		super.setTitle(title);
 	}
 
 	/**
@@ -851,55 +943,55 @@ export class ChatThinkingContentPart extends ChatCollapsibleContentPart implemen
 	 */
 	private buildFinishedSummary(): string {
 		const titles = this.extractedTitles;
-		let edited = 0;
-		let read = 0;
+		// Count distinct FILES per file-action, not label strings: a single create/edit emits several
+		// labels for the same file (the streaming "Writing foo.js", then an "Edited foo.js" codeblock
+		// label), which previously inflated the count to "Edited 2 files" for one file. Keyed by
+		// filename with THINKING_ACTIVITY_RANK precedence so that same file resolves to one action.
+		const fileActions = new Map<string, ThinkingActivity>();
 		let searched = 0;
 		let ran = 0;
-		let lastEditedFile: string | undefined;
-
-		// Only treat a token as a filename if it actually looks like one (has an extension or a
-		// path separator) so we never surface tool names like "modifyFile" as the edited file.
-		const findFileName = (raw: string): string | undefined => {
-			const candidates = [
-				raw.match(/`([^`]+)`/)?.[1],
-				...(raw.match(/[\w\-./\\]+\.[a-zA-Z0-9]+/g) ?? [])
-			].filter((c): c is string => !!c);
-			for (const c of candidates) {
-				const cleaned = c.replace(/[)\].,]+$/, '');
-				if (/[./\\]/.test(cleaned) && /\.[a-zA-Z0-9]+$/.test(cleaned)) {
-					return cleaned.split(/[/\\]/).pop();
-				}
-			}
-			return undefined;
-		};
 
 		for (const raw of titles) {
-			const t = raw.toLowerCase();
-			if (/\b(edit|edited|editing|updat|modif|chang|refactor|creat|wrote|writing|replac)/.test(t)) {
-				edited++;
-				const file = findFileName(raw);
-				if (file) {
-					lastEditedFile = file;
+			// Shared classifier so the finished summary phrases actions the same way as the live header.
+			const activity = classifyThinkingActivity(raw);
+			if (activity === 'search') { searched++; continue; }
+			if (activity === 'run') { ran++; continue; }
+			if (activity === 'create' || activity === 'edit' || activity === 'read') {
+				// Count ONLY file-actions that name a real file. A single op emits several labels - the
+				// streaming "Preparing file edit" (no file), empty codeblock-wrapper "Edited file" (no
+				// file), the named "Writing calc.py", and an "Edited calc.py" codeblock label. Counting
+				// every label inflated one create into "Created 2 files". Real ops always name a file, so
+				// keying by filename (with precedence) collapses the duplicates and drops the fileless
+				// noise; search/run stay counted since they legitimately have no file.
+				const file = extractThinkingFileName(raw);
+				if (!file) { continue; }
+				const existing = fileActions.get(file);
+				if (!existing || THINKING_ACTIVITY_RANK[activity] > THINKING_ACTIVITY_RANK[existing]) {
+					fileActions.set(file, activity);
 				}
-			} else if (/\b(search|searching|grep|look(ed|ing)?\s+up|find|finding)/.test(t)) {
-				searched++;
-			} else if (/\b(ran|running|execut|terminal|command|\$)/.test(t)) {
-				ran++;
-			} else if (/\b(read|reading|review|examin|inspect|check)/.test(t)) {
-				read++;
 			}
 		}
 
+		const createdFiles = [...fileActions].filter(([, a]) => a === 'create').map(([f]) => f);
+		const editedFiles = [...fileActions].filter(([, a]) => a === 'edit').map(([f]) => f);
+		const readFiles = [...fileActions].filter(([, a]) => a === 'read').map(([f]) => f);
+		const created = createdFiles.length;
+		const edited = editedFiles.length;
+		const read = readFiles.length;
+
 		const parts: string[] = [];
-		if (edited === 1 && lastEditedFile) {
-			parts.push(localize('chat.thinking.summary.editedOne', 'Edited {0}', lastEditedFile));
-		} else if (edited === 1) {
-			parts.push(localize('chat.thinking.summary.editedFile', 'Edited a file'));
+		if (created === 1) {
+			parts.push(localize('chat.thinking.summary.createdOne', 'Created {0}', createdFiles[0]));
+		} else if (created > 1) {
+			parts.push(localize('chat.thinking.summary.createdMany', 'Created {0} files', created));
+		}
+		if (edited === 1) {
+			parts.push(localize('chat.thinking.summary.editedOne', 'Edited {0}', editedFiles[0]));
 		} else if (edited > 1) {
 			parts.push(localize('chat.thinking.summary.editedMany', 'Edited {0} files', edited));
 		}
 		if (read === 1) {
-			parts.push(localize('chat.thinking.summary.readOne', 'reviewed a file'));
+			parts.push(localize('chat.thinking.summary.readOne', 'reviewed {0}', readFiles[0]));
 		} else if (read > 1) {
 			parts.push(localize('chat.thinking.summary.readMany', 'reviewed {0} files', read));
 		}
@@ -1131,9 +1223,9 @@ export class ChatThinkingContentPart extends ChatCollapsibleContentPart implemen
 
 		this.lastExtractedTitle = toolCallLabel;
 
-		if (!this.fixedScrollingMode && !this._isExpanded.get()) {
-			this.setTitle(toolCallLabel);
-		}
+		// Reflect the new action in the header immediately, in every display mode (refreshActiveTitle
+		// re-phrases it as a present-tense activity and no-ops once the block is complete).
+		this.refreshActiveTitle();
 	}
 
 	private appendItemToDOM(

@@ -17,6 +17,7 @@ import { localize } from '../../../../../../nls.js';
 import { IFileService } from '../../../../../../platform/files/common/files.js';
 import { IMarkerService, MarkerSeverity } from '../../../../../../platform/markers/common/markers.js';
 import { IWorkspaceContextService } from '../../../../../../platform/workspace/common/workspace.js';
+import { IEditorService } from '../../../../../services/editor/common/editorService.js';
 import { CellUri } from '../../../../notebook/common/notebookCommon.js';
 import { INotebookService } from '../../../../notebook/common/notebookService.js';
 import { ChatModel } from '../../model/chatModel.js';
@@ -76,6 +77,23 @@ function buildReplaceEdits(content: string, oldString: string, newString: string
 		range: offsetToRange(content, start, oldString.length),
 		text: newString
 	}));
+}
+
+/**
+ * Build the live "+A / -R lines" fragment for the streaming edit card from the partial args.
+ * `added` = lines in the (still-streaming) newString, `removed` = lines in oldString (the text being
+ * replaced; empty for a create/full-write, so those show just "+A"). Each side is omitted when 0, so a
+ * pure create reads "+12" and a targeted edit reads "+3 / -2". Falls back to "0" if somehow both empty
+ * so the caller always has a non-empty count to render. Counts are on the raw args (fast, tick-friendly)
+ * rather than a line-by-line diff, which can't be accurate anyway while newString is still truncated.
+ */
+function formatStreamLineDelta(newString: string | undefined, oldString: string | undefined): string {
+	const added = typeof newString === 'string' && newString.length > 0 ? newString.split('\n').length : 0;
+	const removed = typeof oldString === 'string' && oldString.length > 0 ? oldString.split('\n').length : 0;
+	const parts: string[] = [];
+	if (added > 0) { parts.push(`+${added}`); }
+	if (removed > 0) { parts.push(`-${removed}`); }
+	return parts.length > 0 ? parts.join(' / ') : '0';
 }
 
 export const ModifyFileToolId = 'modifyFile';
@@ -151,7 +169,22 @@ export class ModifyFileTool implements IToolImpl {
 		@IChatService private readonly chatService: IChatService,
 		@INotebookService private readonly notebookService: INotebookService,
 		@IMarkerService private readonly markerService: IMarkerService,
+		@IEditorService private readonly editorService: IEditorService,
 	) { }
+
+	/**
+	 * Reveal a just-created/edited file in the workbench so the user actually sees it open, not only the
+	 * inline chat diff. Best-effort: `preserveFocus` keeps the caret in the chat input (so an agent turn
+	 * doesn't yank focus on every write), and a non-pinned PREVIEW tab means a burst of edits across many
+	 * files reuses a single tab instead of flooding the editor with one tab per file. Notebook cell URIs
+	 * are normalized back to the notebook document. Any failure is swallowed - opening is a convenience and
+	 * must never fail the edit itself.
+	 */
+	private _revealInEditor(fileUri: URI): void {
+		const resource = CellUri.parse(fileUri)?.notebook ?? fileUri;
+		this.editorService.openEditor({ resource, options: { preserveFocus: true, pinned: false } })
+			.catch(() => { /* best-effort UX only */ });
+	}
 
 	/**
 	 * After a successful file write, check for linter errors in that file only.
@@ -195,8 +228,8 @@ export class ModifyFileTool implements IToolImpl {
 			// live line count during this phase too, instead of a static "Preparing file edit", so the
 			// count ticks up in real time from the very first tokens.
 			if (newString !== undefined) {
-				const lineCount = newString.split('\n').length;
-				return { invocationMessage: localize('modifyFile.streaming.preparingLines', "Preparing file edit ({0} lines)", String(lineCount)) };
+				const delta = formatStreamLineDelta(newString, input.oldString);
+				return { invocationMessage: localize('modifyFile.streaming.preparingLines', "Preparing file edit ({0} lines)", delta) };
 			}
 			return { invocationMessage: localize('modifyFile.streaming.preparing', "Preparing file edit") };
 		}
@@ -211,11 +244,11 @@ export class ModifyFileTool implements IToolImpl {
 				: localize('modifyFile.streaming.editing', "Editing {0}");
 			return { invocationMessage: buildFileLinkInvocationMessage(template, fileName, fileUri) };
 		}
-		// `localize` fills {1} with the live count while the literal '{0}' survives for the file link.
-		const lineCount = newString.split('\n').length;
+		// `localize` fills {1} with the live +A/-R count while the literal '{0}' survives for the file link.
+		const delta = formatStreamLineDelta(newString, input.oldString);
 		const template = isFullWrite
-			? localize('modifyFile.streaming.writingLines', "Writing {0} ({1} lines)", '{0}', String(lineCount))
-			: localize('modifyFile.streaming.editingLines', "Editing {0} ({1} lines)", '{0}', String(lineCount));
+			? localize('modifyFile.streaming.writingLines', "Writing {0} ({1} lines)", '{0}', delta)
+			: localize('modifyFile.streaming.editingLines', "Editing {0} ({1} lines)", '{0}', delta);
 		return { invocationMessage: buildFileLinkInvocationMessage(template, fileName, fileUri) };
 	}
 
@@ -322,6 +355,7 @@ export class ModifyFileTool implements IToolImpl {
 						model.acceptResponseProgress(request, { kind: 'textEdit', uri: createUri, edits: [] });
 						model.acceptResponseProgress(request, { kind: 'textEdit', uri: createUri, edits });
 						model.acceptResponseProgress(request, { kind: 'textEdit', uri: createUri, edits: [], done: true });
+						this._revealInEditor(fileUri);
 						const lintFailureCreate = await this.getLintFailureAfterEdit(fileUri, params.path);
 						if (lintFailureCreate) { return lintFailureCreate; }
 						return createSuccess;
@@ -331,6 +365,7 @@ export class ModifyFileTool implements IToolImpl {
 				// Fallback (no editing session - e.g. non-chat context): write directly. Not
 				// checkpoint-tracked, but still creates the file the caller asked for.
 				await this.fileService.createFile(fileUri, VSBuffer.fromString(params.newString), { overwrite: false });
+				this._revealInEditor(fileUri);
 				const lintFailure = await this.getLintFailureAfterEdit(fileUri, params.path);
 				if (lintFailure) { return lintFailure; }
 				return createSuccess;
@@ -372,6 +407,7 @@ export class ModifyFileTool implements IToolImpl {
 						model.acceptResponseProgress(request, { kind: 'textEdit', uri, edits: [] });
 						model.acceptResponseProgress(request, { kind: 'textEdit', uri, edits });
 						model.acceptResponseProgress(request, { kind: 'textEdit', uri, edits: [], done: true });
+						this._revealInEditor(fileUri);
 						const successResult: IToolResult = { content: [{ kind: 'text', value: `Successfully replaced entire file "${params.path}". Proceed to the next step or goal.` }] };
 						const lintFailure = await this.getLintFailureAfterEdit(fileUri, params.path);
 						if (lintFailure) { return lintFailure; }
@@ -379,6 +415,7 @@ export class ModifyFileTool implements IToolImpl {
 					}
 				}
 				await this.fileService.writeFile(fileUri, VSBuffer.fromString(newContent));
+				this._revealInEditor(fileUri);
 				const successResultReplace: IToolResult = { content: [{ kind: 'text', value: `Successfully replaced entire file "${params.path}". Proceed to the next step or goal.` }] };
 				const lintFailureReplace = await this.getLintFailureAfterEdit(fileUri, params.path);
 				if (lintFailureReplace) { return lintFailureReplace; }
@@ -438,6 +475,7 @@ export class ModifyFileTool implements IToolImpl {
 					model.acceptResponseProgress(request, { kind: 'textEdit', uri, edits: [] });
 					model.acceptResponseProgress(request, { kind: 'textEdit', uri, edits });
 					model.acceptResponseProgress(request, { kind: 'textEdit', uri, edits: [], done: true });
+					this._revealInEditor(fileUri);
 					const successResultPartial: IToolResult = { content: [{ kind: 'text', value: successMessage }] };
 					const lintFailurePartial = await this.getLintFailureAfterEdit(fileUri, params.path);
 					if (lintFailurePartial) { return lintFailurePartial; }
@@ -446,6 +484,7 @@ export class ModifyFileTool implements IToolImpl {
 			}
 
 			await this.fileService.writeFile(fileUri, VSBuffer.fromString(newContent));
+			this._revealInEditor(fileUri);
 			const successResultFinal: IToolResult = { content: [{ kind: 'text', value: successMessage }] };
 			const lintFailureFinal = await this.getLintFailureAfterEdit(fileUri, params.path);
 			if (lintFailureFinal) { return lintFailureFinal; }
