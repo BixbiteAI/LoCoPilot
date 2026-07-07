@@ -26,6 +26,7 @@ import { ILabelService } from '../../../../../platform/label/common/label.js';
 import { ILogService } from '../../../../../platform/log/common/log.js';
 import { IProgressService, ProgressLocation } from '../../../../../platform/progress/common/progress.js';
 import { IQuickInputService } from '../../../../../platform/quickinput/common/quickInput.js';
+import { IUntitledTextResourceEditorInput } from '../../../../common/editor.js';
 import { IEditorService } from '../../../../services/editor/common/editorService.js';
 import { ITextFileService } from '../../../../services/textfile/common/textfiles.js';
 import { IAiEditTelemetryService } from '../../../editTelemetry/browser/telemetry/aiEditTelemetry/aiEditTelemetryService.js';
@@ -148,6 +149,15 @@ export class ApplyCodeBlockOperation {
 	}
 
 	public async run(context: ICodeBlockActionContext): Promise<void> {
+		// When no smart "apply" (code mapper) provider is available - for example when running
+		// against local models - there is nothing that can merge the edits into a file. Rather
+		// than silently doing nothing, fall back to opening the code block in a new editor so the
+		// action still produces a useful, visible result.
+		if (this.codeMapperService.providers.length === 0) {
+			await this.applyInNewEditor(context);
+			return;
+		}
+
 		let activeEditorControl = getEditableActiveCodeEditor(this.editorService);
 
 		const codemapperUri = await this.evaluateURIToUse(context.codemapperUri, activeEditorControl);
@@ -204,6 +214,28 @@ export class ApplyCodeBlockOperation {
 				totalCharacters: context.code.length,
 				codeMapper: result?.codeMapper,
 				editsProposed: !!result?.editsProposed,
+				totalLines: context.code.split('\n').length,
+				modelId: request?.modelId ?? '',
+				languageId: context.languageId,
+			});
+		}
+	}
+
+	private async applyInNewEditor(context: ICodeBlockActionContext): Promise<void> {
+		await this.editorService.openEditor({
+			contents: context.code,
+			languageId: context.languageId,
+			resource: undefined,
+		} satisfies IUntitledTextResourceEditorInput);
+
+		if (isResponseVM(context.element)) {
+			const requestId = context.element.requestId;
+			const request = context.element.session.getItems().find(item => item.id === requestId && isRequestVM(item)) as IChatRequestViewModel | undefined;
+			notifyUserAction(this.chatService, context, {
+				kind: 'apply',
+				codeBlockIndex: context.codeBlockIndex,
+				totalCharacters: context.code.length,
+				editsProposed: false,
 				totalLines: context.code.split('\n').length,
 				modelId: request?.modelId ?? '',
 				languageId: context.languageId,

@@ -46,6 +46,11 @@
 	margin: 1px;
 }
 
+/* Confirmation state for the "Copy" button: green check for a moment after copying. */
+.interactive-result-code-block .monaco-toolbar .action-item .codicon.code-block-action-copied {
+	color: var(--vscode-charts-green, var(--vscode-terminal-ansiGreen));
+}
+
 .interactive-result-code-block:hover .interactive-result-code-block-toolbar,
 .interactive-result-code-block .interactive-result-code-block-toolbar:focus-within,
 .interactive-result-code-block.focused .interactive-result-code-block-toolbar {

@@ -3,11 +3,13 @@
  *  Licensed under the MIT License. See License.txt in the project root for license information.
  *--------------------------------------------------------------------------------------------*/
 
-import { AsyncIterableProducer } from '../../../../../base/common/async.js';
+import { status } from '../../../../../base/browser/ui/aria/aria.js';
+import { AsyncIterableProducer, RunOnceScheduler } from '../../../../../base/common/async.js';
 import { CancellationToken } from '../../../../../base/common/cancellation.js';
 import { Codicon } from '../../../../../base/common/codicons.js';
 import { KeyCode, KeyMod } from '../../../../../base/common/keyCodes.js';
 import { Disposable, markAsSingleton } from '../../../../../base/common/lifecycle.js';
+import { ThemeIcon } from '../../../../../base/common/themables.js';
 import { ICodeEditor } from '../../../../../editor/browser/editorBrowser.js';
 import { ServicesAccessor } from '../../../../../editor/browser/editorExtensions.js';
 import { ICodeEditorService } from '../../../../../editor/browser/services/codeEditorService.js';
@@ -90,6 +92,76 @@ abstract class ChatCodeBlockAction extends Action2 {
 }
 
 const APPLY_IN_EDITOR_ID = 'workbench.action.chat.applyInEditor';
+const COPY_CODE_BLOCK_ID = 'workbench.action.chat.copyCodeBlock';
+const INSERT_AT_CURSOR_ID = 'workbench.action.chat.insertCodeBlock';
+
+/**
+ * Action view item for the code block toolbar buttons (Copy / Insert at Cursor / Apply)
+ * that briefly swaps the button's icon to a checkmark and its tooltip to a confirmation
+ * ("Copied!" / "Inserted!" / "Applied!") after being clicked, so the user gets clear
+ * visual feedback that the action ran.
+ */
+class CodeBlockFeedbackActionViewItem extends MenuEntryActionViewItem {
+
+	private static readonly FEEDBACK_DURATION = 1500;
+
+	private _showingFeedback = false;
+	private readonly _resetFeedback = this._register(new RunOnceScheduler(() => {
+		this._showingFeedback = false;
+		this.updateClass();
+		this.updateTooltip();
+	}, CodeBlockFeedbackActionViewItem.FEEDBACK_DURATION));
+
+	override async onClick(event: MouseEvent): Promise<void> {
+		await super.onClick(event);
+
+		// Show the confirmation state and schedule reverting back to the original icon.
+		this._showingFeedback = true;
+		this.updateClass();
+		this.updateTooltip();
+		status(this._feedbackLabel);
+		this._resetFeedback.schedule();
+	}
+
+	protected override updateClass(): void {
+		const label = this.label;
+		if (this._showingFeedback && label) {
+			// Hide the action's own icon and show a checkmark instead.
+			const baseIcon = this._commandAction.item.icon;
+			if (ThemeIcon.isThemeIcon(baseIcon)) {
+				label.classList.remove(...ThemeIcon.asClassNameArray(baseIcon));
+			}
+			label.classList.add(...ThemeIcon.asClassNameArray(Codicon.check), 'code-block-action-copied');
+		} else {
+			label?.classList.remove(...ThemeIcon.asClassNameArray(Codicon.check), 'code-block-action-copied');
+			super.updateClass();
+		}
+	}
+
+	protected get isShowingFeedback(): boolean {
+		return this._showingFeedback;
+	}
+
+	protected override getTooltip(): string {
+		if (this._showingFeedback) {
+			return this._feedbackLabel;
+		}
+		return super.getTooltip();
+	}
+
+	private get _feedbackLabel(): string {
+		switch (this._commandAction.id) {
+			case COPY_CODE_BLOCK_ID:
+				return localize('interactive.copyCodeBlock.copied', "Copied!");
+			case INSERT_AT_CURSOR_ID:
+				return localize('interactive.insertCodeBlock.inserted', "Inserted!");
+			case APPLY_IN_EDITOR_ID:
+				return localize('interactive.applyInEditor.applied', "Applied!");
+			default:
+				return localize('interactive.codeBlock.done', "Done!");
+		}
+	}
+}
 
 export class CodeBlockActionRendering extends Disposable implements IWorkbenchContribution {
 
@@ -102,28 +174,41 @@ export class CodeBlockActionRendering extends Disposable implements IWorkbenchCo
 	) {
 		super();
 
-		const disposable = actionViewItemService.register(MenuId.ChatCodeBlock, APPLY_IN_EDITOR_ID, (action, options) => {
+		// The Apply button keeps its dynamic "Apply to {file}" tooltip on top of the shared
+		// checkmark feedback behaviour.
+		const applyDisposable = actionViewItemService.register(MenuId.ChatCodeBlock, APPLY_IN_EDITOR_ID, (action, options) => {
 			if (!(action instanceof MenuItemAction)) {
 				return undefined;
 			}
-			return instantiationService.createInstance(class extends MenuEntryActionViewItem {
+			return instantiationService.createInstance(class extends CodeBlockFeedbackActionViewItem {
 				protected override getTooltip(): string {
+					const feedback = super.getTooltip();
 					const context = this._context;
-					if (isCodeBlockActionContext(context) && context.codemapperUri) {
+					if (!this.isShowingFeedback && isCodeBlockActionContext(context) && context.codemapperUri) {
 						const label = labelService.getUriLabel(context.codemapperUri, { relative: true });
 						return localize('interactive.applyInEditorWithURL.label', "Apply to {0}", label);
 					}
-					return super.getTooltip();
+					return feedback;
 				}
 				override setActionContext(newContext: unknown): void {
 					super.setActionContext(newContext);
 					this.updateTooltip();
 				}
-			}, action, undefined);
+			}, action, options);
 		});
+		markAsSingleton(applyDisposable);
 
-		// Reduces flicker a bit on reload/restart
-		markAsSingleton(disposable);
+		// Render the Copy and Insert at Cursor buttons with transient checkmark
+		// feedback ("Copied!" / "Inserted!") on click.
+		for (const id of [COPY_CODE_BLOCK_ID, INSERT_AT_CURSOR_ID]) {
+			const feedbackDisposable = actionViewItemService.register(MenuId.ChatCodeBlock, id, (action, options) => {
+				if (!(action instanceof MenuItemAction)) {
+					return undefined;
+				}
+				return instantiationService.createInstance(CodeBlockFeedbackActionViewItem, action, options);
+			});
+			markAsSingleton(feedbackDisposable);
+		}
 	}
 }
 
@@ -131,7 +216,7 @@ export function registerChatCodeBlockActions() {
 	registerAction2(class CopyCodeBlockAction extends Action2 {
 		constructor() {
 			super({
-				id: 'workbench.action.chat.copyCodeBlock',
+				id: COPY_CODE_BLOCK_ID,
 				title: localize2('interactive.copyCodeBlock.label', "Copy"),
 				f1: false,
 				category: CHAT_CATEGORY,
