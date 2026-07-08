@@ -711,6 +711,128 @@ export const LOCOPILOT_DEFAULT_CATALOG: readonly ICatalogModel[] = [
 		defaultHidden: true,
 		contextWindow: 131072,
 	},
+
+	// =========================================================================================
+	// Dedicated code models (2026 additions): widen provider + size variety across RAM tiers.
+	// Mistral Codestral (FIM autocomplete), DeepSeek-Coder-V2-Lite (light MoE), BigCode StarCoder2
+	// ladder, plus Microsoft Phi-4 full and 01.AI Yi-Coder for extra provider coverage. Repo ids
+	// verified as public HuggingFace GGUF repos.
+	// =========================================================================================
+
+	// ---- StarCoder2 (BigCode) - fully-open code models; 3B/7B are base completion (great for FIM) ----
+	{
+		catalogId: 'starcoder2-3b-gguf',
+		displayName: 'StarCoder2 3B',
+		vendor: 'BigCode',
+		blurb: 'Tiny fully-open code model; strong fill-in-the-middle completion. Runs on 8 GB.',
+		repoId: 'second-state/StarCoder2-3B-GGUF',
+		supportsVision: false,
+		format: 'Q4_K_M',
+		engine: 'gguf',
+		approxSizeBytes: Math.round(1.9 * GB),
+		minRamGB: 8,
+		tier: '8 GB',
+		contextWindow: 16384,
+		defaultHidden: true,
+	},
+	{
+		catalogId: 'starcoder2-7b-gguf',
+		displayName: 'StarCoder2 7B',
+		vendor: 'BigCode',
+		blurb: 'Mid-size fully-open code model; base completion / FIM. Fits 16 GB.',
+		repoId: 'second-state/StarCoder2-7B-GGUF',
+		supportsVision: false,
+		format: 'Q4_K_M',
+		engine: 'gguf',
+		approxSizeBytes: Math.round(4.3 * GB),
+		minRamGB: 16,
+		tier: '16 GB',
+		contextWindow: 16384,
+		defaultHidden: true,
+	},
+	{
+		catalogId: 'starcoder2-15b-instruct-gguf',
+		displayName: 'StarCoder2 15B',
+		vendor: 'BigCode',
+		blurb: 'Self-aligned instruct code model, permissive & transparent pipeline; 600+ languages.',
+		repoId: 'bartowski/starcoder2-15b-instruct-GGUF',
+		supportsVision: false,
+		format: 'Q4_K_M',
+		engine: 'gguf',
+		approxSizeBytes: Math.round(9.6 * GB),
+		minRamGB: 16,
+		tier: '16 GB',
+		contextWindow: 16384,
+		defaultHidden: true,
+	},
+
+	// ---- DeepSeek-Coder-V2-Lite (DeepSeek) - 16B MoE, ~2.4B active: fast, low-RAM friendly ----
+	{
+		catalogId: 'deepseek-coder-v2-lite-gguf',
+		displayName: 'DeepSeek-Coder-V2-Lite 16B MoE',
+		vendor: 'DeepSeek',
+		blurb: 'MoE coder (16B total, ~2.4B active - fast); strong code + FIM. Fits 16 GB.',
+		repoId: 'bartowski/DeepSeek-Coder-V2-Lite-Instruct-GGUF',
+		supportsVision: false,
+		format: 'Q4_K_M',
+		engine: 'gguf',
+		approxSizeBytes: Math.round(10.4 * GB),
+		minRamGB: 16,
+		tier: '16 GB',
+		contextWindow: 163840,
+		defaultHidden: true,
+	},
+
+	// ---- Codestral 22B (Mistral) - best fill-in-the-middle / autocomplete; 80+ languages ----
+	{
+		catalogId: 'codestral-22b-gguf',
+		displayName: 'Codestral 22B',
+		vendor: 'Mistral',
+		blurb: 'Purpose-built coder; best fill-in-the-middle autocomplete, 80+ languages.',
+		repoId: 'bartowski/Codestral-22B-v0.1-GGUF',
+		supportsVision: false,
+		format: 'Q4_K_M',
+		engine: 'gguf',
+		approxSizeBytes: Math.round(13.3 * GB),
+		minRamGB: 24,
+		tier: '32 GB+',
+		contextWindow: 32768,
+		defaultHidden: true,
+	},
+
+	// ---- Phi-4 14B (Microsoft) - full model (you already ship the mini) ----
+	{
+		catalogId: 'phi-4-14b-gguf',
+		displayName: 'Phi-4 14B',
+		vendor: 'Microsoft',
+		blurb: 'Microsoft Phi-4 (14B); strong reasoning + code for its size. Fits 16 GB.',
+		repoId: 'unsloth/phi-4-GGUF',
+		supportsVision: false,
+		format: 'Q4_K_M',
+		engine: 'gguf',
+		approxSizeBytes: Math.round(9 * GB),
+		minRamGB: 16,
+		tier: '16 GB',
+		contextWindow: 16384,
+		defaultHidden: true,
+	},
+
+	// ---- Yi-Coder 9B (01.AI) - extra provider variety; 128K context ----
+	{
+		catalogId: 'yi-coder-9b-chat-gguf',
+		displayName: 'Yi-Coder 9B',
+		vendor: '01.AI',
+		blurb: 'Compact 01.AI coder with 128K context; good repo-level tasks. Fits 16 GB.',
+		repoId: 'bartowski/Yi-Coder-9B-Chat-GGUF',
+		supportsVision: false,
+		format: 'Q4_K_M',
+		engine: 'gguf',
+		approxSizeBytes: Math.round(5 * GB),
+		minRamGB: 16,
+		tier: '16 GB',
+		contextWindow: 131072,
+		defaultHidden: true,
+	},
 ];
 
 /** Build the stored-model record to seed from a catalog entry (a HuggingFace/local model with no localPath yet). */
