@@ -122,7 +122,7 @@ export class ChatViewTitleControl extends Disposable {
 		}));
 
 		// Context usage widget
-		this.contextUsageWidget = this._register(this.instantiationService.createInstance(ChatContextUsageWidget));
+		this.contextUsageWidget = this._register(this.instantiationService.createInstance(ChatContextUsageWidget, false));
 		elements.contextUsage.appendChild(this.contextUsageWidget.domNode);
 		this._register(this.contextUsageWidget.onDidChangeVisibility(() => {
 			this.checkHeight();

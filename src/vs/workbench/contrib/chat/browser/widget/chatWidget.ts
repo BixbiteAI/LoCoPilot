@@ -236,6 +236,11 @@ export class ChatWidget extends Disposable implements IChatWidget {
 	private requestInProgress: IContextKey<boolean>;
 	/** Tracks the rising edge of an active request so we can reset live server stats once per turn. */
 	private _liveStatsTimerActive = false;
+	// Per-session context-window usage (sessionId -> last prompt-token count), so the input indicator is
+	// scoped to each session: the live-stats service is global, so without keying by session a freshly
+	// opened session would show the previous session's numbers. Recorded only while a session is actively
+	// generating (so the global figure is never mis-attributed), and read back by session on every change.
+	private readonly _contextUsageBySession = new Map<string, number>();
 	private agentInInput: IContextKey<boolean>;
 	private currentRequest: Promise<void> | undefined;
 
@@ -1800,6 +1805,19 @@ export class ChatWidget extends Disposable implements IChatWidget {
 				this.liveStatsService.reset();
 			}
 			this._liveStatsTimerActive = timerActive;
+			// Context-usage indicator, scoped per session. Record the live-stats prompt count under this
+			// session's id only while it is actively generating (so the global figure can't be attributed
+			// to a different session being viewed), then feed the indicator this session's own stored value
+			// (undefined -> hidden), so a new/other session never shows the previous session's usage.
+			const sessionId = this.viewModel.model.sessionId;
+			const promptTokens = this.liveStatsService.get()?.promptTokens;
+			if (timerActive && typeof promptTokens === 'number' && promptTokens > 0) {
+				this._contextUsageBySession.set(sessionId, promptTokens);
+			}
+			this.inputPart.updateContextUsage(
+				this._contextUsageBySession.get(sessionId),
+				this.input.selectedLanguageModel.get()?.metadata.maxInputTokens,
+			);
 			this.inputPart.setRequestInProgress(timerActive, () => {
 				const last = vm.getItems().findLast(item => isResponseVM(item)) as { response?: { value: ReadonlyArray<{ kind: string; value?: string | string[] }> }; contentUpdateTimings?: { lastWordCount: number; impliedWordLoadRate: number } } | undefined;
 				const timings = last?.contentUpdateTimings;

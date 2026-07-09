@@ -38,6 +38,16 @@
 	order: -1;
 }
 
+/* Compact mode (chat input toolbar): show only the pie icon; the usage is revealed as a hover
+	tooltip instead of an inline label, so the row's other icons never get pushed aside. */
+.chat-context-usage-widget.compact .token-label {
+	display: none;
+}
+
+.chat-context-usage-widget.compact {
+	cursor: default;
+}
+
 /* Expand on hover, focus, or when details are shown (expanded class) */
 .chat-context-usage-widget:hover .token-label,
 .chat-context-usage-widget:focus .token-label,

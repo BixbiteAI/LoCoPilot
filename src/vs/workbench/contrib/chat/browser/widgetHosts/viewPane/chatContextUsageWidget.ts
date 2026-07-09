@@ -9,6 +9,7 @@ import { EventType, addDisposableListener } from '../../../../../../base/browser
 import { Emitter, Event } from '../../../../../../base/common/event.js';
 import { Disposable, MutableDisposable } from '../../../../../../base/common/lifecycle.js';
 import { autorun, IObservable, observableValue } from '../../../../../../base/common/observable.js';
+import { getDefaultHoverDelegate } from '../../../../../../base/browser/ui/hover/hoverDelegateFactory.js';
 import { localize } from '../../../../../../nls.js';
 import { IHoverService } from '../../../../../../platform/hover/browser/hover.js';
 import { IInstantiationService } from '../../../../../../platform/instantiation/common/instantiation.js';
@@ -110,6 +111,10 @@ export class ChatContextUsageWidget extends Disposable {
 	private currentData: IChatContextUsageData | undefined;
 
 	constructor(
+		// In compact mode the widget shows only the pie icon and reveals the usage as a hover tooltip
+		// (rather than an inline label that would grow the row and push neighbouring icons). Used by the
+		// chat input toolbar; the session title bar uses the default (inline-label) mode.
+		private readonly compact: boolean = false,
 		@IHoverService private readonly hoverService: IHoverService,
 		@IInstantiationService private readonly instantiationService: IInstantiationService,
 		@ILanguageModelsService private readonly languageModelsService: ILanguageModelsService,
@@ -118,30 +123,64 @@ export class ChatContextUsageWidget extends Disposable {
 
 		this.domNode = $('.chat-context-usage-widget.action-label');
 		this.domNode.style.display = 'none';
-		this.domNode.setAttribute('tabindex', '0');
-		this.domNode.setAttribute('role', 'button');
 		this.domNode.setAttribute('aria-label', localize('contextUsageLabel', "Context window usage"));
+		if (this.compact) {
+			// Compact mode is a passive indicator (hover-only), so it isn't a focusable/clickable button.
+			this.domNode.classList.add('compact');
+		} else {
+			this.domNode.setAttribute('tabindex', '0');
+			this.domNode.setAttribute('role', 'button');
+		}
 
 		// Icon container (always visible, contains the pie chart)
 		const iconContainer = this.domNode.appendChild($('.icon-container'));
 		this.progressIndicator = new CircularProgressIndicator();
 		iconContainer.appendChild(this.progressIndicator.domNode);
 
-		// Token label (shown on hover/focus)
+		// Token label (shown on hover/focus in the default mode; hidden in compact mode via CSS).
 		this.tokenLabel = this.domNode.appendChild($('.token-label'));
 
-		// Show details popup on click
-		this._register(addDisposableListener(this.domNode, EventType.CLICK, () => {
-			this.showDetails();
-		}));
+		if (this.compact) {
+			// Compact mode: surface the usage as a proper hover tooltip instead of the inline label,
+			// so hovering (not clicking) reveals "Used X / Y context window (Z% used)".
+			this._register(this.hoverService.setupManagedHover(
+				getDefaultHoverDelegate('mouse'),
+				this.domNode,
+				() => this.getHoverText() ?? '',
+			));
+		}
 
-		// Show details on Enter/Space for keyboard accessibility
-		this._register(addDisposableListener(this.domNode, EventType.KEY_DOWN, (e: KeyboardEvent) => {
-			if (e.key === 'Enter' || e.key === ' ') {
-				e.preventDefault();
+		// In compact mode the usage is shown via the hover tooltip, so skip the click/keyboard details
+		// popup entirely (it would otherwise open a redundant box on click).
+		if (!this.compact) {
+			// Show details popup on click
+			this._register(addDisposableListener(this.domNode, EventType.CLICK, () => {
 				this.showDetails();
-			}
-		}));
+			}));
+
+			// Show details on Enter/Space for keyboard accessibility
+			this._register(addDisposableListener(this.domNode, EventType.KEY_DOWN, (e: KeyboardEvent) => {
+				if (e.key === 'Enter' || e.key === ' ') {
+					e.preventDefault();
+					this.showDetails();
+				}
+			}));
+		}
+	}
+
+	// Compact-mode tooltip text, e.g. "Used 2K / 13K context window (10% used)".
+	private getHoverText(): string | undefined {
+		if (!this.currentData) {
+			return undefined;
+		}
+		const { promptTokens, maxInputTokens, percentage } = this.currentData;
+		return localize(
+			'contextUsageHover',
+			"Used {0} / {1} context window ({2}% used)",
+			this.formatTokenCount(promptTokens, 1),
+			this.formatTokenCount(maxInputTokens, 0),
+			percentage.toFixed(0),
+		);
 	}
 
 	private showDetails(): void {
@@ -201,6 +240,22 @@ export class ChatContextUsageWidget extends Disposable {
 				this.updateFromResponse(response, modelId);
 			}
 		});
+	}
+
+	/**
+	 * Directly set the usage from explicit token figures, bypassing the `response.result.usage` path
+	 * (which LoCoPilot's pipeline doesn't populate). Used by the chat input's indicator, which is fed
+	 * from the live-stats service's real prompt-token count for the session's latest turn.
+	 */
+	setUsage(promptTokens: number | undefined, maxInputTokens: number | undefined): void {
+		this._lastRequestDisposable.clear();
+		if (!promptTokens || promptTokens <= 0 || !maxInputTokens || maxInputTokens <= 0) {
+			this.hide();
+			return;
+		}
+		const percentage = Math.min(100, (promptTokens / maxInputTokens) * 100);
+		this.render(percentage, promptTokens, maxInputTokens);
+		this.show();
 	}
 
 	private updateFromResponse(response: IChatResponseModel, modelId: string): void {

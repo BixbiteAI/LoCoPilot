@@ -252,7 +252,13 @@ export class LoCoPilotLanguageModelProvider extends Disposable implements ILangu
 			this.liveStatsService.update({
 				// usage is authoritative for token counts; timings.predicted_n tracks it live mid-stream.
 				completionTokens: usage?.completion_tokens ?? timings?.predicted_n,
-				promptTokens: usage?.prompt_tokens ?? timings?.prompt_n,
+				// Full prompt size = whole context sent to the model. `usage.prompt_tokens` already includes
+				// cached tokens, but `timings.prompt_n` counts only the *newly evaluated* prompt tokens and
+				// excludes the KV-cache reuse (`timings.cache_n`) - so on a cached round (e.g. a follow-up
+				// tool call) prompt_n alone is a tiny number. Add cache_n back so the reported prompt is the
+				// true context length and never dips mid-stream.
+				promptTokens: usage?.prompt_tokens
+					?? (typeof timings?.prompt_n === 'number' ? timings.prompt_n + (timings?.cache_n ?? 0) : undefined),
 				tokensPerSecond: typeof timings?.predicted_per_second === 'number'
 					? Math.round(timings.predicted_per_second)
 					: undefined,

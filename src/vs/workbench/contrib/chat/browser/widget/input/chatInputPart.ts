@@ -90,6 +90,7 @@ import { ChatAgentLocation, ChatConfiguration, ChatModeKind, validateChatMode } 
 import { IChatEditingSession, IModifiedFileEntry, ModifiedFileEntryState } from '../../../common/editing/chatEditingService.js';
 import { ILanguageModelChatMetadata, ILanguageModelChatMetadataAndIdentifier, ILanguageModelsService } from '../../../common/languageModels.js';
 import { IChatModelInputState, IChatRequestModeInfo, IInputModel } from '../../../common/model/chatModel.js';
+import { ChatContextUsageWidget } from '../../widgetHosts/viewPane/chatContextUsageWidget.js';
 import { getChatSessionType } from '../../../common/model/chatUri.js';
 import { IChatResponseViewModel } from '../../../common/model/chatViewModel.js';
 import { IChatAgentService } from '../../../common/participants/chatAgents.js';
@@ -282,6 +283,11 @@ export class ChatInputPart extends Disposable implements IHistoryNavigationWidge
 	private readonly _widgetController = this._register(new MutableDisposable<ChatInputPartWidgetController>());
 
 	private _timerBar: HTMLElement | undefined;
+	// Session context-usage indicator shown inside the input toolbar, just before the send button.
+	// It reuses the same ChatContextUsageWidget as the session title bar, so it reflects the real
+	// prompt size sent to the model this session (post auto-summarization) rather than a per-request
+	// estimate, and themes exactly like the other toolbar icons.
+	private _contextUsageWidget: ChatContextUsageWidget | undefined;
 	private _timerIntervalId: number | undefined;
 	private _timerStartTime: number | undefined;
 	// Total time (ms) the request has spent paused waiting for human approval. This is
@@ -2045,6 +2051,13 @@ export class ChatInputPart extends Disposable implements IHistoryNavigationWidge
 		}));
 		this.executeToolbar.getElement().classList.add('chat-execute-toolbar');
 		this.executeToolbar.context = { widget } satisfies IChatExecuteActionContext;
+
+		// Context-usage indicator: a small circular meter that sits to the left of the send button and
+		// fills as the session's prompt fills the model's context window. Hovering shows the exact
+		// "used / total tokens" figure; clicking opens the per-category breakdown. Reuses the shared
+		// ChatContextUsageWidget so it stays in sync with the session title bar's indicator.
+		this._contextUsageWidget = this._register(this.instantiationService.createInstance(ChatContextUsageWidget, true));
+		toolbarsContainer.insertBefore(this._contextUsageWidget.domNode, this.executeToolbar.getElement());
 		this._register(this.executeToolbar.onDidChangeMenuItems(() => {
 			if (this.cachedWidth && typeof this.cachedExecuteToolbarWidth === 'number' && this.cachedExecuteToolbarWidth !== this.executeToolbar.getItemsWidth()) {
 				this.layout(this.cachedWidth);
@@ -2169,6 +2182,13 @@ export class ChatInputPart extends Disposable implements IHistoryNavigationWidge
 		const thousands = count / 1000;
 		// One decimal place, but drop a trailing ".0" (e.g. 2000 -> "2k", not "2.0k").
 		return `${thousands.toFixed(1).replace(/\.0$/, '')}k`;
+	}
+
+	// Set the context-usage indicator to an exact figure (or hide it when `promptTokens` is undefined).
+	// The caller (ChatWidget) owns the per-session bookkeeping, so this is a pure pass-through with no
+	// retained state - critical so one session's usage never leaks into another.
+	public updateContextUsage(promptTokens: number | undefined, maxInputTokens: number | undefined): void {
+		this._contextUsageWidget?.setUsage(promptTokens, maxInputTokens);
 	}
 
 	public setRequestInProgress(inProgress: boolean, getStats?: () => { lastWordCount: number; impliedWordLoadRate: number; thinkingWordCount?: number; serverTokens?: number; serverTokensPerSecond?: number; serverPromptTokens?: number; serverEstimated?: boolean } | undefined, paused?: boolean): void {
