@@ -26,9 +26,9 @@ import { MANAGE_CHAT_COMMAND_ID } from '../../../common/constants.js';
 import { ILanguageModelChatMetadataAndIdentifier } from '../../../common/languageModels.js';
 import { DEFAULT_MODEL_PICKER_CATEGORY } from '../../../common/widget/input/modelPickerWidget.js';
 import { ChatInputPickerActionViewItem, IChatInputPickerOptions } from './chatInputPickerActionItem.js';
-import { ICustomLanguageModelsService, ICustomLanguageModel, getCustomModelListLabel } from '../../../common/customLanguageModelsService.js';
+import { ICustomLanguageModelsService, ICustomLanguageModel, getCustomModelListLabel, LOCOPILOT_AUTO_MODEL_ID } from '../../../common/customLanguageModelsService.js';
 import { LOCOPILOT_SETTINGS_SECTION_LIST_MODELS } from '../../chatManagement/locopilotSettingsEditorInput.js';
-import { getRecommendedRepoId } from '../../locopilotModelCatalog.js';
+import { getRecommendedRepoId, resolveAutoModel } from '../../locopilotModelCatalog.js';
 import { ITimerService } from '../../../../../services/timer/browser/timerService.js';
 import { ExtensionIdentifier } from '../../../../../../platform/extensions/common/extensions.js';
 import { ILoCoPilotLocalModelRunner } from '../../locopilotLocalModelRunner.js';
@@ -104,10 +104,12 @@ function selectCustomModelInChat(delegate: IModelPickerDelegate, customLanguageM
  * drives the picker label/checkmark) so that declining while a request is running leaves the previous
  * selection - and therefore the picker label - completely untouched. No-ops on decline.
  */
-async function applyCustomModelSelection(delegate: IModelPickerDelegate, customLanguageModelsService: ICustomLanguageModelsService, customModelId: string): Promise<void> {
+async function applyCustomModelSelection(delegate: IModelPickerDelegate, customLanguageModelsService: ICustomLanguageModelsService, customModelId: string, skipConfirm = false): Promise<void> {
 	const customModel = customLanguageModelsService.getCustomModels().find(m => m.id === customModelId);
 	const modelName = customModel ? getCustomModelListLabel(customModel) : customModelId;
-	if (!await delegate.confirmModelChange(modelName)) {
+	// `skipConfirm` is set when the picked model is the one already running the in-flight request (e.g. the
+	// model Auto currently resolves to): the switch interrupts nothing, so don't prompt "change anyway?".
+	if (!skipConfirm && !await delegate.confirmModelChange(modelName)) {
 		return;
 	}
 	customLanguageModelsService.setSelectedCustomModelId(customModelId);
@@ -192,6 +194,52 @@ interface IModelPickerState {
 	showHidden: boolean;
 }
 
+// ---- "Auto" picker mode ----------------------------------------------------------------------------
+// Auto is a pinned pseudo-entry at the top of the picker (sentinel LOCOPILOT_AUTO_MODEL_ID). Selecting it
+// stores the sentinel; the agent resolves it per request to a concrete downloaded catalog model (running
+// server wins, else the most capable model that fits the detected RAM - see resolveAutoModel). The picker
+// mirrors that same resolution so the label ("Auto (Qwen3.5 9B)"), the row description, and the row's
+// start/stop icon always show which model Auto is going to use.
+
+/** Sits above Custom Models (order 100) and the standard categories, so Auto is always the first row. */
+const AUTO_PICKER_CATEGORY = { label: localize('chat.modelPicker.autoCategory', "Auto"), order: 0 };
+
+/** The model Auto currently resolves to, mirroring the agent's per-request resolution. */
+function resolveAutoModelForPicker(customLanguageModelsService: ICustomLanguageModelsService, localModelRunner: ILoCoPilotLocalModelRunner, timerService: ITimerService): ICustomLanguageModel | undefined {
+	return resolveAutoModel(
+		customLanguageModelsService.getCustomModels(),
+		detectedRamGB(timerService),
+		id => localModelRunner.isServerRunning(id) || localModelRunner.isServerStarting(id)
+	);
+}
+
+/** Picker-button label for Auto: "Auto (<resolved model>)", or plain "Auto" when nothing is downloaded yet. */
+function autoDisplayName(resolved: ICustomLanguageModel | undefined): string {
+	return resolved
+		? localize('chat.modelPicker.autoWithModel', "Auto ({0})", getCustomModelListLabel(resolved))
+		: localize('chat.modelPicker.auto', "Auto");
+}
+
+/** Synthetic picker/chat entry for the Auto selection (the sentinel is not a registered language model). */
+function buildAutoModelEntry(resolved: ICustomLanguageModel | undefined): ILanguageModelChatMetadataAndIdentifier {
+	return {
+		identifier: LOCOPILOT_AUTO_MODEL_ID,
+		metadata: {
+			extension: new ExtensionIdentifier('custom'),
+			name: autoDisplayName(resolved),
+			id: LOCOPILOT_AUTO_MODEL_ID,
+			vendor: 'locopilot-auto',
+			version: '1.0.0',
+			family: 'auto',
+			maxInputTokens: 0,
+			maxOutputTokens: 0,
+			isDefaultForLocation: {},
+			isUserSelectable: true,
+			modelPickerCategory: AUTO_PICKER_CATEGORY
+		}
+	};
+}
+
 function modelDelegateToWidgetActionsProvider(delegate: IModelPickerDelegate, telemetryService: ITelemetryService, customLanguageModelsService: ICustomLanguageModelsService, actionWidgetService: IActionWidgetService, timerService: ITimerService, state: IModelPickerState, localModelRunner: ILoCoPilotLocalModelRunner, commandService: ICommandService): IActionWidgetDropdownActionProvider {
 	return {
 		getActions: () => {
@@ -212,6 +260,51 @@ function modelDelegateToWidgetActionsProvider(delegate: IModelPickerDelegate, te
 
 			// Convert custom models to ILanguageModelChatMetadataAndIdentifier format
 			const selectedCustomModelId = customLanguageModelsService.getSelectedCustomModelId();
+
+			// Pinned "Auto" row (always first). Shows which model Auto currently resolves to; when Auto is
+			// selected and that model is startable, the row gets the same start/stop control a selected
+			// local model row has, so the server can be started/stopped straight from the Auto row.
+			const autoResolved = resolveAutoModelForPicker(customLanguageModelsService, localModelRunner, timerService);
+			const isAutoSelected = selectedCustomModelId === LOCOPILOT_AUTO_MODEL_ID;
+			const autoStartStop = isAutoSelected && autoResolved && isStartableLocalModel(autoResolved)
+				? buildStartStopControl(localModelRunner, actionWidgetService, commandService, autoResolved.id)
+				: undefined;
+			// The concrete model the current selection actually runs on: the resolved model when Auto is
+			// selected, else the selected model id. Used to suppress the "a request is running, change anyway?"
+			// prompt when switching to Auto would NOT change the model in use (so nothing gets interrupted).
+			const currentEffectiveModelId = selectedCustomModelId === LOCOPILOT_AUTO_MODEL_ID
+				? autoResolved?.id
+				: (selectedCustomModelId ?? delegate.currentModel.get()?.identifier);
+			const autoAction: IActionWidgetDropdownAction = {
+				id: LOCOPILOT_AUTO_MODEL_ID,
+				enabled: true,
+				checked: isAutoSelected,
+				icon: autoStartStop?.icon,
+				category: AUTO_PICKER_CATEGORY,
+				class: undefined,
+				description: autoResolved
+					? localize('chat.modelPicker.auto.uses', "Uses {0}", getCustomModelListLabel(autoResolved))
+					: localize('chat.modelPicker.auto.none', "No local model downloaded yet"),
+				tooltip: autoStartStop
+					? autoStartStop.tooltip
+					: localize('chat.modelPicker.auto.tooltip', "Automatically picks the best downloaded local model for your system"),
+				label: localize('chat.modelPicker.auto', "Auto"),
+				hover: undefined,
+				keepDropdownOpen: !!autoStartStop,
+				run: autoStartStop
+					? autoStartStop.run
+					: async () => {
+						// Only gate on the running-request confirmation when picking Auto would actually change
+						// the model in use. If Auto resolves to the same model that's already running the request
+						// (running-server-wins), the switch interrupts nothing, so skip the prompt and apply silently.
+						const modelUnchanged = !!autoResolved && autoResolved.id === currentEffectiveModelId;
+						if (!modelUnchanged && !await delegate.confirmModelChange(localize('chat.modelPicker.auto', "Auto"))) {
+							return;
+						}
+						customLanguageModelsService.setSelectedCustomModelId(LOCOPILOT_AUTO_MODEL_ID);
+						delegate.setModel(buildAutoModelEntry(autoResolved));
+					}
+			};
 			const customModelActions: IActionWidgetDropdownAction[] = customModels.map(customModel => {
 				// "Best for you": sized for this machine's RAM/engine. Star the label and explain it on hover,
 				// matching the model-list badge so the maximal pick is one obvious click from the conservative default.
@@ -264,7 +357,10 @@ function modelDelegateToWidgetActionsProvider(delegate: IModelPickerDelegate, te
 					run: startStop
 						? startStop.run
 						: () => {
-							applyCustomModelSelection(delegate, customLanguageModelsService, customModel.id);
+							// Skip the running-request prompt when this model is already the one in use (e.g. the
+							// model Auto currently resolves to) - re-selecting it concretely interrupts nothing.
+							const modelUnchanged = customModel.id === currentEffectiveModelId;
+							applyCustomModelSelection(delegate, customLanguageModelsService, customModel.id, modelUnchanged);
 						}
 				};
 			});
@@ -318,20 +414,10 @@ function modelDelegateToWidgetActionsProvider(delegate: IModelPickerDelegate, te
 				};
 			});
 
-			if (models.length === 0 && customModelActions.length === 0) {
-				// Show a fake "Auto" entry when no models are available
-				return [{
-					id: 'auto',
-					enabled: true,
-					checked: true,
-					category: DEFAULT_MODEL_PICKER_CATEGORY,
-					class: undefined,
-					description: undefined,
-					tooltip: localize('chat.modelPicker.auto', "Auto"),
-					label: localize('chat.modelPicker.auto', "Auto"),
-					hover: undefined,
-					run: () => { }
-				} satisfies IActionWidgetDropdownAction];
+			if (models.length === 0 && customModelActions.length === 0 && hiddenModelActions.length === 0) {
+				// No models at all: the real Auto row is still offered (selecting it and sending shows the
+				// in-chat starter download card).
+				return [autoAction];
 			}
 
 			const standardModelActions = models.map(model => {
@@ -362,9 +448,9 @@ function modelDelegateToWidgetActionsProvider(delegate: IModelPickerDelegate, te
 				} satisfies IActionWidgetDropdownAction;
 			});
 
-			// Combine standard models, visible custom models, and (when revealed via the sticky footer toggle)
-			// hidden custom models. The Show/Hide toggle itself lives in the bottom action bar (sticky footer).
-			return [...standardModelActions, ...customModelActions, ...hiddenModelActions];
+			// Combine the pinned Auto row, standard models, visible custom models, and (when revealed via the
+			// sticky footer toggle) hidden custom models. The Show/Hide toggle lives in the bottom action bar.
+			return [autoAction, ...standardModelActions, ...customModelActions, ...hiddenModelActions];
 		}
 	};
 }
@@ -508,7 +594,9 @@ export class ModelPickerActionItem extends ChatInputPickerActionViewItem {
 		const initialCustomModelId = customLanguageModelsService.getSelectedCustomModelId();
 		let initialLabel = localize('chat.modelPicker.auto', "Auto");
 
-		if (initialCustomModelId) {
+		if (initialCustomModelId === LOCOPILOT_AUTO_MODEL_ID) {
+			initialLabel = autoDisplayName(resolveAutoModelForPicker(customLanguageModelsService, localModelRunner, timerService));
+		} else if (initialCustomModelId) {
 			const customModel = customLanguageModelsService.getCustomModels().find(m => m.id === initialCustomModelId);
 			if (customModel && !customModel.hidden) {
 				initialLabel = getCustomModelListLabel(customModel);
@@ -543,12 +631,34 @@ export class ModelPickerActionItem extends ChatInputPickerActionViewItem {
 
 		// While the picker is open, flip the selected model's start/stop icon as its server transitions
 		// (starting -> running -> stopped). refreshItems() is a no-op when the dropdown is closed.
-		this._register(localModelRunner.onDidServerStateChange(() => actionWidgetService.refreshItems()));
+		// When Auto is selected, a server transition can also CHANGE what Auto resolves to (a running
+		// server wins), so re-derive the "Auto (<model>)" button label as well.
+		this._register(localModelRunner.onDidServerStateChange(() => {
+			actionWidgetService.refreshItems();
+			if (customLanguageModelsService.getSelectedCustomModelId() === LOCOPILOT_AUTO_MODEL_ID) {
+				this.currentModel = buildAutoModelEntry(resolveAutoModelForPicker(customLanguageModelsService, localModelRunner, timerService));
+				this.updateTooltip();
+				if (this.element) {
+					this.renderLabel(this.element);
+				}
+			}
+		}));
 
 		// Listen for model changes from the delegate and custom models
 		this._register(autorun(t => {
 			const model = delegate.currentModel.read(t);
 			const selectedCustomModelId = customLanguageModelsService.getSelectedCustomModelId();
+
+			// Auto mode: the sentinel is not a stored model - synthesize its entry (label shows the
+			// currently-resolved model) and never fall through to the "model was deleted" cleanup.
+			if (selectedCustomModelId === LOCOPILOT_AUTO_MODEL_ID) {
+				this.currentModel = buildAutoModelEntry(resolveAutoModelForPicker(customLanguageModelsService, localModelRunner, timerService));
+				this.updateTooltip();
+				if (this.element) {
+					this.renderLabel(this.element);
+				}
+				return;
+			}
 
 			// If a custom model is selected, use it; otherwise use the standard model
 			if (selectedCustomModelId) {
@@ -591,6 +701,15 @@ export class ModelPickerActionItem extends ChatInputPickerActionViewItem {
 			// Re-read the current state and update
 			const selectedCustomModelId = customLanguageModelsService.getSelectedCustomModelId();
 			const model = delegate.currentModel.get();
+
+			// Auto mode: re-resolve (a finished download or deletion changes what Auto uses) and re-label.
+			if (selectedCustomModelId === LOCOPILOT_AUTO_MODEL_ID) {
+				this.currentModel = buildAutoModelEntry(resolveAutoModelForPicker(customLanguageModelsService, localModelRunner, timerService));
+				if (this.element) {
+					this.renderLabel(this.element);
+				}
+				return;
+			}
 
 			if (selectedCustomModelId) {
 				const customModel = customLanguageModelsService.getCustomModels().find(m => m.id === selectedCustomModelId);

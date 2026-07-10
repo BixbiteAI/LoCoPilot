@@ -993,3 +993,155 @@ export function findDraftPairing(repoId: string | undefined): { draftRepoId: str
 	const entry = LOCOPILOT_DEFAULT_CATALOG.find(e => e.repoId === repoId && !!e.draftRepoId);
 	return entry?.draftRepoId ? { draftRepoId: entry.draftRepoId, draftFormat: entry.draftFormat ?? '' } : undefined;
 }
+
+// ---- "Auto" model mode -------------------------------------------------------------------------------
+//
+// "Auto" is a picker mode (sentinel LOCOPILOT_AUTO_MODEL_ID, see customLanguageModelsService.ts), not a
+// model. The helpers below turn it into a concrete choice:
+//  - resolveAutoModel: which downloaded catalog model Auto uses for a request (running server wins,
+//    otherwise the most capable model that fits the detected RAM).
+//  - getAutoStarterPicks: the labelled download suggestions shown in chat when NOTHING is downloaded yet.
+// Scope is deliberately catalog llama.cpp/MLX models only - cloud, Ollama, and user-added local models are
+// never auto-picked (they remain manually selectable).
+
+/**
+ * Find a catalog entry by repo id alone. Post-download enrichment rewrites a stored model's `format` from
+ * the catalog quant ('Q4_K_M') to the family ('gguf'), so the exact repo+format lookup of
+ * {@link findCatalogEntry} misses after enrichment; this loose variant is what Auto resolution uses.
+ * GGUF and MLX builds live in different HF repos, so repo id alone is unambiguous for suitability data.
+ */
+export function findCatalogEntryByRepoId(repoId: string | undefined): ICatalogModel | undefined {
+	return repoId ? LOCOPILOT_DEFAULT_CATALOG.find(e => e.repoId === repoId) : undefined;
+}
+
+/** MoE checkpoints ("35B-A3B") activate few parameters per token - fast for their quality, so Auto prefers them. */
+function isMoEEntry(entry: ICatalogModel): boolean {
+	return /-A\d+(\.\d+)?B/i.test(entry.repoId) || /\bMoE\b/i.test(entry.displayName);
+}
+
+/** A stored model is in Auto's candidate pool when it is a downloaded, visible catalog llama.cpp/MLX model. */
+export function isAutoCandidate(model: ICustomLanguageModel): boolean {
+	return model.type === 'local'
+		&& model.provider === 'huggingface'
+		&& !!model.localPath
+		&& !model.isDownloading
+		&& !model.hidden
+		&& !!findCatalogEntryByRepoId(model.modelName);
+}
+
+/**
+ * Resolve the Auto selection to a concrete downloaded model, or undefined when nothing qualifies (the
+ * caller then shows the starter-picks download card).
+ *
+ * Order:
+ *  1. A candidate whose server is already RUNNING (or starting) wins outright - reusing the warm server
+ *     avoids a cold weight load, and this is also what makes Auto sticky within a session.
+ *  2. Otherwise the most capable candidate that FITS the detected RAM: rank by the catalog RAM tier
+ *     (`minRamGB` already encodes "comfortable", so fitting it is the OOM/thermal guard), then prefer the
+ *     curated "Best for you" repo, then architecture - MoE > MTP > MLX > plain GGUF (faster for equal
+ *     quality). RAM unknown (`ramGB <= 0`) restricts to the 8 GB tier, the safe-everywhere floor.
+ */
+export function resolveAutoModel(
+	models: readonly ICustomLanguageModel[],
+	ramGB: number,
+	isServerActive: (modelId: string) => boolean
+): ICustomLanguageModel | undefined {
+	const candidates = models.filter(isAutoCandidate);
+	if (candidates.length === 0) {
+		return undefined;
+	}
+
+	const running = candidates.find(m => isServerActive(m.id));
+	if (running) {
+		return running;
+	}
+
+	const effectiveRam = ramGB > 0 ? ramGB : 8;
+	const recommendedRepoId = getRecommendedRepoId(ramGB);
+	let bestModel: ICustomLanguageModel | undefined;
+	let bestScore = -1;
+	for (const model of candidates) {
+		const entry = findCatalogEntryByRepoId(model.modelName)!;
+		if (entry.minRamGB > effectiveRam) {
+			continue; // would OOM/thrash on this machine - never auto-picked.
+		}
+		let score = entry.minRamGB * 1000; // capability first: highest RAM tier that fits.
+		if (entry.repoId === recommendedRepoId) {
+			score += 500; // the curated "Best for you" pick wins its tier.
+		}
+		if (isMoEEntry(entry)) {
+			score += 300;
+		} else if (entry.mtp || model.mtp) {
+			score += 200;
+		} else if (entry.engine === 'mlx') {
+			score += 100;
+		}
+		if (entry.recommended) {
+			score += 50;
+		}
+		if (score > bestScore) {
+			bestScore = score;
+			bestModel = model;
+		}
+	}
+	return bestModel;
+}
+
+export type AutoStarterSlot = 'best' | 'balanced' | 'fast';
+
+export interface IAutoStarterPick {
+	readonly slot: AutoStarterSlot;
+	/** Short user-facing slot title, e.g. "Best for your system". */
+	readonly title: string;
+	/** One-line reason shown under the title so the user knows which to download. */
+	readonly reason: string;
+	readonly entry: ICatalogModel;
+}
+
+/** The "Fastest" starter pick: smallest current-gen build, snappy on any machine. */
+const AUTO_FAST_REPO_ID = 'unsloth/Qwen3.5-2B-MTP-GGUF';
+
+/**
+ * The up-to-three labelled download suggestions Auto offers in chat when the user has no local model yet:
+ * best = the curated "Best for you" for the RAM tier, balanced = the conservative first-run default
+ * ({@link getDefaultPickerRepoId}, one tier below max), fast = the smallest current-gen build. Slots that
+ * collapse to the same repo on small machines are deduped (first slot wins), so 8 GB users may see two.
+ */
+export function getAutoStarterPicks(ramGB: number): IAutoStarterPick[] {
+	const slots: { slot: AutoStarterSlot; title: string; reason: string; repoId: string }[] = [
+		{
+			slot: 'best',
+			title: 'Best for your system',
+			reason: 'Highest quality that runs comfortably on your hardware.',
+			repoId: getRecommendedRepoId(ramGB),
+		},
+		{
+			slot: 'balanced',
+			title: 'Balanced',
+			reason: 'Good quality with extra headroom - a safe everyday default.',
+			repoId: getDefaultPickerRepoId(ramGB),
+		},
+		{
+			slot: 'fast',
+			title: 'Fastest',
+			reason: 'Quickest replies for simple edits and questions.',
+			repoId: AUTO_FAST_REPO_ID,
+		},
+	];
+	const picks: IAutoStarterPick[] = [];
+	const seen = new Set<string>();
+	for (const s of slots) {
+		if (seen.has(s.repoId)) {
+			continue;
+		}
+		// Prefer the GGUF build for suggestions (MLX twins are separate repos and stay available in the list).
+		const entry = LOCOPILOT_DEFAULT_CATALOG.find(e => e.repoId === s.repoId && e.engine === 'gguf')
+			?? findCatalogEntryByRepoId(s.repoId);
+		if (!entry) {
+			continue;
+		}
+		seen.add(s.repoId);
+		picks.push({ slot: s.slot, title: s.title, reason: s.reason, entry });
+	}
+	return picks;
+}

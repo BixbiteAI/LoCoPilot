@@ -236,6 +236,15 @@ export interface ICustomLanguageModelsService {
 	autoDisableVision(id: string): Promise<boolean>;
 }
 
+/**
+ * Reserved sentinel stored in the selected-model slot when the user picks "Auto" in the chat model picker.
+ * It is NOT a real model id: consumers that see it must resolve it to a concrete downloaded local model
+ * (see resolveAutoModel in locopilotModelCatalog.ts) - a running local server wins, otherwise the most
+ * capable downloaded catalog model that fits the detected RAM. Persisted like a normal selection so Auto
+ * survives restarts.
+ */
+export const LOCOPILOT_AUTO_MODEL_ID = 'locopilot.auto';
+
 const STORAGE_KEY = 'customLanguageModels';
 const STORAGE_KEY_SELECTED = 'customLanguageModelSelected';
 const SECRET_PREFIX = 'customLanguageModel:';
@@ -330,6 +339,10 @@ export class CustomLanguageModelsService extends Disposable implements ICustomLa
 	private _clearSelectedIfUnavailable(): boolean {
 		const prev = this.selectedCustomModelId;
 		if (!prev) {
+			return false;
+		}
+		// The Auto sentinel is not a stored model - it must never be cleared as "deleted".
+		if (prev === LOCOPILOT_AUTO_MODEL_ID) {
 			return false;
 		}
 		const model = this.models.find(m => m.id === prev);

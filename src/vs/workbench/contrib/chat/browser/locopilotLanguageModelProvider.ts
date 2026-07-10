@@ -19,13 +19,13 @@ import { ILogService } from '../../../../platform/log/common/log.js';
 import { IRequestService } from '../../../../platform/request/common/request.js';
 import { IConfigurationService } from '../../../../platform/configuration/common/configuration.js';
 import { ChatConfiguration, ChatAgentLocation } from '../common/constants.js';
-import { getDefaultPickerRepoId } from './locopilotModelCatalog.js';
+import { getDefaultPickerRepoId, resolveAutoModel } from './locopilotModelCatalog.js';
 import { ITimerService } from '../../../services/timer/browser/timerService.js';
 import { ILoCoPilotFileLog } from './locopilotFileLog.js';
 import { INotificationService } from '../../../../platform/notification/common/notification.js';
 import { IStorageService } from '../../../../platform/storage/common/storage.js';
 import { getReasoningEffort, reasoningBudgetTokens, ReasoningEffort } from '../common/locopilotReasoningEffort.js';
-import { ICustomLanguageModelsService, ICustomLanguageModel, getCustomModelListLabel, deriveTokenLimits, defaultContextWindow, TOOL_FAILURE_DISABLE_THRESHOLD, customModelSupportsVision } from '../common/customLanguageModelsService.js';
+import { ICustomLanguageModelsService, ICustomLanguageModel, getCustomModelListLabel, deriveTokenLimits, defaultContextWindow, TOOL_FAILURE_DISABLE_THRESHOLD, customModelSupportsVision, LOCOPILOT_AUTO_MODEL_ID } from '../common/customLanguageModelsService.js';
 import { AGENT_LOOP_EXCLUDED_TOOL_IDS, LOCAL_MODEL_EXCLUDED_TOOL_IDS, isToolExcluded } from '../common/tools/builtinTools/agentToolPolicy.js';
 import { IChatMessage, ILanguageModelChatInfoOptions, ILanguageModelChatMetadataAndIdentifier, ILanguageModelChatProvider, ILanguageModelChatResponse, ILanguageModelsService, IChatResponsePart, ChatMessageRole } from '../common/languageModels.js';
 import { IWorkbenchContribution } from '../../../common/contributions.js';
@@ -341,6 +341,20 @@ export class LoCoPilotLanguageModelProvider extends Disposable implements ILangu
 
 	async sendChatRequest(modelId: string, messages: IChatMessage[], from: ExtensionIdentifier, options: { [name: string]: unknown }, token: CancellationToken): Promise<ILanguageModelChatResponse> {
 		this._log(`[LoCoPilot Provider] sendChatRequest called for modelId: ${modelId}`);
+		// Safety net for the "Auto" sentinel: the agent path resolves it before reaching here, but any other
+		// caller (extension API, future paths) gets the same resolution instead of a "model not found" error.
+		if (modelId === LOCOPILOT_AUTO_MODEL_ID) {
+			const resolved = resolveAutoModel(
+				this.customLanguageModelsService.getCustomModels(),
+				this._detectedRamGB(),
+				id => this.localModelRunner.isServerRunning(id) || this.localModelRunner.isServerStarting(id)
+			);
+			if (!resolved) {
+				throw new Error('Auto has no downloaded local model to use yet. Download one of the suggested models from the chat panel (or LoCoPilot Settings), then send your message again.');
+			}
+			this._log(`[LoCoPilot Provider] Auto resolved to model: ${getCustomModelListLabel(resolved)} (${resolved.id})`);
+			modelId = resolved.id;
+		}
 		const customModel = this.customLanguageModelsService.getCustomModels().find(m => m.id === modelId);
 		if (!customModel) {
 			this.logService.error(`[LoCoPilot Provider] Model ${modelId} not found in custom models. Available: ${this.customLanguageModelsService.getCustomModels().map(m => m.id).join(', ')}`);

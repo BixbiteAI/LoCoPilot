@@ -35,8 +35,9 @@ import { IChatEditorLocationData, IChatProgress, IChatService } from '../../comm
 import { IChatRequestToolEntry, IChatRequestVariableEntry, isPromptFileVariableEntry, isPromptTextVariableEntry } from '../../common/attachments/chatVariableEntries.js';
 import { ChatAgentLocation, ChatConfiguration, ChatModeKind } from '../../common/constants.js';
 import { ChatMessageRole, IChatMessage, ILanguageModelsService } from '../../common/languageModels.js';
-import { ICustomLanguageModelsService, getCustomModelListLabel, needsDownloadOrPullRetry } from '../../common/customLanguageModelsService.js';
-import { findCatalogEntry } from '../locopilotModelCatalog.js';
+import { ICustomLanguageModelsService, ICustomLanguageModel, getCustomModelListLabel, needsDownloadOrPullRetry, LOCOPILOT_AUTO_MODEL_ID } from '../../common/customLanguageModelsService.js';
+import { findCatalogEntry, getAutoStarterPicks, resolveAutoModel, IAutoStarterPick } from '../locopilotModelCatalog.js';
+import { ITimerService } from '../../../../services/timer/browser/timerService.js';
 import { LOCOPILOT_SETTINGS_SECTION_LIST_MODELS } from '../chatManagement/locopilotSettingsEditorInput.js';
 import { IFileService } from '../../../../../platform/files/common/files.js';
 import { ITextModelService } from '../../../../../editor/common/services/resolverService.js';
@@ -997,6 +998,70 @@ function buildDownloadPromptMarkdown(model: Parameters<typeof getCustomModelList
 	return markSystemNotice(new MarkdownString(text, { isTrusted: { enabledCommands: [...DOWNLOAD_PROMPT_TRUSTED_COMMANDS] } }));
 }
 
+/**
+ * Build the "Auto starter picks" card shown in chat when Auto is selected but no suitable local model is
+ * downloaded yet: up to three labelled suggestions (best for this system / balanced / fastest), each with
+ * its own Download link, so the user can fetch one - or all - without leaving the chat panel. Rows whose
+ * download is already running show live progress instead of the Download link. Picks whose seeded model
+ * record was deleted by the user are skipped; if none remain, fall back to pointing at the model list.
+ */
+function buildAutoStarterPicksMarkdown(ramGB: number, allModels: readonly ICustomLanguageModel[]): MarkdownString {
+	const openModelList = createMarkdownCommandLink({
+		title: 'Open Model List',
+		id: 'workbench.action.chat.openLoCoPilotSettings',
+		arguments: [{ section: LOCOPILOT_SETTINGS_SECTION_LIST_MODELS }],
+	});
+
+	// Match each pick to its seeded model record (the download command needs the stored model id). Seeded
+	// models store the catalog repoId as modelName; match on that (format may have been enriched away).
+	const rows: { pick: IAutoStarterPick; model: ICustomLanguageModel }[] = [];
+	for (const pick of getAutoStarterPicks(ramGB)) {
+		const model = allModels.find(m => m.provider === 'huggingface' && m.modelName === pick.entry.repoId);
+		if (model && !model.localPath) {
+			rows.push({ pick, model });
+		}
+	}
+
+	const ramText = ramGB > 0 ? ` (${Math.round(ramGB)} GB RAM detected)` : '';
+	const lines: string[] = [
+		`**Auto** picks the best local model for your machine, but you don't have one downloaded yet.`,
+	];
+
+	if (rows.length === 0) {
+		lines.push('', `Download a model from the model list to get started. ${openModelList}`);
+	} else {
+		lines.push('', `Recommended for your system${ramText}:`, '');
+		for (const { pick, model } of rows) {
+			const entry = pick.entry;
+			lines.push(`**${pick.title} - ${entry.displayName}**  `);
+			lines.push(`_${pick.reason}_  `);
+			const specs: string[] = [entry.engine === 'mlx' ? 'MLX · Apple Silicon' : `GGUF · ${entry.format}`];
+			const size = _formatModelBytes(entry.approxSizeBytes);
+			if (size) { specs.push(`~${size}`); }
+			specs.push(`${entry.minRamGB} GB+ RAM`);
+			if (model.isDownloading) {
+				const stopLink = createMarkdownCommandLink({
+					title: 'Stop Download',
+					id: 'locopilot.cancelModelDownload',
+					arguments: [model.id],
+				});
+				lines.push(`${specs.map(s => `\`${s}\``).join('  ')} - downloading, ${model.downloadProgress ?? 0}% complete | ${stopLink}`);
+			} else {
+				const downloadLink = createMarkdownCommandLink({
+					title: 'Download',
+					id: 'locopilot.downloadModel',
+					arguments: [model.id],
+				});
+				lines.push(`${specs.map(s => `\`${s}\``).join('  ')} - ${downloadLink}`);
+			}
+			lines.push('');
+		}
+		lines.push(`Download any of them (or all - they stay available in the model picker). Once a download finishes, send your message again and Auto will start the model for you. ${openModelList}`);
+	}
+
+	return markSystemNotice(new MarkdownString(lines.join('\n'), { isTrusted: { enabledCommands: [...DOWNLOAD_PROMPT_TRUSTED_COMMANDS] } }));
+}
+
 // -----------------------------------------------------------------------------------------------------
 
 /**
@@ -1099,6 +1164,7 @@ export class LoCoPilotBuiltInAgent extends Disposable implements IChatAgentImple
 		@ILoCoPilotAgentSettingsService private readonly agentSettingsService: ILoCoPilotAgentSettingsService,
 		@ILoCoPilotProjectMemoryService private readonly projectMemoryService: ILoCoPilotProjectMemoryService,
 		@ILoCoPilotLocalModelRunner private readonly localModelRunner: ILoCoPilotLocalModelRunner,
+		@ITimerService private readonly timerService: ITimerService,
 	) {
 		super();
 		const maxIterations = this.agentSettingsService.getMaxIterationsPerRequest();
@@ -1151,12 +1217,46 @@ export class LoCoPilotBuiltInAgent extends Disposable implements IChatAgentImple
 	 * prompt cache to warm and a real call would cost tokens for nothing. Best-effort and deduped.
 	 */
 	private _maybeWarmSelectedModelPrefix(): void {
-		const modelId = this.customLanguageModelsService.getSelectedCustomModelId()
-			?? this.customLanguageModelsService.getChatSelectableCustomModels()[0]?.id;
+		const modelId = this._effectiveSelectedModelId();
 		if (!modelId) {
 			return;
 		}
 		this._warmModelPrefixIfNeeded(modelId);
+	}
+
+	/**
+	 * Detected system RAM in GB (0 if not yet measured). Same guarded startup-metrics read the provider and
+	 * model picker use, so Auto resolution here always agrees with the badges they show.
+	 */
+	private _detectedRamGB(): number {
+		try {
+			const totalmem = this.timerService.startupMetrics.totalmem;
+			return typeof totalmem === 'number' && totalmem > 0 ? totalmem / (1024 * 1024 * 1024) : 0;
+		} catch {
+			return 0;
+		}
+	}
+
+	/** Resolve the "Auto" sentinel to a concrete downloaded catalog model, or undefined when none qualifies. */
+	private _resolveAutoModel(): ICustomLanguageModel | undefined {
+		return resolveAutoModel(
+			this.customLanguageModelsService.getCustomModels(),
+			this._detectedRamGB(),
+			id => this.localModelRunner.isServerRunning(id) || this.localModelRunner.isServerStarting(id)
+		);
+	}
+
+	/**
+	 * The model id the current selection effectively points at: the explicit selection (with the Auto
+	 * sentinel resolved to a concrete model), else the first chat-ready custom model. Used by the
+	 * prefix-warming paths, which need a real, downloaded model id.
+	 */
+	private _effectiveSelectedModelId(): string | undefined {
+		const selected = this.customLanguageModelsService.getSelectedCustomModelId();
+		if (selected === LOCOPILOT_AUTO_MODEL_ID) {
+			return this._resolveAutoModel()?.id;
+		}
+		return selected ?? this.customLanguageModelsService.getChatSelectableCustomModels()[0]?.id;
 	}
 
 	/**
@@ -1183,8 +1283,7 @@ export class LoCoPilotBuiltInAgent extends Disposable implements IChatAgentImple
 		}
 		// Only warm the model the user is actually on, so we don't spend a full prefill warming a server
 		// that is about to be evicted for a different model.
-		const selectedId = this.customLanguageModelsService.getSelectedCustomModelId()
-			?? this.customLanguageModelsService.getChatSelectableCustomModels()[0]?.id;
+		const selectedId = this._effectiveSelectedModelId();
 		if (modelId !== selectedId) {
 			return;
 		}
@@ -2184,6 +2283,27 @@ Message: ${firstMessage.substring(0, 500)}`;
 
 		// Try to find a custom model - check userSelectedModelId first, then widget's selection, then selected custom model, then any custom model
 		let modelId = userSelectedModelId || widgetModelId || selectedCustomModelId;
+
+		// The Auto sentinel is authoritative when stored: any other picker choice CLEARS it (standard rows
+		// set it to undefined, custom rows overwrite it), so a stored sentinel means the user's last picker
+		// action was Auto. The widget's own model id can be a stale restore (Auto is not a registered
+		// language model, so the widget can't restore it after a reload) - don't let that stale id win.
+		if (selectedCustomModelId === LOCOPILOT_AUTO_MODEL_ID) {
+			modelId = LOCOPILOT_AUTO_MODEL_ID;
+		}
+
+		// "Auto" mode: resolve the sentinel to a concrete downloaded catalog model (running server wins,
+		// else the most capable model that fits this machine's RAM). When NOTHING suitable is downloaded
+		// yet, show the starter card - up to three labelled download suggestions - instead of an error.
+		if (modelId === LOCOPILOT_AUTO_MODEL_ID) {
+			const resolved = this._resolveAutoModel();
+			if (!resolved) {
+				progress([{ kind: 'markdownContent', content: buildAutoStarterPicksMarkdown(this._detectedRamGB(), this.customLanguageModelsService.getCustomModels()) }]);
+				return {};
+			}
+			this._log(`[LoCoPilot] Auto resolved to model: ${getCustomModelListLabel(resolved)} (${resolved.id})`);
+			modelId = resolved.id;
+		}
 
 		// If no explicit selection, fall back to any downloaded (chat-ready) model so we don't accidentally
 		// queue a download prompt when the user hasn't picked one yet.

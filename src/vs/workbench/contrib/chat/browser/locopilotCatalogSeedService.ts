@@ -14,7 +14,7 @@ import { IProductService } from '../../../../platform/product/common/productServ
 import { IRequestService } from '../../../../platform/request/common/request.js';
 import { IStorageService, StorageScope, StorageTarget } from '../../../../platform/storage/common/storage.js';
 import { IWorkbenchContribution } from '../../../common/contributions.js';
-import { ICustomLanguageModelsService } from '../common/customLanguageModelsService.js';
+import { ICustomLanguageModelsService, LOCOPILOT_AUTO_MODEL_ID } from '../common/customLanguageModelsService.js';
 import { isAppleSiliconMac } from './locopilotMlxServer.js';
 import { LOCOPILOT_DEFAULT_CATALOG, catalogModelToSeed, catalogDefaultHidden, findCatalogEntry, ICatalogModel, CatalogEngine } from './locopilotModelCatalog.js';
 
@@ -142,6 +142,14 @@ export class LoCoPilotCatalogSeedContribution extends Disposable implements IWor
 		this._storeSeededIds(seededIds);
 		if (seeded > 0) {
 			this.logService.info(`[LoCoPilot Catalog] Seeded ${seeded} model(s) (Apple Silicon: ${appleSilicon}, remote entries: ${remote.length}).`);
+		}
+
+		// Fresh installs default the chat picker to "Auto" (which resolves to the best downloaded model, or
+		// shows the starter download card when nothing is downloaded yet). Strictly first-run only - existing
+		// installs (seededIds already populated) and any explicit user selection are never touched.
+		if (isFirstRun && !this.customLanguageModelsService.getSelectedCustomModelId()) {
+			this.customLanguageModelsService.setSelectedCustomModelId(LOCOPILOT_AUTO_MODEL_ID);
+			this.logService.info('[LoCoPilot Catalog] First run: defaulting chat model selection to Auto.');
 		}
 
 		if (!isFirstRun && newlyFromRemote.length > 0) {
