@@ -37,6 +37,14 @@ export interface IModelPickerDelegate {
 	readonly currentModel: IObservable<ILanguageModelChatMetadataAndIdentifier | undefined>;
 	setModel(model: ILanguageModelChatMetadataAndIdentifier): void;
 	getModels(): ILanguageModelChatMetadataAndIdentifier[];
+	/**
+	 * Gate a model switch. If a chat request is currently running, switching the model would break the
+	 * ongoing execution, so the delegate prompts the user to confirm. Returns `true` when the switch may
+	 * proceed (no request running, or the user confirmed - in which case the running request is cancelled)
+	 * and `false` when the user chose to keep the current model. Must be awaited BEFORE any selection side
+	 * effects run, so nothing changes when the user declines. `newModelName` is shown in the prompt.
+	 */
+	confirmModelChange(newModelName: string): Promise<boolean>;
 }
 
 type ChatModelChangeClassification = {
@@ -89,6 +97,21 @@ function selectCustomModelInChat(delegate: IModelPickerDelegate, customLanguageM
 			modelPickerCategory: { label: 'Custom Models', order: 100 }
 		}
 	});
+}
+
+/**
+ * Confirm-then-select a custom model. The confirmation MUST run before `setSelectedCustomModelId` (which
+ * drives the picker label/checkmark) so that declining while a request is running leaves the previous
+ * selection - and therefore the picker label - completely untouched. No-ops on decline.
+ */
+async function applyCustomModelSelection(delegate: IModelPickerDelegate, customLanguageModelsService: ICustomLanguageModelsService, customModelId: string): Promise<void> {
+	const customModel = customLanguageModelsService.getCustomModels().find(m => m.id === customModelId);
+	const modelName = customModel ? getCustomModelListLabel(customModel) : customModelId;
+	if (!await delegate.confirmModelChange(modelName)) {
+		return;
+	}
+	customLanguageModelsService.setSelectedCustomModelId(customModelId);
+	selectCustomModelInChat(delegate, customLanguageModelsService, customModelId);
 }
 
 /**
@@ -241,8 +264,7 @@ function modelDelegateToWidgetActionsProvider(delegate: IModelPickerDelegate, te
 					run: startStop
 						? startStop.run
 						: () => {
-							customLanguageModelsService.setSelectedCustomModelId(customModel.id);
-							selectCustomModelInChat(delegate, customLanguageModelsService, customModel.id);
+							applyCustomModelSelection(delegate, customLanguageModelsService, customModel.id);
 						}
 				};
 			});
@@ -273,7 +295,10 @@ function modelDelegateToWidgetActionsProvider(delegate: IModelPickerDelegate, te
 							class: ThemeIcon.asClassName(Codicon.eye),
 							tooltip: localize('chat.modelPicker.unhide.tooltip', 'Show this model in the picker'),
 							run: async () => {
-								// Unhide then select - close picker after both
+								// Confirm before changing anything if a request is running, then unhide + select.
+								if (!await delegate.confirmModelChange(getCustomModelListLabel(hiddenModel))) {
+									return;
+								}
 								await customLanguageModelsService.hideCustomModel(hiddenModel.id, false);
 								customLanguageModelsService.setSelectedCustomModelId(hiddenModel.id);
 								selectCustomModelInChat(delegate, customLanguageModelsService, hiddenModel.id);
@@ -282,6 +307,9 @@ function modelDelegateToWidgetActionsProvider(delegate: IModelPickerDelegate, te
 						})
 					],
 					run: async () => {
+						if (!await delegate.confirmModelChange(getCustomModelListLabel(hiddenModel))) {
+							return;
+						}
 						await customLanguageModelsService.hideCustomModel(hiddenModel.id, false);
 						customLanguageModelsService.setSelectedCustomModelId(hiddenModel.id);
 						selectCustomModelInChat(delegate, customLanguageModelsService, hiddenModel.id);
@@ -318,7 +346,11 @@ function modelDelegateToWidgetActionsProvider(delegate: IModelPickerDelegate, te
 					tooltip: model.metadata.name,
 					hover: undefined,
 					label: model.metadata.name,
-					run: () => {
+					run: async () => {
+						// Gate the switch first so declining while a request runs leaves the selection untouched.
+						if (!await delegate.confirmModelChange(model.metadata.name)) {
+							return;
+						}
 						const previousModel = delegate.currentModel.get();
 						customLanguageModelsService.setSelectedCustomModelId(undefined);
 						telemetryService.publicLog2<ChatModelChangeEvent, ChatModelChangeClassification>('chat.modelChange', {

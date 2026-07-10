@@ -66,6 +66,7 @@ import { ILabelService } from '../../../../../../platform/label/common/label.js'
 import { WorkbenchList } from '../../../../../../platform/list/browser/listService.js';
 import { ILogService } from '../../../../../../platform/log/common/log.js';
 import { ICommandService } from '../../../../../../platform/commands/common/commands.js';
+import { IDialogService } from '../../../../../../platform/dialogs/common/dialogs.js';
 import { ObservableMemento, observableMemento } from '../../../../../../platform/observable/common/observableMemento.js';
 import { bindContextKey } from '../../../../../../platform/observable/common/platformObservableUtils.js';
 import { IStorageService, StorageScope, StorageTarget } from '../../../../../../platform/storage/common/storage.js';
@@ -498,6 +499,7 @@ export class ChatInputPart extends Disposable implements IHistoryNavigationWidge
 		@IAgentSessionsService private readonly agentSessionsService: IAgentSessionsService,
 		@IWorkspaceContextService private readonly workspaceContextService: IWorkspaceContextService,
 		@ICommandService private readonly commandService: ICommandService,
+		@IDialogService private readonly dialogService: IDialogService,
 	) {
 		super();
 
@@ -1966,7 +1968,31 @@ export class ChatInputPart extends Disposable implements IHistoryNavigationWidge
 							this.setCurrentLanguageModel(model, true /* userInitiated */);
 							this.renderAttachedContext();
 						},
-						getModels: () => this.getModels()
+						getModels: () => this.getModels(),
+						confirmModelChange: async (newModelName: string) => {
+							// A running request drives the agent loop against the current model; switching
+							// mid-flight would break the ongoing execution. Only prompt in that case, and only
+							// return true (apply) once the user confirms - cancelling the in-flight request.
+							const requestInProgress = this._widget?.viewModel?.model.requestInProgress.get();
+							if (!requestInProgress) {
+								return true;
+							}
+							const result = await this.dialogService.confirm({
+								type: 'warning',
+								message: localize('chat.modelChange.confirm.message', "A request is still running. Change the model anyway?"),
+								detail: localize('chat.modelChange.confirm.detail', "Switching to \"{0}\" while a request is in progress will stop the current execution.", newModelName),
+								primaryButton: localize('chat.modelChange.confirm.primary', "Change Model"),
+								cancelButton: localize('chat.modelChange.confirm.cancel', "Keep Current"),
+							});
+							if (!result.confirmed) {
+								return false;
+							}
+							const sessionResource = this._widget?.viewModel?.model.sessionResource;
+							if (sessionResource) {
+								this.chatService.cancelCurrentRequestForSession(sessionResource);
+							}
+							return true;
+						}
 					};
 					return this.modelWidget = this.instantiationService.createInstance(ModelPickerActionItem, action, undefined, itemDelegate, pickerOptions);
 				} else if (action.id === OpenReasoningEffortPickerAction.ID && action instanceof MenuItemAction) {
