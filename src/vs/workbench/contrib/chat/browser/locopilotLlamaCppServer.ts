@@ -613,8 +613,12 @@ export function getLlamaCppServerCommand(modelPath: string, backend: LlamaBacken
 	}
 
 	// Persist per-slot KV cache to disk so a previously-processed prompt prefix survives restarts.
+	// `--slot-save-path` enables the save capability, but recent llama.cpp builds gate the actual
+	// `POST /slots/:id?action=save|restore` route behind the slots endpoint, which is DISABLED by default
+	// (a request 404s without it). `--slots` turns that endpoint on so save/restore are reachable.
 	if (tuning.slotSavePath && tuning.slotSavePath.trim()) {
 		args.push('--slot-save-path', tuning.slotSavePath.trim());
+		args.push('--slots');
 	}
 
 	// Parallel request slots + continuous batching: serve concurrent requests (e.g. chat alongside inline
@@ -687,4 +691,13 @@ export function getLlamaServerBaseUrl(port: number = LOCOPILOT_LLAMA_SERVER_PORT
 /** Health endpoint for readiness polling (llama-server exposes GET /health). */
 export function getLlamaServerHealthUrl(port: number = LOCOPILOT_LLAMA_SERVER_PORT): string {
 	return `http://127.0.0.1:${port}/health`;
+}
+
+/**
+ * Root base URL (no `/v1` prefix). llama.cpp's native endpoints - `/health`, `/slots`,
+ * `/slots/:id?action=save|restore` - live at the root; only the OpenAI-compat routes are under `/v1`.
+ * Use this for the slot save/restore calls, otherwise they 404 against `/v1/slots/...`.
+ */
+export function getLlamaServerRootUrl(port: number = LOCOPILOT_LLAMA_SERVER_PORT): string {
+	return `http://127.0.0.1:${port}`;
 }

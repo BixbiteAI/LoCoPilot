@@ -166,6 +166,8 @@ suite('LoCoPilot llama.cpp server', () => {
 			const { args } = getLlamaCppServerCommand('/m.gguf', 'metal', undefined, 38452, { cpuMoeLayers: 12, slotSavePath: '/tmp/kv', promptLookup: true });
 			assert.strictEqual(argValue(args, '--n-cpu-moe'), '12');
 			assert.strictEqual(argValue(args, '--slot-save-path'), '/tmp/kv');
+			// The slots endpoint must be enabled too, or the save/restore route 404s.
+			assert.ok(args.includes('--slots'));
 			assert.ok(args.includes('--spec-type') && args.includes('ngram-cache'));
 		});
 	});

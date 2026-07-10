@@ -636,7 +636,9 @@ export class Response extends AbstractResponse implements IDisposable {
 			if (part.kind === kind) {
 				return i;
 			}
-			if (part.kind === 'toolInvocation' || part.kind === 'toolInvocationSerialized') {
+			if (part.kind === 'toolInvocation' || part.kind === 'toolInvocationSerialized'
+				|| part.kind === 'codeblockUri' || part.kind === 'undoStop'
+				|| part.kind === 'textEditGroup' || part.kind === 'notebookEditGroup') {
 				return -1;
 			}
 		}

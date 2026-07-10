@@ -44,7 +44,7 @@ export function annotateSpecialMarkdownContent(response: Iterable<IChatProgressR
 			} else {
 				result.push({ content: new MarkdownString(markdownText), inlineReferences: annotationMetadata, kind: 'markdownContent' });
 			}
-		} else if (item.kind === 'markdownContent' && previousItem?.kind === 'markdownContent' && canMergeMarkdownStrings(previousItem.content, item.content)) {
+		} else if (item.kind === 'markdownContent' && previousItemIndex === result.length - 1 && previousItem?.kind === 'markdownContent' && canMergeMarkdownStrings(previousItem.content, item.content)) {
 			const merged = appendMarkdownString(previousItem.content, item.content);
 			result[previousItemIndex] = { ...previousItem, content: merged };
 		} else if (item.kind === 'markdownVuln') {

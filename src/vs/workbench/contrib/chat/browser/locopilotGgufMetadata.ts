@@ -282,7 +282,7 @@ export function isSwaModelInfo(info: IGgufModelInfo): boolean {
  * Single-pass GGUF header read returning {@link IGgufModelInfo}. Stops as soon as all three keys are
  * found (or the metadata block ends). Only the header is read - never the multi-GB tensor data.
  */
-export async function readGgufModelInfo(fileService: IFileService, filePath: string): Promise<IGgufModelInfo> {
+export async function readGgufModelInfo(fileService: IFileService, filePath: string, onError?: (e: unknown) => void): Promise<IGgufModelInfo> {
 	let layerCount: number | undefined;
 	let expertCount: number | undefined;
 	let contextLength: number | undefined;
@@ -355,8 +355,11 @@ export async function readGgufModelInfo(fileService: IFileService, filePath: str
 			// (small, scalar) architecture keys and stop at the tokenizer boundary above - which is where the
 			// expensive arrays begin - so SWA is always resolved without ever scanning the vocab.
 		}
-	} catch {
-		// any failure -> return whatever we gathered (callers treat undefined as "use defaults")
+	} catch (e) {
+		// any failure -> return whatever we gathered (callers treat undefined as "use defaults").
+		// Surface it to the optional hook so a silently-truncated parse (e.g. a key we can't skip landing
+		// before attention.sliding_window, which then misses SWA detection) is diagnosable instead of hidden.
+		onError?.(e);
 	}
 	return { layerCount, expertCount, contextLength, kvHeadCount, headCount, embeddingLength, keyLength, valueLength, slidingWindow };
 }

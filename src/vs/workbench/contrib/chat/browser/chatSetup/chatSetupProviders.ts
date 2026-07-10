@@ -1221,6 +1221,10 @@ export class LoCoPilotBuiltInAgent extends Disposable implements IChatAgentImple
 		// excluded (it lives in the user turn), so this prefix matches the real turn's prefix and hits cache.
 		(async () => {
 			try {
+				// Boot the server and wait for it to be ready BEFORE attempting the restore. The warm can be
+				// triggered on model SELECTION (before any server exists), and restoreSlotCache hard-requires a
+				// present+ready server - without this it always bailed with present=false and we re-prefilled.
+				await this.localModelRunner.ensureServerForModel(modelId, CancellationToken.None);
 				// Try the persisted slot cache first: on a hit the prefix KV is already resident, so we skip
 				// the (multi-thousand-token) prefill entirely. The restore is keyed by (model, mode) so a
 				// different mode never restores the wrong prefix.

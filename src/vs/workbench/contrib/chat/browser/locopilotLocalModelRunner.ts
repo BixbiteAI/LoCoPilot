@@ -23,6 +23,7 @@ import {
 	getLlamaCppServerCommand,
 	getLlamaServerBaseUrl,
 	getLlamaServerHealthUrl,
+	getLlamaServerRootUrl,
 	computeGpuLayers,
 	computeCpuMoeLayers,
 	computeKvBudgetBytes,
@@ -716,6 +717,7 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 		// Only llama.cpp exposes the /slots save/restore API; MLX and unmanaged endpoints have none.
 		const running = this.runningServers.get(modelId);
 		if (!running || running.kind !== 'llama' || !running.ready) {
+			this._log(`[LoCoPilot Runner] KV slot restore skipped for ${modelId}: server not ready (present=${!!running}, kind=${running?.kind ?? 'none'}, ready=${running?.ready ?? false}).`);
 			return false;
 		}
 		const filename = this._slotCacheFileName(key);
@@ -724,23 +726,27 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 		try {
 			await this.fileService.stat(joinPath(this._kvCacheDir(), filename));
 		} catch {
+			this._log(`[LoCoPilot Runner] KV slot restore skipped for ${modelId}: no cache file "${filename}" in ${this._kvCacheDir().fsPath}.`);
 			return false;
 		}
+		this._log(`[LoCoPilot Runner] KV slot restore: found "${filename}", requesting restore for ${modelId}...`);
 		try {
 			const res = await this.requestService.request({
 				type: 'POST',
-				url: `${getLlamaServerBaseUrl(running.port)}/slots/0?action=restore`,
+				url: `${getLlamaServerRootUrl(running.port)}/slots/0?action=restore`,
 				headers: { 'Content-Type': 'application/json' },
 				data: JSON.stringify({ filename }),
 			}, token);
 			const status = res.res.statusCode ?? 0;
+			// Always drain the body so the connection is freed; keep it to surface the real error on failure.
+			const body = await streamToBuffer(res.stream).then(b => b.toString()).catch(() => '');
 			if (status === 200) {
 				this._log(`[LoCoPilot Runner] Restored KV slot cache "${filename}" for ${modelId}.`);
 				return true;
 			}
 			// A non-200 (e.g. 400 when the saved prefix is incompatible with the current weights/context) just
-			// means we re-warm; drain the body so the connection is freed.
-			this._log(`[LoCoPilot Runner] KV slot restore for ${modelId} returned ${status}; will warm instead.`);
+			// means we re-warm.
+			this._log(`[LoCoPilot Runner] KV slot restore for ${modelId} returned ${status}; will warm instead: ${body.slice(0, 500) || '<empty body>'}`);
 			return false;
 		} catch (e) {
 			this._log(`[LoCoPilot Runner] KV slot restore failed (ignored) for ${modelId}: ${e}`);
@@ -758,13 +764,23 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 		}
 		const filename = this._slotCacheFileName(key);
 		try {
-			await this.requestService.request({
+			const res = await this.requestService.request({
 				type: 'POST',
-				url: `${getLlamaServerBaseUrl(running.port)}/slots/0?action=save`,
+				url: `${getLlamaServerRootUrl(running.port)}/slots/0?action=save`,
 				headers: { 'Content-Type': 'application/json' },
 				data: JSON.stringify({ filename }),
 			}, token);
-			this._log(`[LoCoPilot Runner] Saved KV slot cache "${filename}" for ${modelId}.`);
+			const status = res.res.statusCode ?? 0;
+			// Always drain the body so the connection is freed; keep it around to surface the real error.
+			const body = await streamToBuffer(res.stream).then(b => b.toString()).catch(() => '');
+			if (status !== 200) {
+				// The endpoint rejected the save (e.g. 400/501 when speculative decoding or a quantized KV
+				// cache makes the slot state unsaveable). Nothing is written to disk in this case, so log the
+				// real status + body instead of falsely reporting success - that is what "Saved" used to hide.
+				this._log(`[LoCoPilot Runner] KV slot save for ${modelId} returned ${status} (no file written): ${body.slice(0, 500) || '<empty body>'}`);
+				return;
+			}
+			this._log(`[LoCoPilot Runner] Saved KV slot cache "${filename}" for ${modelId} (status ${status}).`);
 			// Keep the KV-cache dir bounded: retain only the most-recently-saved caches, evict the rest (LRU).
 			await this._pruneSlotCaches();
 		} catch (e) {
@@ -1336,7 +1352,8 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 		if (cached) {
 			return cached;
 		}
-		const info = await readGgufModelInfo(this.fileService, modelPath);
+		const info = await readGgufModelInfo(this.fileService, modelPath, e => this._log(`[LoCoPilot Runner] GGUF metadata parse aborted for "${modelPath}": ${e}`));
+		this._log(`[LoCoPilot Runner] GGUF metadata for "${modelPath}": layers=${info.layerCount ?? '?'}, ctx=${info.contextLength ?? '?'}, experts=${info.expertCount ?? '?'}, slidingWindow=${info.slidingWindow ?? 'none'}.`);
 		this._modelInfoCache.set(modelPath, info);
 		return info;
 	}
@@ -1468,11 +1485,18 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 		// passed the clamp/fit gate already has room for the full cache - enabling it here is memory-consistent.
 		// Setting: 'auto' (on for SWA models when we have a memory budget to reason about), 'on' (force for SWA),
 		// 'off'. Skipped for the session once a build rejected the flag.
-		if (tuning.swaFull === undefined && !this._swaFullUnsupported && isSwaModelInfo(info)) {
+		if (tuning.swaFull === undefined && !this._swaFullUnsupported) {
 			const mode = this.configurationService.getValue<'auto' | 'on' | 'off'>(ChatConfiguration.LocopilotLlamaCppSwaFull) ?? 'auto';
-			if (mode === 'on' || (mode === 'auto' && budget !== undefined && budget > 0)) {
+			// 'on' forces --swa-full even when our GGUF SWA sniff didn't fire (detection can miss newer archs like
+			// gemma-4 whose sliding_window key we don't capture). llama.cpp harmlessly ignores it on non-SWA models,
+			// and if a build rejects the flag by name the launch-crash fallback strips it. 'auto' still needs a
+			// positively-detected SWA model + a memory budget.
+			if (mode === 'on') {
 				tuning.swaFull = true;
-				this._log(`[LoCoPilot Runner] SWA model (window ${info.slidingWindow}); enabling --swa-full so the prompt cache survives across turns (mode=${mode}).`);
+				this._log(`[LoCoPilot Runner] Forcing --swa-full (mode=on, detectedSwa=${isSwaModelInfo(info)}, window=${info.slidingWindow ?? 'n/a'}).`);
+			} else if (mode === 'auto' && isSwaModelInfo(info) && budget !== undefined && budget > 0) {
+				tuning.swaFull = true;
+				this._log(`[LoCoPilot Runner] SWA model (window ${info.slidingWindow}); enabling --swa-full so the prompt cache survives across turns (mode=auto).`);
 			}
 		}
 
