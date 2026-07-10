@@ -207,6 +207,13 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 	private modelMtpFilter: boolean = false;
 	/** Parameter-count range filter (billions). Undefined means "all sizes" - no constraint applied. */
 	private modelParamsFilter: { min: number; max: number } | undefined = undefined;
+	/**
+	 * Whether the collapsed "too large for this system" group is expanded. Models that need more memory
+	 * than this machine has are tucked below a "Show N more" button so low-end systems don't scroll past
+	 * a wall of models they can't run - the full catalog is one click away. Reset to false (collapsed)
+	 * every time the user (re-)enters the model list via {@link resetModelFilters}.
+	 */
+	private modelsIncompatibleExpanded: boolean = false;
 
 	// Add Language Model form
 	/** Cloud / Local segmented control buttons (index 0 = Cloud, 1 = Local). */
@@ -1082,25 +1089,58 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 		const isRunning = (m: ICustomLanguageModel): boolean =>
 			this.localModelRunner.isServerRunning(m.id) || this.localModelRunner.isServerStarting(m.id);
 
-		// One flat, A-Z sorted list. Order of precedence from the top:
-		//   1. the pinned model (set when the user clicks a chat-panel "Download" link), so the
+		// One flat list, ordered by "what the user most likely wants to touch". Rank buckets from the top:
+		//   0. the pinned model (set when the user clicks a chat-panel "Download" link), so the
 		//      just-started download is the first row they see;
-		//   2. currently running/starting models;
-		//   3. everything else, A-Z.
+		//   1. currently running/starting models;
+		//   2. ready local models - HF weights on disk or a pulled Ollama model (the daemon auto-loads
+		//      those on demand, so they are just as usable as a downloaded GGUF);
+		//   3. ready cloud/localhost models - a cloud model with an API key, or an OpenAI-compatible
+		//      localhost server (needs no key): zero load time, usable right now, but this is a
+		//      local-first product so they sort below the downloaded local models;
+		//   4. the single "Best for you" curated pick - the first not-yet-downloaded row, since it is
+		//      literally our suggestion of what to get next;
+		//   5. everything else (remaining catalog / custom models), largest parameter count first so the
+		//      most capable model that fits this machine reads like a quality ranking;
+		//   6. cloud models without an API key - "needs setup" items belong at the bottom.
+		// A-Z is the final tiebreaker everywhere so the order stays stable and scannable.
 		// (Visibility and "Best for you" are applied as filters in matchesFilters rather than as
 		// separate sections, so there are no sticky section titles anymore - hidden models stay in
 		// place, just dimmed via the .hidden row class.)
+		const modelRank = (m: ICustomLanguageModel): number => {
+			if (m.id === this.pinnedModelId) { return 0; }
+			if (isRunning(m)) { return 1; }
+			if (m.type === 'local' && m.provider !== 'localhost' && isModelDownloaded(m)) { return 2; }
+			if (m.type === 'cloud' || m.provider === 'localhost') {
+				return (m.apiKey || m.provider === 'localhost') ? 3 : 6;
+			}
+			if (this.isRecommendedForSystem(m)) { return 4; }
+			return 5;
+		};
 		const matched = allModels.filter(matchesFilters);
 		const sortedModels = matched.sort((a, b) => {
-			const pa = a.id === this.pinnedModelId ? 0 : 1;
-			const pb = b.id === this.pinnedModelId ? 0 : 1;
-			if (pa !== pb) { return pa - pb; }
-			const ra = isRunning(a) ? 0 : 1;
-			const rb = isRunning(b) ? 0 : 1;
+			const ra = modelRank(a);
+			const rb = modelRank(b);
 			if (ra !== rb) { return ra - rb; }
+			if (ra === 5) {
+				// Params descending; models without a "<n>B" size hint in their name sort after sized ones.
+				const pa = parseModelParamsB(getCustomModelListLabel(a)) ?? -1;
+				const pb = parseModelParamsB(getCustomModelListLabel(b)) ?? -1;
+				if (pa !== pb) { return pb - pa; }
+			}
 			return sortAZ(a, b);
 		});
 		const hasActiveFilter = this.modelTypeFilter !== 'all' || this.modelStatusFilter !== 'all' || this.modelVisibilityFilter !== 'all' || this.modelBestFilter !== 'all' || this.modelToolsFilter || this.modelMtpFilter || !!this.modelParamsFilter;
+
+		// A catalog model too large for this machine's RAM (or Apple-Silicon-only off Apple Silicon) is
+		// "incompatible" and gets tucked into the collapsed group. A pinned model (a just-clicked download)
+		// or a running server stays in the always-visible list even if oversized, so the user never loses
+		// sight of the model they just acted on.
+		const isCollapsibleIncompatible = (m: ICustomLanguageModel): boolean => {
+			if (m.id === this.pinnedModelId || isRunning(m)) { return false; }
+			const suitability = this.modelSuitability(m);
+			return suitability === 'too-big' || suitability === 'incompatible';
+		};
 
 		const listContainer = DOM.append(this.listModelsContainer, $('.models-list-container'));
 		if (sortedModels.length === 0) {
@@ -1109,7 +1149,12 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 				? localize('customLanguageModels.list.noMatch', 'No models match your search')
 				: localize('customLanguageModels.list.none', 'No models');
 		} else {
-			sortedModels.forEach((model: ICustomLanguageModel) => this.renderListModelItem(model, listContainer));
+			const compatibleModels = sortedModels.filter(m => !isCollapsibleIncompatible(m));
+			const incompatibleModels = sortedModels.filter(isCollapsibleIncompatible);
+			compatibleModels.forEach((model: ICustomLanguageModel) => this.renderListModelItem(model, listContainer));
+			if (incompatibleModels.length > 0) {
+				this.renderIncompatibleModelsSection(incompatibleModels, listContainer);
+			}
 		}
 
 		if (this.contentsContainer) { this.contentsContainer.scrollTop = savedScroll; }
@@ -1391,6 +1436,45 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 				: localize('customLanguageModels.savedTo', 'Saved to: {0}', model.localPath);
 			pathLabel.title = model.localPath || '';
 		}
+	}
+
+	/**
+	 * Renders the collapsible "too large for this system" group at the bottom of the model list. The toggle is a
+	 * plain right-aligned text link (no button chrome, no chevron): collapsed it reads "Show N more too large for
+	 * this system"; expanded it lists the oversized models followed by a "Show less" link. The expanded models keep
+	 * their "Needs N GB RAM" chip so the reason stays visible right where the user decides.
+	 */
+	private renderIncompatibleModelsSection(models: ICustomLanguageModel[], listContainer: HTMLElement): void {
+		const tooltip = localize('customLanguageModels.showIncompatible.tooltip', 'These models need more memory than this system has. You can still download them, but they may run slowly or fail to load.');
+		const addToggleLink = (text: string, expand: boolean): void => {
+			const toggleRow = DOM.append(listContainer, $('.models-incompatible-toggle'));
+			const link = DOM.append(toggleRow, $('a.models-incompatible-link'));
+			link.textContent = text;
+			link.title = tooltip;
+			link.setAttribute('role', 'button');
+			link.setAttribute('tabindex', '0');
+			const activate = () => { this.modelsIncompatibleExpanded = expand; this.renderListModels(); };
+			this._register(DOM.addDisposableListener(link, 'click', activate));
+			this._register(DOM.addDisposableListener(link, 'keydown', (e: KeyboardEvent) => {
+				if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); activate(); }
+			}));
+		};
+
+		if (!this.modelsIncompatibleExpanded) {
+			addToggleLink(localize('customLanguageModels.showIncompatible', 'Show {0} more too large for this system', models.length), true);
+			return;
+		}
+
+		// Closest-to-runnable first: "needs 24 GB" before "needs 64 GB", so the models a user might
+		// unlock by freeing memory (or a RAM upgrade) surface at the top of the expanded group.
+		const sorted = [...models].sort((a, b) => {
+			const ra = findCatalogEntry(a.modelName, a.format)?.minRamGB ?? Number.MAX_SAFE_INTEGER;
+			const rb = findCatalogEntry(b.modelName, b.format)?.minRamGB ?? Number.MAX_SAFE_INTEGER;
+			if (ra !== rb) { return ra - rb; }
+			return getCustomModelListLabel(a).localeCompare(getCustomModelListLabel(b));
+		});
+		sorted.forEach((model: ICustomLanguageModel) => this.renderListModelItem(model, listContainer));
+		addToggleLink(localize('customLanguageModels.hideIncompatible', 'Show less'), false);
 	}
 
 	/**
@@ -2221,6 +2305,7 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 		this.modelToolsFilter = false;
 		this.modelMtpFilter = false;
 		this.modelParamsFilter = undefined;
+		this.modelsIncompatibleExpanded = false;
 	}
 
 	/**
