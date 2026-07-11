@@ -27,7 +27,7 @@ import { ChatResponseResource, getAttachableImageExtension } from '../../chat/co
 import { LanguageModelPartAudience } from '../../chat/common/languageModels.js';
 import { CountTokensCallback, ILanguageModelToolsService, IPreparedToolInvocation, IToolConfirmationMessages, IToolData, IToolImpl, IToolInvocation, IToolInvocationPreparationContext, IToolResult, IToolResultInputOutputDetails, ToolDataSource, ToolProgress, ToolSet } from '../../chat/common/tools/languageModelToolsService.js';
 import { IMcpRegistry } from './mcpRegistryTypes.js';
-import { IMcpServer, IMcpService, IMcpTool, IMcpToolResourceLinkContents, McpResourceURI, McpToolResourceLinkMimeType, McpToolVisibility } from './mcpTypes.js';
+import { IMcpServer, IMcpService, IMcpTool, IMcpToolResourceLinkContents, McpConnectionState, McpResourceURI, McpToolResourceLinkMimeType, McpToolVisibility } from './mcpTypes.js';
 import { mcpServerToSourceData } from './mcpTypesUtils.js';
 import { ILifecycleService } from '../../../services/lifecycle/common/lifecycle.js';
 
@@ -120,6 +120,19 @@ export class McpLanguageModelToolContribution extends Disposable implements IWor
 
 			const collection = collectionObservable.read(reader);
 			if (!collection) {
+				tools.forEach(t => t.store.dispose());
+				tools.clear();
+				return;
+			}
+
+			// LoCoPilot: only expose MCP tools to the model while the server is actually running
+			// (or starting). Upstream registers tools from cached definitions even for stopped
+			// servers (lazy start-on-call), but for local models that silently bloats every
+			// request's prompt/KV-cache with dozens of unused tool schemas. The explicit server
+			// toggles (e.g. the Playwright browser globe in the chat input) are the gate: flipping
+			// one re-runs this autorun via connectionState and registers/unregisters the tools.
+			const connectionKind = server.connectionState.read(reader).state;
+			if (connectionKind !== McpConnectionState.Kind.Running && connectionKind !== McpConnectionState.Kind.Starting) {
 				tools.forEach(t => t.store.dispose());
 				tools.clear();
 				return;
