@@ -290,8 +290,6 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 	private agentSettingsService!: ILoCoPilotAgentSettingsService;
 	private customLanguageModelsService!: ICustomLanguageModelsService;
 	private localModelRunner!: ILoCoPilotLocalModelRunner;
-	/** Last launch-failure message per model, cleared when the user retries. */
-	private serverStartErrors = new Map<string, string>();
 
 	private dimension: Dimension | undefined;
 	private selectedSection: string = LOCOPILOT_SETTINGS_SECTION_LIST_MODELS;
@@ -335,8 +333,10 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 				this._hideLogsOverlay();
 			}
 		}));
-		this._register(this.localModelRunner.onDidServerStartFailed(({ modelId, message }) => {
-			this.serverStartErrors.set(modelId, message);
+		this._register(this.localModelRunner.onDidServerStartFailed(() => {
+			// The failure is surfaced to the user by a toast (see the runner). The list just needs to drop the
+			// "Starting..." spinner and fall back to the plain "Start server" button - no distinct error/Retry
+			// state - so re-render.
 			this.renderListModels();
 		}));
 		this._register(this.localModelRunner.onDidLogUpdate((modelId) => {
@@ -1484,8 +1484,8 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 	 */
 	private _renderRunningIndicator(modelId: string, nameLabel: HTMLElement): void {
 		// Only show this for a fully-ready server. While starting/loading, the server controls already show a
-		// spinner; a failed launch shows "Failed to start" + Retry there too. No second indicator in either case.
-		if (this.serverStartErrors.has(modelId) || this.localModelRunner.getServerPhase(modelId) !== 'ready') {
+		// spinner, so there is no second indicator.
+		if (this.localModelRunner.getServerPhase(modelId) !== 'ready') {
 			return;
 		}
 		const badge = DOM.append(nameLabel, $('span.model-running-indicator.model-running-ready'));
@@ -1498,8 +1498,10 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 
 	/**
 	 * Renders the Run/Stop button area for a local model server (llama.cpp or Ollama).
-	 * Shows a spinner while starting, an inline error with a retry button on failure, and
-	 * Stop + Logs once the server is running. Clears the stored error when the user retries.
+	 * Shows a spinner while starting and Stop + Logs once the server is running; otherwise a plain
+	 * "Start server" button. A failed launch is NOT given a distinct "Failed / Retry" state here - the
+	 * failure is already reported by a toast, and the model simply falls back to "Start server" (identical
+	 * to a model that was never started), so the user isn't shown the error twice and can just start again.
 	 */
 	private _renderServerControls(
 		modelId: string,
@@ -1510,7 +1512,6 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 	): void {
 		const isRunning = this.localModelRunner.isServerRunning(modelId);
 		const isStarting = this.localModelRunner.isServerStarting(modelId);
-		const failureMsg = this.serverStartErrors.get(modelId);
 
 		if (isStarting) {
 			// Spinner + disabled label while the server is launching
@@ -1522,18 +1523,6 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 			startingLabel.textContent = localize('customLanguageModels.serverStarting', 'Starting...');
 			spinnerWrap.setAttribute('aria-busy', 'true');
 			spinnerWrap.setAttribute('aria-label', localize('customLanguageModels.serverStartingAria', 'Server is starting, please wait'));
-		} else if (failureMsg) {
-			// Error state: show message and a Retry button
-			const errorWrap = DOM.append(runSlot, $('.model-server-error'));
-			const errorLabel = DOM.append(errorWrap, $('span.model-server-error-label'));
-			errorLabel.textContent = localize('customLanguageModels.serverStartFailed', 'Failed to start');
-			errorLabel.title = failureMsg;
-			const retryButton = this._register(new Button(errorWrap, { ...defaultButtonStyles, secondary: true, title: failureMsg }));
-			retryButton.label = localize('customLanguageModels.serverRetry', 'Retry');
-			this._register(retryButton.onDidClick(() => {
-				this.serverStartErrors.delete(modelId);
-				startCommand();
-			}));
 		} else if (isRunning) {
 			// Running: Stop + Logs. Local models also auto-start on first use (see ensureServerForModel),
 			// so the button below is a convenience to spin up (or shut down) the server ahead of a request.
@@ -1544,15 +1533,12 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 			logsButton.label = localize('customLanguageModels.logs', 'Logs');
 			this._register(logsButton.onDidClick(() => this._showLogsOverlay(modelId, modelLabel)));
 		} else {
-			// Not running and no error: offer a manual Start button. The server would otherwise start
-			// automatically on the first message (ensureServerForModel), but showing an explicit Start
-			// mirrors the Stop button and lets users pre-warm the model before chatting.
+			// Not running (never started, stopped, OR a previous start failed): offer a plain Start button.
+			// The server would otherwise start automatically on the first message (ensureServerForModel), but
+			// showing an explicit Start mirrors the Stop button and lets users pre-warm the model before chatting.
 			const startBtn = this._register(new Button(runSlot, { ...defaultButtonStyles, secondary: true, supportIcons: true, title: localize('customLanguageModels.startServerTooltip', 'Load this model and start its server') }));
 			startBtn.label = '$(play) ' + localize('customLanguageModels.startServer', 'Start server');
-			this._register(startBtn.onDidClick(() => {
-				this.serverStartErrors.delete(modelId);
-				startCommand();
-			}));
+			this._register(startBtn.onDidClick(() => startCommand()));
 		}
 	}
 
