@@ -3,7 +3,7 @@
  *  Licensed under the MIT License. See License.txt in the project root for license information.
  *--------------------------------------------------------------------------------------------*/
 
-import { Disposable } from '../../../../base/common/lifecycle.js';
+import { Disposable, IDisposable, toDisposable } from '../../../../base/common/lifecycle.js';
 import { URI } from '../../../../base/common/uri.js';
 import { ILogService } from '../../../../platform/log/common/log.js';
 import { IConfigurationService } from '../../../../platform/configuration/common/configuration.js';
@@ -58,7 +58,7 @@ import {
 import { findDraftPairing } from './locopilotModelCatalog.js';
 import { LoCoPilotModelDownloadService, modelDownloadDirName } from './locopilotModelDownloadService.js';
 import { joinPath } from '../../../../base/common/resources.js';
-import { streamToBuffer } from '../../../../base/common/buffer.js';
+import { streamToBuffer, VSBuffer } from '../../../../base/common/buffer.js';
 import { generateUuid } from '../../../../base/common/uuid.js';
 import { IPathService } from '../../../services/path/common/pathService.js';
 import { ILifecycleService, LifecyclePhase } from '../../../services/lifecycle/common/lifecycle.js';
@@ -70,7 +70,7 @@ import { IOpenerService } from '../../../../platform/opener/common/opener.js';
 import { INativeHostService } from '../../../../platform/native/common/native.js';
 import { IEnvironmentService, INativeEnvironmentService } from '../../../../platform/environment/common/environment.js';
 import { IRequestService } from '../../../../platform/request/common/request.js';
-import { CancellationToken } from '../../../../base/common/cancellation.js';
+import { CancellationToken, CancellationTokenSource } from '../../../../base/common/cancellation.js';
 import { timeout } from '../../../../base/common/async.js';
 import { LOCOPILOT_SETTINGS_SECTION_LIST_MODELS } from './chatManagement/locopilotSettingsEditorInput.js';
 
@@ -90,6 +90,25 @@ const MAX_SLOT_CACHE_ENTRIES = 10;
  *  - 'ready'   : the OpenAI endpoint answered 200; safe to send requests.
  */
 export type LocalServerPhase = 'starting' | 'loading' | 'ready';
+
+/**
+ * Cross-window active-server lock file contents. A launch first writes a 'claiming' entry (atomic exclusive
+ * create - only one window across the machine wins the race to start a server), then overwrites it with a
+ * 'running' entry carrying the real pid/port once the server is up. Other windows read this to attach to or
+ * replace the single active server.
+ */
+interface IActiveServerLock {
+	phase: 'claiming' | 'running';
+	modelId: string;
+	kind: 'llama' | 'mlx';
+	/** Present while phase==='claiming' (and carried into 'running') to identify the owning window. */
+	claimToken?: string;
+	/** Present once phase==='running'. */
+	pid?: number;
+	/** Present once phase==='running'. */
+	port?: number;
+	servedModelId?: string;
+}
 
 export interface ILoCoPilotLocalModelRunner {
 	readonly _serviceBrand: undefined;
@@ -177,9 +196,33 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 	private readonly _startInFlight = new Map<string, Promise<void>>();
 	/** Ports picked by an in-flight launch but not yet bound; reserved so concurrent launches don't reuse them. */
 	private readonly _reservedPorts = new Set<number>();
+	/**
+	 * PID of the model server THIS window currently owns and has published to the cross-window active-server lock.
+	 * Used so the coordination step never kills our own process (only another window's) and so we only clear the
+	 * lock when it still points at us. Undefined when this window owns no running server.
+	 */
+	private _ownedServerPid: number | undefined;
+	/** Token for the 'claiming' lock this window holds while its launch is in flight (before the server is up). */
+	private _myClaimToken: string | undefined;
+	/** Trailing-throttle timer for mirroring the owned server's logs to the shared log file. */
+	private _logMirrorTimer: ReturnType<typeof setTimeout> | undefined;
+	/** Per-model watchers tailing the shared log file for records attached to another window's server. */
+	private readonly _foreignLogWatchers = new Map<string, IDisposable>();
+	/** Debounce timer for re-syncing local state after the shared active-server lock changes on disk. */
+	private _lockSyncTimer: ReturnType<typeof setTimeout> | undefined;
+	/** Remaining probe retries for a lock that appeared but whose server is still loading (not healthy yet). */
+	private _lockSyncRetries = 0;
 	private runningServers = new Map<string, {
 		port: number;
-		terminal: ITerminalInstance;
+		/**
+		 * The terminal that owns this server's process. Undefined for a *foreign* record - a server started by a
+		 * DIFFERENT app window that this window has attached to (see {@link _coordinateGlobalSingleServer}). A
+		 * foreign record is a read-only handle: this window sends chat/KV requests to its port over HTTP but does
+		 * not own the process, so it must never dispose a terminal (there is none) or run idle/LRU teardown for it.
+		 */
+		terminal?: ITerminalInstance;
+		/** True when this record points at a server owned by another window (attached via the active-server lock). */
+		foreign?: boolean;
 		kind: 'llama' | 'mlx';
 		/**
 		 * The model identifier the server was actually loaded with (the value passed to `--model`).
@@ -272,6 +315,24 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 		this._registerCommands();
 		// Make sure idle timers and child processes are torn down when the service is disposed.
 		this._register({ dispose: () => this.stopManagedServers() });
+		// Watch the shared active-server lock so status stays in sync across windows: when another window
+		// starts/stops/replaces the global model server, this window updates its own records (attach a foreign
+		// handle to the new server, drop handles that no longer match) and the My Models UI follows live.
+		const lockUri = this._activeServerLockUri();
+		// Watch the containing directory, not the lock file itself: the lock is created/deleted constantly and a
+		// direct file watch logs "Watcher shutdown because watched path got deleted" every time it's removed.
+		this._register(this.fileService.watch(this.environmentService.cacheHome));
+		this._register(this.fileService.onDidFilesChange(e => {
+			if (e.contains(lockUri)) {
+				this._scheduleLockSync();
+			}
+		}));
+		this._register(toDisposable(() => {
+			for (const w of this._foreignLogWatchers.values()) { w.dispose(); }
+			this._foreignLogWatchers.clear();
+			if (this._lockSyncTimer) { clearTimeout(this._lockSyncTimer); }
+			if (this._logMirrorTimer) { clearTimeout(this._logMirrorTimer); }
+		}));
 	}
 
 	private _registerCommands(): void {
@@ -844,9 +905,19 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 			if (running.idleTimer) {
 				clearTimeout(running.idleTimer);
 			}
+			if (running.foreign) {
+				// A record attached to another window's server: we own no terminal here. Just drop our handle -
+				// the owning window is responsible for the process lifecycle and the active-server lock.
+				this._disposeForeignLogWatcher(modelId);
+				this.runningServers.delete(modelId);
+				this._onDidServerStateChange.fire(modelId);
+				this._log(`[LoCoPilot Runner] Detached from foreign server for model ${modelId}.`);
+				return;
+			}
 			this._intentionalStops.add(modelId); // mark so onExit treats this as a clean stop, not a crash
-			running.terminal.dispose();
+			running.terminal?.dispose();
 			this.runningServers.delete(modelId);
+			void this._clearActiveServerLockIfOwned();
 			this._onDidServerStateChange.fire(modelId);
 			this._log(`[LoCoPilot Runner] Stopped server for model ${modelId}`);
 		}
@@ -895,6 +966,9 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 		const running = this.runningServers.get(modelId);
 		if (!running) {
 			return;
+		}
+		if (running.foreign) {
+			return; // idle-unload is the owning window's job; we only hold a read-only handle
 		}
 		if (running.idleTimer) {
 			clearTimeout(running.idleTimer);
@@ -1958,6 +2032,423 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 		this._reservedPorts.delete(port);
 	}
 
+	// --- Cross-window single-server coordination -------------------------------------------------------------
+	//
+	// Every app window runs its own copy of this renderer-side service, so without coordination each window
+	// launches its own model server (a second multi-GB process + KV cache). To keep only ONE model resident
+	// system-wide, launches route through a shared on-disk lock under the per-user cache home. The lock records
+	// the one active server ({ pid, port, kind, modelId }). On launch a window either ATTACHES to that server
+	// (same model, still healthy) or REPLACES it (different model: kill it, then start its own). The lock lives
+	// in cacheHome, which is shared across windows of the same user/install.
+
+	private _activeServerLockUri(): URI {
+		return joinPath(this.environmentService.cacheHome, 'locopilot-active-server.lock');
+	}
+
+	private async _readActiveServerLock(): Promise<IActiveServerLock | undefined> {
+		try {
+			const buf = await this.fileService.readFile(this._activeServerLockUri());
+			const parsed = JSON.parse(buf.value.toString());
+			if (!parsed || typeof parsed.modelId !== 'string' || (parsed.kind !== 'llama' && parsed.kind !== 'mlx')) {
+				return undefined;
+			}
+			const kind: 'llama' | 'mlx' = parsed.kind;
+			if (parsed.phase === 'claiming' && typeof parsed.claimToken === 'string') {
+				const lock: IActiveServerLock = { phase: 'claiming', modelId: parsed.modelId, kind, claimToken: parsed.claimToken };
+				return lock;
+			}
+			// A 'running' lock (or a legacy lock with no phase field) must carry a real pid+port.
+			if (typeof parsed.pid === 'number' && typeof parsed.port === 'number') {
+				const lock: IActiveServerLock = {
+					phase: 'running',
+					modelId: parsed.modelId,
+					kind,
+					pid: parsed.pid,
+					port: parsed.port,
+					servedModelId: typeof parsed.servedModelId === 'string' ? parsed.servedModelId : undefined,
+					claimToken: typeof parsed.claimToken === 'string' ? parsed.claimToken : undefined,
+				};
+				return lock;
+			}
+		} catch {
+			// Missing/unreadable/corrupt lock -> treat as "no active server".
+		}
+		return undefined;
+	}
+
+	/** Health-probe a server's OpenAI/health endpoint on 127.0.0.1. Returns true only on a 200 within the timeout. */
+	private async _probeServerHealth(port: number, kind: 'llama' | 'mlx'): Promise<boolean> {
+		const url = kind === 'llama' ? getLlamaServerHealthUrl(port) : `${getMlxServerBaseUrl(port)}/models`;
+		try {
+			const src = new CancellationTokenSource();
+			const timer = setTimeout(() => src.cancel(), 1500);
+			try {
+				const res = await this.requestService.request({ type: 'GET', url }, src.token);
+				const status = res.res.statusCode ?? 0;
+				await streamToBuffer(res.stream).catch(() => undefined); // drain so the connection frees
+				return status >= 200 && status < 300;
+			} finally {
+				clearTimeout(timer);
+				src.dispose();
+			}
+		} catch {
+			return false;
+		}
+	}
+
+	/** Best-effort kill of another window's server process by PID via the native host. */
+	private async _killForeignServer(pid: number, signal: 'SIGTERM' | 'SIGKILL' = 'SIGTERM'): Promise<void> {
+		try {
+			await this.instantiationService.invokeFunction(accessor => accessor.get(INativeHostService).killProcess(pid, signal));
+			this._log(`[LoCoPilot Runner] Sent ${signal} to the previously-active model server (pid ${pid}) started by another window.`);
+		} catch (e) {
+			this._log(`[LoCoPilot Runner] Could not ${signal} previously-active server pid ${pid} (ignored): ${e}`);
+		}
+	}
+
+	/**
+	 * Waits until a just-killed server has actually gone away before we launch the replacement. Without this the
+	 * new server races the dying one: the old process still holds the port and (worse) the GPU/Metal working set
+	 * for a moment after SIGTERM, so the fresh launch fails to bind / can't fit params to device memory and exits
+	 * with a crash toast. Polls the health endpoint until it stops answering, escalates to SIGKILL if the process
+	 * ignores SIGTERM, then adds a short grace for the OS to reclaim the freed GPU memory.
+	 */
+	private async _waitForServerGone(port: number, kind: 'llama' | 'mlx', pid: number): Promise<void> {
+		const deadline = Date.now() + 8000;
+		let escalated = false;
+		while (Date.now() < deadline) {
+			if (!await this._probeServerHealth(port, kind)) {
+				break; // HTTP listener closed -> the process is shutting down / gone
+			}
+			// If it's still answering ~3s in, SIGTERM didn't take (e.g. mid-request); force it.
+			if (!escalated && Date.now() > deadline - 5000) {
+				escalated = true;
+				await this._killForeignServer(pid, 'SIGKILL');
+			}
+			await timeout(250);
+		}
+		// Grace for the OS to release the GPU/Metal memory and the socket the old process held.
+		await timeout(600);
+	}
+
+	/**
+	 * Publishes THIS window's freshly-started server to the shared active-server lock so other windows can attach
+	 * to or replace it. Awaits the terminal's real PID (needed so another window can kill it on replace).
+	 */
+	private async _publishActiveServerLock(port: number, kind: 'llama' | 'mlx', terminal: ITerminalInstance, modelId: string, servedModelId?: string): Promise<void> {
+		try {
+			await terminal.processReady; // processId is only populated once the pty has spawned
+			const pid = terminal.processId;
+			if (typeof pid !== 'number') {
+				return; // no PID -> another window couldn't kill it, so don't advertise a server it can't manage
+			}
+			// Only publish if we still own this exact running record (a rapid switch may have replaced it).
+			const rec = this.runningServers.get(modelId);
+			if (!rec || rec.terminal !== terminal) {
+				return;
+			}
+			this._ownedServerPid = pid;
+			this._myClaimToken = undefined; // the claim is now upgraded to a running entry
+			const content = JSON.stringify({ phase: 'running', pid, port, kind, modelId, servedModelId });
+			await this.fileService.writeFile(this._activeServerLockUri(), VSBuffer.fromString(content));
+		} catch (e) {
+			this._log(`[LoCoPilot Runner] Failed to publish active-server lock (ignored): ${e}`);
+		}
+	}
+
+	/**
+	 * Called when THIS window's server process exits unexpectedly. Reads the shared lock to tell a genuine crash
+	 * apart from another window intentionally killing our server to take over (attach-else-replace). Returns true
+	 * when we were replaced externally (caller should stay silent - it isn't a crash). On a real crash the lock
+	 * still points at our now-dead pid, so we clear that stale entry here. Either way we drop our owned-pid.
+	 */
+	private async _wasReplacedByAnotherWindow(ownedPid: number | undefined): Promise<boolean> {
+		if (ownedPid === undefined) {
+			return false; // we never published a server -> treat the exit as a normal crash
+		}
+		let replaced = false;
+		try {
+			const lock = await this._readActiveServerLock();
+			// Lock gone or now pointing at a different pid => another window cleared/replaced us on purpose.
+			replaced = !lock || lock.pid !== ownedPid;
+			if (!replaced) {
+				// Stale lock still names our dead process; clean it up so the next launch doesn't attach to a corpse.
+				try { await this.fileService.del(this._activeServerLockUri()); } catch { /* already gone */ }
+			}
+		} catch {
+			replaced = false;
+		}
+		if (this._ownedServerPid === ownedPid) {
+			this._ownedServerPid = undefined;
+		}
+		return replaced;
+	}
+
+	/** Clears the shared lock, but only if it still points at the process this window owns (avoids racing another window). */
+	private async _clearActiveServerLockIfOwned(): Promise<void> {
+		if (this._ownedServerPid === undefined) {
+			return;
+		}
+		const owned = this._ownedServerPid;
+		this._ownedServerPid = undefined;
+		try {
+			const lock = await this._readActiveServerLock();
+			if (lock && lock.pid === owned) {
+				await this.fileService.del(this._activeServerLockUri());
+				await this.fileService.del(this._activeServerLogUri()).catch(() => undefined);
+			}
+		} catch {
+			// lock already gone / unwritable -> nothing to clean up
+		}
+	}
+
+	/** Shared file mirroring the active server's recent logs, so windows attached to it can show them too. */
+	private _activeServerLogUri(): URI {
+		return joinPath(this.environmentService.cacheHome, 'locopilot-active-server.log');
+	}
+
+	/**
+	 * Mirrors the owned server's logs to the shared log file (trailing throttle) so OTHER windows attached to
+	 * this server can display them. Rewrites the whole capped buffer each flush - simple and self-healing.
+	 */
+	private _mirrorLogsToSharedFile(modelId: string): void {
+		if (this._ownedServerPid === undefined || this._logMirrorTimer) {
+			return; // not the global owner yet (pid unpublished), or a flush is already scheduled
+		}
+		this._logMirrorTimer = setTimeout(() => {
+			this._logMirrorTimer = undefined;
+			const rec = this.runningServers.get(modelId);
+			if (!rec || rec.foreign || this._ownedServerPid === undefined) {
+				return;
+			}
+			this.fileService.writeFile(this._activeServerLogUri(), VSBuffer.fromString(rec.logs.join('\n')))
+				.catch(() => undefined); // best-effort; the in-window log view never depends on this
+		}, 500);
+	}
+
+	/** Loads the shared log file into a foreign record's log buffer and notifies the log view. */
+	private async _loadForeignLogs(modelId: string): Promise<void> {
+		try {
+			const buf = await this.fileService.readFile(this._activeServerLogUri());
+			const rec = this.runningServers.get(modelId);
+			if (rec?.foreign) {
+				rec.logs = buf.value.toString().split('\n');
+				this._onDidLogUpdate.fire(modelId);
+			}
+		} catch {
+			// No shared log yet (owner hasn't flushed) - the placeholder line stays until it appears.
+		}
+	}
+
+	/**
+	 * Tails the shared log file for a foreign record so the log view updates live in this window too. The
+	 * containing dir is already watched (see constructor), so this only needs a change listener - no direct
+	 * file watch (which would log "watched path got deleted" when the owner clears the log on teardown).
+	 */
+	private _watchForeignLogs(modelId: string): void {
+		this._disposeForeignLogWatcher(modelId);
+		const uri = this._activeServerLogUri();
+		const listener = this.fileService.onDidFilesChange(e => {
+			if (e.contains(uri)) {
+				void this._loadForeignLogs(modelId);
+			}
+		});
+		this._foreignLogWatchers.set(modelId, listener);
+	}
+
+	private _disposeForeignLogWatcher(modelId: string): void {
+		this._foreignLogWatchers.get(modelId)?.dispose();
+		this._foreignLogWatchers.delete(modelId);
+	}
+
+	/**
+	 * Registers a read-only record for a server owned by another window: it shows as running in this window's
+	 * UI, chat requests go to its port, and its logs are tailed from the shared log file.
+	 */
+	private async _attachForeignRecord(lock: { pid: number; port: number; kind: 'llama' | 'mlx'; modelId: string; servedModelId?: string }): Promise<void> {
+		this.startingServers.delete(lock.modelId);
+		this.runningServers.set(lock.modelId, {
+			port: lock.port,
+			kind: lock.kind,
+			foreign: true,
+			servedModelId: lock.servedModelId,
+			logs: ['This model was started in another LoCoPilot window; showing its mirrored server logs.'],
+			lastUsedAt: Date.now(),
+			ready: true,
+		});
+		this._watchForeignLogs(lock.modelId);
+		await this._loadForeignLogs(lock.modelId);
+		this._onDidServerStateChange.fire(lock.modelId);
+		this._onDidLogUpdate.fire(lock.modelId);
+		this._log(`[LoCoPilot Runner] Attached to model ${lock.modelId} running in another window on port ${lock.port}.`);
+	}
+
+	/** Debounced entry point for lock-file changes; also used for the "server still loading" probe retries. */
+	private _scheduleLockSync(delayMs: number = 300): void {
+		if (this._lockSyncTimer) {
+			clearTimeout(this._lockSyncTimer);
+		}
+		this._lockSyncTimer = setTimeout(() => {
+			this._lockSyncTimer = undefined;
+			void this._syncFromActiveServerLock();
+		}, delayMs);
+	}
+
+	/**
+	 * Re-syncs this window's records with the shared lock after it changed on disk. Keeps every window's
+	 * My Models status identical: drops foreign handles whose server was stopped/replaced elsewhere, and
+	 * attaches a foreign handle when another window started a server we don't know about yet. A lock whose
+	 * server is still loading (health probe fails) is retried for a while - the lock is published at launch,
+	 * before the weights finish loading.
+	 */
+	private async _syncFromActiveServerLock(): Promise<void> {
+		const lock = await this._readActiveServerLock();
+		// Treat a 'claiming' lock (a launch in flight elsewhere, no server yet) as "nothing to attach to yet".
+		const running = lock && lock.phase === 'running' ? lock : undefined;
+		// Drop foreign handles that no longer match a running lock (their server was stopped or replaced elsewhere).
+		for (const [id, rec] of Array.from(this.runningServers.entries())) {
+			if (rec.foreign && (!running || running.modelId !== id || running.port !== rec.port)) {
+				this._disposeForeignLogWatcher(id);
+				this.runningServers.delete(id);
+				this._onDidServerStateChange.fire(id);
+				this._log(`[LoCoPilot Runner] Foreign server for ${id} went away (lock changed); detached.`);
+			}
+		}
+		if (!running || (this._ownedServerPid !== undefined && running.pid === this._ownedServerPid)) {
+			// No global server yet, a claim is still in flight, or it's our own. If a claim is pending, poll a bit
+			// so we attach once it becomes 'running'.
+			if (lock && lock.phase === 'claiming' && this._lockSyncRetries++ < 40) {
+				this._scheduleLockSync(3000);
+			} else {
+				this._lockSyncRetries = 0;
+			}
+			return;
+		}
+		if (this.runningServers.has(running.modelId) || this.startingServers.has(running.modelId)) {
+			this._lockSyncRetries = 0;
+			return; // already tracked (own or foreign)
+		}
+		if (!this.customLanguageModelsService.getCustomModels().some(m => m.id === running.modelId)) {
+			return; // model unknown to this window's list - nothing to show
+		}
+		if (running.port === undefined || !await this._probeServerHealth(running.port, running.kind)) {
+			// Published at launch; weights may still be loading. Retry for up to ~2 minutes, then give up
+			// (a later ensureServerForModel or lock change will retry anyway).
+			if (this._lockSyncRetries++ < 40) {
+				this._scheduleLockSync(3000);
+			} else {
+				this._lockSyncRetries = 0;
+			}
+			return;
+		}
+		this._lockSyncRetries = 0;
+		await this._attachForeignRecord({ pid: running.pid!, port: running.port, kind: running.kind, modelId: running.modelId, servedModelId: running.servedModelId });
+	}
+
+	/**
+	 * Enforces "one model server at a time across all windows" before a launch, and closes the cold-start race
+	 * where two windows pre-warm the same model simultaneously and both bind the base port. It uses the lock file
+	 * as an atomic mutex: a launch must win an exclusive 'claiming' create before it may pick a port and spawn.
+	 *
+	 *  - No lock            -> try to atomically claim it. Winner returns 'proceed'; a loser re-reads and reacts.
+	 *  - Someone claiming   -> another window is mid-launch: wait for it to resolve, then re-evaluate.
+	 *  - Healthy, same model -> ATTACH to it (no duplicate) and return 'attached'.
+	 *  - Healthy, other model -> REPLACE: kill it, wait for it to fully release the port/GPU, then claim + proceed.
+	 *  - Dead/stale lock    -> clear it and retry.
+	 *
+	 * Returns 'attached' when the caller should reuse another window's server, or 'proceed' (holding a claim that
+	 * {@link _publishActiveServerLock} later upgrades to 'running', or {@link _releaseClaimIfHeld} releases on failure).
+	 */
+	private async _coordinateGlobalSingleServer(modelId: string): Promise<'attached' | 'proceed'> {
+		const deadline = Date.now() + 30_000; // bound the wait for another window's in-flight launch
+		for (; ;) {
+			const lock = await this._readActiveServerLock();
+
+			// No active lock: atomically claim the exclusive right to launch. createFile with overwrite:false
+			// fails if another window created the lock first, which is what makes this race-safe.
+			if (!lock) {
+				const token = generateUuid();
+				try {
+					await this.fileService.createFile(
+						this._activeServerLockUri(),
+						VSBuffer.fromString(JSON.stringify({ phase: 'claiming', claimToken: token, modelId, kind: 'llama' })),
+						{ overwrite: false }
+					);
+				} catch {
+					continue; // lost the create race; re-read and react to whoever won
+				}
+				// createFile's existence check isn't OS-atomic, so two windows can both create and the last write
+				// wins. Read back and only proceed if OUR token is the one that stuck; otherwise back off and retry.
+				const after = await this._readActiveServerLock();
+				if (after?.phase === 'claiming' && after.claimToken === token) {
+					this._myClaimToken = token;
+					return 'proceed';
+				}
+				await timeout(50 + Math.floor(Math.random() * 100)); // jitter to de-sync racing windows
+				continue;
+			}
+
+			// Another window (or this one) is mid-launch. Wait for that claim to become 'running' or vanish.
+			if (lock.phase === 'claiming') {
+				if (lock.claimToken && lock.claimToken === this._myClaimToken) {
+					return 'proceed'; // it's our own claim
+				}
+				if (Date.now() > deadline) {
+					// The claim never progressed (the claiming window likely crashed mid-launch). Steal it.
+					this._log('[LoCoPilot Runner] Stale launch claim in the active-server lock; taking it over.');
+					try { await this.fileService.del(this._activeServerLockUri()); } catch { /* gone */ }
+					continue;
+				}
+				this._beginStarting(modelId); // show a spinner while we wait for the other launch
+				await timeout(300);
+				continue;
+			}
+
+			// phase === 'running'. A server this window already owns? let the normal guards handle it.
+			if (this._ownedServerPid !== undefined && lock.pid === this._ownedServerPid) {
+				return 'proceed';
+			}
+			const healthy = lock.port !== undefined && await this._probeServerHealth(lock.port, lock.kind);
+			if (!healthy) {
+				// Dead/crashed owner: clear the stale lock and retry (the next iteration claims it).
+				try { await this.fileService.del(this._activeServerLockUri()); } catch { /* already gone */ }
+				continue;
+			}
+			if (lock.modelId === modelId) {
+				await this._attachForeignRecord({ pid: lock.pid!, port: lock.port!, kind: lock.kind, modelId: lock.modelId, servedModelId: lock.servedModelId });
+				return 'attached';
+			}
+			// A different model is globally active: stop it so only one model stays resident, then loop back to
+			// claim - but WAIT for it to fully release the port/GPU first, or our fresh launch races the dying one.
+			this._beginStarting(modelId); // show a spinner during the (multi-second) handoff instead of a dead UI
+			await this._killForeignServer(lock.pid!);
+			try { await this.fileService.del(this._activeServerLockUri()); } catch { /* already gone */ }
+			await this._waitForServerGone(lock.port!, lock.kind, lock.pid!);
+			continue;
+		}
+	}
+
+	/**
+	 * Releases the 'claiming' lock this window holds if its launch never reached the 'running' state (e.g. a
+	 * failed fit check or a spawn error). Without this, a bailed launch would leave the mutex held and block
+	 * every window from starting a model.
+	 */
+	private async _releaseClaimIfHeld(): Promise<void> {
+		if (this._myClaimToken === undefined) {
+			return;
+		}
+		const token = this._myClaimToken;
+		this._myClaimToken = undefined;
+		try {
+			const lock = await this._readActiveServerLock();
+			if (lock && lock.phase === 'claiming' && lock.claimToken === token) {
+				await this.fileService.del(this._activeServerLockUri());
+			}
+		} catch {
+			// lock already gone / upgraded to running -> nothing to release
+		}
+	}
+
 	/** Mark a model as starting and notify the UI immediately so it can show a spinner. */
 	private _beginStarting(modelId: string): void {
 		this.startingServers.add(modelId);
@@ -1992,6 +2483,18 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 		}
 		const launch = this._doStartServerInTerminal(modelId).finally(() => {
 			this._startInFlight.delete(modelId);
+			// Safety net: the cross-window handoff optimistically shows a spinner (_beginStarting) before it
+			// knows the launch will succeed. If the launch then bails early (failed fit check, missing engine,
+			// etc.) without promoting to a running server, clear that leftover "starting" state so the picker
+			// doesn't hang on a spinner forever.
+			if (this.startingServers.has(modelId) && !this.runningServers.has(modelId)) {
+				this._endStarting(modelId);
+			}
+			// If we won the launch claim but never promoted to a running server (bailed early or attached to
+			// another window's server), release the mutex so other windows aren't blocked from launching.
+			if (this._myClaimToken !== undefined) {
+				void this._releaseClaimIfHeld();
+			}
 		});
 		this._startInFlight.set(modelId, launch);
 		return launch;
@@ -2001,6 +2504,13 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 		const model = this.customLanguageModelsService.getCustomModels().find(m => m.id === modelId);
 		if (!model || !model.localPath) {
 			this._log(`[LoCoPilot Runner] Model ${modelId} not found or has no local path.`);
+			return;
+		}
+
+		// Coordinate with other app windows before doing anything expensive: if another window already runs this
+		// exact model, attach to it (no second process); if it runs a different model, stop that one first so only
+		// one model stays resident system-wide. Returns 'attached' when we reused another window's server.
+		if (await this._coordinateGlobalSingleServer(modelId) === 'attached') {
 			return;
 		}
 
@@ -2240,6 +2750,7 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 					}
 				}
 				this._onDidLogUpdate.fire(modelId);
+				this._mirrorLogsToSharedFile(modelId); // so windows attached to this server see the logs too
 			}));
 
 			// If the process exits, decide whether it was an intentional stop or a real crash. A crash
@@ -2264,7 +2775,11 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 					this.runningServers.delete(modelId);
 					this._onDidServerStateChange.fire(modelId);
 				}
+				// Capture our owned pid now; the async check below reads the shared lock to see if this exit was
+				// caused by another window replacing us (attach-else-replace) rather than a genuine crash.
+				const ownedPid = this._ownedServerPid;
 				if (wasIntentional) {
+					void this._wasReplacedByAnotherWindow(ownedPid); // clears our stale lock entry, if any
 					this._log(`[LoCoPilot Runner] Server for model ${modelId} stopped (exit ${exitCode ?? 'n/a'}).`);
 					return;
 				}
@@ -2272,10 +2787,20 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 				// A pre-warm attempt that will be retried suppresses its notification so a self-healing
 				// startup race doesn't flash a scary "failed to start" toast; the crash is still logged.
 				if (this._suppressCrashNotice.delete(modelId)) {
+					void this._wasReplacedByAnotherWindow(ownedPid);
 					const tail = logs.slice(-60).join('\n');
 					this._log(`[LoCoPilot Runner] Pre-warm attempt for "${model.modelName}" exited (exit ${exitCode ?? 'n/a'}); will retry. Last output:\n${tail}`);
 				} else {
-					void this._reportServerCrash(modelId, model.modelName, exitCode, logs);
+					void (async () => {
+						// Another window intentionally stopped our server to run its own model - that is the smooth
+						// handoff, not a crash, so stay silent instead of flashing a "Couldn't start" toast.
+						if (await this._wasReplacedByAnotherWindow(ownedPid)) {
+							this._crashedBeforeReady.delete(modelId);
+							this._log(`[LoCoPilot Runner] Server for ${modelId} was stopped by another window taking over; not reporting a crash.`);
+							return;
+						}
+						await this._reportServerCrash(modelId, model.modelName, exitCode, logs);
+					})();
 				}
 			}));
 
@@ -2311,6 +2836,8 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 			this.startingServers.delete(modelId); // running state replaces starting state
 			this.runningServers.set(modelId, { port, terminal, kind: 'llama', logs, lastUsedAt: Date.now(), ready: false });
 			this._releaseReservedPort(port); // now tracked via runningServers; reservation no longer needed
+			// Advertise this server to other windows so they attach to it instead of launching a duplicate.
+			void this._publishActiveServerLock(port, 'llama', terminal, modelId);
 			this._onDidServerStateChange.fire(modelId);
 
 			// Warm up in the background so the first real message has no kernel-JIT / cache lag.
@@ -2339,8 +2866,18 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 		// with 503 while it loads. Instead we fall through to _waitForServerReady below so the request waits.
 		const existingRec = this.runningServers.get(modelId);
 		if (existingRec?.ready) {
-			this._touch(modelId);
-			return this.getServerBaseUrl(modelId);
+			// A foreign record points at another window's server; that window may have closed it since we attached.
+			// Re-probe before handing back its URL - if it's gone, drop the stale handle and fall through to launch
+			// our own (which will re-run cross-window coordination and either re-attach or start fresh).
+			if (existingRec.foreign && !await this._probeServerHealth(existingRec.port, existingRec.kind)) {
+				this._disposeForeignLogWatcher(modelId);
+				this.runningServers.delete(modelId);
+				this._onDidServerStateChange.fire(modelId);
+				this._log(`[LoCoPilot Runner] Foreign server for ${modelId} is no longer reachable; will (re)launch.`);
+			} else {
+				this._touch(modelId);
+				return this.getServerBaseUrl(modelId);
+			}
 		}
 
 		// Only launch (and enforce the RAM budget) when there is no server record at all. If one already
@@ -2610,6 +3147,7 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 					logs.splice(0, logs.length - LoCoPilotLocalModelRunner.MAX_LOG_LINES);
 				}
 				this._onDidLogUpdate.fire(modelId);
+				this._mirrorLogsToSharedFile(modelId); // so windows attached to this server see the logs too
 
 				// Optional-tuning-flag rejection (argparse): an old mlx-lm exits immediately on unknown args,
 				// so this launch is already dead. Remember for the session, tear the launch down right here
@@ -2681,6 +3219,8 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 			this.startingServers.delete(modelId);
 			this.runningServers.set(modelId, { port, terminal, kind: 'mlx', servedModelId: modelDir, logs, lastUsedAt: Date.now(), ready: false });
 			this._releaseReservedPort(port); // now tracked via runningServers; reservation no longer needed
+			// Advertise this server to other windows so they attach to it instead of launching a duplicate.
+			void this._publishActiveServerLock(port, 'mlx', terminal, modelId, modelDir);
 			this._onDidServerStateChange.fire(modelId);
 
 			// Warm up in the background: mlx_lm.server answers /v1/models 200 while the weights are still
@@ -2699,6 +3239,7 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 				}
 				if (this.runningServers.has(modelId)) {
 					this.runningServers.delete(modelId);
+					void this._wasReplacedByAnotherWindow(this._ownedServerPid); // clears our stale lock entry, if any
 					this._onDidServerStateChange.fire(modelId);
 					this._log(`[LoCoPilot Runner] MLX terminal closed for model ${modelId}`);
 				}
