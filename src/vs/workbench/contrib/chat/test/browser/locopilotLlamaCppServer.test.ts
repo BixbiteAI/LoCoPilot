@@ -16,7 +16,9 @@ import {
 	shouldUseBundledVulkan,
 	metalOffloadBudgetBytes,
 	usableSystemMemoryBytes,
-	METAL_WIRED_MEMORY_FRACTION,
+	METAL_WIRED_MEMORY_FRACTION_SMALL,
+	METAL_WIRED_MEMORY_FRACTION_LARGE,
+	METAL_LARGE_RAM_THRESHOLD_BYTES,
 	USABLE_SYSTEM_MEMORY_FRACTION,
 	KV_AUTO_QUANT_CONTEXT_THRESHOLD,
 	KV_BUDGET_FRACTION,
@@ -112,9 +114,25 @@ suite('LoCoPilot llama.cpp server', () => {
 		const GB = 1024 * 1024 * 1024;
 
 		test('metalOffloadBudgetBytes is the wired fraction of total, not raw total', () => {
-			assert.strictEqual(metalOffloadBudgetBytes(32 * GB), Math.floor(32 * GB * METAL_WIRED_MEMORY_FRACTION));
+			assert.strictEqual(metalOffloadBudgetBytes(32 * GB), Math.floor(32 * GB * METAL_WIRED_MEMORY_FRACTION_SMALL));
 			// The whole point of the fix: the budget must be strictly less than total RAM.
 			assert.ok(metalOffloadBudgetBytes(32 * GB) < 32 * GB);
+		});
+
+		test('metalOffloadBudgetBytes is tiered like Apple\'s default wired ceiling', () => {
+			// <=36GB machines get the conservative small-machine fraction; larger ones the 75% tier.
+			assert.strictEqual(metalOffloadBudgetBytes(16 * GB), Math.floor(16 * GB * METAL_WIRED_MEMORY_FRACTION_SMALL));
+			assert.strictEqual(metalOffloadBudgetBytes(64 * GB), Math.floor(64 * GB * METAL_WIRED_MEMORY_FRACTION_LARGE));
+			assert.strictEqual(metalOffloadBudgetBytes(METAL_LARGE_RAM_THRESHOLD_BYTES), Math.floor(METAL_LARGE_RAM_THRESHOLD_BYTES * METAL_WIRED_MEMORY_FRACTION_LARGE));
+		});
+
+		test('metalOffloadBudgetBytes honors an explicit iogpu wired limit, capped below total', () => {
+			// User raised the sysctl: their explicit ceiling wins over the fraction heuristic.
+			assert.strictEqual(metalOffloadBudgetBytes(64 * GB, 56 * GB), 56 * GB);
+			// A wild value can never budget past 90% of physical RAM.
+			assert.strictEqual(metalOffloadBudgetBytes(16 * GB, 100 * GB), Math.floor(16 * GB * 0.9));
+			// Unset/zero limit -> fraction heuristic as usual.
+			assert.strictEqual(metalOffloadBudgetBytes(16 * GB, 0), Math.floor(16 * GB * METAL_WIRED_MEMORY_FRACTION_SMALL));
 		});
 
 		test('usableSystemMemoryBytes leaves headroom below total', () => {
@@ -176,16 +194,16 @@ suite('LoCoPilot llama.cpp server', () => {
 		const GB = 1024 * 1024 * 1024;
 
 		test('small weights -> full fraction allowance', () => {
-			// 11.2GB budget (16GB Mac wired), 4GB weights: remaining 5.7GB > 25% fraction (2.8GB) -> fraction wins.
-			const budget = Math.floor(16 * GB * METAL_WIRED_MEMORY_FRACTION);
+			// ~10.6GB budget (16GB Mac wired), 4GB weights: remaining > 25% fraction (2.6GB) -> fraction wins.
+			const budget = Math.floor(16 * GB * METAL_WIRED_MEMORY_FRACTION_SMALL);
 			assert.strictEqual(computeKvBudgetBytes(budget, 4 * GB), Math.floor(budget * KV_BUDGET_FRACTION));
 		});
 
 		test('weights near the budget -> only the true remainder, not the fraction', () => {
-			// 11.2GB budget, 9GB weights: remaining = 11.2 - 9 - 1.5 = ~0.7GB < 2.8GB fraction.
-			const budget = Math.floor(16 * GB * METAL_WIRED_MEMORY_FRACTION);
-			const expected = budget - 9 * GB - RUNTIME_OVERHEAD_BYTES;
-			assert.strictEqual(computeKvBudgetBytes(budget, 9 * GB), expected);
+			// ~10.6GB budget, 8.5GB weights: remaining = 10.6 - 8.5 - 1.5 = ~0.6GB < 2.6GB fraction.
+			const budget = Math.floor(16 * GB * METAL_WIRED_MEMORY_FRACTION_SMALL);
+			const expected = budget - 8.5 * GB - RUNTIME_OVERHEAD_BYTES;
+			assert.strictEqual(computeKvBudgetBytes(budget, 8.5 * GB), expected);
 			assert.ok(expected < budget * KV_BUDGET_FRACTION);
 		});
 

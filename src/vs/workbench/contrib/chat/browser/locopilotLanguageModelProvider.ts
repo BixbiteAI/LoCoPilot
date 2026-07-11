@@ -347,7 +347,8 @@ export class LoCoPilotLanguageModelProvider extends Disposable implements ILangu
 			const resolved = resolveAutoModel(
 				this.customLanguageModelsService.getCustomModels(),
 				this._detectedRamGB(),
-				id => this.localModelRunner.isServerRunning(id) || this.localModelRunner.isServerStarting(id)
+				id => this.localModelRunner.isServerRunning(id) || this.localModelRunner.isServerStarting(id),
+				this.localModelRunner.getAvailableRamGB()
 			);
 			if (!resolved) {
 				throw new Error('Auto has no downloaded local model to use yet. Download one of the suggested models from the chat panel (or LoCoPilot Settings), then send your message again.');

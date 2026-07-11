@@ -209,7 +209,9 @@ function resolveAutoModelForPicker(customLanguageModelsService: ICustomLanguageM
 	return resolveAutoModel(
 		customLanguageModelsService.getCustomModels(),
 		detectedRamGB(timerService),
-		id => localModelRunner.isServerRunning(id) || localModelRunner.isServerStarting(id)
+		id => localModelRunner.isServerRunning(id) || localModelRunner.isServerStarting(id),
+		// Live free-RAM figure so the picker label previews the same fit-now-aware choice the agent makes.
+		localModelRunner.getAvailableRamGB()
 	);
 }
 

@@ -188,13 +188,18 @@ export const DEFAULT_LLAMA_CONTEXT_SIZE = 16384;
 export const KV_AUTO_QUANT_CONTEXT_THRESHOLD = 32768;
 
 /**
- * Fraction of Apple-Silicon unified memory the GPU may WIRE for inference. macOS caps a Metal app's
- * working set at roughly `recommendedMaxWorkingSetSize` (~70% of total RAM on M-series); trying to wire
- * more than this forces the OS to page weights to SSD, which thrashes the machine (freeze, sustained 100%
- * GPU, heat, thermal shutdown). So the offload/KV budget on Metal must be sized off this fraction of TOTAL
- * RAM - never raw total, which ignores both this ceiling and the RAM the OS + editor already hold.
+ * Fractions of Apple-Silicon unified memory the GPU may WIRE for inference. macOS caps a Metal app's
+ * working set at `recommendedMaxWorkingSetSize`; trying to wire more forces the OS to page weights to SSD,
+ * which thrashes the machine (freeze, sustained 100% GPU, heat, thermal shutdown). Apple's actual default
+ * ceiling is TIERED: ~66-68% of total RAM on <=36GB machines and ~75% on larger ones - a flat 0.70 (the
+ * old constant) over-budgeted exactly the memory-tight 8-16GB Macs that hang. So the offload/KV budget on
+ * Metal must be sized off these fractions of TOTAL RAM - never raw total, which ignores both this ceiling
+ * and the RAM the OS + editor already hold.
  */
-export const METAL_WIRED_MEMORY_FRACTION = 0.70;
+export const METAL_WIRED_MEMORY_FRACTION_SMALL = 0.66;
+export const METAL_WIRED_MEMORY_FRACTION_LARGE = 0.75;
+/** RAM size at/above which macOS applies the larger default wired-memory fraction. */
+export const METAL_LARGE_RAM_THRESHOLD_BYTES = 36 * 1024 * 1024 * 1024;
 
 /**
  * Fraction of TOTAL system RAM treated as usable for inference (weights + KV) when deciding whether a model
@@ -212,11 +217,23 @@ export const USABLE_SYSTEM_MEMORY_FRACTION = 0.85;
 export const KV_BUDGET_FRACTION = 0.25;
 
 /**
- * Usable unified-memory budget (bytes) for GPU offload on Apple Silicon (Metal): a fraction of total RAM
- * bounded by the wired working-set ceiling. Returns 0 when total is unknown so callers skip the budget.
+ * Usable unified-memory budget (bytes) for GPU offload on Apple Silicon (Metal): the wired working-set
+ * ceiling. When the user raised the kernel limit themselves (`iogpu.wired_limit_mb`, passed via
+ * `wiredLimitBytes`), that explicit ceiling wins (capped at 90% of RAM so a wild sysctl value cannot
+ * budget past physical memory); otherwise Apple's tiered default fraction applies. Returns 0 when total
+ * is unknown so callers skip the budget.
  */
-export function metalOffloadBudgetBytes(totalmemBytes: number): number {
-	return totalmemBytes > 0 ? Math.floor(totalmemBytes * METAL_WIRED_MEMORY_FRACTION) : 0;
+export function metalOffloadBudgetBytes(totalmemBytes: number, wiredLimitBytes?: number): number {
+	if (totalmemBytes <= 0) {
+		return 0;
+	}
+	if (wiredLimitBytes && wiredLimitBytes > 0) {
+		return Math.floor(Math.min(wiredLimitBytes, totalmemBytes * 0.9));
+	}
+	const fraction = totalmemBytes >= METAL_LARGE_RAM_THRESHOLD_BYTES
+		? METAL_WIRED_MEMORY_FRACTION_LARGE
+		: METAL_WIRED_MEMORY_FRACTION_SMALL;
+	return Math.floor(totalmemBytes * fraction);
 }
 
 /**

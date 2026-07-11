@@ -25,6 +25,36 @@ export interface ISystemHardwareInfo {
 	readonly logicalCoreCount: number;
 	/** Detected discrete GPUs with their VRAM, best-effort. Empty when none detected/probeable. */
 	readonly gpus: IGpuInfo[];
+	/**
+	 * Apple Silicon only: the user-configured GPU wired-memory limit in bytes (`sysctl iogpu.wired_limit_mb`),
+	 * or 0 when unset/unknown/not-macOS. When a user raised this limit (common on high-RAM Macs used for
+	 * inference), the Metal offload budget may use it instead of the default fraction heuristic.
+	 */
+	readonly metalWiredLimitBytes?: number;
+}
+
+/**
+ * Coarse memory-pressure level. On macOS this mirrors `kern.memorystatus_vm_pressure_level`
+ * (1 = normal, 2 = warn, 4 = critical); on Linux it is derived from PSI when available.
+ * 'unknown' when the platform gives no signal - callers must then rely on availableBytes alone.
+ */
+export type MemoryPressureLevel = 'normal' | 'warn' | 'critical' | 'unknown';
+
+/**
+ * A LIVE snapshot of system memory, taken at call time (never cached - unlike the hardware probe).
+ *
+ * `availableBytes` is the memory the OS could actually give an allocating process WITHOUT swapping:
+ * free + reclaimable (file cache / inactive / purgeable) pages. This is deliberately NOT `os.freemem()`,
+ * which on macOS counts only truly-free pages (wildly pessimistic - most RAM sits in reclaimable file
+ * cache) and on Linux excludes reclaimable cache too. Windows' freemem is already "available".
+ */
+export interface IMemoryStatus {
+	readonly totalBytes: number;
+	/** Free + reclaimable memory in bytes; 0 when it could not be determined. */
+	readonly availableBytes: number;
+	readonly pressure: MemoryPressureLevel;
+	/** Bytes of swap currently in use, or -1 when unknown. Rising swap while a model runs = thrashing. */
+	readonly swapUsedBytes: number;
 }
 
 /**
@@ -39,4 +69,17 @@ export interface ISystemHardwareInfo {
 export interface ILoCoPilotSystemInfoService {
 	readonly _serviceBrand: undefined;
 	getHardwareInfo(): Promise<ISystemHardwareInfo>;
+	/**
+	 * Live system-memory snapshot (see {@link IMemoryStatus}). Never cached: the local-model runner calls
+	 * this before every launch decision and from its runtime watchdog, so it must reflect the machine NOW.
+	 * Best-effort: fields degrade to 0/'unknown'/-1 rather than throwing.
+	 */
+	getMemoryStatus(): Promise<IMemoryStatus>;
+	/**
+	 * Lowers the scheduling priority of a process (an inference server we spawned) so the OS keeps the UI
+	 * responsive - and on Apple Silicon prefers efficiency cores under contention, reducing heat - while the
+	 * model still gets full throughput when the machine is otherwise idle. Best-effort: resolves false when
+	 * the platform tools are missing or the call fails; never throws.
+	 */
+	deprioritizeProcess(pid: number): Promise<boolean>;
 }

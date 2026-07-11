@@ -1030,6 +1030,19 @@ export function isAutoCandidate(model: ICustomLanguageModel): boolean {
 }
 
 /**
+ * Rough working-set headroom (GB) a model needs ON TOP of its weight bytes to run: minimum KV cache +
+ * engine runtime overhead. Used by the Auto fit-now scoring, mirroring the runner's pre-flight arithmetic
+ * (weights + min KV + ~1.5GB runtime) in catalog terms.
+ */
+export const AUTO_FIT_NOW_OVERHEAD_GB = 2.5;
+
+/** True when the entry's weights + a minimal runtime footprint fit within `availableRamGB` right now. */
+export function autoEntryFitsAvailableRam(entry: ICatalogModel, availableRamGB: number): boolean {
+	const weightsGB = entry.approxSizeBytes / (1024 ** 3);
+	return weightsGB + AUTO_FIT_NOW_OVERHEAD_GB <= availableRamGB;
+}
+
+/**
  * Resolve the Auto selection to a concrete downloaded model, or undefined when nothing qualifies (the
  * caller then shows the starter-picks download card).
  *
@@ -1040,11 +1053,18 @@ export function isAutoCandidate(model: ICustomLanguageModel): boolean {
  *     (`minRamGB` already encodes "comfortable", so fitting it is the OOM/thermal guard), then prefer the
  *     curated "Best for you" repo, then architecture - MoE > MTP > MLX > plain GGUF (faster for equal
  *     quality). RAM unknown (`ramGB <= 0`) restricts to the 8 GB tier, the safe-everywhere floor.
+ *
+ * `availableRamGB` (optional): memory available RIGHT NOW (free + reclaimable, from the runner's live
+ * probe). Candidates whose weights + minimal runtime fit it get a DOMINATING score bonus, so on a machine
+ * whose RAM is half-eaten by other apps Auto steps down to a model that runs smoothly today instead of
+ * the biggest one that fits on paper (which would launch straight into the availability warning). When
+ * none fit now - or the figure is unknown - the ranking gracefully degrades to the total-RAM tier order.
  */
 export function resolveAutoModel(
 	models: readonly ICustomLanguageModel[],
 	ramGB: number,
-	isServerActive: (modelId: string) => boolean
+	isServerActive: (modelId: string) => boolean,
+	availableRamGB?: number
 ): ICustomLanguageModel | undefined {
 	const candidates = models.filter(isAutoCandidate);
 	if (candidates.length === 0) {
@@ -1066,6 +1086,9 @@ export function resolveAutoModel(
 			continue; // would OOM/thrash on this machine - never auto-picked.
 		}
 		let score = entry.minRamGB * 1000; // capability first: highest RAM tier that fits.
+		if (availableRamGB !== undefined && availableRamGB > 0 && autoEntryFitsAvailableRam(entry, availableRamGB)) {
+			score += 100_000; // fits the machine's CURRENT headroom - dominates every capability/architecture bonus.
+		}
 		if (entry.repoId === recommendedRepoId) {
 			score += 500; // the curated "Best for you" pick wins its tier.
 		}

@@ -3,12 +3,13 @@
  *  Licensed under the MIT License. See License.txt in the project root for license information.
  *--------------------------------------------------------------------------------------------*/
 
+import { mainWindow } from '../../../../base/browser/window.js';
 import { Disposable, IDisposable, toDisposable } from '../../../../base/common/lifecycle.js';
 import { URI } from '../../../../base/common/uri.js';
 import { ILogService } from '../../../../platform/log/common/log.js';
 import { IConfigurationService } from '../../../../platform/configuration/common/configuration.js';
 import { IFileService } from '../../../../platform/files/common/files.js';
-import { ICustomLanguageModelsService, customModelVisionEnabled, type ICustomLanguageModel } from '../common/customLanguageModelsService.js';
+import { ICustomLanguageModelsService, customModelVisionEnabled, LOCOPILOT_AUTO_MODEL_ID, type ICustomLanguageModel } from '../common/customLanguageModelsService.js';
 import { ChatConfiguration } from '../common/constants.js';
 import { ILoCoPilotFileLog } from './locopilotFileLog.js';
 import { registerAction2, Action2 } from '../../../../platform/actions/common/actions.js';
@@ -42,7 +43,7 @@ import {
 	type KvCacheType
 } from './locopilotLlamaCppServer.js';
 import { readGgufModelInfo, isMoeModelInfo, isSwaModelInfo, kvBytesPerTokenPerLayer, type IGgufModelInfo } from './locopilotGgufMetadata.js';
-import { ILoCoPilotSystemInfoService, type ISystemHardwareInfo } from '../../../../platform/locopilotSystemInfo/common/locopilotSystemInfo.js';
+import { ILoCoPilotSystemInfoService, type IMemoryStatus, type ISystemHardwareInfo } from '../../../../platform/locopilotSystemInfo/common/locopilotSystemInfo.js';
 import { dirname } from '../../../../base/common/path.js';
 import { isWindows, isMacintosh } from '../../../../base/common/platform.js';
 import {
@@ -72,7 +73,6 @@ import { IEnvironmentService, INativeEnvironmentService } from '../../../../plat
 import { IRequestService } from '../../../../platform/request/common/request.js';
 import { CancellationToken, CancellationTokenSource } from '../../../../base/common/cancellation.js';
 import { timeout } from '../../../../base/common/async.js';
-import { LOCOPILOT_SETTINGS_SECTION_LIST_MODELS } from './chatManagement/locopilotSettingsEditorInput.js';
 
 export const ILoCoPilotLocalModelRunner = createDecorator<ILoCoPilotLocalModelRunner>('locopilotLocalModelRunner');
 
@@ -169,6 +169,13 @@ export interface ILoCoPilotLocalModelRunner {
 	isServerRunning(modelId: string): boolean;
 	/** True while the server process is being launched (between button click and first state change). */
 	isServerStarting(modelId: string): boolean;
+	/**
+	 * Best-effort system RAM available RIGHT NOW (free + reclaimable) in GB, from the most recent live
+	 * memory probe (refreshed in the background when stale). Undefined until the first probe lands or on
+	 * web. Lets Auto model selection prefer a model that fits the machine's current headroom instead of
+	 * one that only fits on paper (total RAM).
+	 */
+	getAvailableRamGB(): number | undefined;
 }
 
 export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotLocalModelRunner {
@@ -294,6 +301,27 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 	private _cudaOfferedThisSession = false;
 	/** Guards against parallel CUDA engine downloads. */
 	private _cudaDownloadInFlight = false;
+	/** Last live memory snapshot + when it was taken; a short-lived cache for sync consumers (Auto mode). */
+	private _lastMemoryStatus: IMemoryStatus | undefined;
+	private _lastMemoryStatusAt = 0;
+	/** Guards concurrent memory-status probes so bursts (picker open + launch) share one exec round. */
+	private _memoryStatusInFlight: Promise<IMemoryStatus | undefined> | undefined;
+	/** Periodic memory watchdog while owned servers are resident (see _updateMemoryWatchdog). */
+	private _watchdogTimer: number | undefined;
+	/** Consecutive watchdog samples that looked critical; the breaker trips at 2 (~10s) to skip one-tick blips. */
+	private _watchdogStrikes = 0;
+	/** Swap-in-use (bytes) at the previous watchdog sample, so the tick can detect ACTIVELY GROWING swap (paging). */
+	private _watchdogLastSwapBytes = -1;
+	/** Epoch ms until which automatic (pre-warm) launches stay suppressed after the watchdog tripped. */
+	private _watchdogCooldownUntil = 0;
+	/** Per-model count of OOM-crash degradation relaunches this session (see _reportServerCrash's OOM ladder). */
+	private readonly _oomRetryCount = new Map<string, number>();
+	/** Per-model context-size cap applied by the OOM ladder; consulted when building the launch tuning. */
+	private readonly _oomContextCap = new Map<string, number>();
+	/** Models whose OOM ladder also strips the memory-heavy extras (MTP self-draft / separate draft model). */
+	private readonly _oomStripExtras = new Set<string>();
+	/** Context size (-c) each model's LAST llama launch actually used, so the OOM ladder can halve it. */
+	private readonly _lastLaunchContext = new Map<string, number>();
 
 	constructor(
 		@ICustomLanguageModelsService private readonly customLanguageModelsService: ICustomLanguageModelsService,
@@ -313,8 +341,9 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 	) {
 		super();
 		this._registerCommands();
-		// Make sure idle timers and child processes are torn down when the service is disposed.
+		// Make sure idle timers, the memory watchdog and child processes are torn down when the service is disposed.
 		this._register({ dispose: () => this.stopManagedServers() });
+		this._register({ dispose: () => this._stopMemoryWatchdog() });
 		// Watch the shared active-server lock so status stays in sync across windows: when another window
 		// starts/stops/replaces the global model server, this window updates its own records (attach a foreign
 		// handle to the new server, drop handles that no longer match) and the My Models UI follows live.
@@ -1129,6 +1158,51 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 	}
 
 	/**
+	 * LIVE memory snapshot (total, AVAILABLE = free + reclaimable, pressure, swap) from the shared-process
+	 * system-info service. Unlike `_getSystemMemory` (raw os.freemem, misleadingly low on macOS/Linux) this
+	 * is the figure launch decisions and the watchdog may trust. `maxAgeMs` > 0 accepts a recent cached
+	 * snapshot (UI/scoring callers); 0 forces a fresh probe (launch gate, watchdog). Undefined on web or
+	 * when the probe fails - callers must then skip availability reasoning, never block on it.
+	 */
+	private async _getMemoryStatus(maxAgeMs = 0): Promise<IMemoryStatus | undefined> {
+		if (this._lastMemoryStatus && maxAgeMs > 0 && Date.now() - this._lastMemoryStatusAt <= maxAgeMs) {
+			return this._lastMemoryStatus;
+		}
+		if (!this._memoryStatusInFlight) {
+			this._memoryStatusInFlight = this.instantiationService.invokeFunction(async (accessor) => {
+				try {
+					const status = await accessor.get(ILoCoPilotSystemInfoService).getMemoryStatus();
+					if (status.totalBytes > 0 && status.availableBytes > 0) {
+						this._lastMemoryStatus = status;
+						this._lastMemoryStatusAt = Date.now();
+						return status;
+					}
+					return undefined;
+				} catch {
+					return undefined; // service not registered (web) or probe failed
+				} finally {
+					this._memoryStatusInFlight = undefined;
+				}
+			});
+		}
+		return this._memoryStatusInFlight;
+	}
+
+	/**
+	 * Synchronous best-effort "RAM available right now" in GB for UI/scoring consumers (Auto model mode).
+	 * Serves the last snapshot and refreshes it in the background when stale, so callers in sync render
+	 * paths get a current-enough figure without awaiting an exec round-trip. Undefined until the first
+	 * probe lands (callers fall back to total-RAM reasoning).
+	 */
+	getAvailableRamGB(): number | undefined {
+		const STALE_MS = 15_000;
+		if (Date.now() - this._lastMemoryStatusAt > STALE_MS) {
+			void this._getMemoryStatus(); // refresh for the next caller; this call returns the previous snapshot
+		}
+		return this._lastMemoryStatus ? this._lastMemoryStatus.availableBytes / (1024 ** 3) : undefined;
+	}
+
+	/**
 	 * The engine a model will (or does) run under. Reuses the running server's kind when up; otherwise mirrors
 	 * the selection in _doStartServerInTerminal (MLX for Apple-Silicon HF models whose weights look like MLX,
 	 * llama.cpp otherwise) so the budget can reason about a not-yet-started model.
@@ -1345,6 +1419,39 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 			return;
 		}
 
+		// OOM degradation ladder (Ollama-style): a launch that died because memory ran out is not a bug to
+		// report, it's a footprint to shrink. Instead of surfacing a scary crash, retry with progressively
+		// smaller memory demands - attempt 1: halve the context window and strip the memory-heavy extras
+		// (MTP self-draft / separate draft model); attempt 2: floor the context at the minimum. The caps are
+		// per-model per-session; only after both attempts still OOM does the user see an actionable error.
+		const oomCrash = /out of memory|outofmemory|failed to allocate|unable to allocate|cudamalloc failed|kiogpucommandbuffercallbackerroroutofmemory|insufficient memory|not enough (?:memory|space)|ggml_backend.*buffer.*(?:fail|null)|std::bad_alloc/i.test(tail);
+		if (oomCrash) {
+			const attempts = this._oomRetryCount.get(modelId) ?? 0;
+			if (attempts < 2) {
+				this._oomRetryCount.set(modelId, attempts + 1);
+				const lastCtx = this._lastLaunchContext.get(modelId) ?? DEFAULT_LLAMA_CONTEXT_SIZE;
+				const newCap = attempts === 0
+					? Math.max(MIN_CLAMPED_CONTEXT, Math.floor(lastCtx / 2 / 1024) * 1024)
+					: MIN_CLAMPED_CONTEXT;
+				this._oomContextCap.set(modelId, newCap);
+				this._oomStripExtras.add(modelId);
+				this._log(`[LoCoPilot Runner] "${modelName}" ran out of memory (attempt ${attempts + 1}/2); relaunching with context capped at ${newCap} and speculative extras stripped.`);
+				this._endStarting(modelId);
+				timeout(6000).then(() => {
+					if (!this.runningServers.has(modelId) && !this.startingServers.has(modelId)) {
+						this.startServerInTerminal(modelId).catch(e => this._log(`[LoCoPilot Runner] OOM-degraded relaunch failed: ${e}`));
+					}
+				});
+				return;
+			}
+			// Both degraded attempts still OOM-ed: this model genuinely doesn't fit right now. Be honest
+			// and specific instead of the generic "couldn't start" message.
+			const oomMessage = `"${modelName}" ran out of memory while loading, even with reduced settings. Close some applications to free up memory, or choose a smaller model.`;
+			this._endStarting(modelId, oomMessage);
+			this.notificationService.notify({ severity: Severity.Error, message: oomMessage });
+			return;
+		}
+
 		const actions: { label: string; run: () => void }[] = [];
 
 		// Keep the user-facing wording friendly and free of internal details (engine names, settings keys,
@@ -1453,7 +1560,7 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 		if (!mem?.totalmem) {
 			return undefined;
 		}
-		const budget = backend === 'metal' ? metalOffloadBudgetBytes(mem.totalmem) : usableSystemMemoryBytes(mem.totalmem);
+		const budget = backend === 'metal' ? metalOffloadBudgetBytes(mem.totalmem, hw.metalWiredLimitBytes) : usableSystemMemoryBytes(mem.totalmem);
 		return budget > 0 ? budget : undefined;
 	}
 
@@ -1641,7 +1748,7 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 		//    bust the GPU ceiling at decode (kIOGPUCommandBufferCallbackErrorOutOfMemory).
 		//  - cuda/vulkan/cpu: system RAM left for inference (85%), plus discrete VRAM when weights offload to a GPU.
 		const usableBytes = backend === 'metal'
-			? metalOffloadBudgetBytes(mem.totalmem)
+			? metalOffloadBudgetBytes(mem.totalmem, (await this._getHardwareInfo())?.metalWiredLimitBytes)
 			: usableSystemMemoryBytes(mem.totalmem) + (discreteVramBytes && discreteVramBytes > 0 ? discreteVramBytes : 0);
 		return { requiredBytes, usableBytes };
 	}
@@ -1718,25 +1825,170 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 			return true;
 		}
 		const fit = await this._computeFit(modelPath, backend, discreteVramBytes, extraResidentBytes);
-		if (!fit || fit.requiredBytes <= fit.usableBytes) {
-			return true;
+		if (fit && fit.requiredBytes > fit.usableBytes) {
+			// CAPABILITY failure: even the minimum footprint exceeds what this machine can EVER offer (total
+			// usable RAM), so this model can never run here - an honest, plain refusal. This is the ONLY
+			// pre-launch memory block. We deliberately do NOT block on transient "available right now" memory:
+			// Auto mode already picks a model that fits current free RAM, and the runtime watchdog stops a
+			// launch that actually starts thrashing - so a switch just loads (evicting the old model first)
+			// instead of throwing a confusing "not enough free RAM" that ignored the RAM the switch frees.
+			const GB = 1024 * 1024 * 1024;
+			const needGb = Math.ceil(fit.requiredBytes / GB);
+			const haveGb = Math.max(1, Math.round(fit.usableBytes / GB));
+			this._log(`[LoCoPilot Runner] Refusing to start ${modelId}: needs ~${needGb}GB but only ~${haveGb}GB is usable on this machine.`);
+			const name = model.displayName || model.modelName;
+			const message = `"${name}" needs about ${needGb} GB of memory to run, but this computer has about ${haveGb} GB usable. Please choose a smaller model.`;
+			this._endStarting(modelId, message);
+			this.notificationService.notify({ severity: Severity.Error, message });
+			return false;
+		}
+		return true;
+	}
+
+	/**
+	 * Lowers the just-launched server process's scheduling priority (best-effort, behind the
+	 * `locopilot.local.backgroundPriority` setting, default on). On macOS this applies the 'utility' QoS
+	 * clamp - under contention the scheduler prefers efficiency cores for it, which keeps the editor UI
+	 * fluid during weight loading/decode and runs measurably cooler - while an otherwise-idle machine
+	 * still gives the server full throughput. Windows/Linux get below-normal priority / nice+5.
+	 */
+	private async _deprioritizeServerProcess(terminal: ITerminalInstance, modelName: string, delayMs = 0): Promise<void> {
+		if (this.configurationService.getValue<boolean>(ChatConfiguration.LocopilotLocalBackgroundPriority) === false) {
+			return;
+		}
+		try {
+			await terminal.processReady; // processId is only populated once the pty has spawned
+			if (delayMs > 0) {
+				// MLX runs inside a shell (sendText), so give the shell a moment to fork the actual python
+				// server before we look for child processes to deprioritize.
+				await timeout(delayMs);
+			}
+			const pid = terminal.processId;
+			if (typeof pid !== 'number' || pid <= 1) {
+				return;
+			}
+			const ok = await this.instantiationService.invokeFunction(accessor =>
+				accessor.get(ILoCoPilotSystemInfoService).deprioritizeProcess(pid));
+			this._log(`[LoCoPilot Runner] ${ok ? 'Lowered' : 'Could not lower'} scheduling priority of the "${modelName}" server (pid ${pid}).`);
+		} catch (e) {
+			this._log(`[LoCoPilot Runner] Deprioritizing the "${modelName}" server failed (ignored): ${e}`);
+		}
+	}
+
+	// ---- Runtime memory watchdog (circuit breaker) ----------------------------------------------------
+	//
+	// Every pre-launch estimate can be wrong (GGUF variance, compute buffers, OTHER apps allocating while
+	// the model runs), and the failure mode of "wrong" on a memory-tight machine is not an error - it is
+	// the swap/thrash death spiral: UI freeze, sustained 100% GPU, heat, sometimes a forced reboot. A
+	// thrashing process never exits, so onExit-based crash handling can't catch it. This watchdog is the
+	// safety net behind all the estimation: while THIS window owns a resident server it samples the live
+	// memory state and, when the system is genuinely drowning (two consecutive critical samples, ~10s),
+	// stops our servers - a 1-second recovery instead of a frozen machine. Killing our own process is
+	// always the better trade: the user can relaunch a smaller model; they can't un-freeze a Mac.
+
+	/** Available-memory floor (bytes) below which a watchdog sample counts as critical. */
+	private static readonly WATCHDOG_AVAILABLE_FLOOR = 1024 * 1024 * 1024; // 1 GiB
+	/** Sample interval; two bad samples trip the breaker, so reaction time is ~2x this. */
+	private static readonly WATCHDOG_INTERVAL_MS = 5000;
+	/** How long automatic (pre-warm) launches stay suppressed after the breaker trips. */
+	private static readonly WATCHDOG_COOLDOWN_MS = 60_000;
+
+	/** True when this window owns at least one live server process (foreign attachments don't count). */
+	private _ownsResidentServer(): boolean {
+		for (const rec of this.runningServers.values()) {
+			if (!rec.foreign) {
+				return true;
+			}
+		}
+		return false;
+	}
+
+	/**
+	 * (Re)evaluates whether the watchdog should be running. Called after every server promotion; the tick
+	 * itself stops the timer once no owned server remains, so stop paths need no hook. Disabled entirely by
+	 * the `locopilot.local.memoryWatchdog` setting.
+	 */
+	private _updateMemoryWatchdog(): void {
+		const enabled = this.configurationService.getValue<boolean>(ChatConfiguration.LocopilotLocalMemoryWatchdog) !== false;
+		if (!enabled || !this._ownsResidentServer()) {
+			this._stopMemoryWatchdog();
+			return;
+		}
+		if (this._watchdogTimer) {
+			return; // already running
+		}
+		this._watchdogStrikes = 0;
+		this._watchdogLastSwapBytes = -1;
+		this._watchdogTimer = mainWindow.setInterval(() => void this._memoryWatchdogTick(), LoCoPilotLocalModelRunner.WATCHDOG_INTERVAL_MS);
+		this._log('[LoCoPilot Runner] Memory watchdog armed (5s sampling while a local server is resident).');
+	}
+
+	private _stopMemoryWatchdog(): void {
+		if (this._watchdogTimer) {
+			mainWindow.clearInterval(this._watchdogTimer);
+			this._watchdogTimer = undefined;
+			this._watchdogStrikes = 0;
+			this._watchdogLastSwapBytes = -1;
+		}
+	}
+
+	/** Swap growth (bytes/tick) that counts as active paging - the machine is spilling RAM to disk. */
+	private static readonly WATCHDOG_SWAP_GROWTH_BYTES = 256 * 1024 * 1024; // 256 MiB per ~5s sample
+
+	private async _memoryWatchdogTick(): Promise<void> {
+		if (!this._ownsResidentServer()) {
+			this._stopMemoryWatchdog();
+			return;
+		}
+		const mem = await this._getMemoryStatus();
+		if (!mem) {
+			return; // probe unavailable this tick; keep sampling
 		}
 
+		// Only trip on GENUINE thrash, not a static "low memory" threshold - otherwise a model the user
+		// deliberately chose to Run Anyway (tight but stable) would be killed the moment it loaded, which
+		// contradicts their choice. The real thrash signals:
+		//   - the kernel itself reporting CRITICAL memory pressure (its own low-memory-warning trigger), or
+		//   - memory low AND swap actively GROWING (the machine is paging RAM to disk right now), or
+		//   - memory critically low on a platform that gives us no pressure/swap signal at all (last resort).
+		const lowAvailable = mem.availableBytes < LoCoPilotLocalModelRunner.WATCHDOG_AVAILABLE_FLOOR;
+		const swapGrowing = mem.swapUsedBytes >= 0 && this._watchdogLastSwapBytes >= 0
+			&& (mem.swapUsedBytes - this._watchdogLastSwapBytes) > LoCoPilotLocalModelRunner.WATCHDOG_SWAP_GROWTH_BYTES;
+		const noSignals = mem.pressure === 'unknown' && mem.swapUsedBytes < 0;
+		this._watchdogLastSwapBytes = mem.swapUsedBytes;
+
+		const critical = mem.pressure === 'critical'
+			|| (lowAvailable && swapGrowing)
+			|| (lowAvailable && noSignals);
+		if (!critical) {
+			this._watchdogStrikes = 0;
+			return;
+		}
+		this._watchdogStrikes++;
 		const GB = 1024 * 1024 * 1024;
-		const needGb = Math.ceil(fit.requiredBytes / GB);
-		const haveGb = Math.max(1, Math.round(fit.usableBytes / GB));
-		this._log(`[LoCoPilot Runner] Refusing to start ${modelId}: needs ~${needGb}GB but only ~${haveGb}GB is usable on this machine.`);
-		const name = model.displayName || model.modelName;
-		const message = `"${name}" needs about ${needGb} GB of memory to run, but only about ${haveGb} GB is available on this machine. Please choose a smaller model.`;
-		this.notificationService.prompt(Severity.Error, message, [
-			{
-				label: 'Choose Another Model',
-				run: () => {
-					this.commandService.executeCommand('workbench.action.chat.openLoCoPilotSettings', { section: LOCOPILOT_SETTINGS_SECTION_LIST_MODELS });
-				}
+		this._log(`[LoCoPilot Runner] Memory watchdog: critical sample ${this._watchdogStrikes}/2 (available ~${(mem.availableBytes / GB).toFixed(1)}GB, pressure=${mem.pressure}, swap used ~${mem.swapUsedBytes >= 0 ? (mem.swapUsedBytes / GB).toFixed(1) + 'GB' : 'n/a'}).`);
+		if (this._watchdogStrikes < 2) {
+			return;
+		}
+
+		// Trip the breaker: free our memory NOW and tell the user why their model stopped.
+		const stoppedNames: string[] = [];
+		for (const [id, rec] of Array.from(this.runningServers.entries())) {
+			if (rec.foreign) {
+				continue;
 			}
-		]);
-		return false;
+			const model = this.customLanguageModelsService.getCustomModels().find(m => m.id === id);
+			stoppedNames.push(model?.displayName || model?.modelName || id);
+			this.stopServer(id);
+		}
+		this._stopMemoryWatchdog();
+		this._watchdogCooldownUntil = Date.now() + LoCoPilotLocalModelRunner.WATCHDOG_COOLDOWN_MS;
+		this._log(`[LoCoPilot Runner] Memory watchdog TRIPPED: stopped ${stoppedNames.join(', ') || 'local server'} to keep the system responsive.`);
+		const names = stoppedNames.join('", "');
+		this.notificationService.notify({
+			severity: Severity.Warning,
+			message: `LoCoPilot stopped "${names}" because your system was running out of memory. Close some applications and try again, or switch to a smaller model.`,
+		});
 	}
 
 	/**
@@ -2514,6 +2766,16 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 			return;
 		}
 
+		// Availability guard - EVERY launch path reaches here (message send, manual Start, Retry, picker,
+		// pre-warm). Refuse to start a model that won't fit the RAM free RIGHT NOW, rather than loading it
+		// into a swap/thrash hang. Placed BEFORE eviction so the RAM that stopping our other resident servers
+		// will free is credited (a model that fits after the switch is not blocked). Shows a toast pointing at
+		// Auto / a smaller model. The capability gate (too big for TOTAL RAM) runs later per backend; this is
+		// the transient "not right now" companion.
+		if (!await this._memoryAllowsLaunch(modelId)) {
+			return;
+		}
+
 		// Enforce the resident-model budget here, at the single choke point every launch flows through
 		// (auto-start-on-use, the manual "Start server" button, Retry, and the model picker all reach this).
 		// Doing it here - rather than only in ensureServerForModel - means a manual start also evicts the
@@ -2593,6 +2855,17 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 		// model (MTP) + the mmproj projector. Loading these extras without reserving for them is what OOM-ed
 		// the Metal command buffer (kIOGPUCommandBufferCallbackErrorOutOfMemory) on a 16GB Mac.
 		const baseTuning = this._getLlamaTuning(model);
+		// OOM degradation ladder: a previous launch of this model died from memory exhaustion, so this one
+		// runs with the reduced footprint the ladder chose (smaller context, no speculative extras).
+		const oomCap = this._oomContextCap.get(modelId);
+		if (oomCap && (!baseTuning.contextSize || baseTuning.contextSize > oomCap)) {
+			this._log(`[LoCoPilot Runner] OOM ladder: capping context for ${modelId} at ${oomCap}.`);
+			baseTuning.contextSize = oomCap;
+		}
+		if (this._oomStripExtras.has(modelId)) {
+			baseTuning.multiTokenPrediction = false;
+			baseTuning.draftModelPath = undefined;
+		}
 		// Vision: load the projector (`--mmproj`) ONLY when the user has explicitly enabled vision for this
 		// model. The projector is downloaded for every vision-capable model, but loading it wires ~1GB+ into
 		// the GPU/Metal working set. So it stays off by default (text-only) and is opt-in per model; see
@@ -2627,7 +2900,7 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 		// Paired drafts are GPU/Metal-only: on a pure CPU backend the draft model competes with the target
 		// for the same cores, so speculation can end up *slower* than plain decode. CPU machines keep the
 		// n-gram fallback below, which drafts from the context with no second model and near-zero overhead.
-		if (autoSpec && backend !== 'cpu' && !baseTuning.multiTokenPrediction && !userDraftPath) {
+		if (autoSpec && backend !== 'cpu' && !baseTuning.multiTokenPrediction && !userDraftPath && !this._oomStripExtras.has(modelId)) {
 			const draft = await this._resolvePairedDraft(model, 'gguf');
 			if (draft && await this._extrasFitBudget(modelPath, backend, discreteVramBytes, extraResidentBytes + draft.bytes)) {
 				baseTuning.draftModelPath = draft.path;
@@ -2663,6 +2936,8 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 		// creating it up front keeps the --slot-save-path flag valid for the whole server lifetime.
 		await this._ensureKvCacheDir();
 		const tuning = await this._augmentTuningWithHardware(modelPath, backend, baseTuning, extraResidentBytes);
+		// Remember the context this launch runs with, so an OOM crash can halve it on the retry.
+		this._lastLaunchContext.set(modelId, tuning.contextSize ?? DEFAULT_LLAMA_CONTEXT_SIZE);
 		const { command, args } = getLlamaCppServerCommand(modelPath, backend, serverPath, port, tuning);
 		// Remember whether this launch carries speculative flags, so a crash caused by an old build rejecting
 		// them can be told apart from a real failure and self-healed (relaunch without speculation).
@@ -2839,6 +3114,10 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 			// Advertise this server to other windows so they attach to it instead of launching a duplicate.
 			void this._publishActiveServerLock(port, 'llama', terminal, modelId);
 			this._onDidServerStateChange.fire(modelId);
+			// A resident server means estimates are now live commitments - arm the memory circuit breaker.
+			this._updateMemoryWatchdog();
+			// Keep the machine responsive (and cooler) while the model loads/serves: run it below the UI.
+			void this._deprioritizeServerProcess(terminal, model.modelName);
 
 			// Warm up in the background so the first real message has no kernel-JIT / cache lag.
 			if (this.configurationService.getValue<boolean>(ChatConfiguration.LocopilotLlamaCppWarmup) !== false) {
@@ -2916,6 +3195,13 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 		if (this.configurationService.getValue<boolean>(ChatConfiguration.LocopilotLocalPrewarmOnSelect) === false) {
 			return;
 		}
+		// After the memory watchdog stopped a server for system health, don't let an automatic pre-warm
+		// immediately reload weights into the same starved machine. Explicit user actions (send message,
+		// Start button) still launch - they re-run the availability gate, which will warn with numbers.
+		if (Date.now() < this._watchdogCooldownUntil) {
+			this._log(`[LoCoPilot Runner] Pre-warm of ${modelId} skipped: memory watchdog cooldown active.`);
+			return;
+		}
 		// Nothing to do if it's already up or mid-launch.
 		if (this.runningServers.has(modelId) || this.startingServers.has(modelId)) {
 			if (this.runningServers.has(modelId)) {
@@ -2977,6 +3263,66 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 		}
 		// Second attempt is NOT suppressed: if it still crashes, surface the real failure to the user.
 		await this.ensureServerForModel(modelId);
+	}
+
+	/**
+	 * Availability guard applied to EVERY launch path (message send, manual Start, Retry, picker, pre-warm):
+	 * may we load `modelId` given the RAM free RIGHT NOW? Returns true (proceed) whenever we can't reason
+	 * about it - unknown weight size, no live probe, a discrete-GPU backend whose VRAM occupancy we can't
+	 * size, or web. Returns false (and shows a helpful toast pointing to Auto / a smaller model) only when
+	 * the minimum footprint clearly won't fit the currently-available memory, or the kernel already reports
+	 * critical pressure. Called BEFORE the launch's own eviction, so RAM that stopping our other resident
+	 * servers will free is credited - a model that fits AFTER the switch is never blocked (no switch false
+	 * alarm). This is a stricter, transient companion to the capability gate (which blocks models too big
+	 * for total RAM); together they stop an unsupported model from ever starting.
+	 */
+	private async _memoryAllowsLaunch(modelId: string): Promise<boolean> {
+		const model = this.customLanguageModelsService.getCustomModels().find(m => m.id === modelId);
+		if (!model || !model.localPath || !this._useMemoryBudget()) {
+			return true; // discrete-GPU / CPU-VRAM-less reasoning, or missing model -> don't block
+		}
+		const mem = await this._getMemoryStatus();
+		if (!mem) {
+			return true; // no live probe -> never block on what we can't measure
+		}
+		const kind = await this._intendedServerKind(modelId);
+		const backend: LlamaBackend = kind === 'mlx' ? 'metal' : this.getBackend();
+		let modelPath: string;
+		try {
+			modelPath = kind === 'mlx' ? await this.getMlxModelRootPath(model.localPath) : await this.resolveModelFilePath(model.localPath);
+		} catch {
+			return true;
+		}
+		const fit = await this._computeFit(modelPath, backend, undefined);
+		if (!fit) {
+			return true; // unknown footprint -> don't block
+		}
+		// Credit RAM the launch's own eviction will free (our resident, non-foreign servers).
+		let evictableBytes = 0;
+		for (const [id, rec] of this.runningServers) {
+			if (id !== modelId && !rec.foreign) {
+				evictableBytes += await this._estimateModelCost(id);
+			}
+		}
+		const availableNow = mem.availableBytes + evictableBytes;
+		if (mem.pressure !== 'critical' && fit.requiredBytes <= availableNow) {
+			return true;
+		}
+
+		const GB = 1024 * 1024 * 1024;
+		const needGb = Math.ceil(fit.requiredBytes / GB);
+		const haveGb = Math.max(0, Math.floor(availableNow / GB));
+		const name = model.displayName || model.modelName;
+		this._log(`[LoCoPilot Runner] Pre-warm of ${modelId} skipped: needs ~${needGb}GB but only ~${haveGb}GB is free right now (pressure=${mem.pressure}, evictable ~${Math.round(evictableBytes / GB)}GB).`);
+		this._endStarting(modelId);
+		const message = `"${name}" needs about ${needGb} GB of memory, but only about ${haveGb} GB is free right now, so it was not started automatically. Close some applications, choose a smaller model, or switch to Auto to let LoCoPilot pick one that fits.`;
+		this.notificationService.prompt(Severity.Warning, message, [
+			{
+				label: 'Switch to Auto',
+				run: () => this.customLanguageModelsService.setSelectedCustomModelId(LOCOPILOT_AUTO_MODEL_ID),
+			}
+		]);
+		return false;
 	}
 
 	/**
@@ -3100,7 +3446,7 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 				// Applied via the -c bootstrap in getMlxLmServerCommand (no CLI flag exists); soft cap - MLX
 				// throttles allocation instead of hard-failing. Also cap the freed-buffer reuse cache, which
 				// otherwise defaults to the memory limit and can hoard GBs after a big prefill.
-				mlxTuning.memoryLimitBytes = metalOffloadBudgetBytes(mem.totalmem);
+				mlxTuning.memoryLimitBytes = metalOffloadBudgetBytes(mem.totalmem, (await this._getHardwareInfo())?.metalWiredLimitBytes);
 				mlxTuning.cacheLimitBytes = Math.floor(mem.totalmem * 0.10);
 				this._log(`[LoCoPilot Runner] MLX memory limits: mx.set_memory_limit ~${Math.round(mlxTuning.memoryLimitBytes / 1e9)}GB (wired budget), mx.set_cache_limit ~${Math.round(mlxTuning.cacheLimitBytes / 1e9)}GB.`);
 			}
@@ -3222,6 +3568,11 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 			// Advertise this server to other windows so they attach to it instead of launching a duplicate.
 			void this._publishActiveServerLock(port, 'mlx', terminal, modelId, modelDir);
 			this._onDidServerStateChange.fire(modelId);
+			// A resident server means estimates are now live commitments - arm the memory circuit breaker.
+			this._updateMemoryWatchdog();
+			// Keep the machine responsive (and cooler) while the model loads/serves: run it below the UI.
+			// The delay lets the terminal's shell fork the actual python server first (see the helper).
+			void this._deprioritizeServerProcess(terminal, model.modelName, 3000);
 
 			// Warm up in the background: mlx_lm.server answers /v1/models 200 while the weights are still
 			// loading, so this 1-token ping is the first thing that truly waits for the model to be usable -

@@ -4,9 +4,10 @@
  *--------------------------------------------------------------------------------------------*/
 
 import { execFile } from 'child_process';
-import { cpus, arch, platform } from 'os';
+import { cpus, arch, platform, totalmem, freemem } from 'os';
+import { readFile } from 'fs/promises';
 import { ILogService } from '../../log/common/log.js';
-import { IGpuInfo, ISystemHardwareInfo, ILoCoPilotSystemInfoService, GpuVendor } from '../common/locopilotSystemInfo.js';
+import { IGpuInfo, ISystemHardwareInfo, ILoCoPilotSystemInfoService, GpuVendor, IMemoryStatus, MemoryPressureLevel } from '../common/locopilotSystemInfo.js';
 
 /** Kill any probe command that runs longer than this. */
 const PROBE_TIMEOUT_MS = 4000;
@@ -20,6 +21,17 @@ function tryExec(command: string, args: string[]): Promise<string> {
 			});
 		} catch {
 			resolve('');
+		}
+	});
+}
+
+/** Runs a command for its side effect. Resolves true only when it exited 0. */
+function tryExecOk(command: string, args: string[]): Promise<boolean> {
+	return new Promise<boolean>(resolve => {
+		try {
+			execFile(command, args, { timeout: PROBE_TIMEOUT_MS, windowsHide: true }, err => resolve(!err));
+		} catch {
+			resolve(false);
 		}
 	});
 }
@@ -46,12 +58,183 @@ export class LoCoPilotSystemInfoService implements ILoCoPilotSystemInfoService {
 
 	private async _probe(): Promise<ISystemHardwareInfo> {
 		const logicalCoreCount = cpus().length;
-		const [physicalCoreCount, gpus] = await Promise.all([
+		const [physicalCoreCount, gpus, metalWiredLimitBytes] = await Promise.all([
 			this._detectPhysicalCores(logicalCoreCount),
 			this._detectGpus(),
+			this._detectMetalWiredLimit(),
 		]);
-		this.logService.info(`[LoCoPilotSystemInfo] cores: ${physicalCoreCount} physical / ${logicalCoreCount} logical; GPUs: ${gpus.map(g => `${g.name} (${Math.round(g.totalVramBytes / 1e9)}GB)`).join(', ') || 'none detected'}`);
-		return { physicalCoreCount, logicalCoreCount, gpus };
+		this.logService.info(`[LoCoPilotSystemInfo] cores: ${physicalCoreCount} physical / ${logicalCoreCount} logical; GPUs: ${gpus.map(g => `${g.name} (${Math.round(g.totalVramBytes / 1e9)}GB)`).join(', ') || 'none detected'}${metalWiredLimitBytes > 0 ? `; iogpu.wired_limit ${Math.round(metalWiredLimitBytes / 1e9)}GB` : ''}`);
+		return { physicalCoreCount, logicalCoreCount, gpus, metalWiredLimitBytes };
+	}
+
+	/**
+	 * Apple Silicon: the user-configured GPU wired-memory ceiling (`iogpu.wired_limit_mb`, MiB). 0 means
+	 * "not set" (macOS then applies its built-in ~66-75% default) or not applicable on this platform.
+	 */
+	private async _detectMetalWiredLimit(): Promise<number> {
+		if (platform() !== 'darwin' || arch() !== 'arm64') {
+			return 0;
+		}
+		const out = (await tryExec('sysctl', ['-n', 'iogpu.wired_limit_mb'])).trim();
+		const mib = parseInt(out, 10);
+		return Number.isFinite(mib) && mib > 0 ? mib * 1024 * 1024 : 0;
+	}
+
+	async getMemoryStatus(): Promise<IMemoryStatus> {
+		const plat = platform();
+		try {
+			if (plat === 'darwin') {
+				return await this._darwinMemoryStatus();
+			}
+			if (plat === 'linux') {
+				return await this._linuxMemoryStatus();
+			}
+		} catch (err) {
+			this.logService.warn(`[LoCoPilotSystemInfo] memory status probe failed: ${err}`);
+		}
+		// Windows (and any fallback): os.freemem() is GlobalMemoryStatusEx.ullAvailPhys, which already
+		// includes reclaimable standby-list memory - i.e. the "available" figure we want.
+		return { totalBytes: totalmem(), availableBytes: freemem(), pressure: 'unknown', swapUsedBytes: -1 };
+	}
+
+	/**
+	 * macOS: `os.freemem()` counts only truly-free pages and is wildly pessimistic (most RAM sits in
+	 * reclaimable file cache), so available memory is computed from `vm_stat` page counts instead:
+	 * free + inactive + speculative + purgeable - a close analogue of what Activity Monitor and Ollama's
+	 * host_statistics64 path treat as reclaimable. Pressure comes from the kernel's own memorystatus level
+	 * (the signal macOS itself uses to fire low-memory warnings), swap from `vm.swapusage`.
+	 */
+	private async _darwinMemoryStatus(): Promise<IMemoryStatus> {
+		const [vmStatOut, pressureOut, swapOut] = await Promise.all([
+			tryExec('vm_stat', []),
+			tryExec('sysctl', ['-n', 'kern.memorystatus_vm_pressure_level']),
+			tryExec('sysctl', ['-n', 'vm.swapusage']),
+		]);
+
+		const totalBytes = totalmem();
+		let availableBytes = freemem(); // worst-case fallback when vm_stat is unavailable
+
+		if (vmStatOut) {
+			const pageSizeMatch = vmStatOut.match(/page size of (\d+) bytes/);
+			const pageSize = pageSizeMatch ? parseInt(pageSizeMatch[1], 10) : 16384;
+			const count = (label: string): number => {
+				const m = vmStatOut.match(new RegExp(`${label}:\\s+(\\d+)`, 'i'));
+				return m ? parseInt(m[1], 10) : 0;
+			};
+			const reclaimablePages = count('Pages free')
+				+ count('Pages inactive')
+				+ count('Pages speculative')
+				+ count('Pages purgeable');
+			if (reclaimablePages > 0) {
+				availableBytes = reclaimablePages * pageSize;
+			}
+		}
+
+		// kern.memorystatus_vm_pressure_level: 1 = normal, 2 = warn, 4 = critical.
+		let pressure: MemoryPressureLevel = 'unknown';
+		const level = parseInt(pressureOut.trim(), 10);
+		if (level === 1) { pressure = 'normal'; }
+		else if (level === 2) { pressure = 'warn'; }
+		else if (level >= 4) { pressure = 'critical'; }
+
+		// vm.swapusage: "total = 2048.00M  used = 1024.00M  free = 1024.00M  (encrypted)"
+		let swapUsedBytes = -1;
+		const swapMatch = swapOut.match(/used\s*=\s*([\d.]+)([KMGT])/i);
+		if (swapMatch) {
+			const mult = { K: 1024, M: 1024 ** 2, G: 1024 ** 3, T: 1024 ** 4 }[swapMatch[2].toUpperCase() as 'K' | 'M' | 'G' | 'T'] ?? 1024 ** 2;
+			swapUsedBytes = Math.round(parseFloat(swapMatch[1]) * mult);
+		}
+
+		return { totalBytes, availableBytes, pressure, swapUsedBytes };
+	}
+
+	/**
+	 * Linux: `MemAvailable` from /proc/meminfo is the kernel's own estimate of memory available without
+	 * swapping (free + reclaimable cache) - exactly the figure `os.freemem()` (raw MemFree) misses.
+	 * Pressure comes from the PSI memory file when the kernel exposes it.
+	 */
+	private async _linuxMemoryStatus(): Promise<IMemoryStatus> {
+		const totalBytes = totalmem();
+		let availableBytes = freemem();
+		let swapUsedBytes = -1;
+		try {
+			const meminfo = await readFile('/proc/meminfo', 'utf8');
+			const kib = (label: string): number => {
+				const m = meminfo.match(new RegExp(`^${label}:\\s+(\\d+) kB`, 'm'));
+				return m ? parseInt(m[1], 10) : -1;
+			};
+			const availKib = kib('MemAvailable');
+			if (availKib > 0) {
+				availableBytes = availKib * 1024;
+			}
+			const swapTotal = kib('SwapTotal');
+			const swapFree = kib('SwapFree');
+			if (swapTotal >= 0 && swapFree >= 0) {
+				swapUsedBytes = Math.max(0, (swapTotal - swapFree) * 1024);
+			}
+		} catch {
+			// keep fallbacks
+		}
+
+		// PSI: /proc/pressure/memory "some avg10=1.23 ..." - avg10 is the % of time in the last 10s that
+		// at least one task stalled on memory. >10% = meaningful pressure, >40% = the machine is struggling.
+		let pressure: MemoryPressureLevel = 'unknown';
+		try {
+			const psi = await readFile('/proc/pressure/memory', 'utf8');
+			const m = psi.match(/some avg10=([\d.]+)/);
+			if (m) {
+				const avg10 = parseFloat(m[1]);
+				pressure = avg10 >= 40 ? 'critical' : (avg10 >= 10 ? 'warn' : 'normal');
+			}
+		} catch {
+			// PSI not exposed (older kernel / not mounted) -> unknown
+		}
+
+		return { totalBytes, availableBytes, pressure, swapUsedBytes };
+	}
+
+	async deprioritizeProcess(pid: number): Promise<boolean> {
+		if (!Number.isInteger(pid) || pid <= 1) {
+			return false;
+		}
+		const plat = platform();
+		try {
+			if (plat === 'darwin' || plat === 'linux') {
+				// The pid we get may be a shell wrapping the real server (MLX launches via `sh -c python -m
+				// mlx_lm.server ...`), so apply to the pid AND its direct children. Children forked later
+				// inherit the parent's (already lowered) niceness, so one level is enough in practice.
+				const pids = [pid, ...await this._childPids(pid)];
+				let ok = false;
+				for (const p of pids) {
+					if (plat === 'darwin') {
+						// `taskpolicy -c utility` moves the process to the utility QoS clamp: macOS then prefers
+						// efficiency cores for it under contention (keeps the UI fluid and runs cooler) while it
+						// can still use performance cores when the machine is idle. renice as an orthogonal nudge.
+						ok = await tryExecOk('taskpolicy', ['-c', 'utility', '-p', String(p)]) || ok;
+						await tryExecOk('renice', ['-n', '5', '-p', String(p)]);
+					} else {
+						ok = await tryExecOk('renice', ['-n', '5', '-p', String(p)]) || ok;
+					}
+				}
+				return ok;
+			}
+			if (plat === 'win32') {
+				// BelowNormal keeps the desktop responsive while the server still gets all spare cycles.
+				return await tryExecOk('powershell', ['-NoProfile', '-NonInteractive', '-Command',
+					`(Get-Process -Id ${pid}).PriorityClass = 'BelowNormal'`]);
+			}
+		} catch {
+			// fall through
+		}
+		return false;
+	}
+
+	/** Direct child PIDs of `pid` (darwin/linux, via pgrep). Empty on error or when there are none. */
+	private async _childPids(pid: number): Promise<number[]> {
+		const out = await tryExec('pgrep', ['-P', String(pid)]);
+		return out.split('\n')
+			.map(l => parseInt(l.trim(), 10))
+			.filter(n => Number.isInteger(n) && n > 1);
 	}
 
 	/**

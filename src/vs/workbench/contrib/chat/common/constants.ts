@@ -116,6 +116,10 @@ export enum ChatConfiguration {
 	LocopilotLocalMemoryBudgetFraction = 'locopilot.local.memoryBudgetFraction',
 	/** Hard floor (in GB) of free system RAM to preserve; loading a model that would breach it evicts LRU first. */
 	LocopilotLocalMinFreeMemoryGB = 'locopilot.local.minFreeMemoryGB',
+	/** Runtime memory watchdog: stop local servers automatically when the system runs critically low on memory. */
+	LocopilotLocalMemoryWatchdog = 'locopilot.local.memoryWatchdog',
+	/** Run local model server processes at below-normal scheduling priority so the UI stays responsive. */
+	LocopilotLocalBackgroundPriority = 'locopilot.local.backgroundPriority',
 	/** Whether to show tool call parameters and results in the chat UI. */
 	LocopilotShowToolDetails = 'locopilot.chat.showToolDetails',
 }

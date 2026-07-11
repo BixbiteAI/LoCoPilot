@@ -842,6 +842,16 @@ configurationRegistry.registerConfiguration({
 			markdownDescription: nls.localize('locopilot.local.minFreeMemoryGB.description', "Hard floor (in GB) of free system RAM to preserve. If loading a local model would leave less than this much memory free, least-recently-used models are unloaded first. A safety net against out-of-memory and swapping even when `#locopilot.local.memoryBudgetFraction#` would otherwise allow the load."),
 			default: 2,
 		},
+		[ChatConfiguration.LocopilotLocalMemoryWatchdog]: {
+			type: 'boolean',
+			markdownDescription: nls.localize('locopilot.local.memoryWatchdog.description', "Automatically stop local model servers when the system runs critically low on memory, instead of letting the machine slow to a crawl (swapping/overheating). A notification explains what was stopped and why. Strongly recommended to leave on."),
+			default: true,
+		},
+		[ChatConfiguration.LocopilotLocalBackgroundPriority]: {
+			type: 'boolean',
+			markdownDescription: nls.localize('locopilot.local.backgroundPriority.description', "Run local model server processes at a lower scheduling priority so the editor and the rest of the system stay responsive while a model is loading or generating. On Apple Silicon this also lets macOS prefer efficiency cores under load, which runs cooler. The model still gets full speed when the machine is otherwise idle."),
+			default: true,
+		},
 		[ChatConfiguration.LocopilotShowToolDetails]: {
 			type: 'boolean',
 			default: false,

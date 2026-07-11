@@ -1242,7 +1242,9 @@ export class LoCoPilotBuiltInAgent extends Disposable implements IChatAgentImple
 		return resolveAutoModel(
 			this.customLanguageModelsService.getCustomModels(),
 			this._detectedRamGB(),
-			id => this.localModelRunner.isServerRunning(id) || this.localModelRunner.isServerStarting(id)
+			id => this.localModelRunner.isServerRunning(id) || this.localModelRunner.isServerStarting(id),
+			// Live free-RAM figure so Auto steps down to a model that fits the machine's current headroom.
+			this.localModelRunner.getAvailableRamGB()
 		);
 	}
 
