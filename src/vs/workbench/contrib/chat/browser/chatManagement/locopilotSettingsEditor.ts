@@ -296,12 +296,21 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 	private sections: SectionItem[] = [];
 
 	private currentLogsModelId: string | undefined;
+	private logsBackdropEl: HTMLElement | undefined;
 	private logsOverlayEl: HTMLElement | undefined;
 	private logsTitleEl: HTMLElement | undefined;
+	private logsSubtitleEl: HTMLElement | undefined;
 	private logsBadgeEl: HTMLElement | undefined;
 	private logsBodyEl: HTMLElement | undefined;
 	private logsFooterInfoEl: HTMLElement | undefined;
+	private logsErrorStatEl: HTMLElement | undefined;
+	private logsWarnStatEl: HTMLElement | undefined;
 	private logsCopyBtn: HTMLElement | undefined;
+	private logsCopyLabel: HTMLElement | undefined;
+	private logsSearchInput: HTMLInputElement | undefined;
+	private logsJumpBtn: HTMLElement | undefined;
+	private logsAutoScroll: boolean = true;
+	private logsFilterText: string = '';
 
 	constructor(
 		group: IEditorGroup,
@@ -443,34 +452,9 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 		this.listModelsContainer = DOM.append(this.listModelsPanel, $('.custom-language-models-list-editor'));
 		this._register(this.customLanguageModelsService.onDidChangeCustomModels(() => this.renderListModels()));
 
-		// Logs overlay - sits at the bottom of the list panel, hidden until a "Logs" button is clicked
-		this.logsOverlayEl = DOM.append(this.listModelsPanel, $('.model-logs-overlay'));
-		this.logsOverlayEl.style.display = 'none';
-		const logsHeader = DOM.append(this.logsOverlayEl, $('.model-logs-header'));
-		const logsHeaderLeft = DOM.append(logsHeader, $('.model-logs-header-left'));
-		DOM.append(logsHeaderLeft, $('.model-logs-status-dot'));
-		this.logsTitleEl = DOM.append(logsHeaderLeft, $('.model-logs-title'));
-		this.logsBadgeEl = DOM.append(logsHeaderLeft, $('.model-logs-badge'));
-		this.logsBadgeEl.style.display = 'none';
-		const logsHeaderActions = DOM.append(logsHeader, $('.model-logs-header-actions'));
-		this.logsCopyBtn = DOM.append(logsHeaderActions, $('button.model-logs-action-btn'));
-		this.logsCopyBtn.textContent = localize('customLanguageModels.logs.copy', 'Copy');
-		this.logsCopyBtn.title = localize('customLanguageModels.logs.copyTooltip', 'Copy all logs to clipboard');
-		this._register(DOM.addDisposableListener(this.logsCopyBtn, 'click', () => this._copyLogs()));
-		const logsClearBtn = DOM.append(logsHeaderActions, $('button.model-logs-action-btn'));
-		logsClearBtn.textContent = localize('customLanguageModels.logs.clear', 'Clear');
-		logsClearBtn.title = localize('customLanguageModels.logs.clearTooltip', 'Clear log view');
-		this._register(DOM.addDisposableListener(logsClearBtn, 'click', () => {
-			if (this.logsBodyEl) { DOM.clearNode(this.logsBodyEl); this._updateLogsBadge(); }
-		}));
-		const logsCloseBtn = DOM.append(logsHeaderActions, $('button.model-logs-close'));
-		logsCloseBtn.textContent = 'x';
-		logsCloseBtn.title = localize('customLanguageModels.logs.close', 'Close logs');
-		this._register(DOM.addDisposableListener(logsCloseBtn, 'click', () => this._hideLogsOverlay()));
-		this.logsBodyEl = DOM.append(this.logsOverlayEl, $('.model-logs-body'));
-		const logsFooter = DOM.append(this.logsOverlayEl, $('.model-logs-footer'));
-		this.logsFooterInfoEl = DOM.append(logsFooter, $('.model-logs-footer-info'));
-		this.logsFooterInfoEl.textContent = localize('customLanguageModels.logs.footerEmpty', 'No log entries');
+		// Logs modal - a floating, centered popup with a dimmed backdrop, appended to the editor
+		// root so it overlays the whole settings surface instead of living inside the list panel.
+		this._createLogsModal();
 
 		// Agent Settings - system prompts + max iteration
 		this.agentSettingsPanel = DOM.append(bodyContainer, $('.locopilot-settings-panel.agent-settings-panel'));
@@ -1542,25 +1526,147 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 		}
 	}
 
+	/**
+	 * Builds the floating logs modal once, hidden. Appended to the editor root (this.container)
+	 * so the dimmed backdrop and centered dialog overlay the entire settings surface.
+	 */
+	private _createLogsModal(): void {
+		const root = this.container ?? this.listModelsPanel;
+
+		// Dimmed backdrop - click outside the dialog to dismiss.
+		this.logsBackdropEl = DOM.append(root, $('.model-logs-backdrop'));
+		this.logsBackdropEl.style.display = 'none';
+		this._register(DOM.addDisposableListener(this.logsBackdropEl, 'click', (e: MouseEvent) => {
+			if (e.target === this.logsBackdropEl) { this._hideLogsOverlay(); }
+		}));
+		this._register(DOM.addDisposableListener(this.logsBackdropEl, 'keydown', (e: KeyboardEvent) => {
+			if (e.key === 'Escape') { this._hideLogsOverlay(); }
+		}));
+
+		// The dialog itself.
+		this.logsOverlayEl = DOM.append(this.logsBackdropEl, $('.model-logs-overlay'));
+		this.logsOverlayEl.setAttribute('role', 'dialog');
+		this.logsOverlayEl.setAttribute('aria-modal', 'true');
+
+		// --- Header: status dot, terminal icon, title + model id subtitle, live line badge, close.
+		const logsHeader = DOM.append(this.logsOverlayEl, $('.model-logs-header'));
+		const logsHeaderLeft = DOM.append(logsHeader, $('.model-logs-header-left'));
+		DOM.append(logsHeaderLeft, $('.model-logs-status-dot'));
+		const headerIcon = DOM.append(logsHeaderLeft, $('.model-logs-header-icon'));
+		headerIcon.appendChild(renderIcon(Codicon.terminal));
+		const titleWrap = DOM.append(logsHeaderLeft, $('.model-logs-title-wrap'));
+		this.logsTitleEl = DOM.append(titleWrap, $('.model-logs-title'));
+		this.logsSubtitleEl = DOM.append(titleWrap, $('.model-logs-subtitle'));
+		this.logsBadgeEl = DOM.append(logsHeaderLeft, $('.model-logs-badge'));
+		this.logsBadgeEl.style.display = 'none';
+
+		const logsCloseBtn = DOM.append(logsHeader, $('button.model-logs-close'));
+		logsCloseBtn.appendChild(renderIcon(Codicon.close));
+		logsCloseBtn.title = localize('customLanguageModels.logs.close', 'Close logs');
+		this._register(DOM.addDisposableListener(logsCloseBtn, 'click', () => this._hideLogsOverlay()));
+
+		// --- Toolbar: search filter + Copy / Clear actions.
+		const logsToolbar = DOM.append(this.logsOverlayEl, $('.model-logs-toolbar'));
+		const searchWrap = DOM.append(logsToolbar, $('.model-logs-search'));
+		const searchIcon = DOM.append(searchWrap, $('.model-logs-search-icon'));
+		searchIcon.appendChild(renderIcon(Codicon.search));
+		this.logsSearchInput = DOM.append(searchWrap, $('input.model-logs-search-input')) as HTMLInputElement;
+		this.logsSearchInput.type = 'text';
+		this.logsSearchInput.placeholder = localize('customLanguageModels.logs.searchPlaceholder', 'Filter logs…');
+		this._register(DOM.addDisposableListener(this.logsSearchInput, 'input', () => {
+			this.logsFilterText = (this.logsSearchInput?.value ?? '').toLowerCase();
+			this._applyLogFilter();
+		}));
+
+		const toolbarActions = DOM.append(logsToolbar, $('.model-logs-toolbar-actions'));
+		this.logsCopyBtn = DOM.append(toolbarActions, $('button.model-logs-action-btn'));
+		this.logsCopyBtn.appendChild(renderIcon(Codicon.copy));
+		this.logsCopyLabel = DOM.append(this.logsCopyBtn, $('span.model-logs-action-label'));
+		this.logsCopyLabel.textContent = localize('customLanguageModels.logs.copy', 'Copy');
+		this.logsCopyBtn.title = localize('customLanguageModels.logs.copyTooltip', 'Copy all logs to clipboard');
+		this._register(DOM.addDisposableListener(this.logsCopyBtn, 'click', () => this._copyLogs()));
+
+		const logsClearBtn = DOM.append(toolbarActions, $('button.model-logs-action-btn'));
+		logsClearBtn.appendChild(renderIcon(Codicon.clearAll));
+		DOM.append(logsClearBtn, $('span')).textContent = localize('customLanguageModels.logs.clear', 'Clear');
+		logsClearBtn.title = localize('customLanguageModels.logs.clearTooltip', 'Clear log view');
+		this._register(DOM.addDisposableListener(logsClearBtn, 'click', () => {
+			if (this.logsBodyEl) { DOM.clearNode(this.logsBodyEl); this._updateLogsBadge(); this._updateJumpButton(); }
+		}));
+
+		// --- Body: scrolling log lines.
+		this.logsBodyEl = DOM.append(this.logsOverlayEl, $('.model-logs-body'));
+		this._register(DOM.addDisposableListener(this.logsBodyEl, 'scroll', () => {
+			if (!this.logsBodyEl) { return; }
+			const { scrollTop, scrollHeight, clientHeight } = this.logsBodyEl;
+			this.logsAutoScroll = scrollHeight - scrollTop - clientHeight < 24;
+			this._updateJumpButton();
+		}));
+
+		// Floating "jump to latest" button, shown when scrolled up.
+		this.logsJumpBtn = DOM.append(this.logsOverlayEl, $('button.model-logs-jump'));
+		this.logsJumpBtn.appendChild(renderIcon(Codicon.arrowDown));
+		DOM.append(this.logsJumpBtn, $('span')).textContent = localize('customLanguageModels.logs.jump', 'Latest');
+		this.logsJumpBtn.title = localize('customLanguageModels.logs.jumpTooltip', 'Scroll to latest log line');
+		this._register(DOM.addDisposableListener(this.logsJumpBtn, 'click', () => {
+			if (this.logsBodyEl) {
+				this.logsAutoScroll = true;
+				this.logsBodyEl.scrollTop = this.logsBodyEl.scrollHeight;
+			}
+			this._updateJumpButton();
+		}));
+
+		// --- Footer: line count + error/warning tallies.
+		const logsFooter = DOM.append(this.logsOverlayEl, $('.model-logs-footer'));
+		this.logsFooterInfoEl = DOM.append(logsFooter, $('.model-logs-footer-info'));
+		this.logsFooterInfoEl.textContent = localize('customLanguageModels.logs.footerEmpty', 'No log entries');
+		const footerStats = DOM.append(logsFooter, $('.model-logs-footer-stats'));
+		this.logsErrorStatEl = DOM.append(footerStats, $('.model-logs-stat.stat-error'));
+		this.logsErrorStatEl.style.display = 'none';
+		this.logsWarnStatEl = DOM.append(footerStats, $('.model-logs-stat.stat-warn'));
+		this.logsWarnStatEl.style.display = 'none';
+	}
+
 	private _showLogsOverlay(modelId: string, modelLabel: string): void {
 		this.currentLogsModelId = modelId;
-		if (!this.logsOverlayEl || !this.logsBodyEl) { return; }
+		if (!this.logsBackdropEl || !this.logsOverlayEl || !this.logsBodyEl) { return; }
 		if (this.logsTitleEl) {
-			this.logsTitleEl.textContent = localize('customLanguageModels.logs.title', 'Logs: {0}', modelLabel);
+			this.logsTitleEl.textContent = modelLabel;
 		}
+		if (this.logsSubtitleEl) {
+			const running = this.localModelRunner.isServerRunning(modelId);
+			this.logsSubtitleEl.textContent = running
+				? localize('customLanguageModels.logs.subtitleRunning', 'Server running · live')
+				: localize('customLanguageModels.logs.subtitleStopped', 'Server stopped');
+			this.logsSubtitleEl.classList.toggle('running', running);
+		}
+		if (this.logsSearchInput) {
+			this.logsSearchInput.value = '';
+			this.logsFilterText = '';
+		}
+		this.logsAutoScroll = true;
 		DOM.clearNode(this.logsBodyEl);
 		const lines = this.localModelRunner.getServerLogs(modelId);
 		for (const line of lines) {
 			this._appendLogLine(line);
 		}
-		this.logsOverlayEl.style.display = '';
+		this.logsBackdropEl.style.display = '';
+		// Force reflow then add the class so the CSS enter-animation plays.
+		this.logsOverlayEl.classList.remove('visible');
+		void this.logsOverlayEl.offsetWidth;
+		this.logsOverlayEl.classList.add('visible');
 		this.logsBodyEl.scrollTop = this.logsBodyEl.scrollHeight;
+		this._updateJumpButton();
+		this.logsSearchInput?.focus();
 	}
 
 	private _hideLogsOverlay(): void {
 		this.currentLogsModelId = undefined;
 		if (this.logsOverlayEl) {
-			this.logsOverlayEl.style.display = 'none';
+			this.logsOverlayEl.classList.remove('visible');
+		}
+		if (this.logsBackdropEl) {
+			this.logsBackdropEl.style.display = 'none';
 		}
 		if (this.logsBodyEl) {
 			DOM.clearNode(this.logsBodyEl);
@@ -1568,6 +1674,7 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 		if (this.logsBadgeEl) {
 			this.logsBadgeEl.style.display = 'none';
 		}
+		this.logsJumpBtn?.classList.remove('visible');
 		if (this.logsFooterInfoEl) {
 			this.logsFooterInfoEl.textContent = localize('customLanguageModels.logs.footerEmpty', 'No log entries');
 		}
@@ -1581,11 +1688,21 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 		for (const line of newLines) {
 			this._appendLogLine(line);
 		}
-		// Auto-scroll only if already near the bottom
-		const { scrollTop, scrollHeight, clientHeight } = this.logsBodyEl;
-		if (scrollHeight - scrollTop - clientHeight < 60) {
-			this.logsBodyEl.scrollTop = scrollHeight;
+		// Auto-scroll only if the user hasn't scrolled up.
+		if (this.logsAutoScroll) {
+			this.logsBodyEl.scrollTop = this.logsBodyEl.scrollHeight;
 		}
+		this._updateJumpButton();
+	}
+
+	/** Show the "Latest" pill only when there is scrollable content and the user has scrolled up. */
+	private _updateJumpButton(): void {
+		if (!this.logsBodyEl || !this.logsJumpBtn) { return; }
+		const { scrollTop, scrollHeight, clientHeight } = this.logsBodyEl;
+		const hasOverflow = scrollHeight - clientHeight > 4;
+		const atBottom = scrollHeight - scrollTop - clientHeight < 24;
+		const show = hasOverflow && !atBottom && this.logsBodyEl.childElementCount > 0;
+		this.logsJumpBtn.classList.toggle('visible', show);
 	}
 
 	private _appendLogLine(line: string): void {
@@ -1602,34 +1719,68 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 		} else if (/\b(debug|trace|verbose)\b/.test(lower)) {
 			lineEl.classList.add('log-level-debug');
 		}
+		// Respect an active filter on freshly appended lines.
+		if (this.logsFilterText && !lower.includes(this.logsFilterText)) {
+			lineEl.classList.add('filtered-out');
+		}
 		this._updateLogsBadge();
+	}
+
+	/** Show/hide already-rendered log lines to match the current search filter. */
+	private _applyLogFilter(): void {
+		if (!this.logsBodyEl) { return; }
+		const filter = this.logsFilterText;
+		for (const child of Array.from(this.logsBodyEl.children)) {
+			const el = child as HTMLElement;
+			const match = !filter || (el.textContent ?? '').toLowerCase().includes(filter);
+			el.classList.toggle('filtered-out', !match);
+		}
 	}
 
 	private _updateLogsBadge(): void {
 		if (!this.logsBodyEl || !this.logsBadgeEl || !this.logsFooterInfoEl) { return; }
 		const count = this.logsBodyEl.childElementCount;
 		if (count > 0) {
-			this.logsBadgeEl.textContent = String(count);
+			this.logsBadgeEl.textContent = localize('customLanguageModels.logs.badge', '{0} lines', count);
 			this.logsBadgeEl.style.display = '';
 			this.logsFooterInfoEl.textContent = localize('customLanguageModels.logs.footerCount', '{0} lines', count);
 		} else {
 			this.logsBadgeEl.style.display = 'none';
 			this.logsFooterInfoEl.textContent = localize('customLanguageModels.logs.footerEmpty', 'No log entries');
 		}
+		// Error / warning tallies in the footer.
+		let errors = 0;
+		let warns = 0;
+		for (const child of Array.from(this.logsBodyEl.children)) {
+			const cls = (child as HTMLElement).classList;
+			if (cls.contains('log-level-error')) { errors++; }
+			else if (cls.contains('log-level-warn')) { warns++; }
+		}
+		if (this.logsErrorStatEl) {
+			this.logsErrorStatEl.style.display = errors > 0 ? '' : 'none';
+			this.logsErrorStatEl.textContent = localize('customLanguageModels.logs.errorStat', '{0} errors', errors);
+		}
+		if (this.logsWarnStatEl) {
+			this.logsWarnStatEl.style.display = warns > 0 ? '' : 'none';
+			this.logsWarnStatEl.textContent = localize('customLanguageModels.logs.warnStat', '{0} warnings', warns);
+		}
 	}
 
 	private _copyLogs(): void {
 		if (!this.logsBodyEl || !this.logsCopyBtn) { return; }
-		const lines = Array.from(this.logsBodyEl.children).map(el => (el as HTMLElement).textContent ?? '');
+		// Copy only the lines currently visible (i.e. matching the active filter).
+		const lines = Array.from(this.logsBodyEl.children)
+			.filter(el => !(el as HTMLElement).classList.contains('filtered-out'))
+			.map(el => (el as HTMLElement).textContent ?? '');
 		const text = lines.join('\n');
 		this.clipboardService.writeText(text);
-		const btn = this.logsCopyBtn;
-		btn.textContent = localize('customLanguageModels.logs.copied', 'Copied');
-		btn.style.opacity = '0.7';
-		setTimeout(() => {
-			btn.textContent = localize('customLanguageModels.logs.copy', 'Copy');
-			btn.style.opacity = '';
-		}, 2000);
+		const label = this.logsCopyLabel;
+		if (label) {
+			label.textContent = localize('customLanguageModels.logs.copied', 'Copied');
+			setTimeout(() => {
+				label.textContent = localize('customLanguageModels.logs.copy', 'Copy');
+			}, 2000);
+		}
 	}
 
 	private renderAgentSettings(container: HTMLElement): void {
@@ -2340,6 +2491,10 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 	}
 
 	private renderSelectedSection(): void {
+		// Never leave the logs modal open across a section switch or a return to the settings page.
+		if (this.logsBackdropEl && this.logsBackdropEl.style.display !== 'none') {
+			this._hideLogsOverlay();
+		}
 		this.addModelsPanel.style.display = 'none';
 		this.listModelsPanel.style.display = 'none';
 		this.agentSettingsPanel.style.display = 'none';
