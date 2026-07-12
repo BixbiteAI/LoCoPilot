@@ -344,11 +344,15 @@ export class LoCoPilotLanguageModelProvider extends Disposable implements ILangu
 		// Safety net for the "Auto" sentinel: the agent path resolves it before reaching here, but any other
 		// caller (extension API, future paths) gets the same resolution instead of a "model not found" error.
 		if (modelId === LOCOPILOT_AUTO_MODEL_ID) {
+			// Fresh PROSPECTIVE headroom (live probe + what evicting our resident servers frees), so the
+			// choice reflects the RAM the new model would actually get after the switch - not a stale
+			// snapshot taken while the previous model's weights were still resident.
+			const prospectiveRamGB = await this.localModelRunner.probeProspectiveAvailableRamGB();
 			const resolved = resolveAutoModel(
 				this.customLanguageModelsService.getCustomModels(),
 				this._detectedRamGB(),
 				id => this.localModelRunner.isServerRunning(id) || this.localModelRunner.isServerStarting(id),
-				this.localModelRunner.getAvailableRamGB()
+				prospectiveRamGB
 			);
 			if (!resolved) {
 				throw new Error('Auto has no downloaded local model to use yet. Download one of the suggested models from the chat panel (or LoCoPilot Settings), then send your message again.');

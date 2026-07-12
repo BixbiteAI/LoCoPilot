@@ -176,6 +176,22 @@ export interface ILoCoPilotLocalModelRunner {
 	 * one that only fits on paper (total RAM).
 	 */
 	getAvailableRamGB(): number | undefined;
+	/**
+	 * Best-effort RAM available AFTER an Auto model switch, in GB: the live available figure PLUS the
+	 * estimated resident footprint of every managed (non-foreign) server that switching models would
+	 * evict. Auto resolution must score against this figure, not the raw one - the raw number is
+	 * measured while the previous model's weights are still resident, which would systematically push
+	 * Auto to smaller models on every switch. Sync/cached like {@link getAvailableRamGB}; undefined
+	 * until the first probe lands or on web.
+	 */
+	getProspectiveAvailableRamGB(): number | undefined;
+	/**
+	 * Fresh-probe variant of {@link getProspectiveAvailableRamGB} for decision points (request-time Auto
+	 * resolution, the user selecting Auto in the picker): forces a live memory probe instead of serving a
+	 * snapshot that may predate a just-stopped server, and uses full per-server cost estimates for the
+	 * eviction credit. Undefined on web or when the probe fails.
+	 */
+	probeProspectiveAvailableRamGB(): Promise<number | undefined>;
 }
 
 export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotLocalModelRunner {
@@ -1200,6 +1216,47 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 			void this._getMemoryStatus(); // refresh for the next caller; this call returns the previous snapshot
 		}
 		return this._lastMemoryStatus ? this._lastMemoryStatus.availableBytes / (1024 ** 3) : undefined;
+	}
+
+	/**
+	 * Estimated bytes an Auto switch would reclaim: the resident cost of every managed (non-foreign)
+	 * server. Sync flavour for render-path callers - uses the cached weight bytes only (conservative:
+	 * omits KV/runtime for models not yet estimated) and kicks off the full async estimate in the
+	 * background so the next call is accurate.
+	 */
+	private _evictableResidentBytesSync(): number {
+		let bytes = 0;
+		for (const [id, rec] of this.runningServers) {
+			if (rec.foreign) {
+				continue; // another window owns it; switching here doesn't free it
+			}
+			const cached = this._modelSizeCache.get(id);
+			if (cached !== undefined) {
+				bytes += cached;
+			} else {
+				void this._estimateModelCost(id); // populate the cache for the next caller
+			}
+		}
+		return bytes;
+	}
+
+	getProspectiveAvailableRamGB(): number | undefined {
+		const available = this.getAvailableRamGB();
+		return available === undefined ? undefined : available + this._evictableResidentBytesSync() / (1024 ** 3);
+	}
+
+	async probeProspectiveAvailableRamGB(): Promise<number | undefined> {
+		const mem = await this._getMemoryStatus(); // maxAgeMs 0: force a fresh probe, never a stale snapshot
+		if (!mem) {
+			return undefined;
+		}
+		let evictableBytes = 0;
+		for (const [id, rec] of this.runningServers) {
+			if (!rec.foreign) {
+				evictableBytes += await this._estimateModelCost(id);
+			}
+		}
+		return (mem.availableBytes + evictableBytes) / (1024 ** 3);
 	}
 
 	/**

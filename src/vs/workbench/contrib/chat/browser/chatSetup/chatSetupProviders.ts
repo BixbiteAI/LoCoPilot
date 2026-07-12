@@ -1237,14 +1237,19 @@ export class LoCoPilotBuiltInAgent extends Disposable implements IChatAgentImple
 		}
 	}
 
-	/** Resolve the "Auto" sentinel to a concrete downloaded catalog model, or undefined when none qualifies. */
-	private _resolveAutoModel(): ICustomLanguageModel | undefined {
+	/**
+	 * Resolve the "Auto" sentinel to a concrete downloaded catalog model, or undefined when none qualifies.
+	 * `prospectiveRamGB` lets the async request path pass a freshly-probed figure; sync callers (warming,
+	 * labels) fall back to the cached prospective snapshot.
+	 */
+	private _resolveAutoModel(prospectiveRamGB?: number): ICustomLanguageModel | undefined {
 		return resolveAutoModel(
 			this.customLanguageModelsService.getCustomModels(),
 			this._detectedRamGB(),
 			id => this.localModelRunner.isServerRunning(id) || this.localModelRunner.isServerStarting(id),
-			// Live free-RAM figure so Auto steps down to a model that fits the machine's current headroom.
-			this.localModelRunner.getAvailableRamGB()
+			// PROSPECTIVE headroom (available + what evicting our resident servers frees), so Auto sizes
+			// against the RAM the new model would actually get after the switch.
+			prospectiveRamGB ?? this.localModelRunner.getProspectiveAvailableRamGB()
 		);
 	}
 
@@ -2298,7 +2303,9 @@ Message: ${firstMessage.substring(0, 500)}`;
 		// else the most capable model that fits this machine's RAM). When NOTHING suitable is downloaded
 		// yet, show the starter card - up to three labelled download suggestions - instead of an error.
 		if (modelId === LOCOPILOT_AUTO_MODEL_ID) {
-			const resolved = this._resolveAutoModel();
+			// Force-fresh probe: a snapshot up to 15s old can predate a just-stopped server and misreport
+			// the headroom the new model would get, steering Auto to a smaller model than necessary.
+			const resolved = this._resolveAutoModel(await this.localModelRunner.probeProspectiveAvailableRamGB());
 			if (!resolved) {
 				progress([{ kind: 'markdownContent', content: buildAutoStarterPicksMarkdown(this._detectedRamGB(), this.customLanguageModelsService.getCustomModels()) }]);
 				return {};

@@ -998,8 +998,8 @@ export function findDraftPairing(repoId: string | undefined): { draftRepoId: str
 //
 // "Auto" is a picker mode (sentinel LOCOPILOT_AUTO_MODEL_ID, see customLanguageModelsService.ts), not a
 // model. The helpers below turn it into a concrete choice:
-//  - resolveAutoModel: which downloaded catalog model Auto uses for a request (running server wins,
-//    otherwise the most capable model that fits the detected RAM).
+//  - resolveAutoModel: which downloaded catalog model Auto uses for a request (the most capable model
+//    that fits the prospective RAM, with a warm running server as a within-tier tie-breaker).
 //  - getAutoStarterPicks: the labelled download suggestions shown in chat when NOTHING is downloaded yet.
 // Scope is deliberately catalog llama.cpp/MLX models only - cloud, Ollama, and user-added local models are
 // never auto-picked (they remain manually selectable).
@@ -1030,35 +1030,39 @@ export function isAutoCandidate(model: ICustomLanguageModel): boolean {
 }
 
 /**
- * Rough working-set headroom (GB) a model needs ON TOP of its weight bytes to run: minimum KV cache +
- * engine runtime overhead. Used by the Auto fit-now scoring, mirroring the runner's pre-flight arithmetic
- * (weights + min KV + ~1.5GB runtime) in catalog terms.
+ * Working-set headroom (GB) a model needs ON TOP of its weight bytes to run: KV cache + engine runtime
+ * overhead. Scale-aware rather than a flat constant - the KV cache grows with model size, and agent
+ * sessions carry long contexts, so a big model needs proportionally more headroom than a small one
+ * (~1.5GB engine runtime + a KV/prompt-cache share that tracks the weights, floored at 1GB).
  */
-export const AUTO_FIT_NOW_OVERHEAD_GB = 2.5;
+export function autoFitOverheadGB(weightsGB: number): number {
+	return 1.5 + Math.max(1.0, weightsGB * 0.25);
+}
 
-/** True when the entry's weights + a minimal runtime footprint fit within `availableRamGB` right now. */
+/** True when the entry's weights + its runtime footprint fit within `availableRamGB` right now. */
 export function autoEntryFitsAvailableRam(entry: ICatalogModel, availableRamGB: number): boolean {
 	const weightsGB = entry.approxSizeBytes / (1024 ** 3);
-	return weightsGB + AUTO_FIT_NOW_OVERHEAD_GB <= availableRamGB;
+	return weightsGB + autoFitOverheadGB(weightsGB) <= availableRamGB;
 }
 
 /**
  * Resolve the Auto selection to a concrete downloaded model, or undefined when nothing qualifies (the
  * caller then shows the starter-picks download card).
  *
- * Order:
- *  1. A candidate whose server is already RUNNING (or starting) wins outright - reusing the warm server
- *     avoids a cold weight load, and this is also what makes Auto sticky within a session.
- *  2. Otherwise the most capable candidate that FITS the detected RAM: rank by the catalog RAM tier
- *     (`minRamGB` already encodes "comfortable", so fitting it is the OOM/thermal guard), then prefer the
- *     curated "Best for you" repo, then architecture - MoE > MTP > MLX > plain GGUF (faster for equal
- *     quality). RAM unknown (`ramGB <= 0`) restricts to the 8 GB tier, the safe-everywhere floor.
+ * Ranking: the most capable candidate that FITS the machine wins. Rank by the catalog RAM tier
+ * (`minRamGB` already encodes "comfortable", so fitting it is the OOM/thermal guard), then prefer a
+ * candidate whose server is already RUNNING (warm server, no cold weight load - but only as a
+ * tie-breaker WITHIN a tier, so a genuinely bigger model that fits still beats it), then the curated
+ * "Best for you" repo, then architecture - MoE > MTP > MLX > plain GGUF (faster for equal quality).
+ * RAM unknown (`ramGB <= 0`) restricts to the 8 GB tier, the safe-everywhere floor.
  *
- * `availableRamGB` (optional): memory available RIGHT NOW (free + reclaimable, from the runner's live
- * probe). Candidates whose weights + minimal runtime fit it get a DOMINATING score bonus, so on a machine
- * whose RAM is half-eaten by other apps Auto steps down to a model that runs smoothly today instead of
- * the biggest one that fits on paper (which would launch straight into the availability warning). When
- * none fit now - or the figure is unknown - the ranking gracefully degrades to the total-RAM tier order.
+ * `availableRamGB` (optional): memory available AFTER an Auto switch - the runner's PROSPECTIVE figure
+ * (live free + reclaimable + what evicting our resident servers frees), NOT the raw free number. The raw
+ * figure is measured while the previous model's weights are still resident, which would systematically
+ * push Auto to smaller models on every switch. Candidates that fit it get a DOMINATING score bonus, so on
+ * a machine whose RAM is half-eaten by other apps Auto steps down to a model that runs smoothly today
+ * instead of the biggest one that fits on paper (which would launch straight into the availability
+ * warning). When none fit now - or the figure is unknown - the ranking degrades to the total-RAM tier order.
  */
 export function resolveAutoModel(
 	models: readonly ICustomLanguageModel[],
@@ -1069,11 +1073,6 @@ export function resolveAutoModel(
 	const candidates = models.filter(isAutoCandidate);
 	if (candidates.length === 0) {
 		return undefined;
-	}
-
-	const running = candidates.find(m => isServerActive(m.id));
-	if (running) {
-		return running;
 	}
 
 	const effectiveRam = ramGB > 0 ? ramGB : 8;
@@ -1087,7 +1086,14 @@ export function resolveAutoModel(
 		}
 		let score = entry.minRamGB * 1000; // capability first: highest RAM tier that fits.
 		if (availableRamGB !== undefined && availableRamGB > 0 && autoEntryFitsAvailableRam(entry, availableRamGB)) {
-			score += 100_000; // fits the machine's CURRENT headroom - dominates every capability/architecture bonus.
+			score += 100_000; // fits the machine's PROSPECTIVE headroom - dominates every capability/architecture bonus.
+		}
+		if (isServerActive(model.id)) {
+			// Warm-server tie-breaker: reusing the running server skips a cold weight load, so it beats
+			// every same-tier rival (including the curated +500 pick - a lateral swap isn't worth a cold
+			// load) - but stays below one tier step (1000), so a bigger model that also fits still takes
+			// over when the user (re)selects Auto.
+			score += 600;
 		}
 		if (entry.repoId === recommendedRepoId) {
 			score += 500; // the curated "Best for you" pick wins its tier.

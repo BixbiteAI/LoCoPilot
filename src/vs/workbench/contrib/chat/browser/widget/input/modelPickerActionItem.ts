@@ -196,8 +196,8 @@ interface IModelPickerState {
 
 // ---- "Auto" picker mode ----------------------------------------------------------------------------
 // Auto is a pinned pseudo-entry at the top of the picker (sentinel LOCOPILOT_AUTO_MODEL_ID). Selecting it
-// stores the sentinel; the agent resolves it per request to a concrete downloaded catalog model (running
-// server wins, else the most capable model that fits the detected RAM - see resolveAutoModel). The picker
+// stores the sentinel; the agent resolves it per request to a concrete downloaded catalog model (the most
+// capable model that fits the prospective RAM, warm server as tie-breaker - see resolveAutoModel). The picker
 // mirrors that same resolution so the label ("Auto (Qwen3.5 9B)"), the row description, and the row's
 // start/stop icon always show which model Auto is going to use.
 
@@ -210,8 +210,9 @@ function resolveAutoModelForPicker(customLanguageModelsService: ICustomLanguageM
 		customLanguageModelsService.getCustomModels(),
 		detectedRamGB(timerService),
 		id => localModelRunner.isServerRunning(id) || localModelRunner.isServerStarting(id),
-		// Live free-RAM figure so the picker label previews the same fit-now-aware choice the agent makes.
-		localModelRunner.getAvailableRamGB()
+		// PROSPECTIVE free-RAM figure (available + what evicting our resident servers frees) so the picker
+		// label previews the same fit-after-switch-aware choice the agent makes.
+		localModelRunner.getProspectiveAvailableRamGB()
 	);
 }
 
@@ -305,6 +306,19 @@ function modelDelegateToWidgetActionsProvider(delegate: IModelPickerDelegate, te
 						}
 						customLanguageModelsService.setSelectedCustomModelId(LOCOPILOT_AUTO_MODEL_ID);
 						delegate.setModel(buildAutoModelEntry(autoResolved));
+						// Picking Auto is a decision point: force a fresh memory probe (the cached snapshot can
+						// be up to 15s old and predate a just-stopped server) and re-resolve. If the fresh
+						// prospective headroom lands on a different - typically bigger - model, re-label so the
+						// user sees the model Auto will actually use.
+						void localModelRunner.probeProspectiveAvailableRamGB().then(() => {
+							if (customLanguageModelsService.getSelectedCustomModelId() !== LOCOPILOT_AUTO_MODEL_ID) {
+								return; // selection moved on while probing
+							}
+							const reResolved = resolveAutoModelForPicker(customLanguageModelsService, localModelRunner, timerService);
+							if (reResolved?.id !== autoResolved?.id) {
+								delegate.setModel(buildAutoModelEntry(reResolved));
+							}
+						});
 					}
 			};
 			const customModelActions: IActionWidgetDropdownAction[] = customModels.map(customModel => {
@@ -633,8 +647,8 @@ export class ModelPickerActionItem extends ChatInputPickerActionViewItem {
 
 		// While the picker is open, flip the selected model's start/stop icon as its server transitions
 		// (starting -> running -> stopped). refreshItems() is a no-op when the dropdown is closed.
-		// When Auto is selected, a server transition can also CHANGE what Auto resolves to (a running
-		// server wins), so re-derive the "Auto (<model>)" button label as well.
+		// When Auto is selected, a server transition can also CHANGE what Auto resolves to (a warm
+		// server is a within-tier tie-breaker), so re-derive the "Auto (<model>)" button label as well.
 		this._register(localModelRunner.onDidServerStateChange(() => {
 			actionWidgetService.refreshItems();
 			if (customLanguageModelsService.getSelectedCustomModelId() === LOCOPILOT_AUTO_MODEL_ID) {
