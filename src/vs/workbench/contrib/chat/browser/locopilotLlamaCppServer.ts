@@ -202,12 +202,26 @@ export const METAL_WIRED_MEMORY_FRACTION_LARGE = 0.75;
 export const METAL_LARGE_RAM_THRESHOLD_BYTES = 36 * 1024 * 1024 * 1024;
 
 /**
- * Fraction of TOTAL system RAM treated as usable for inference (weights + KV) when deciding whether a model
- * fits the machine AT ALL (the pre-flight gate). Leaves headroom for the OS + editor. Based on total rather
- * than currently-free RAM on purpose: macOS reports much of its RAM as non-free (file cache / purgeable)
- * even when it is reclaimable, so a free-based gate would block models that actually run.
+ * Upper bound on the fraction of TOTAL system RAM treated as usable for inference (weights + KV) when
+ * deciding whether a model fits the machine AT ALL (the pre-flight gate). Leaves headroom for the OS +
+ * editor. Based on total rather than currently-free RAM on purpose: macOS reports much of its RAM as
+ * non-free (file cache / purgeable) even when it is reclaimable, so a free-based gate would block models
+ * that actually run. This is only the CEILING - {@link usableSystemMemoryBytes} also subtracts an absolute
+ * OS/editor reserve, which binds tighter on small machines (see below).
  */
 export const USABLE_SYSTEM_MEMORY_FRACTION = 0.85;
+
+/**
+ * Absolute RAM (bytes) held back for the OS + editor before a fraction cap even applies. A flat 85% assumed
+ * the OS+editor fit in 15% of RAM, which is false on the small machines that actually hang: on a 16 GB
+ * Windows/Linux laptop the OS alone is ~4 GB, so 85% (13.6 GB usable) over-budgeted a model into paging.
+ * The reserve scales with RAM (bigger machines run heavier editors/toolchains) but is clamped so it neither
+ * vanishes on tiny machines nor eats an unreasonable slice of large ones. The 0.85 cap still wins on big
+ * machines where the clamped reserve would leave more than 85% usable.
+ */
+export const SYSTEM_MEMORY_RESERVE_FRACTION = 0.20;
+export const SYSTEM_MEMORY_RESERVE_MIN_BYTES = 2 * 1024 * 1024 * 1024;  // never reserve less than 2 GB
+export const SYSTEM_MEMORY_RESERVE_MAX_BYTES = 6 * 1024 * 1024 * 1024;  // never reserve more than 6 GB
 
 /**
  * Fraction of the memory budget reserved for the KV cache (the rest is for weights). Used both to size the
@@ -237,12 +251,26 @@ export function metalOffloadBudgetBytes(totalmemBytes: number, wiredLimitBytes?:
 }
 
 /**
- * Usable system-RAM budget (bytes) for the pre-flight fit check: a fraction of total RAM left after the
- * OS + editor. On Apple Silicon, offloading experts to "CPU" keeps them in the SAME unified pool, so the
- * weights + KV must fit this budget regardless of offload. Returns 0 when total is unknown.
+ * Usable system-RAM budget (bytes) for the pre-flight fit check: total RAM left after an absolute OS/editor
+ * reserve, capped at {@link USABLE_SYSTEM_MEMORY_FRACTION} of total. On Apple Silicon, offloading experts to
+ * "CPU" keeps them in the SAME unified pool, so the weights + KV must fit this budget regardless of offload.
+ * The reserve (not a flat fraction) is what keeps small Windows/Linux/CPU machines - where the OS holds a
+ * large ABSOLUTE share - from over-budgeting a model into swap. Returns 0 when total is unknown.
+ *
+ * Examples: 8 GB -> reserve 2 GB -> 6 GB usable (75%); 16 GB -> reserve 3.2 GB -> 12.8 GB (80%);
+ * 32 GB -> reserve 6 GB -> 26 GB (81%); 64 GB -> reserve capped 6 GB but the 85% cap binds -> ~54 GB (85%).
  */
 export function usableSystemMemoryBytes(totalmemBytes: number): number {
-	return totalmemBytes > 0 ? Math.floor(totalmemBytes * USABLE_SYSTEM_MEMORY_FRACTION) : 0;
+	if (totalmemBytes <= 0) {
+		return 0;
+	}
+	const reserve = Math.min(
+		SYSTEM_MEMORY_RESERVE_MAX_BYTES,
+		Math.max(SYSTEM_MEMORY_RESERVE_MIN_BYTES, totalmemBytes * SYSTEM_MEMORY_RESERVE_FRACTION)
+	);
+	const afterReserve = totalmemBytes - reserve;
+	const cap = totalmemBytes * USABLE_SYSTEM_MEMORY_FRACTION;
+	return Math.max(0, Math.floor(Math.min(afterReserve, cap)));
 }
 
 /**

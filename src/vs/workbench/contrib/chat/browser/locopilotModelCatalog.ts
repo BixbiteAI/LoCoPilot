@@ -1046,23 +1046,38 @@ export function autoEntryFitsAvailableRam(entry: ICatalogModel, availableRamGB: 
 }
 
 /**
+ * RAM slack (GB) a model that is ALREADY RUNNING is allowed to run under before Auto switches away from it.
+ * Available-RAM probes jitter by a gigabyte or two as other apps allocate/free, and a running model that
+ * dips just below the fit line for one probe should not trigger a cold reload of a different model - that
+ * churn (unload 16-20GB, load another 16-20GB) is exactly what heats the machine. So a running pick is kept
+ * as long as it fits `available + this margin`; a fresh (not-yet-running) pick still uses the strict line.
+ */
+export const AUTO_RUNNING_HYSTERESIS_GB = 2;
+
+/**
  * Resolve the Auto selection to a concrete downloaded model, or undefined when nothing qualifies (the
  * caller then shows the starter-picks download card).
  *
- * Ranking: the most capable candidate that FITS the machine wins. Rank by the catalog RAM tier
- * (`minRamGB` already encodes "comfortable", so fitting it is the OOM/thermal guard), then prefer a
- * candidate whose server is already RUNNING (warm server, no cold weight load - but only as a
- * tie-breaker WITHIN a tier, so a genuinely bigger model that fits still beats it), then the curated
- * "Best for you" repo, then architecture - MoE > MTP > MLX > plain GGUF (faster for equal quality).
- * RAM unknown (`ramGB <= 0`) restricts to the 8 GB tier, the safe-everywhere floor.
+ * Selection is a two-level decision, admission before capability:
+ *  1. ADMISSION - a candidate is "admitted" when its weights + runtime footprint fit the memory the model
+ *     would ACTUALLY get (`availableRamGB`). This is the OOM/thermal guard: an admitted model runs smoothly
+ *     today; a non-admitted one would launch straight into the availability warning / swap thrash. A model
+ *     whose server is already RUNNING is admitted under a small slack ({@link AUTO_RUNNING_HYSTERESIS_GB})
+ *     so RAM jitter doesn't churn it (see below).
+ *  2. Among admitted candidates, the most capable wins (highest catalog RAM tier), but a currently-RUNNING
+ *     admitted candidate is kept over a bigger not-running one (STICKINESS): re-resolving Auto every request
+ *     must not cold-swap a working model just because RAM briefly freed. Ties fall to the curated "Best for
+ *     you" repo, then architecture - MoE > MTP > MLX > plain GGUF (faster for equal quality).
+ *
+ * When NOTHING is admitted (every candidate is too big for the RAM free right now), Auto picks the SMALLEST
+ * candidate rather than the biggest-by-tier: the small one has the best chance of launching without thrash,
+ * where the biggest would just trip the launch gate. RAM unknown (`ramGB <= 0`) restricts to the 8 GB tier.
  *
  * `availableRamGB` (optional): memory available AFTER an Auto switch - the runner's PROSPECTIVE figure
  * (live free + reclaimable + what evicting our resident servers frees), NOT the raw free number. The raw
  * figure is measured while the previous model's weights are still resident, which would systematically
- * push Auto to smaller models on every switch. Candidates that fit it get a DOMINATING score bonus, so on
- * a machine whose RAM is half-eaten by other apps Auto steps down to a model that runs smoothly today
- * instead of the biggest one that fits on paper (which would launch straight into the availability
- * warning). When none fit now - or the figure is unknown - the ranking degrades to the total-RAM tier order.
+ * push Auto to smaller models on every switch. When the figure is unknown, admission can't be evaluated and
+ * the ranking degrades to the total-RAM tier order (capability first, running server as a warm tie-breaker).
  */
 export function resolveAutoModel(
 	models: readonly ICustomLanguageModel[],
@@ -1077,23 +1092,32 @@ export function resolveAutoModel(
 
 	const effectiveRam = ramGB > 0 ? ramGB : 8;
 	const recommendedRepoId = getRecommendedRepoId(ramGB);
-	let bestModel: ICustomLanguageModel | undefined;
-	let bestScore = -1;
+	const availKnown = availableRamGB !== undefined && availableRamGB > 0;
+
+	interface IScored { model: ICustomLanguageModel; entry: ICatalogModel; admitted: boolean; score: number }
+	const scored: IScored[] = [];
 	for (const model of candidates) {
 		const entry = findCatalogEntryByRepoId(model.modelName)!;
 		if (entry.minRamGB > effectiveRam) {
-			continue; // would OOM/thrash on this machine - never auto-picked.
+			continue; // would OOM/thrash on this machine's TOTAL RAM - never auto-picked.
 		}
-		let score = entry.minRamGB * 1000; // capability first: highest RAM tier that fits.
-		if (availableRamGB !== undefined && availableRamGB > 0 && autoEntryFitsAvailableRam(entry, availableRamGB)) {
-			score += 100_000; // fits the machine's PROSPECTIVE headroom - dominates every capability/architecture bonus.
+		const running = isServerActive(model.id);
+		// Admission: a fresh pick must fit the strict available figure; a running pick keeps a small slack so
+		// a one-probe dip below the line doesn't force a cold reload of a different model.
+		const admitted = availKnown && (
+			autoEntryFitsAvailableRam(entry, availableRamGB!)
+			|| (running && autoEntryFitsAvailableRam(entry, availableRamGB! + AUTO_RUNNING_HYSTERESIS_GB))
+		);
+
+		let score = entry.minRamGB * 1000; // capability: highest RAM tier that fits.
+		if (admitted) {
+			score += 1_000_000; // fits the RAM the model would actually get - dominates every capability step.
 		}
-		if (isServerActive(model.id)) {
-			// Warm-server tie-breaker: reusing the running server skips a cold weight load, so it beats
-			// every same-tier rival (including the curated +500 pick - a lateral swap isn't worth a cold
-			// load) - but stays below one tier step (1000), so a bigger model that also fits still takes
-			// over when the user (re)selects Auto.
-			score += 600;
+		if (running) {
+			// Stickiness: a running model beats a bigger, not-running rival in the SAME admission class (the
+			// +200k clears the largest realistic tier gap, 8->64 = 56k) so re-resolving Auto keeps the warm
+			// model instead of cold-swapping. A non-admitted running model still loses to any admitted one.
+			score += 200_000;
 		}
 		if (entry.repoId === recommendedRepoId) {
 			score += 500; // the curated "Best for you" pick wins its tier.
@@ -1108,12 +1132,18 @@ export function resolveAutoModel(
 		if (entry.recommended) {
 			score += 50;
 		}
-		if (score > bestScore) {
-			bestScore = score;
-			bestModel = model;
-		}
+		scored.push({ model, entry, admitted, score });
 	}
-	return bestModel;
+	if (scored.length === 0) {
+		return undefined;
+	}
+
+	// Nothing fits the RAM free right now (and we HAVE a reading): step down to the smallest candidate, the
+	// one most likely to launch without paging. The capability score rewards bigger, so pick min size directly.
+	if (availKnown && !scored.some(s => s.admitted)) {
+		return scored.reduce((best, s) => s.entry.approxSizeBytes < best.entry.approxSizeBytes ? s : best).model;
+	}
+	return scored.reduce((best, s) => s.score > best.score ? s : best).model;
 }
 
 export type AutoStarterSlot = 'best' | 'balanced' | 'fast';

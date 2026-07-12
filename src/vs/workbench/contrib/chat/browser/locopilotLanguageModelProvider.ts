@@ -217,6 +217,13 @@ export class LoCoPilotLanguageModelProvider extends Disposable implements ILangu
 	 * scary failure when the model simply hasn't finished loading.
 	 */
 	private _getLocalServerUnavailableMessage(model: ICustomLanguageModel): string {
+		// A launch that was abandoned at the memory/fit gate ("Keep current model", or a too-big pre-warm) is a
+		// terminal "won't start" - NOT a slow load. Surface that concrete reason instead of the misleading
+		// "taking a moment to start", which tells the user to just wait and resend a model that never will start.
+		const blockedReason = this.localModelRunner.getRecentLaunchFailure(model.id);
+		if (blockedReason) {
+			return blockedReason;
+		}
 		const phase = this.localModelRunner.getServerPhase(model.id);
 		if (phase === 'loading' || phase === 'starting') {
 			return this._getLocalModelStillLoadingMessage(model.modelName, model.displayName);

@@ -135,8 +135,15 @@ suite('LoCoPilot llama.cpp server', () => {
 			assert.strictEqual(metalOffloadBudgetBytes(16 * GB, 0), Math.floor(16 * GB * METAL_WIRED_MEMORY_FRACTION_SMALL));
 		});
 
-		test('usableSystemMemoryBytes leaves headroom below total', () => {
-			assert.strictEqual(usableSystemMemoryBytes(16 * GB), Math.floor(16 * GB * USABLE_SYSTEM_MEMORY_FRACTION));
+		test('usableSystemMemoryBytes reserves an absolute OS/editor slice, capped at the fraction', () => {
+			// Small machines: the absolute reserve (not the flat 85%) binds, leaving a safer margin for the OS.
+			assert.strictEqual(usableSystemMemoryBytes(8 * GB), Math.floor(8 * GB - 2 * GB));   // reserve floored at 2 GB
+			assert.strictEqual(usableSystemMemoryBytes(16 * GB), Math.floor(16 * GB - 16 * GB * 0.20)); // 20% reserve
+			assert.strictEqual(usableSystemMemoryBytes(32 * GB), Math.floor(32 * GB - 6 * GB)); // reserve capped at 6 GB
+			// Large machines: the reserve is capped at 6 GB, so the 85% ceiling is what binds instead.
+			assert.strictEqual(usableSystemMemoryBytes(64 * GB), Math.floor(64 * GB * USABLE_SYSTEM_MEMORY_FRACTION));
+			// Never exceeds the fraction cap, always below total, and monotonic in the direction of safety.
+			assert.ok(usableSystemMemoryBytes(16 * GB) <= Math.floor(16 * GB * USABLE_SYSTEM_MEMORY_FRACTION));
 			assert.ok(usableSystemMemoryBytes(16 * GB) < 16 * GB);
 		});
 

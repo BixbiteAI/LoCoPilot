@@ -9,7 +9,7 @@ import { URI } from '../../../../base/common/uri.js';
 import { ILogService } from '../../../../platform/log/common/log.js';
 import { IConfigurationService } from '../../../../platform/configuration/common/configuration.js';
 import { IFileService } from '../../../../platform/files/common/files.js';
-import { ICustomLanguageModelsService, customModelVisionEnabled, LOCOPILOT_AUTO_MODEL_ID, type ICustomLanguageModel } from '../common/customLanguageModelsService.js';
+import { ICustomLanguageModelsService, customModelVisionEnabled, type ICustomLanguageModel } from '../common/customLanguageModelsService.js';
 import { ChatConfiguration } from '../common/constants.js';
 import { ILoCoPilotFileLog } from './locopilotFileLog.js';
 import { registerAction2, Action2 } from '../../../../platform/actions/common/actions.js';
@@ -38,6 +38,7 @@ import {
 	MIN_CLAMPED_CONTEXT,
 	LOCOPILOT_LLAMA_SERVER_PORT,
 	LlamaBackend,
+	resolveKvCacheType,
 	type LlamaServerTuning,
 	type FlashAttentionMode,
 	type KvCacheType
@@ -66,6 +67,7 @@ import { ILifecycleService, LifecyclePhase } from '../../../services/lifecycle/c
 import { ITerminalService, ITerminalInstance } from '../../terminal/browser/terminal.js';
 import { Event, Emitter } from '../../../../base/common/event.js';
 import { INotificationService, Severity } from '../../../../platform/notification/common/notification.js';
+import { IDialogService } from '../../../../platform/dialogs/common/dialogs.js';
 import { ICommandService } from '../../../../platform/commands/common/commands.js';
 import { IOpenerService } from '../../../../platform/opener/common/opener.js';
 import { INativeHostService } from '../../../../platform/native/common/native.js';
@@ -82,6 +84,9 @@ export const ILoCoPilotLocalModelRunner = createDecorator<ILoCoPilotLocalModelRu
  * the cache dir at a few GB while comfortably covering the user's 2-3 hot models across modes.
  */
 const MAX_SLOT_CACHE_ENTRIES = 10;
+
+/** How long a "launch blocked at the fit gate" reason stays relevant to the chat panel before it's treated as stale. */
+const LAUNCH_BLOCK_TTL_MS = 60_000;
 
 /**
  * Lifecycle phase of a local model server:
@@ -116,6 +121,8 @@ export interface ILoCoPilotLocalModelRunner {
 	readonly onDidLogUpdate: Event<string>;
 	/** Fired when a server launch fails. Payload contains modelId and a human-readable reason. */
 	readonly onDidServerStartFailed: Event<{ modelId: string; message: string }>;
+	/** Fired when the live memory snapshot changes, so Auto-label consumers can re-derive the resolved model. */
+	readonly onDidAvailableRamChange: Event<void>;
 	/** Current load phase for a model whose server we are starting/running, or undefined when not managed. */
 	getServerPhase(modelId: string): LocalServerPhase | undefined;
 	/** Latest human-readable load-progress line (parsed from llama.cpp output), if any. */
@@ -137,7 +144,13 @@ export interface ILoCoPilotLocalModelRunner {
 	 */
 	getServedModelId(modelId: string): string | undefined;
 	getServerLogs(modelId: string): string[];
-	startServerInTerminal(modelId: string): Promise<void>;
+	/**
+	 * Launches the server for `modelId`. `interactive` = true for explicit user actions (send message, Start
+	 * button, Retry, picker): a model that won't fit shows the "Run anyway / Keep current" dialog. false for
+	 * background pre-warm / crash-relaunch: a non-fitting model is skipped silently, and a prior "Run anyway"
+	 * choice (the `_forcedLaunch` flag) still carries the relaunch through.
+	 */
+	startServerInTerminal(modelId: string, interactive?: boolean): Promise<void>;
 	/**
 	 * Ensures a local server for the model is running and ready to answer chat requests.
 	 * If not running, starts it (evicting the least-recently-used server first when the resident-model
@@ -192,6 +205,12 @@ export interface ILoCoPilotLocalModelRunner {
 	 * eviction credit. Undefined on web or when the probe fails.
 	 */
 	probeProspectiveAvailableRamGB(): Promise<number | undefined>;
+	/**
+	 * The reason a recent launch of `modelId` was abandoned at a memory/fit gate (user declined "Run anyway",
+	 * or a pre-warm skipped a too-big model), or undefined when there is none / it has gone stale. Lets the
+	 * chat panel distinguish a model that WON'T start (fit-blocked) from one that is merely still loading.
+	 */
+	getRecentLaunchFailure(modelId: string): string | undefined;
 }
 
 export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotLocalModelRunner {
@@ -206,6 +225,14 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 
 	private readonly _onDidServerStartFailed = this._register(new Emitter<{ modelId: string; message: string }>());
 	readonly onDidServerStartFailed = this._onDidServerStartFailed.event;
+
+	/**
+	 * Fires when the live memory snapshot changes (a fresh probe landed). The model picker listens so the
+	 * "Auto (X)" label re-derives when available RAM shifts - otherwise it only re-rendered on a server
+	 * state change and drifted out of sync with the dropdown and the actual per-request resolution (Q1).
+	 */
+	private readonly _onDidAvailableRamChange = this._register(new Emitter<void>());
+	readonly onDidAvailableRamChange = this._onDidAvailableRamChange.event;
 
 	private static readonly MAX_LOG_LINES = 2000;
 
@@ -275,12 +302,35 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 	private readonly _activeLaunchTerminals = new Map<string, ITerminalInstance>();
 	/** Models we are intentionally stopping, so the process-exit handler doesn't report a stop as a crash. */
 	private readonly _intentionalStops = new Set<string>();
+	/**
+	 * Models the user chose "Run anyway" for at the fit-check dialog: their next launch bypasses BOTH memory
+	 * gates. Cleared when the model is stopped (manual stop, eviction, or a watchdog trip), so a model the
+	 * machine proved it can't hold re-prompts on the next explicit selection instead of silently forcing again.
+	 */
+	private readonly _forcedLaunch = new Set<string>();
+	/** The last local model that was actually used/ready, so "Keep current" can revert selection to it. */
+	private _lastReadyModelId: string | undefined;
+	/**
+	 * Terminal reason a launch was abandoned at a memory/fit gate (user chose "Keep current model", or a
+	 * background pre-warm skipped a too-big model). Lets the chat panel show the real "won't fit / not started"
+	 * cause instead of the misleading "taking a moment to start" (which implies the server is still coming up).
+	 * Keyed by modelId; the getter treats an entry older than {@link LAUNCH_BLOCK_TTL_MS} as stale so it never
+	 * haunts a later, unrelated slow-load. Cleared at the top of every fresh launch attempt and on ready.
+	 */
+	private readonly _launchBlockReason = new Map<string, { message: string; at: number }>();
 	/** Models whose server process exited before it ever became ready (so readiness polling can bail early). */
 	private readonly _crashedBeforeReady = new Set<string>();
 	/** Models whose next crash should be logged but NOT surfaced as a notification (e.g. a pre-warm attempt that will be retried). */
 	private readonly _suppressCrashNotice = new Set<string>();
 	/** Cache of on-disk weight sizes (bytes) keyed by modelId, so the eviction budget doesn't re-stat on every switch. */
 	private readonly _modelSizeCache = new Map<string, number>();
+	/**
+	 * Cache of the FULL estimated resident cost (weights + KV + runtime) per model, populated by
+	 * {@link _estimateModelCost}. The sync prospective-RAM path (the picker's "Auto (X)" label) reads this so it
+	 * scores against the SAME eviction credit the async request-time probe uses - otherwise the label (weights
+	 * only) and the actual pick (full cost) can resolve to different models on the same machine (Q1).
+	 */
+	private readonly _modelCostCache = new Map<string, number>();
 	/** Cached hardware probe (CPU cores / GPU VRAM); hardware doesn't change during a session. */
 	private _hardwareInfo: Promise<ISystemHardwareInfo | undefined> | undefined;
 	/** Cache of GGUF model info (layer count, expert count, context length) keyed by resolved model file path. */
@@ -338,6 +388,14 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 	private readonly _oomStripExtras = new Set<string>();
 	/** Context size (-c) each model's LAST llama launch actually used, so the OOM ladder can halve it. */
 	private readonly _lastLaunchContext = new Map<string, number>();
+	/**
+	 * Resolved KV-cache tensor type (f16 / q8_0 / q4_0) each model's current llama server launched with. A saved
+	 * slot-cache blob is only byte-compatible with a server using the SAME type, so this is folded into the slot
+	 * filename: a later launch that resolves a different type (context size shifted the 'auto' choice, or the OOM
+	 * ladder capped it) looks for a differently-named file, misses cleanly, and warms - instead of hitting the
+	 * server-side "mismatched key type" restore error on an incompatible blob saved under the same name.
+	 */
+	private readonly _lastLaunchKvType = new Map<string, string>();
 
 	constructor(
 		@ICustomLanguageModelsService private readonly customLanguageModelsService: ICustomLanguageModelsService,
@@ -348,6 +406,7 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 		@ILoCoPilotFileLog private readonly locopilotFileLog: ILoCoPilotFileLog,
 		@ITerminalService private readonly terminalService: ITerminalService,
 		@INotificationService private readonly notificationService: INotificationService,
+		@IDialogService private readonly dialogService: IDialogService,
 		@ICommandService private readonly commandService: ICommandService,
 		@IOpenerService private readonly openerService: IOpenerService,
 		@IInstantiationService private readonly instantiationService: IInstantiationService,
@@ -388,7 +447,7 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 			}
 			async run(accessor: ServicesAccessor, modelId?: string): Promise<void> {
 				if (modelId) {
-					await self.startServerInTerminal(modelId);
+					await self.startServerInTerminal(modelId, true); // explicit user action (Start/Retry) -> may prompt "Run anyway?"
 				}
 			}
 		});
@@ -598,9 +657,21 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 		return this._kvCacheDirReady;
 	}
 
-	/** Filesystem-safe slot-cache filename for a (model, mode) prefix. */
-	private _slotCacheFileName(key: string): string {
-		return `${key.replace(/[^a-zA-Z0-9._-]/g, '_').slice(0, 200)}.bin`;
+	/**
+	 * Filesystem-safe slot-cache filename for a (model, mode) prefix, tagged with the server's resolved KV cache
+	 * type. The type tag is what stops the "mismatched key type" restore error: a saved blob is byte-compatible
+	 * only with a server using the same KV type, so a launch that resolves a different type (context shift flipped
+	 * the 'auto' f16<->q8_0 choice, or the OOM ladder capped context) looks for a differently-named file and
+	 * misses cleanly instead of restoring an incompatible blob. Falls back to 'kvunknown' when the type isn't
+	 * known here (e.g. a server owned by another window) - a real launch never resolves to that tag, so such a
+	 * blob is simply never picked up by a launching window rather than mismatched.
+	 */
+	private _slotCacheFileName(modelId: string, key: string): string {
+		// Only trust the locally-recorded KV type when THIS window owns the server; a foreign (attached) server was
+		// launched elsewhere, so our record's type may be stale/absent - fall back to the never-restored tag.
+		const foreign = this.runningServers.get(modelId)?.foreign === true;
+		const kvType = (!foreign && this._lastLaunchKvType.get(modelId)) || 'kvunknown';
+		return `${key.replace(/[^a-zA-Z0-9._-]/g, '_').slice(0, 180)}.${kvType}.bin`;
 	}
 
 	/** Finds `name` (case-insensitive) under `dir`, descending at most `depth` directory levels. */
@@ -826,7 +897,7 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 			this._log(`[LoCoPilot Runner] KV slot restore skipped for ${modelId}: server not ready (present=${!!running}, kind=${running?.kind ?? 'none'}, ready=${running?.ready ?? false}).`);
 			return false;
 		}
-		const filename = this._slotCacheFileName(key);
+		const filename = this._slotCacheFileName(modelId, key);
 		// The file must exist under the slot-save dir, or llama.cpp rejects the restore. Check first so a
 		// cold first-ever run (no cache yet) quietly falls back to warming instead of logging a failure.
 		try {
@@ -868,7 +939,7 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 		if (!await this._ensureKvCacheDir()) {
 			return;
 		}
-		const filename = this._slotCacheFileName(key);
+		const filename = this._slotCacheFileName(modelId, key);
 		try {
 			const res = await this.requestService.request({
 				type: 'POST',
@@ -960,11 +1031,42 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 				return;
 			}
 			this._intentionalStops.add(modelId); // mark so onExit treats this as a clean stop, not a crash
+			this._forcedLaunch.delete(modelId); // a stopped model re-prompts "Run anyway?" on its next launch
 			running.terminal?.dispose();
 			this.runningServers.delete(modelId);
 			void this._clearActiveServerLockIfOwned();
 			this._onDidServerStateChange.fire(modelId);
 			this._log(`[LoCoPilot Runner] Stopped server for model ${modelId}`);
+		}
+	}
+
+	/**
+	 * Stops an owned server AND waits until its process has actually released the port + its wired weights
+	 * before resolving. Eviction on a model switch must be serialized against the replacement launch:
+	 * {@link stopServer} only *requests* teardown (disposing the terminal SIGTERMs the pty asynchronously),
+	 * so a launch that proceeds immediately briefly DOUBLE-BOOKS RAM - the dying model's weights are still
+	 * resident while the new model loads. On a memory-tight machine that transient spike is a top cause of a
+	 * switch OOM-ing or tripping the watchdog on a launch that would have been fine seconds later. Foreign
+	 * records (owned by another window) and already-gone models resolve immediately - there is nothing here
+	 * to wait on. Never throws: a teardown-wait failure must not block the switch.
+	 */
+	private async _stopServerAndWait(modelId: string): Promise<void> {
+		const rec = this.runningServers.get(modelId);
+		if (!rec || rec.foreign) {
+			this.stopServer(modelId);
+			return;
+		}
+		const { port, kind } = rec;
+		let pid: number | undefined;
+		try {
+			await rec.terminal?.processReady;
+			pid = rec.terminal?.processId;
+		} catch {
+			// processId unavailable -> we can still poll the health endpoint for the port to close
+		}
+		this.stopServer(modelId);
+		if (typeof pid === 'number' && pid > 1) {
+			await this._waitForServerGone(port, kind, pid).catch(() => undefined);
 		}
 	}
 
@@ -1000,6 +1102,7 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 			return;
 		}
 		running.lastUsedAt = Date.now();
+		this._lastReadyModelId = modelId; // the model actively in use; "Keep current" reverts selection here
 		this._armIdleTimer(modelId);
 	}
 
@@ -1072,7 +1175,7 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 		for (const [id, rec] of Array.from(this.runningServers.entries())) {
 			if (id !== keepModelId && rec.kind !== keepKind) {
 				this._log(`[LoCoPilot Runner] Cross-engine switch: evicting ${rec.kind} server ${id} before starting ${keepKind} model ${keepModelId}.`);
-				this.stopServer(id);
+				await this._stopServerAndWait(id); // serialize: the two engines must never be co-resident
 			}
 		}
 		// Same cross-engine guard for launches still in their 'starting' phase (not yet in runningServers).
@@ -1132,7 +1235,10 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 			const reason = others.length > Math.max(0, max - 1) ? `count budget (${max})` : 'memory budget';
 			this._log(`[LoCoPilot Runner] Resident ${reason} reached; evicting LRU model ${lruId}.`);
 			freedBytes += otherCost.get(lruId) ?? 0;
-			this.stopServer(lruId);
+			// Wait for the evicted process to actually release its RAM before the loop re-checks the budget
+			// (and before the caller launches keepModelId): otherwise the freed weights are still resident and
+			// the replacement load spikes memory into a switch OOM. See _stopServerAndWait.
+			await this._stopServerAndWait(lruId);
 			others = evictable();
 		}
 
@@ -1158,6 +1264,22 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 	private _useMemoryBudget(): boolean {
 		const backend = this.getBackend();
 		return backend === 'metal' || backend === 'cpu';
+	}
+
+	/**
+	 * Extra RESIDENT bytes an MLX launch commits beyond weights+KV, so the fit gates reserve for them the same
+	 * way the llama.cpp path reserves for its MTP/draft/mmproj extras (the two engines must reason alike - Q4).
+	 * MLX auto-tune pins a cross-request prompt cache at ~15% of total RAM (mirrors `promptCacheBytes` in
+	 * {@link _startMlxServerInTerminal}); the paired speculative draft is NOT included here because it is loaded
+	 * only after its own {@link _extrasFitBudget} check at launch. Returns 0 when auto-tune is off / unsupported.
+	 */
+	private _mlxRuntimeReserveBytes(totalMemBytes: number): number {
+		const autoTune = this.configurationService.getValue<boolean>(ChatConfiguration.LocopilotMlxAutoTune) !== false
+			&& !this._mlxExtraFlagsUnsupported;
+		if (!autoTune || !(totalMemBytes > 0)) {
+			return 0;
+		}
+		return Math.floor(totalMemBytes * 0.15);
 	}
 
 	/** Reads total/free system RAM via the native host. Returns undefined on web or if the query fails. */
@@ -1189,8 +1311,14 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 				try {
 					const status = await accessor.get(ILoCoPilotSystemInfoService).getMemoryStatus();
 					if (status.totalBytes > 0 && status.availableBytes > 0) {
+						const prevAvailable = this._lastMemoryStatus?.availableBytes;
 						this._lastMemoryStatus = status;
 						this._lastMemoryStatusAt = Date.now();
+						// Notify Auto-label consumers when available RAM shifts enough to plausibly change which
+						// model Auto resolves to (>~0.25 GB). Threshold keeps idle probe jitter from churning the UI.
+						if (prevAvailable === undefined || Math.abs(status.availableBytes - prevAvailable) > 0.25 * 1024 ** 3) {
+							this._onDidAvailableRamChange.fire();
+						}
 						return status;
 					}
 					return undefined;
@@ -1230,12 +1358,19 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 			if (rec.foreign) {
 				continue; // another window owns it; switching here doesn't free it
 			}
-			const cached = this._modelSizeCache.get(id);
-			if (cached !== undefined) {
-				bytes += cached;
-			} else {
-				void this._estimateModelCost(id); // populate the cache for the next caller
+			// Prefer the FULL resident cost (weights + KV + runtime) the async probe also credits, so the sync
+			// prospective figure and the request-time one agree. Fall back to the weight-only size until the full
+			// estimate has run once, and kick that estimate off in the background for the next caller (Q1).
+			const fullCost = this._modelCostCache.get(id);
+			if (fullCost !== undefined) {
+				bytes += fullCost;
+				continue;
 			}
+			const weights = this._modelSizeCache.get(id);
+			if (weights !== undefined) {
+				bytes += weights;
+			}
+			void this._estimateModelCost(id); // populate the full-cost cache for the next caller
 		}
 		return bytes;
 	}
@@ -1280,12 +1415,37 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 	}
 
 	/**
+	 * KV-cache bytes for `ctxTokens` of context, derived from the model's REAL attention geometry (kv heads x
+	 * head dim x layers, at f16 k+v) so the footprint estimate, the pre-flight fit gate, and the context clamp
+	 * all size the KV cache the SAME way. Best-effort: for MLX (no GGUF to probe) or when the GGUF can't be
+	 * parsed, falls back to a conservative flat ~128 KiB/token that covers a typical 7-13B model.
+	 */
+	private async _kvBytesForContext(localPath: string, kind: 'llama' | 'mlx', ctxTokens: number): Promise<number> {
+		const FALLBACK_BYTES_PER_TOKEN = 128 * 1024;
+		if (kind === 'llama') {
+			try {
+				const filePath = await this.resolveModelFilePath(localPath);
+				const info = await this._getModelInfo(filePath);
+				const perTokenPerLayer = kvBytesPerTokenPerLayer(info, 2); // f16 k+v; conservative for a budget
+				const layers = info.layerCount && info.layerCount > 0 ? info.layerCount : 32;
+				if (perTokenPerLayer && perTokenPerLayer > 0) {
+					return ctxTokens * perTokenPerLayer * layers;
+				}
+			} catch {
+				// fall through to the flat fallback below
+			}
+		}
+		return ctxTokens * FALLBACK_BYTES_PER_TOKEN;
+	}
+
+	/**
 	 * Estimates a model's *resident* memory footprint in bytes - honestly, not just weights. Adds the runtime
 	 * cost the old `weights * 1.2` heuristic ignored, which is exactly what let two models "fit" on paper and
 	 * then OOM in practice:
-	 *  - KV cache: scales with the context window (a conservative all-layers k+v per-token figure).
+	 *  - KV cache: sized from the model's real attention geometry (shared with the fit gate / context clamp).
 	 *  - llama.cpp prompt cache: the server reserves a sizeable host-RAM prompt cache (`--cache-ram`).
-	 *  - speculative draft: MTP self-draft or a separate draft model roughly adds another weights-worth.
+	 *  - speculative draft: a SEPARATE draft model adds its (small) file; an MTP self-draft shares the mmap'd
+	 *    weights and only adds a small KV/context slice - NOT another weights-worth (see the MTP branch).
 	 * Weight bytes are cached per model (they don't change); the runtime terms are cheap to recompute.
 	 * Returns 0 when the weight size can't be determined (e.g. Ollama), so an unknown model never blocks a load.
 	 */
@@ -1293,6 +1453,7 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 		const model = this.customLanguageModelsService.getCustomModels().find(m => m.id === modelId);
 		if (!model || !model.localPath || model.provider === 'ollama') {
 			this._modelSizeCache.set(modelId, 0);
+			this._modelCostCache.set(modelId, 0);
 			return 0;
 		}
 		let weightBytes = this._modelSizeCache.get(modelId);
@@ -1301,6 +1462,7 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 			this._modelSizeCache.set(modelId, weightBytes);
 		}
 		if (weightBytes === 0) {
+			this._modelCostCache.set(modelId, 0);
 			return 0; // unknown weight size -> don't let the budget block this load
 		}
 
@@ -1310,16 +1472,22 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 			MIN_CLAMPED_CONTEXT,
 			model.contextWindow && model.contextWindow > 0 ? model.contextWindow : DEFAULT_LLAMA_CONTEXT_SIZE
 		);
-		// ~128 KiB/token covers a typical 7-13B model's f16 k+v across all layers; conservative for the budget.
-		const KV_BYTES_PER_TOKEN = 128 * 1024;
 		const GB = 1024 * 1024 * 1024;
-		let runtime = ctxTokens * KV_BYTES_PER_TOKEN;
+		// KV cache: sized from the model's REAL attention geometry (same source the pre-flight fit gate and the
+		// context clamp use), so this estimate and those gates agree instead of drifting apart. Falls back to a
+		// conservative ~128 KiB/token (a typical 7-13B f16 k+v across all layers) when the GGUF can't be parsed.
+		let runtime = await this._kvBytesForContext(model.localPath, kind, ctxTokens);
 		if (kind === 'llama') {
 			runtime += 2 * GB; // conservative slice of llama.cpp's host-RAM prompt cache (default --cache-ram 8 GiB).
 			const tuning = this._getLlamaTuning(model);
 			const sepDraft = tuning.draftModelPath?.trim();
 			if (tuning.multiTokenPrediction) {
-				runtime += weightBytes; // self-draft (MTP) loads a second copy of the same weights.
+				// MTP self-draft points `--model-draft` at the SAME GGUF, which llama.cpp mmaps - the weight pages
+				// are SHARED with the main model, so there is no second full copy in RSS. The real added cost is
+				// the draft decode path's small KV/context, not another weights-worth. The old `+= weightBytes`
+				// doubled a 20 GB MTP model to ~40 GB, which over-evicted AND - since this same figure feeds the
+				// "evictable" reclaim estimate - made Auto believe unloading it frees ~2x the RAM it actually does.
+				runtime += Math.min(weightBytes * 0.1, GB); // draft KV/context slack, never a whole weights copy.
 			} else if (sepDraft) {
 				// A separate draft costs its own (much smaller) file; full weights only when it can't be statted.
 				runtime += (await this._fileBytes(sepDraft)) || weightBytes;
@@ -1339,7 +1507,9 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 				}
 			}
 		}
-		return weightBytes + runtime;
+		const cost = weightBytes + runtime;
+		this._modelCostCache.set(modelId, cost); // let the sync prospective-RAM path reuse the full estimate (Q1)
+		return cost;
 	}
 
 	/** Sums the on-disk size of a model's weights: the .gguf file, or every file in an MLX/sharded directory. */
@@ -1876,28 +2046,32 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 	 * `discreteVramBytes`: dedicated VRAM (CUDA/Vulkan) that can hold offloaded weights ON TOP of system RAM;
 	 * undefined on unified-memory (Metal) / CPU, where weights live in system RAM regardless of any offload.
 	 */
-	private async _checkModelFitsOrNotify(modelId: string, modelPath: string, backend: LlamaBackend, discreteVramBytes: number | undefined, extraResidentBytes: number = 0): Promise<boolean> {
+	private async _checkModelFitsOrNotify(modelId: string, modelPath: string, backend: LlamaBackend, discreteVramBytes: number | undefined, interactive: boolean, extraResidentBytes: number = 0): Promise<boolean> {
 		const model = this.customLanguageModelsService.getCustomModels().find(m => m.id === modelId);
 		if (!model) {
 			return true;
 		}
+		if (this._forcedLaunch.has(modelId)) {
+			return true; // user already chose "Run anyway" for this model
+		}
 		const fit = await this._computeFit(modelPath, backend, discreteVramBytes, extraResidentBytes);
 		if (fit && fit.requiredBytes > fit.usableBytes) {
 			// CAPABILITY failure: even the minimum footprint exceeds what this machine can EVER offer (total
-			// usable RAM), so this model can never run here - an honest, plain refusal. This is the ONLY
-			// pre-launch memory block. We deliberately do NOT block on transient "available right now" memory:
-			// Auto mode already picks a model that fits current free RAM, and the runtime watchdog stops a
-			// launch that actually starts thrashing - so a switch just loads (evicting the old model first)
-			// instead of throwing a confusing "not enough free RAM" that ignored the RAM the switch frees.
+			// usable RAM), so this model cannot safely run here. Unlike the transient gate this is a HARD
+			// shortfall, so the "Run anyway" dialog warns more strongly (it may freeze/overheat the machine);
+			// the watchdog is the backstop if the user proceeds anyway.
 			const GB = 1024 * 1024 * 1024;
 			const needGb = Math.ceil(fit.requiredBytes / GB);
 			const haveGb = Math.max(1, Math.round(fit.usableBytes / GB));
-			this._log(`[LoCoPilot Runner] Refusing to start ${modelId}: needs ~${needGb}GB but only ~${haveGb}GB is usable on this machine.`);
+			this._log(`[LoCoPilot Runner] ${modelId} exceeds usable RAM: needs ~${needGb}GB but only ~${haveGb}GB is usable on this machine (interactive=${interactive}).`);
 			const name = model.displayName || model.modelName;
-			const message = `"${name}" needs about ${needGb} GB of memory to run, but this computer has about ${haveGb} GB usable. Please choose a smaller model.`;
-			this._endStarting(modelId, message);
-			this.notificationService.notify({ severity: Severity.Error, message });
-			return false;
+			if (!interactive) {
+				// Background pre-warm of a too-big model: skip silently (no dialog, no toast).
+				this._recordLaunchBlocked(modelId, this._buildFitBlockedMessage(name, needGb, haveGb, true));
+				this._endStarting(modelId);
+				return false;
+			}
+			return this._promptRunAnyway(modelId, name, needGb, haveGb, true);
 		}
 		return true;
 	}
@@ -1943,12 +2117,26 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 	// stops our servers - a 1-second recovery instead of a frozen machine. Killing our own process is
 	// always the better trade: the user can relaunch a smaller model; they can't un-freeze a Mac.
 
-	/** Available-memory floor (bytes) below which a watchdog sample counts as critical. */
-	private static readonly WATCHDOG_AVAILABLE_FLOOR = 1024 * 1024 * 1024; // 1 GiB
+	/** Minimum available-memory floor (bytes) below which a watchdog sample counts as critical. */
+	private static readonly WATCHDOG_AVAILABLE_FLOOR_MIN = 1024 * 1024 * 1024; // 1 GiB
+	/** Fraction of TOTAL RAM used as the floor when it is larger than the absolute minimum (scales up on big machines). */
+	private static readonly WATCHDOG_AVAILABLE_FLOOR_FRACTION = 0.03;
 	/** Sample interval; two bad samples trip the breaker, so reaction time is ~2x this. */
 	private static readonly WATCHDOG_INTERVAL_MS = 5000;
-	/** How long automatic (pre-warm) launches stay suppressed after the breaker trips. */
+	/** How long automatic (pre-warm) launches stay suppressed after the breaker trips (or a first strike lands). */
 	private static readonly WATCHDOG_COOLDOWN_MS = 60_000;
+
+	/**
+	 * Available-memory floor (bytes) for THIS machine: the larger of a 1 GiB absolute minimum and a small
+	 * fraction of total RAM. A flat 1 GiB reacts too late on a 64 GB workstation (1 GB free there already means
+	 * heavy paging) yet is fine on an 8 GB laptop; scaling by total RAM keeps the trip point proportionate.
+	 */
+	private _watchdogAvailableFloor(totalBytes: number): number {
+		return Math.max(
+			LoCoPilotLocalModelRunner.WATCHDOG_AVAILABLE_FLOOR_MIN,
+			Math.floor(totalBytes * LoCoPilotLocalModelRunner.WATCHDOG_AVAILABLE_FLOOR_FRACTION)
+		);
+	}
 
 	/** True when this window owns at least one live server process (foreign attachments don't count). */
 	private _ownsResidentServer(): boolean {
@@ -1958,6 +2146,30 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 			}
 		}
 		return false;
+	}
+
+	/**
+	 * Graceful first-strike relief: evict our least-recently-used OWNED servers while keeping the most-recently
+	 * -used one resident. Only acts when more than one owned server is up (the multi-resident case, e.g.
+	 * `maxResidentModels > 1`); with a single server there is nothing to shed short of killing it, which the
+	 * second strike handles. Fire-and-forget teardown - we want the pressure relieved this tick, not awaited.
+	 */
+	private _watchdogRelieveByEvictingExtras(): void {
+		const owned = Array.from(this.runningServers.entries())
+			.filter(([, rec]) => !rec.foreign)
+			.sort((a, b) => a[1].lastUsedAt - b[1].lastUsedAt); // oldest first
+		if (owned.length <= 1) {
+			return; // single owned server: nothing to shed without killing the active model (strike 2's job)
+		}
+		const keepMru = owned[owned.length - 1][0];
+		for (const [id] of owned) {
+			if (id === keepMru) {
+				continue;
+			}
+			const model = this.customLanguageModelsService.getCustomModels().find(m => m.id === id);
+			this._log(`[LoCoPilot Runner] Memory watchdog (first strike): evicting extra resident model ${model?.displayName || model?.modelName || id} to relieve pressure while keeping the active one.`);
+			this.stopServer(id);
+		}
 	}
 
 	/**
@@ -2008,7 +2220,8 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 		//   - the kernel itself reporting CRITICAL memory pressure (its own low-memory-warning trigger), or
 		//   - memory low AND swap actively GROWING (the machine is paging RAM to disk right now), or
 		//   - memory critically low on a platform that gives us no pressure/swap signal at all (last resort).
-		const lowAvailable = mem.availableBytes < LoCoPilotLocalModelRunner.WATCHDOG_AVAILABLE_FLOOR;
+		const floor = this._watchdogAvailableFloor(mem.totalBytes);
+		const lowAvailable = mem.availableBytes < floor;
 		const swapGrowing = mem.swapUsedBytes >= 0 && this._watchdogLastSwapBytes >= 0
 			&& (mem.swapUsedBytes - this._watchdogLastSwapBytes) > LoCoPilotLocalModelRunner.WATCHDOG_SWAP_GROWTH_BYTES;
 		const noSignals = mem.pressure === 'unknown' && mem.swapUsedBytes < 0;
@@ -2023,8 +2236,15 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 		}
 		this._watchdogStrikes++;
 		const GB = 1024 * 1024 * 1024;
-		this._log(`[LoCoPilot Runner] Memory watchdog: critical sample ${this._watchdogStrikes}/2 (available ~${(mem.availableBytes / GB).toFixed(1)}GB, pressure=${mem.pressure}, swap used ~${mem.swapUsedBytes >= 0 ? (mem.swapUsedBytes / GB).toFixed(1) + 'GB' : 'n/a'}).`);
+		this._log(`[LoCoPilot Runner] Memory watchdog: critical sample ${this._watchdogStrikes}/2 (available ~${(mem.availableBytes / GB).toFixed(1)}GB, floor ~${(floor / GB).toFixed(1)}GB, pressure=${mem.pressure}, swap used ~${mem.swapUsedBytes >= 0 ? (mem.swapUsedBytes / GB).toFixed(1) + 'GB' : 'n/a'}).`);
 		if (this._watchdogStrikes < 2) {
+			// GRACEFUL FIRST STRIKE: don't kill the user's model yet, but relieve pressure and stop making it
+			// worse. (1) Suppress automatic pre-warm launches right away so nothing new loads while we're tight.
+			// (2) If more than one of OUR servers is resident, evict the least-recently-used extras now, keeping
+			// the most-recently-used (the one the user is likely mid-conversation with). Often this alone clears
+			// the pressure so the second strike never lands and the active model survives.
+			this._watchdogCooldownUntil = Date.now() + LoCoPilotLocalModelRunner.WATCHDOG_COOLDOWN_MS;
+			this._watchdogRelieveByEvictingExtras();
 			return;
 		}
 
@@ -2773,6 +2993,33 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 		this._onDidServerStateChange.fire(modelId);
 	}
 
+	/** Record why a launch was abandoned at a memory/fit gate, so the chat panel can show the real reason. */
+	private _recordLaunchBlocked(modelId: string, message: string): void {
+		this._launchBlockReason.set(modelId, { message, at: Date.now() });
+	}
+
+	/**
+	 * The reason a recent launch of `modelId` was abandoned at a memory/fit gate, or undefined when there is
+	 * none (or it has gone stale). Consumed by the provider so a fit-blocked model reports "won't fit" rather
+	 * than the "taking a moment to start" message reserved for a server that really is still coming up.
+	 */
+	getRecentLaunchFailure(modelId: string): string | undefined {
+		const rec = this._launchBlockReason.get(modelId);
+		if (!rec) {
+			return undefined;
+		}
+		if (Date.now() - rec.at > LAUNCH_BLOCK_TTL_MS) {
+			this._launchBlockReason.delete(modelId);
+			return undefined;
+		}
+		return rec.message;
+	}
+
+	/** Forget any recorded fit-gate block for `modelId` (a fresh launch attempt or a successful start supersedes it). */
+	private _clearLaunchBlocked(modelId: string): void {
+		this._launchBlockReason.delete(modelId);
+	}
+
 	/**
 	 * Starts the llama.cpp server for the given model in a new terminal.
 	 * Uses recommended backend (GPU/Metal/CPU). The server runs until the terminal is closed.
@@ -2780,7 +3027,7 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 	 * Concurrent callers for the same model share a single launch (see {@link _startInFlight}) so two
 	 * pre-warm triggers cannot spawn duplicate servers on the same port.
 	 */
-	startServerInTerminal(modelId: string): Promise<void> {
+	startServerInTerminal(modelId: string, interactive: boolean = false): Promise<void> {
 		if (this.runningServers.has(modelId)) {
 			this._log(`[LoCoPilot Runner] Server for model ${modelId} is already running.`);
 			return Promise.resolve();
@@ -2790,7 +3037,7 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 			this._log(`[LoCoPilot Runner] Launch already in progress for model ${modelId}; reusing it.`);
 			return inFlight;
 		}
-		const launch = this._doStartServerInTerminal(modelId).finally(() => {
+		const launch = this._doStartServerInTerminal(modelId, interactive).finally(() => {
 			this._startInFlight.delete(modelId);
 			// Safety net: the cross-window handoff optimistically shows a spinner (_beginStarting) before it
 			// knows the launch will succeed. If the launch then bails early (failed fit check, missing engine,
@@ -2809,12 +3056,15 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 		return launch;
 	}
 
-	private async _doStartServerInTerminal(modelId: string): Promise<void> {
+	private async _doStartServerInTerminal(modelId: string, interactive: boolean): Promise<void> {
 		const model = this.customLanguageModelsService.getCustomModels().find(m => m.id === modelId);
 		if (!model || !model.localPath) {
 			this._log(`[LoCoPilot Runner] Model ${modelId} not found or has no local path.`);
 			return;
 		}
+		// A fresh launch attempt supersedes any prior fit-gate block: clear it now so a stale "won't fit" reason
+		// can't outlive a retry. If this attempt bails at a gate again, that gate re-records the current reason.
+		this._clearLaunchBlocked(modelId);
 
 		// Coordinate with other app windows before doing anything expensive: if another window already runs this
 		// exact model, attach to it (no second process); if it runs a different model, stop that one first so only
@@ -2829,15 +3079,15 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 		// will free is credited (a model that fits after the switch is not blocked). Shows a toast pointing at
 		// Auto / a smaller model. The capability gate (too big for TOTAL RAM) runs later per backend; this is
 		// the transient "not right now" companion.
-		if (!await this._memoryAllowsLaunch(modelId)) {
+		if (!await this._memoryAllowsLaunch(modelId, interactive)) {
 			return;
 		}
 
-		// Enforce the resident-model budget here, at the single choke point every launch flows through
-		// (auto-start-on-use, the manual "Start server" button, Retry, and the model picker all reach this).
-		// Doing it here - rather than only in ensureServerForModel - means a manual start also evicts the
-		// least-recently-used other server, so we never end up with more resident servers than the budget allows.
-		await this._enforceResidentBudget(modelId);
+		// NOTE: the resident-model budget (eviction of the previous model) is enforced LATER, only AFTER the
+		// per-backend capability gate has passed - see the _enforceResidentBudget calls in each launch branch
+		// below. It must not run before that gate: if the user answers "Keep current model" at the fit dialog,
+		// the previous model has to still be running (nothing evicted yet). Both gates run first; only a launch
+		// that is actually going ahead evicts.
 
 		// Wait until the workbench has finished restoring before spawning. During early startup VS Code
 		// revives/restores persistent terminals; a terminal we create before that restoration runs gets
@@ -2854,10 +3104,16 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 			if (shouldUseMlxServerForHfModel(model, hasGguf, true)) {
 				// Same pre-flight fit check as the llama.cpp path: MLX runs on Apple Silicon unified memory via
 				// Metal, so there is no separate VRAM pool and the same ~70% wired working-set ceiling applies -
-				// pass 'metal' so the gate uses that ceiling rather than the looser 85% system figure.
-				if (!await this._checkModelFitsOrNotify(modelId, model.localPath, 'metal', undefined)) {
+				// pass 'metal' so the gate uses that ceiling rather than the looser 85% system figure. Size the
+				// weights from the RESOLVED model root, not the raw localPath, so this matches the transient gate
+				// and the actual launch (Q4). The prompt-cache headroom is reserved in the SOFT transient gate
+				// (_memoryAllowsLaunch), not here - it is a growable, throttled cache, not a hard capability limit.
+				const mlxModelDir = await this.getMlxModelRootPath(model.localPath);
+				if (!await this._checkModelFitsOrNotify(modelId, mlxModelDir, 'metal', undefined, interactive)) {
 					return;
 				}
+				// Both gates passed (or the user chose "Run anyway"): NOW evict the previous model to make room.
+				await this._enforceResidentBudget(modelId);
 				await this._startMlxServerInTerminal(modelId, model as ICustomLanguageModel & { localPath: string });
 				return;
 			}
@@ -2984,9 +3240,13 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 			extraResidentBytes = mmprojBytes;
 		}
 
-		if (!await this._checkModelFitsOrNotify(modelId, modelPath, backend, discreteVramBytes, extraResidentBytes)) {
+		if (!await this._checkModelFitsOrNotify(modelId, modelPath, backend, discreteVramBytes, interactive, extraResidentBytes)) {
 			return;
 		}
+
+		// Both gates passed (or the user chose "Run anyway"): NOW evict the previous model to make room. Doing
+		// this only here - after the fit dialog - means "Keep current model" leaves the previous server running.
+		await this._enforceResidentBudget(modelId);
 
 		const port = await this.findAvailablePort(LOCOPILOT_LLAMA_SERVER_PORT);
 		// Make sure the slot-save dir exists before launch: llama.cpp only touches it on save/restore, but
@@ -2994,7 +3254,11 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 		await this._ensureKvCacheDir();
 		const tuning = await this._augmentTuningWithHardware(modelPath, backend, baseTuning, extraResidentBytes);
 		// Remember the context this launch runs with, so an OOM crash can halve it on the retry.
-		this._lastLaunchContext.set(modelId, tuning.contextSize ?? DEFAULT_LLAMA_CONTEXT_SIZE);
+		const launchContext = tuning.contextSize ?? DEFAULT_LLAMA_CONTEXT_SIZE;
+		this._lastLaunchContext.set(modelId, launchContext);
+		// Remember the resolved KV cache type this server uses, so slot save/restore only reuses a byte-compatible
+		// blob (see _lastLaunchKvType / _slotCacheFileName). Mirrors getLlamaCppServerCommand's own resolution.
+		this._lastLaunchKvType.set(modelId, resolveKvCacheType(tuning.kvCacheType ?? 'auto', launchContext));
 		const { command, args } = getLlamaCppServerCommand(modelPath, backend, serverPath, port, tuning);
 		// Remember whether this launch carries speculative flags, so a crash caused by an old build rejecting
 		// them can be told apart from a real failure and self-healed (relaunch without speculation).
@@ -3224,7 +3488,8 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 			// Launch (no-op if another caller already kicked it off; startServerInTerminal guards on runningServers).
 			// The resident-model budget (LRU eviction, singleActiveModel -> 1) is enforced inside the launch itself
 			// (_doStartServerInTerminal), so every start path - manual button, Retry, picker, auto-start - is bounded.
-			await this.startServerInTerminal(modelId);
+			// interactive=true: this runs on the user's send/use action, so a too-big model prompts "Run anyway?".
+			await this.startServerInTerminal(modelId, true);
 		}
 
 		const baseUrl = this.getServerBaseUrl(modelId);
@@ -3243,6 +3508,7 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 			rec.ready = true;
 			rec.loadProgress = undefined;
 		}
+		this._clearLaunchBlocked(modelId); // it started fine; drop any stale "won't fit" reason
 		this._touch(modelId);
 		this._onDidServerStateChange.fire(modelId);
 		return baseUrl;
@@ -3323,20 +3589,86 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 	}
 
 	/**
+	 * Shows the "this model may not fit" decision dialog and returns the user's choice as a boolean:
+	 *  - true  = "Run anyway": the model is added to {@link _forcedLaunch} so this launch (and its degraded
+	 *            relaunches) skip both memory gates. The watchdog remains the safety net if it thrashes.
+	 *  - false = "Keep current model" (also the Close/Esc result): selection is reverted to the model still
+	 *            in use, nothing is evicted, and the launch is aborted.
+	 * `hard` picks the wording: the transient "not enough free right now" case is mild; the capability case
+	 * ("bigger than this machine's memory") warns that it may freeze/overheat the machine.
+	 */
+	/**
+	 * Chat-panel message for a model that was NOT started because it couldn't fit. `hard` = larger than this
+	 * machine can ever hold (capability); otherwise a transient "not enough free right now" shortfall.
+	 */
+	private _buildFitBlockedMessage(name: string, needGb: number, haveGb: number, hard: boolean): string {
+		return hard
+			? `**${name}** wasn't started: it needs about ${needGb} GB, more than this computer can safely provide (about ${haveGb} GB usable). Pick a smaller model or switch the picker to Auto.`
+			: `**${name}** wasn't started: it needs about ${needGb} GB but only about ${haveGb} GB is free right now. Close other apps to free memory, pick a smaller model, or switch the picker to Auto - then send again.`;
+	}
+
+	private async _promptRunAnyway(modelId: string, name: string, needGb: number, haveGb: number, hard: boolean): Promise<boolean> {
+		const message = `"${name}" needs about ${needGb} GB of memory, but only about ${haveGb} GB is available.`;
+		const detail = hard
+			? 'This model is larger than this computer can safely hold. Running it anyway may make your system freeze, slow down badly, or overheat until you stop the model. LoCoPilot will stop it automatically if memory runs out.'
+			: 'Running it now may slow your system down until memory frees up. LoCoPilot will stop it automatically if memory runs out.';
+		const { result } = await this.dialogService.prompt<'run' | 'keep'>({
+			type: Severity.Warning,
+			message,
+			detail,
+			buttons: [{ label: 'Run anyway', run: () => 'run' as const }],
+			cancelButton: { label: 'Keep current model', run: () => 'keep' as const },
+		});
+		if (result === 'run') {
+			this._forcedLaunch.add(modelId);
+			this._clearLaunchBlocked(modelId); // proceeding now; drop any prior "blocked" reason
+			this._log(`[LoCoPilot Runner] User chose "Run anyway" for ${modelId} (needs ~${needGb}GB, have ~${haveGb}GB, hard=${hard}); bypassing the fit gate.`);
+			return true;
+		}
+		this._log(`[LoCoPilot Runner] User chose "Keep current model" for ${modelId}; not launching.`);
+		this._recordLaunchBlocked(modelId, this._buildFitBlockedMessage(name, needGb, haveGb, hard));
+		this._endStarting(modelId);
+		this._revertSelectionAwayFrom(modelId);
+		return false;
+	}
+
+	/**
+	 * "Keep current model": if the declined model is the one currently SELECTED (the user just picked it),
+	 * put the selection back so the picker label matches what is actually running. Reverts to the owned server
+	 * still resident (the model in use), else the last model that was used, else leaves the selection alone.
+	 * Deliberately never stops or changes any running server - "keep current" must be side-effect-free on it.
+	 */
+	private _revertSelectionAwayFrom(declinedModelId: string): void {
+		if (this.customLanguageModelsService.getSelectedCustomModelId() !== declinedModelId) {
+			return; // the declined launch wasn't a selection change (e.g. a background retry) - nothing to revert
+		}
+		const running = Array.from(this.runningServers.entries()).find(([id, rec]) => !rec.foreign && id !== declinedModelId);
+		const revertTo = running?.[0]
+			?? (this._lastReadyModelId && this._lastReadyModelId !== declinedModelId ? this._lastReadyModelId : undefined);
+		if (revertTo) {
+			this.customLanguageModelsService.setSelectedCustomModelId(revertTo);
+			this._log(`[LoCoPilot Runner] Reverted model selection to ${revertTo} after declining ${declinedModelId}.`);
+		}
+	}
+
+	/**
 	 * Availability guard applied to EVERY launch path (message send, manual Start, Retry, picker, pre-warm):
 	 * may we load `modelId` given the RAM free RIGHT NOW? Returns true (proceed) whenever we can't reason
 	 * about it - unknown weight size, no live probe, a discrete-GPU backend whose VRAM occupancy we can't
-	 * size, or web. Returns false (and shows a helpful toast pointing to Auto / a smaller model) only when
-	 * the minimum footprint clearly won't fit the currently-available memory, or the kernel already reports
-	 * critical pressure. Called BEFORE the launch's own eviction, so RAM that stopping our other resident
-	 * servers will free is credited - a model that fits AFTER the switch is never blocked (no switch false
-	 * alarm). This is a stricter, transient companion to the capability gate (which blocks models too big
-	 * for total RAM); together they stop an unsupported model from ever starting.
+	 * size, or web. When the minimum footprint clearly won't fit currently-available memory (or the kernel
+	 * already reports critical pressure): a `_forcedLaunch` model proceeds; an INTERACTIVE launch (user action)
+	 * shows the Run-anyway / Keep-current dialog; a non-interactive one (pre-warm) is skipped silently. Called
+	 * BEFORE the launch's own eviction, so RAM that stopping our other resident servers will free is credited -
+	 * a model that fits AFTER the switch is never blocked. This is the transient companion to the capability
+	 * gate (models too big for total RAM).
 	 */
-	private async _memoryAllowsLaunch(modelId: string): Promise<boolean> {
+	private async _memoryAllowsLaunch(modelId: string, interactive: boolean): Promise<boolean> {
 		const model = this.customLanguageModelsService.getCustomModels().find(m => m.id === modelId);
 		if (!model || !model.localPath || !this._useMemoryBudget()) {
 			return true; // discrete-GPU / CPU-VRAM-less reasoning, or missing model -> don't block
+		}
+		if (this._forcedLaunch.has(modelId)) {
+			return true; // user already chose "Run anyway" for this model
 		}
 		const mem = await this._getMemoryStatus();
 		if (!mem) {
@@ -3350,16 +3682,27 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 		} catch {
 			return true;
 		}
-		const fit = await this._computeFit(modelPath, backend, undefined);
+		// MLX commits a ~15%-of-RAM prompt cache alongside the weights; reserve it here so a model that leaves no
+		// headroom for its cache trips this SOFT "not enough free right now" gate (Run-anyway available) instead
+		// of thrashing after launch. llama.cpp's growable KV is bounded by the context clamp instead, so 0 there.
+		const extraResidentBytes = kind === 'mlx' ? this._mlxRuntimeReserveBytes(mem.totalBytes) : 0;
+		const fit = await this._computeFit(modelPath, backend, undefined, extraResidentBytes);
 		if (!fit) {
 			return true; // unknown footprint -> don't block
 		}
-		// Credit RAM the launch's own eviction will free (our resident, non-foreign servers).
+		// Credit only the RAM the launch's own eviction will ACTUALLY free. _enforceResidentBudget keeps the
+		// (maxResidentModels - 1) most-recently-used other servers and evicts the rest, so crediting EVERY
+		// resident other would over-count when the budget allows more than one model to stay (a model that only
+		// "fits" because we assumed servers that will remain resident get evicted). With the default budget of 1
+		// this reduces to "credit all others" as before; it only tightens the multi-resident case (Q3). The
+		// memory budget may evict still more, so this is the conservative (never over-admitting) direction.
+		const keepOthers = Math.max(0, this._maxResidentModels() - 1);
+		const otherServers = Array.from(this.runningServers.entries())
+			.filter(([id, rec]) => id !== modelId && !rec.foreign)
+			.sort((a, b) => b[1].lastUsedAt - a[1].lastUsedAt); // most-recently-used first (these are kept)
 		let evictableBytes = 0;
-		for (const [id, rec] of this.runningServers) {
-			if (id !== modelId && !rec.foreign) {
-				evictableBytes += await this._estimateModelCost(id);
-			}
+		for (const [id] of otherServers.slice(keepOthers)) {
+			evictableBytes += await this._estimateModelCost(id);
 		}
 		const availableNow = mem.availableBytes + evictableBytes;
 		if (mem.pressure !== 'critical' && fit.requiredBytes <= availableNow) {
@@ -3370,16 +3713,14 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 		const needGb = Math.ceil(fit.requiredBytes / GB);
 		const haveGb = Math.max(0, Math.floor(availableNow / GB));
 		const name = model.displayName || model.modelName;
-		this._log(`[LoCoPilot Runner] Pre-warm of ${modelId} skipped: needs ~${needGb}GB but only ~${haveGb}GB is free right now (pressure=${mem.pressure}, evictable ~${Math.round(evictableBytes / GB)}GB).`);
-		this._endStarting(modelId);
-		const message = `"${name}" needs about ${needGb} GB of memory, but only about ${haveGb} GB is free right now, so it was not started automatically. Close some applications, choose a smaller model, or switch to Auto to let LoCoPilot pick one that fits.`;
-		this.notificationService.prompt(Severity.Warning, message, [
-			{
-				label: 'Switch to Auto',
-				run: () => this.customLanguageModelsService.setSelectedCustomModelId(LOCOPILOT_AUTO_MODEL_ID),
-			}
-		]);
-		return false;
+		this._log(`[LoCoPilot Runner] ${modelId} would not fit free RAM: needs ~${needGb}GB but only ~${haveGb}GB is free right now (pressure=${mem.pressure}, evictable ~${Math.round(evictableBytes / GB)}GB, interactive=${interactive}).`);
+		if (!interactive) {
+			this._recordLaunchBlocked(modelId, this._buildFitBlockedMessage(name, needGb, haveGb, false));
+			this._endStarting(modelId); // background pre-warm: skip silently, no dialog/toast
+			return false;
+		}
+		// Transient shortfall (soft): eviction is already credited above, so "Run anyway" usually fits.
+		return this._promptRunAnyway(modelId, name, needGb, haveGb, false);
 	}
 
 	/**
@@ -3731,7 +4072,7 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 	}
 
 	runModel(modelId: string): void {
-		this.startServerInTerminal(modelId);
+		this.startServerInTerminal(modelId, true); // explicit user "Run" action -> may prompt "Run anyway?"
 	}
 
 	private _log(msg: string, ...args: unknown[]): void {

@@ -645,19 +645,35 @@ export class ModelPickerActionItem extends ChatInputPickerActionViewItem {
 		super(actionWithLabel, widgetOptions ?? modelPickerActionWidgetOptions, pickerOptions, actionWidgetService, keybindingService, contextKeyService, telemetryService);
 		this.currentModel = initialModel;
 
+		// Re-derive the "Auto (<model>)" button label from the current inputs. Only meaningful while Auto is
+		// selected; a no-op otherwise. Keeps the collapsed button label in sync with the dropdown row and the
+		// actual per-request resolution, all of which call resolveAutoModel over the same live figures (Q1).
+		const refreshAutoLabel = () => {
+			if (customLanguageModelsService.getSelectedCustomModelId() !== LOCOPILOT_AUTO_MODEL_ID) {
+				return;
+			}
+			this.currentModel = buildAutoModelEntry(resolveAutoModelForPicker(customLanguageModelsService, localModelRunner, timerService));
+			this.updateTooltip();
+			if (this.element) {
+				this.renderLabel(this.element);
+			}
+		};
+
 		// While the picker is open, flip the selected model's start/stop icon as its server transitions
 		// (starting -> running -> stopped). refreshItems() is a no-op when the dropdown is closed.
 		// When Auto is selected, a server transition can also CHANGE what Auto resolves to (a warm
 		// server is a within-tier tie-breaker), so re-derive the "Auto (<model>)" button label as well.
 		this._register(localModelRunner.onDidServerStateChange(() => {
 			actionWidgetService.refreshItems();
-			if (customLanguageModelsService.getSelectedCustomModelId() === LOCOPILOT_AUTO_MODEL_ID) {
-				this.currentModel = buildAutoModelEntry(resolveAutoModelForPicker(customLanguageModelsService, localModelRunner, timerService));
-				this.updateTooltip();
-				if (this.element) {
-					this.renderLabel(this.element);
-				}
-			}
+			refreshAutoLabel();
+		}));
+
+		// Available RAM shifting can change which model Auto resolves to just as much as a server state change
+		// can (both feed the prospective-headroom figure), so re-derive the label - and refresh the open
+		// dropdown's rows - whenever the live memory probe lands a new reading.
+		this._register(localModelRunner.onDidAvailableRamChange(() => {
+			actionWidgetService.refreshItems();
+			refreshAutoLabel();
 		}));
 
 		// Listen for model changes from the delegate and custom models
