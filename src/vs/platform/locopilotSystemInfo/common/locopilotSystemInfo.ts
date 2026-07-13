@@ -41,6 +41,15 @@ export interface ISystemHardwareInfo {
 export type MemoryPressureLevel = 'normal' | 'warn' | 'critical' | 'unknown';
 
 /**
+ * Coarse thermal-pressure level, mirroring NSProcessInfoThermalState / macOS `kern.thermalpressurelevel`
+ * (0 = nominal, 1 = fair, 2 = serious, 3 = critical). Sustained 'serious'/'critical' means the system is
+ * actively throttling to shed heat - a distinct failure mode from OOM that memory sampling alone misses,
+ * and a reason to stop a heavy inference load before the machine forces a thermal shutdown. 'unknown' on
+ * platforms/versions that expose no thermal signal.
+ */
+export type ThermalPressureLevel = 'nominal' | 'fair' | 'serious' | 'critical' | 'unknown';
+
+/**
  * A LIVE snapshot of system memory, taken at call time (never cached - unlike the hardware probe).
  *
  * `availableBytes` is the memory the OS could actually give an allocating process WITHOUT swapping:
@@ -55,6 +64,8 @@ export interface IMemoryStatus {
 	readonly pressure: MemoryPressureLevel;
 	/** Bytes of swap currently in use, or -1 when unknown. Rising swap while a model runs = thrashing. */
 	readonly swapUsedBytes: number;
+	/** System thermal-pressure level (macOS only for now); 'unknown' where unavailable. */
+	readonly thermalPressure: ThermalPressureLevel;
 }
 
 /**

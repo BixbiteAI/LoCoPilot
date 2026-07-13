@@ -7,7 +7,7 @@ import { execFile } from 'child_process';
 import { cpus, arch, platform, totalmem, freemem } from 'os';
 import { readFile } from 'fs/promises';
 import { ILogService } from '../../log/common/log.js';
-import { IGpuInfo, ISystemHardwareInfo, ILoCoPilotSystemInfoService, GpuVendor, IMemoryStatus, MemoryPressureLevel } from '../common/locopilotSystemInfo.js';
+import { IGpuInfo, ISystemHardwareInfo, ILoCoPilotSystemInfoService, GpuVendor, IMemoryStatus, MemoryPressureLevel, ThermalPressureLevel } from '../common/locopilotSystemInfo.js';
 
 /** Kill any probe command that runs longer than this. */
 const PROBE_TIMEOUT_MS = 4000;
@@ -94,7 +94,7 @@ export class LoCoPilotSystemInfoService implements ILoCoPilotSystemInfoService {
 		}
 		// Windows (and any fallback): os.freemem() is GlobalMemoryStatusEx.ullAvailPhys, which already
 		// includes reclaimable standby-list memory - i.e. the "available" figure we want.
-		return { totalBytes: totalmem(), availableBytes: freemem(), pressure: 'unknown', swapUsedBytes: -1 };
+		return { totalBytes: totalmem(), availableBytes: freemem(), pressure: 'unknown', swapUsedBytes: -1, thermalPressure: 'unknown' };
 	}
 
 	/**
@@ -105,10 +105,11 @@ export class LoCoPilotSystemInfoService implements ILoCoPilotSystemInfoService {
 	 * (the signal macOS itself uses to fire low-memory warnings), swap from `vm.swapusage`.
 	 */
 	private async _darwinMemoryStatus(): Promise<IMemoryStatus> {
-		const [vmStatOut, pressureOut, swapOut] = await Promise.all([
+		const [vmStatOut, pressureOut, swapOut, thermalOut] = await Promise.all([
 			tryExec('vm_stat', []),
 			tryExec('sysctl', ['-n', 'kern.memorystatus_vm_pressure_level']),
 			tryExec('sysctl', ['-n', 'vm.swapusage']),
+			tryExec('sysctl', ['-n', 'kern.thermalpressurelevel']),
 		]);
 
 		const totalBytes = totalmem();
@@ -145,7 +146,19 @@ export class LoCoPilotSystemInfoService implements ILoCoPilotSystemInfoService {
 			swapUsedBytes = Math.round(parseFloat(swapMatch[1]) * mult);
 		}
 
-		return { totalBytes, availableBytes, pressure, swapUsedBytes };
+		// kern.thermalpressurelevel: 0 nominal, 1 fair, 2 serious, 3 critical (mirrors NSProcessInfoThermalState).
+		// The sysctl is absent on some Macs/older versions -> empty output -> 'unknown'.
+		let thermalPressure: ThermalPressureLevel = 'unknown';
+		const thermalTrimmed = thermalOut.trim();
+		if (thermalTrimmed !== '') {
+			const t = parseInt(thermalTrimmed, 10);
+			if (t <= 0) { thermalPressure = 'nominal'; }
+			else if (t === 1) { thermalPressure = 'fair'; }
+			else if (t === 2) { thermalPressure = 'serious'; }
+			else if (t >= 3) { thermalPressure = 'critical'; }
+		}
+
+		return { totalBytes, availableBytes, pressure, swapUsedBytes, thermalPressure };
 	}
 
 	/**
@@ -190,7 +203,8 @@ export class LoCoPilotSystemInfoService implements ILoCoPilotSystemInfoService {
 			// PSI not exposed (older kernel / not mounted) -> unknown
 		}
 
-		return { totalBytes, availableBytes, pressure, swapUsedBytes };
+		// Linux exposes no simple, universally-available thermal-pressure scalar; leave 'unknown' for now.
+		return { totalBytes, availableBytes, pressure, swapUsedBytes, thermalPressure: 'unknown' };
 	}
 
 	async deprioritizeProcess(pid: number): Promise<boolean> {

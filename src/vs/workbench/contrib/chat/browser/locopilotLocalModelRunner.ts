@@ -1198,7 +1198,11 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 			.sort((a, b) => a[1].lastUsedAt - b[1].lastUsedAt); // oldest first
 
 		// --- Memory budget inputs (best-effort; absent on web or when stats are unavailable) ---
-		const memInfo = this._useMemoryBudget() ? await this._getSystemMemory() : undefined;
+		// Use the LIVE availableBytes snapshot (free + reclaimable), NOT raw os.freemem(): on macOS freemem is
+		// wildly pessimistic (~1-3 GB while 9 GB is truly available), so the old freemem-based floor check was
+		// almost always "violated" and would over-evict the moment maxResidentModels > 1. This keeps eviction
+		// reasoning from the SAME number as the launch gate (_memoryAllowsLaunch) instead of a stricter one.
+		const memInfo = this._useMemoryBudget() ? await this._getMemoryStatus() : undefined;
 		let cap = Number.POSITIVE_INFINITY;     // max total resident bytes allowed
 		let floor = 0;                          // min free bytes to preserve
 		let newCost = 0;                        // estimated footprint of the model we are about to load
@@ -1206,7 +1210,7 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 		if (memInfo) {
 			const fraction = this.configurationService.getValue<number>(ChatConfiguration.LocopilotLocalMemoryBudgetFraction);
 			const minFreeGb = this.configurationService.getValue<number>(ChatConfiguration.LocopilotLocalMinFreeMemoryGB);
-			cap = (typeof fraction === 'number' && fraction > 0 ? fraction : 0.7) * memInfo.totalmem;
+			cap = (typeof fraction === 'number' && fraction > 0 ? fraction : 0.7) * memInfo.totalBytes;
 			floor = (typeof minFreeGb === 'number' && minFreeGb > 0 ? minFreeGb : 0) * 1024 * 1024 * 1024;
 			newCost = await this._estimateModelCost(keepModelId);
 			for (const [id] of this.runningServers) {
@@ -1223,7 +1227,7 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 			}
 			const residentOther = others.reduce((sum, [id]) => sum + (otherCost.get(id) ?? 0), 0);
 			const totalAfter = residentOther + newCost;
-			const freeAfter = memInfo.freemem + freedBytes - newCost;
+			const freeAfter = memInfo.availableBytes + freedBytes - newCost;
 			return totalAfter > cap || freeAfter < floor;
 		};
 
@@ -1942,7 +1946,7 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 	 * block or degrade a launch we can't reason about. Shared by the pre-flight fit gate and the
 	 * auto-speculation draft gate, so both answer "does X more resident bytes still fit?" identically.
 	 */
-	private async _computeFit(modelPath: string, backend: LlamaBackend, discreteVramBytes: number | undefined, extraResidentBytes: number = 0): Promise<{ requiredBytes: number; usableBytes: number } | undefined> {
+	private async _computeFit(modelPath: string, backend: LlamaBackend, discreteVramBytes: number | undefined, extraResidentBytes: number = 0): Promise<{ requiredBytes: number; usableBytes: number; weightBytes: number } | undefined> {
 		const weightBytes = await this._weightBytesOnDisk(modelPath);
 		if (weightBytes <= 0) {
 			return undefined; // unknown size -> can't reason about it.
@@ -1977,7 +1981,7 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 		const usableBytes = backend === 'metal'
 			? metalOffloadBudgetBytes(mem.totalmem, (await this._getHardwareInfo())?.metalWiredLimitBytes)
 			: usableSystemMemoryBytes(mem.totalmem) + (discreteVramBytes && discreteVramBytes > 0 ? discreteVramBytes : 0);
-		return { requiredBytes, usableBytes };
+		return { requiredBytes, usableBytes, weightBytes };
 	}
 
 	/**
@@ -2117,10 +2121,18 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 	// stops our servers - a 1-second recovery instead of a frozen machine. Killing our own process is
 	// always the better trade: the user can relaunch a smaller model; they can't un-freeze a Mac.
 
-	/** Minimum available-memory floor (bytes) below which a watchdog sample counts as critical. */
-	private static readonly WATCHDOG_AVAILABLE_FLOOR_MIN = 1024 * 1024 * 1024; // 1 GiB
-	/** Fraction of TOTAL RAM used as the floor when it is larger than the absolute minimum (scales up on big machines). */
-	private static readonly WATCHDOG_AVAILABLE_FLOOR_FRACTION = 0.03;
+	/**
+	 * Minimum available-memory floor (bytes) below which a watchdog sample counts as critical. Raised from
+	 * 1 GiB to 1.5 GiB so the breaker reacts BEFORE the machine is fully out of headroom (at 1 GiB free the
+	 * editor is already janky); killing our own server early is the cheap recovery.
+	 */
+	private static readonly WATCHDOG_AVAILABLE_FLOOR_MIN = Math.round(1.5 * 1024 * 1024 * 1024); // 1.5 GiB
+	/**
+	 * Fraction of TOTAL RAM used as the floor when it is larger than the absolute minimum (scales up on big
+	 * machines). Raised from 0.03 to 0.08 so e.g. a 32 GB Mac trips at ~2.5 GB free (heavy paging territory)
+	 * rather than waiting for a flat 1 GB, giving the breaker a useful head start.
+	 */
+	private static readonly WATCHDOG_AVAILABLE_FLOOR_FRACTION = 0.08;
 	/** Sample interval; two bad samples trip the breaker, so reaction time is ~2x this. */
 	private static readonly WATCHDOG_INTERVAL_MS = 5000;
 	/** How long automatic (pre-warm) launches stay suppressed after the breaker trips (or a first strike lands). */
@@ -2214,12 +2226,17 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 			return; // probe unavailable this tick; keep sampling
 		}
 
-		// Only trip on GENUINE thrash, not a static "low memory" threshold - otherwise a model the user
-		// deliberately chose to Run Anyway (tight but stable) would be killed the moment it loaded, which
-		// contradicts their choice. The real thrash signals:
-		//   - the kernel itself reporting CRITICAL memory pressure (its own low-memory-warning trigger), or
-		//   - memory low AND swap actively GROWING (the machine is paging RAM to disk right now), or
-		//   - memory critically low on a platform that gives us no pressure/swap signal at all (last resort).
+		// Trip on GENUINE thrash (or a thermal emergency), not a static "low memory" threshold - otherwise a
+		// model the user deliberately chose to Run Anyway (tight but stable) would be killed the moment it
+		// loaded, which contradicts their choice. On a memory-tight machine (e.g. 16 GB running a ~10 GB model)
+		// "available" is SUPPOSED to sit low - that alone is not thrashing. Two tiers:
+		//  - IMMEDIATE (single sample) = only a CRITICAL THERMAL sample: imminent throttle/thermal-shutdown is a
+		//    true emergency, so we don't wait another 5 s. Memory is deliberately NOT here - even the kernel's
+		//    "critical" pressure level can blip for one tick on a stably-tight machine, so killing on a single
+		//    memory sample is exactly the false-positive that stopped a healthy running model.
+		//  - TWO CONSECUTIVE SAMPLES (~10 s) = inferred thrash that must persist before we act: kernel CRITICAL
+		//    memory pressure, OR memory low AND swap actively GROWING (paging to disk now), OR memory low on a
+		//    platform with no pressure/swap signal at all (last resort), OR SERIOUS (not yet critical) thermal.
 		const floor = this._watchdogAvailableFloor(mem.totalBytes);
 		const lowAvailable = mem.availableBytes < floor;
 		const swapGrowing = mem.swapUsedBytes >= 0 && this._watchdogLastSwapBytes >= 0
@@ -2227,17 +2244,20 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 		const noSignals = mem.pressure === 'unknown' && mem.swapUsedBytes < 0;
 		this._watchdogLastSwapBytes = mem.swapUsedBytes;
 
-		const critical = mem.pressure === 'critical'
+		const thermalEmergency = mem.thermalPressure === 'critical';
+		const softCritical = mem.pressure === 'critical'
 			|| (lowAvailable && swapGrowing)
-			|| (lowAvailable && noSignals);
-		if (!critical) {
+			|| (lowAvailable && noSignals)
+			|| mem.thermalPressure === 'serious';
+		if (!thermalEmergency && !softCritical) {
 			this._watchdogStrikes = 0;
 			return;
 		}
 		this._watchdogStrikes++;
 		const GB = 1024 * 1024 * 1024;
-		this._log(`[LoCoPilot Runner] Memory watchdog: critical sample ${this._watchdogStrikes}/2 (available ~${(mem.availableBytes / GB).toFixed(1)}GB, floor ~${(floor / GB).toFixed(1)}GB, pressure=${mem.pressure}, swap used ~${mem.swapUsedBytes >= 0 ? (mem.swapUsedBytes / GB).toFixed(1) + 'GB' : 'n/a'}).`);
-		if (this._watchdogStrikes < 2) {
+		this._log(`[LoCoPilot Runner] Memory watchdog: critical sample ${this._watchdogStrikes} (thermalEmergency=${thermalEmergency}, available ~${(mem.availableBytes / GB).toFixed(1)}GB, floor ~${(floor / GB).toFixed(1)}GB, pressure=${mem.pressure}, thermal=${mem.thermalPressure}, swap used ~${mem.swapUsedBytes >= 0 ? (mem.swapUsedBytes / GB).toFixed(1) + 'GB' : 'n/a'}).`);
+		// Only a thermal emergency trips on the first strike; every memory signal needs two consecutive samples.
+		if (!thermalEmergency && this._watchdogStrikes < 2) {
 			// GRACEFUL FIRST STRIKE: don't kill the user's model yet, but relieve pressure and stop making it
 			// worse. (1) Suppress automatic pre-warm launches right away so nothing new loads while we're tight.
 			// (2) If more than one of OUR servers is resident, evict the least-recently-used extras now, keeping
@@ -2260,11 +2280,14 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 		}
 		this._stopMemoryWatchdog();
 		this._watchdogCooldownUntil = Date.now() + LoCoPilotLocalModelRunner.WATCHDOG_COOLDOWN_MS;
-		this._log(`[LoCoPilot Runner] Memory watchdog TRIPPED: stopped ${stoppedNames.join(', ') || 'local server'} to keep the system responsive.`);
+		const thermalCause = mem.thermalPressure === 'critical' || mem.thermalPressure === 'serious';
+		this._log(`[LoCoPilot Runner] Memory watchdog TRIPPED: stopped ${stoppedNames.join(', ') || 'local server'} to keep the system responsive (thermal=${mem.thermalPressure}, pressure=${mem.pressure}).`);
 		const names = stoppedNames.join('", "');
 		this.notificationService.notify({
 			severity: Severity.Warning,
-			message: `LoCoPilot stopped "${names}" because your system was running out of memory. Close some applications and try again, or switch to a smaller model.`,
+			message: thermalCause
+				? `LoCoPilot stopped "${names}" because your system was overheating. Let it cool down and try again, or switch to a smaller model.`
+				: `LoCoPilot stopped "${names}" because your system was running out of memory. Close some applications and try again, or switch to a smaller model.`,
 		});
 	}
 
@@ -3705,12 +3728,21 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 			evictableBytes += await this._estimateModelCost(id);
 		}
 		const availableNow = mem.availableBytes + evictableBytes;
-		if (mem.pressure !== 'critical' && fit.requiredBytes <= availableNow) {
+		// Only the NON-RECLAIMABLE working set must be physically free at launch: KV cache + compute/graph
+		// overhead (+ the MLX prompt-cache reserve folded into requiredBytes via extraResidentBytes). The
+		// weights do NOT need to be free right now - on CPU they are mmap-pageable, and on Metal they are wired
+		// only up to the ceiling the pre-flight CAPABILITY gate (_checkModelFitsOrNotify) already verified, which
+		// macOS satisfies by reclaiming file cache / compressing cold pages. Gating an interactive launch on the
+		// whole footprint (weights included) is exactly what falsely refused a model that fits the machine
+		// whenever the editor + browser were holding reclaimable RAM (e.g. Gemma 4B on a 16 GB Mac). Background
+		// pre-warm keeps the strict full-footprint check - refusing an optional speculative load is harmless.
+		const requiredFreeNow = interactive ? Math.max(0, fit.requiredBytes - fit.weightBytes) : fit.requiredBytes;
+		if (mem.pressure !== 'critical' && requiredFreeNow <= availableNow) {
 			return true;
 		}
 
 		const GB = 1024 * 1024 * 1024;
-		const needGb = Math.ceil(fit.requiredBytes / GB);
+		const needGb = Math.ceil(requiredFreeNow / GB);
 		const haveGb = Math.max(0, Math.floor(availableNow / GB));
 		const name = model.displayName || model.modelName;
 		this._log(`[LoCoPilot Runner] ${modelId} would not fit free RAM: needs ~${needGb}GB but only ~${haveGb}GB is free right now (pressure=${mem.pressure}, evictable ~${Math.round(evictableBytes / GB)}GB, interactive=${interactive}).`);
