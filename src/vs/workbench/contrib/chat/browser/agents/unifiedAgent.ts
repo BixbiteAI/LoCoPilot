@@ -8,6 +8,7 @@
 import { timeout } from '../../../../../base/common/async.js';
 import { CancellationToken } from '../../../../../base/common/cancellation.js';
 import { MarkdownString } from '../../../../../base/common/htmlContent.js';
+import { URI } from '../../../../../base/common/uri.js';
 import { ILogService } from '../../../../../platform/log/common/log.js';
 import { IWorkspaceContextService } from '../../../../../platform/workspace/common/workspace.js';
 import { ILoCoPilotFileLog } from '../locopilotFileLog.js';
@@ -17,6 +18,8 @@ import { IChatProgress, IChatToolInvocation } from '../../common/chatService/cha
 import { ChatToolInvocation } from '../../common/model/chatProgressTypes/chatToolInvocation.js';
 import { ChatImageMimeType, ChatMessageRole, IChatMessage, IChatMessageImagePart, IChatMessageTextPart, IChatMessageToolResultPart, IChatResponseToolUsePart, ILanguageModelsService, LanguageModelPartAudience } from '../../common/languageModels.js';
 import { ILanguageModelToolsService, IToolData, toolMatchesModel } from '../../common/tools/languageModelToolsService.js';
+import { IChatTodo, IChatTodoListService } from '../../common/tools/chatTodoListService.js';
+import { ManageTodoListToolToolId } from '../../common/tools/builtinTools/manageTodoListTool.js';
 import { AGENT_LOOP_EXCLUDED_TOOL_IDS, EDIT_TOOL_IDS, isToolExcluded } from '../../common/tools/builtinTools/agentToolPolicy.js';
 import { parsePartialJsonObject } from '../../common/tools/partialJsonInput.js';
 import { ContextManager } from './contextManager.js';
@@ -131,6 +134,7 @@ export class UnifiedAgent {
 		private readonly logService: ILogService,
 		_workspaceService: IWorkspaceContextService,
 		private readonly locopilotFileLog: ILoCoPilotFileLog,
+		private readonly chatTodoListService: IChatTodoListService,
 		maxIterations: number = DEFAULT_MAX_ITERATIONS
 	) {
 		// Honor the user's "Max iterations per request" setting, which the settings UI allows up to 500.
@@ -659,6 +663,18 @@ export class UnifiedAgent {
 				toolResults.push({ type: 'text', value: `\n\n\u2500\u2500 SELF-CORRECTION \u2500\u2500\n${coachingNotes.join('\n\n')}` });
 			}
 
+			// Re-inject the current TODO plan into the SAME tail tool-results message so the model keeps
+			// following it across turns. It rides ONLY on this fresh tail message - never the cached
+			// system/tools prefix - so it adds nothing to the KV-cached prefix and can't force a reprocess
+			// (see buildTodoReminder). Skipped on rounds where the model just wrote the list, since the
+			// state is already fresh in its context and re-stating it would be pure noise.
+			if (toolResults.length > 0 && !results.some(r => r && r.realToolId === ManageTodoListToolToolId)) {
+				const todoReminder = this.buildTodoReminder(request.sessionResource);
+				if (todoReminder) {
+					toolResults.push({ type: 'text', value: todoReminder });
+				}
+			}
+
 			// Add tool results to conversation
 			if (toolResults.length > 0) {
 				conversationMessages.push({
@@ -990,6 +1006,48 @@ export class UnifiedAgent {
 			`2. State the current blocker and its root cause in one line.\n` +
 			`3. Choose ONE concrete next action that is DIFFERENT from what has been failing - e.g. fix filesystem state with run_in_terminal, re-read a file/dir to correct a wrong assumption, or write the target file directly.\n` +
 			`Consider using \`manage_todo_list\` to record what is done vs. remaining so you stop repeating steps.`;
+	}
+
+	/**
+	 * Compact reminder of the session's current TODO plan, re-injected each round so the model keeps
+	 * following it instead of drifting once the original write scrolls out of its effective context.
+	 *
+	 * KV-cache safety: this string is appended ONLY to the fresh tail tool-results message (see the
+	 * call site), never to the system/tools prefix. The prefix - which is what the model server keeps
+	 * cached - is therefore byte-identical across turns, so re-injection costs zero extra prompt-eval
+	 * and cannot degrade a running model. The tail message is new every turn and must be processed
+	 * regardless, so carrying the reminder there is effectively free.
+	 *
+	 * Returns undefined when there is nothing worth reminding: no list, or every item completed (in
+	 * which case we let the model wrap up rather than nag it into a loop).
+	 */
+	private buildTodoReminder(sessionResource: URI | undefined): string | undefined {
+		if (!sessionResource) {
+			return undefined;
+		}
+		let todos: IChatTodo[];
+		try {
+			todos = this.chatTodoListService.getTodos(sessionResource);
+		} catch {
+			return undefined;
+		}
+		if (!todos || todos.length === 0 || !todos.some(t => t.status !== 'completed')) {
+			return undefined;
+		}
+
+		const lines = todos.map(t => {
+			const box = t.status === 'completed' ? '[x]' : t.status === 'in-progress' ? '[-]' : '[ ]';
+			return `- ${box} ${t.title}`;
+		});
+
+		const inProgress = todos.filter(t => t.status === 'in-progress').length;
+		const hint = inProgress === 0
+			? 'No item is in-progress - mark the next item in-progress before working on it.'
+			: inProgress > 1
+				? 'More than one item is in-progress - keep exactly ONE and finish it before starting another.'
+				: 'Finish the in-progress item, mark it completed the moment it is done, then start the next.';
+
+		return `\n\n\u2500\u2500 TODO LIST (your plan - keep following it) \u2500\u2500\n${lines.join('\n')}\n${hint} Update statuses via \`manage_todo_list\`.`;
 	}
 
 	/**

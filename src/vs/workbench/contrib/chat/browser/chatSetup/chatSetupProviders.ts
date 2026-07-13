@@ -26,6 +26,7 @@ import { IWorkspaceTrustManagementService } from '../../../../../platform/worksp
 import { IWorkbenchEnvironmentService } from '../../../../services/environment/common/environmentService.js';
 import { nullExtensionDescription } from '../../../../services/extensions/common/extensions.js';
 import { CountTokensCallback, ILanguageModelToolsService, IPreparedToolInvocation, IToolData, IToolImpl, IToolInvocation, IToolResult, ToolDataSource, ToolProgress } from '../../common/tools/languageModelToolsService.js';
+import { IChatTodoListService } from '../../common/tools/chatTodoListService.js';
 import { IChatAgentHistoryEntry, IChatAgentImplementation, IChatAgentRequest, IChatAgentResult, IChatAgentService } from '../../common/participants/chatAgents.js';
 import { ChatEntitlement, ChatEntitlementContext, IChatEntitlementService } from '../../../../services/chat/common/chatEntitlementService.js';
 import { ChatModel, ChatRequestModel, IChatRequestModel, IChatRequestVariableData, IChatRequestModeInfo } from '../../common/model/chatModel.js';
@@ -1165,10 +1166,11 @@ export class LoCoPilotBuiltInAgent extends Disposable implements IChatAgentImple
 		@ILoCoPilotProjectMemoryService private readonly projectMemoryService: ILoCoPilotProjectMemoryService,
 		@ILoCoPilotLocalModelRunner private readonly localModelRunner: ILoCoPilotLocalModelRunner,
 		@ITimerService private readonly timerService: ITimerService,
+		@IChatTodoListService private readonly chatTodoListService: IChatTodoListService,
 	) {
 		super();
 		const maxIterations = this.agentSettingsService.getMaxIterationsPerRequest();
-		this.unifiedAgent = new UnifiedAgent(this.languageModelsService, this.toolsService, this.logService, this.workspaceService, this.locopilotFileLog, maxIterations);
+		this.unifiedAgent = new UnifiedAgent(this.languageModelsService, this.toolsService, this.logService, this.workspaceService, this.locopilotFileLog, this.chatTodoListService, maxIterations);
 
 		// Warm the model's stable system+tools prefix ahead of the user's first message so that first
 		// message isn't stuck behind a cold, multi-thousand-token prompt-eval. Fire when the selection
