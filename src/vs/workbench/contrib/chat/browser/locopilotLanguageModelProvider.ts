@@ -100,6 +100,14 @@ export class LoCoPilotLanguageModelProvider extends Disposable implements ILangu
 			this._onDidChange.fire();
 		}));
 
+		// A model's server starting/stopping changes its EFFECTIVE context window (the clamped `-c` becomes
+		// known on launch). Re-fire so provideLanguageModelChatInfo re-derives maxInputTokens from the real
+		// window - otherwise the gauge and the agent's context manager keep using the larger nominal window
+		// and let the prompt overrun the server, which then silently truncates.
+		this._register(this.localModelRunner.onDidServerStateChange(() => {
+			this._onDidChange.fire();
+		}));
+
 		// Trigger initial model resolution if we have custom models
 		// Use setTimeout to ensure the provider registration is fully complete
 		setTimeout(async () => {
@@ -301,9 +309,13 @@ export class LoCoPilotLanguageModelProvider extends Disposable implements ILangu
 		// Conservative, RAM-aware out-of-box default (one tier below max; floor = Qwen3.5 4B MTP).
 		const defaultPickerRepoId = getDefaultPickerRepoId(this._detectedRamGB());
 		const result = customModels.map(m => {
-			// Input/output budgets are derived from the single user-set context window.
+			// Input/output budgets are derived from the single user-set context window. Once the model's server
+			// has launched, prefer the REAL clamped window it runs with (getLaunchedContextWindow) over the
+			// nominal/catalog value, so the gauge and the agent's context manager budget against what the server
+			// can actually hold instead of a larger window it would silently truncate.
 			const isLocal = m.provider === 'huggingface' || m.provider === 'localhost' || m.provider === 'ollama';
-			const contextWindow = m.contextWindow ?? defaultContextWindow(isLocal);
+			const nominalContextWindow = m.contextWindow ?? defaultContextWindow(isLocal);
+			const contextWindow = this.localModelRunner.getLaunchedContextWindow(m.id) ?? nominalContextWindow;
 			const { maxInputTokens, maxOutputTokens } = deriveTokenLimits(contextWindow, isLocal);
 
 			// First-time users land on the smallest seeded model. VS Code only honors this when nothing is

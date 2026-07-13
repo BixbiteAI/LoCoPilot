@@ -39,6 +39,8 @@ import {
 	LOCOPILOT_LLAMA_SERVER_PORT,
 	LlamaBackend,
 	resolveKvCacheType,
+	kvCacheBytesPerElem,
+	DEFAULT_KV_BYTES_PER_TOKEN_PER_LAYER_F16,
 	type LlamaServerTuning,
 	type FlashAttentionMode,
 	type KvCacheType
@@ -125,6 +127,14 @@ export interface ILoCoPilotLocalModelRunner {
 	readonly onDidAvailableRamChange: Event<void>;
 	/** Current load phase for a model whose server we are starting/running, or undefined when not managed. */
 	getServerPhase(modelId: string): LocalServerPhase | undefined;
+	/**
+	 * The context window (`-c`) the model's server was actually launched with - i.e. the value AFTER the
+	 * memory clamp, which can be far smaller than the model's nominal/catalog window on a tight machine.
+	 * Undefined until the model has been launched at least once this session. Consumers (the context-usage
+	 * gauge, the agent's context manager) should prefer this over the nominal window so they summarize/trim
+	 * against the real budget instead of over-filling a window the server will silently truncate.
+	 */
+	getLaunchedContextWindow(modelId: string): number | undefined;
 	/** Latest human-readable load-progress line (parsed from llama.cpp output), if any. */
 	getLoadProgress(modelId: string): string | undefined;
 	/**
@@ -1000,6 +1010,10 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 		return this.runningServers.get(modelId)?.loadProgress;
 	}
 
+	getLaunchedContextWindow(modelId: string): number | undefined {
+		return this._lastLaunchContext.get(modelId);
+	}
+
 	stopServer(modelId: string): void {
 		const running = this.runningServers.get(modelId);
 		if (running) {
@@ -1783,11 +1797,23 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 		// The fraction-only allowance (the old behavior) let a dense Metal model whose weights already filled
 		// ~85% of the wired budget still claim a full 25% KV on top - past the ceiling, straight into paging.
 		if (tuning.contextSize && tuning.contextSize > 0) {
-			// Estimate KV bytes/token/layer from the model's attention geometry (f16 - conservative, since
-			// large windows actually run q8_0 which is ~half). Falls back to clampContextSize's own default
-			// when the GGUF lacks the attention keys. Without this the default under-estimates KV by ~25x and
-			// a 256K-trained model would never get clamped on a 16GB machine.
-			const perTokenPerLayer = kvBytesPerTokenPerLayer(info, 2);
+			// Size the KV estimate at the SAME precision the server will actually allocate. 'auto' picks q8_0
+			// for the default window and larger (~half the bytes of f16), so estimating at that precision lets
+			// the clamp grant roughly twice the context for the same budget instead of over-clamping on an f16
+			// assumption. Resolve from the requested window; getLlamaCppServerCommand re-resolves from the
+			// clamped window for the actual flag (a negligible diff only right at the quant threshold).
+			// Resolve the KV precision from the REQUESTED window (before the clamp shrinks it). A long-context
+			// catalog model (e.g. 131K/256K) resolves to q8_0; we size the clamp at that precision AND pin it
+			// below so the launch runs the same precision even after the clamp drops the window under the
+			// auto-quant threshold - otherwise the server would re-resolve 'auto' to f16 and use ~2x the KV the
+			// clamp budgeted (unsafe on a tight machine, and it wastes the extra window q8_0 was meant to buy).
+			const resolvedKvType = resolveKvCacheType(tuning.kvCacheType ?? 'auto', tuning.contextSize);
+			const kvBytesPerElem = kvCacheBytesPerElem(resolvedKvType);
+			// Estimate KV bytes/token/layer from the model's attention geometry at the cache precision. When the
+			// GGUF lacks the attention keys, fall back to the conservative f16 default SCALED to the precision
+			// (q8_0 -> ~half), so a quantized cache actually grants ~2x the window instead of being sized as f16.
+			const perTokenPerLayer = kvBytesPerTokenPerLayer(info, kvBytesPerElem)
+				?? Math.round(DEFAULT_KV_BYTES_PER_TOKEN_PER_LAYER_F16 * kvBytesPerElem / 2);
 			let kvBudgetBytes: number | undefined;
 			if (budget && budget > 0) {
 				// Discrete GPUs: partial offload caps the weights that land in VRAM at the offload budget;
@@ -1808,9 +1834,12 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 				kvBytesPerTokenPerLayer: perTokenPerLayer,
 			});
 			if (clamped < tuning.contextSize) {
-				this._log(`[LoCoPilot Runner] Clamped context ${tuning.contextSize} -> ${clamped} to fit the model/memory budget (KV ~${perTokenPerLayer ?? 'default'} B/tok/layer).`);
+				this._log(`[LoCoPilot Runner] Clamped context ${tuning.contextSize} -> ${clamped} to fit the model/memory budget (KV ${resolvedKvType}, ~${perTokenPerLayer} B/tok/layer).`);
 				tuning.contextSize = clamped;
 			}
+			// Pin the precision the clamp sized for so getLlamaCppServerCommand doesn't re-resolve 'auto' from the
+			// (possibly now sub-threshold) clamped window and flip to f16. No-op when the user pinned a fixed type.
+			tuning.kvCacheType = resolvedKvType;
 		}
 
 		// SWA full cache: sliding-window models (Gemma 2/3) default to a window-sized KV for their SWA layers,

@@ -13,6 +13,7 @@ import {
 	getBundledLlamaServerPath,
 	getLlamaCppServerCommand,
 	resolveKvCacheType,
+	kvCacheBytesPerElem,
 	shouldUseBundledVulkan,
 	metalOffloadBudgetBytes,
 	usableSystemMemoryBytes,
@@ -25,6 +26,9 @@ import {
 	RUNTIME_OVERHEAD_BYTES,
 	VULKAN_MIN_DEDICATED_VRAM_BYTES,
 	MIN_CLAMPED_CONTEXT,
+	DEFAULT_CLAMP_LAYER_COUNT,
+	DEFAULT_LLAMA_CONTEXT_SIZE,
+	DEFAULT_KV_BYTES_PER_TOKEN_PER_LAYER_F16,
 	type GpuLike,
 } from '../../browser/locopilotLlamaCppServer.js';
 import { getMlxLmServerCommand, MLX_MEMORY_LIMIT_BOOTSTRAP } from '../../browser/locopilotMlxServer.js';
@@ -50,6 +54,20 @@ suite('LoCoPilot llama.cpp server', () => {
 			assert.strictEqual(resolveKvCacheType('f16', 65536), 'f16');
 			assert.strictEqual(resolveKvCacheType('q8_0', 1024), 'q8_0');
 			assert.strictEqual(resolveKvCacheType('q4_0', 65536), 'q4_0');
+		});
+
+		test('the default context window runs a q8_0 KV cache', () => {
+			// The threshold is pinned to the default window, so out-of-the-box context is quantized.
+			assert.strictEqual(KV_AUTO_QUANT_CONTEXT_THRESHOLD, DEFAULT_LLAMA_CONTEXT_SIZE);
+			assert.strictEqual(resolveKvCacheType('auto', DEFAULT_LLAMA_CONTEXT_SIZE), 'q8_0');
+		});
+	});
+
+	suite('kvCacheBytesPerElem', () => {
+		test('f16 is 2 bytes; q8_0/q4_0 round up to 1', () => {
+			assert.strictEqual(kvCacheBytesPerElem('f16'), 2);
+			assert.strictEqual(kvCacheBytesPerElem('q8_0'), 1);
+			assert.strictEqual(kvCacheBytesPerElem('q4_0'), 1);
 		});
 	});
 
@@ -172,6 +190,27 @@ suite('LoCoPilot llama.cpp server', () => {
 			// 2GB KV budget / (4096 B/tok/layer * 36 layers) = ~14563 -> rounded down to 14336.
 			const ctx = clampContextSize({ requestedContext: 262144, kvBudgetBytes: 2 * 1024 * 1024 * 1024, layerCount: 36 });
 			assert.strictEqual(ctx, 14336);
+		});
+
+		test('a q8_0 cache grants ~2x the window of f16 for the same budget', () => {
+			// The runner sizes perTokenPerLayer at the cache precision (f16=4096, q8_0=2048 via the scaled
+			// fallback), so quantizing halves the per-token cost and doubles how much context fits.
+			const budget = 2 * 1024 * 1024 * 1024;
+			const f16 = clampContextSize({ requestedContext: 262144, kvBudgetBytes: budget, layerCount: 48, kvBytesPerTokenPerLayer: DEFAULT_KV_BYTES_PER_TOKEN_PER_LAYER_F16 });
+			const q8 = clampContextSize({ requestedContext: 262144, kvBudgetBytes: budget, layerCount: 48, kvBytesPerTokenPerLayer: DEFAULT_KV_BYTES_PER_TOKEN_PER_LAYER_F16 / 2 });
+			assert.strictEqual(f16, 10240);
+			assert.strictEqual(q8, 21504); // ~2x the f16 window
+		});
+
+		test('clamps a long-context model even when the GGUF has no layer count', () => {
+			// Regression: a non-standard GGUF (e.g. some gemma-4 conversions) can parse without a layer count.
+			// The clamp used to be skipped entirely for these, letting a 256K window through and OOM-ing the
+			// device. It must now fall back to DEFAULT_CLAMP_LAYER_COUNT and clamp. With the 4096 B/tok default:
+			// 2GB / (4096 * 48) = ~10922 -> rounded down to 10240.
+			const ctx = clampContextSize({ requestedContext: 262144, kvBudgetBytes: 2 * 1024 * 1024 * 1024 });
+			assert.strictEqual(DEFAULT_CLAMP_LAYER_COUNT, 48);
+			assert.strictEqual(ctx, 10240);
+			assert.ok(ctx < 262144);
 		});
 
 		test('never below the floor', () => {

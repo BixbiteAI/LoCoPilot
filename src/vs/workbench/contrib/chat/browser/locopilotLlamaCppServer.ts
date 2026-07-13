@@ -181,11 +181,29 @@ export type KvCacheType = 'auto' | 'f16' | 'q8_0' | 'q4_0';
 export const DEFAULT_LLAMA_CONTEXT_SIZE = 16384;
 
 /**
- * Context window at/above which 'auto' KV cache switches from f16 to q8_0. Below this the cache is small
- * enough that full precision is the better trade; at/above it the cache dominates memory, so halving it
- * with q8_0 (negligible quality impact) frees room for weights/compute and fits more context on-device.
+ * Context window at/above which 'auto' KV cache switches from f16 to q8_0. Set to the default window so the
+ * out-of-the-box context (and anything larger) runs a q8_0 KV cache: q8_0 is ~half the bytes of f16 with
+ * negligible quality impact, which both cuts the memory footprint AND lets the context clamp grant roughly
+ * twice the window for the same budget. Only genuinely small windows (below the default) stay f16, where the
+ * cache is cheap and full precision is the better trade.
  */
-export const KV_AUTO_QUANT_CONTEXT_THRESHOLD = 32768;
+export const KV_AUTO_QUANT_CONTEXT_THRESHOLD = DEFAULT_LLAMA_CONTEXT_SIZE;
+
+/**
+ * Bytes-per-element the KV cache uses at a given precision, for sizing the context clamp so it matches what
+ * the runtime will actually allocate. f16 = 2 bytes; q8_0/q4_0 are block-quantized (~1.06 / ~0.56 bytes with
+ * their scale overhead) but we round up to 1 to stay on the safe side of the memory budget.
+ */
+export function kvCacheBytesPerElem(kvCacheType: Exclude<KvCacheType, 'auto'>): number {
+	switch (kvCacheType) {
+		case 'q8_0':
+		case 'q4_0':
+			return 1;
+		case 'f16':
+		default:
+			return 2;
+	}
+}
 
 /**
  * Fractions of Apple-Silicon unified memory the GPU may WIRE for inference. macOS caps a Metal app's
@@ -334,6 +352,23 @@ export interface ContextClampInputs {
 export const MIN_CLAMPED_CONTEXT = 4096;
 
 /**
+ * Transformer-layer count assumed by the memory clamp when the GGUF metadata doesn't expose `block_count`
+ * (e.g. a non-standard / newly-published arch like some `gemma-4` conversions). Without a fallback the
+ * clamp used to be SKIPPED entirely for such models, letting a 256K-trained window through unclamped and
+ * OOM the device. 48 is the layer count of a ~12B model (Gemma 3 12B); erring on the higher side sizes the
+ * KV cache conservatively (fewer tokens fit -> smaller, safer window) when we truly don't know.
+ */
+export const DEFAULT_CLAMP_LAYER_COUNT = 48;
+
+/**
+ * Conservative KV bytes/token/layer at f16 (k+v) for a typical GQA model (8 kv-heads x 128 dim x 2 [k+v] x
+ * 2 bytes), used by the context clamp when the GGUF doesn't expose the attention geometry. Callers running a
+ * quantized cache scale this by (KV bytes-per-element / 2) so a q8_0 cache is estimated at ~half and the
+ * clamp grants proportionally more context.
+ */
+export const DEFAULT_KV_BYTES_PER_TOKEN_PER_LAYER_F16 = 4096;
+
+/**
  * Clamps the requested context window to (a) the model's trained maximum and (b) what the KV-cache memory
  * budget can hold, rounded down to a multiple of 1024 and floored at {@link MIN_CLAMPED_CONTEXT}. Returns
  * the requested size unchanged when no constraint applies or inputs are missing. This stops a long-context
@@ -344,11 +379,14 @@ export function clampContextSize(inputs: ContextClampInputs): number {
 	if (inputs.modelContextLength && inputs.modelContextLength > 0) {
 		ctx = Math.min(ctx, inputs.modelContextLength);
 	}
-	if (inputs.kvBudgetBytes && inputs.kvBudgetBytes > 0 && inputs.layerCount && inputs.layerCount > 0) {
+	if (inputs.kvBudgetBytes && inputs.kvBudgetBytes > 0) {
 		const perTokenPerLayer = inputs.kvBytesPerTokenPerLayer && inputs.kvBytesPerTokenPerLayer > 0
 			? inputs.kvBytesPerTokenPerLayer
-			: 4096; // f16 k+v for a typical GQA model (8 kv-heads x 128 dim x 2); conservative when unknown.
-		const maxTokens = Math.floor(inputs.kvBudgetBytes / (perTokenPerLayer * inputs.layerCount));
+			: DEFAULT_KV_BYTES_PER_TOKEN_PER_LAYER_F16; // conservative f16 estimate when the geometry is unknown.
+		// Fall back to a conservative layer count when the GGUF didn't expose one, so a long-context model
+		// with unparseable metadata still gets clamped instead of escaping with its full trained window.
+		const layerCount = inputs.layerCount && inputs.layerCount > 0 ? inputs.layerCount : DEFAULT_CLAMP_LAYER_COUNT;
+		const maxTokens = Math.floor(inputs.kvBudgetBytes / (perTokenPerLayer * layerCount));
 		// Clamp even when the budget holds ~0 tokens: the MIN_CLAMPED_CONTEXT floor below keeps the model
 		// usable, and skipping the clamp here (the old behavior) let a near-full budget escape unclamped.
 		ctx = Math.min(ctx, Math.max(0, maxTokens));
