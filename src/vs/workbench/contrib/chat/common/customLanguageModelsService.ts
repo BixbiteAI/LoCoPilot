@@ -239,9 +239,10 @@ export interface ICustomLanguageModelsService {
 /**
  * Reserved sentinel stored in the selected-model slot when the user picks "Auto" in the chat model picker.
  * It is NOT a real model id: consumers that see it must resolve it to a concrete downloaded local model
- * (see resolveAutoModel in locopilotModelCatalog.ts) - the most capable downloaded catalog model that fits
- * the prospective RAM (what's free after evicting our resident servers), with a warm running server as a
- * within-tier tie-breaker. Persisted like a normal selection so Auto survives restarts.
+ * (see resolveAutoModel in locopilotModelCatalog.ts) - the most capable downloaded catalog model this
+ * machine's RAM tier supports, with a warm running server as a within-tier tie-breaker. The live-RAM fit is
+ * deferred to the launch gate, which the provider's request path steps down against if the pick can't fit
+ * right now. Persisted like a normal selection so Auto survives restarts.
  */
 export const LOCOPILOT_AUTO_MODEL_ID = 'locopilot.auto';
 

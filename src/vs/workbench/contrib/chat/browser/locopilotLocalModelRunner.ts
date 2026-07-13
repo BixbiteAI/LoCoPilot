@@ -44,7 +44,7 @@ import {
 	type KvCacheType
 } from './locopilotLlamaCppServer.js';
 import { readGgufModelInfo, isMoeModelInfo, isSwaModelInfo, kvBytesPerTokenPerLayer, type IGgufModelInfo } from './locopilotGgufMetadata.js';
-import { ILoCoPilotSystemInfoService, type IMemoryStatus, type ISystemHardwareInfo } from '../../../../platform/locopilotSystemInfo/common/locopilotSystemInfo.js';
+import { ILoCoPilotSystemInfoService, type IMemoryStatus, type ISystemHardwareInfo, type MemoryPressureLevel } from '../../../../platform/locopilotSystemInfo/common/locopilotSystemInfo.js';
 import { dirname } from '../../../../base/common/path.js';
 import { isWindows, isMacintosh } from '../../../../base/common/platform.js';
 import {
@@ -183,28 +183,13 @@ export interface ILoCoPilotLocalModelRunner {
 	/** True while the server process is being launched (between button click and first state change). */
 	isServerStarting(modelId: string): boolean;
 	/**
-	 * Best-effort system RAM available RIGHT NOW (free + reclaimable) in GB, from the most recent live
-	 * memory probe (refreshed in the background when stale). Undefined until the first probe lands or on
-	 * web. Lets Auto model selection prefer a model that fits the machine's current headroom instead of
-	 * one that only fits on paper (total RAM).
+	 * Read-only mirror of the interactive launch gate for Auto's step-down: would `modelId` fit the RAM a
+	 * launch would ACTUALLY get right now (live available + what this launch's own eviction frees, counting
+	 * only the non-reclaimable working set)? Runs the same math as the real gate but WITHOUT side effects - no
+	 * "Run anyway?" prompt, no recorded block, no server start. True when it fits or the fit can't be measured
+	 * (non-RAM backend, no probe, unknown footprint - i.e. the real gate wouldn't block either).
 	 */
-	getAvailableRamGB(): number | undefined;
-	/**
-	 * Best-effort RAM available AFTER an Auto model switch, in GB: the live available figure PLUS the
-	 * estimated resident footprint of every managed (non-foreign) server that switching models would
-	 * evict. Auto resolution must score against this figure, not the raw one - the raw number is
-	 * measured while the previous model's weights are still resident, which would systematically push
-	 * Auto to smaller models on every switch. Sync/cached like {@link getAvailableRamGB}; undefined
-	 * until the first probe lands or on web.
-	 */
-	getProspectiveAvailableRamGB(): number | undefined;
-	/**
-	 * Fresh-probe variant of {@link getProspectiveAvailableRamGB} for decision points (request-time Auto
-	 * resolution, the user selecting Auto in the picker): forces a live memory probe instead of serving a
-	 * snapshot that may predate a just-stopped server, and uses full per-server cost estimates for the
-	 * eviction credit. Undefined on web or when the probe fails.
-	 */
-	probeProspectiveAvailableRamGB(): Promise<number | undefined>;
+	wouldModelFitForLaunch(modelId: string): Promise<boolean>;
 	/**
 	 * The reason a recent launch of `modelId` was abandoned at a memory/fit gate (user declined "Run anyway",
 	 * or a pre-warm skipped a too-big model), or undefined when there is none / it has gone stale. Lets the
@@ -1334,68 +1319,6 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 			});
 		}
 		return this._memoryStatusInFlight;
-	}
-
-	/**
-	 * Synchronous best-effort "RAM available right now" in GB for UI/scoring consumers (Auto model mode).
-	 * Serves the last snapshot and refreshes it in the background when stale, so callers in sync render
-	 * paths get a current-enough figure without awaiting an exec round-trip. Undefined until the first
-	 * probe lands (callers fall back to total-RAM reasoning).
-	 */
-	getAvailableRamGB(): number | undefined {
-		const STALE_MS = 15_000;
-		if (Date.now() - this._lastMemoryStatusAt > STALE_MS) {
-			void this._getMemoryStatus(); // refresh for the next caller; this call returns the previous snapshot
-		}
-		return this._lastMemoryStatus ? this._lastMemoryStatus.availableBytes / (1024 ** 3) : undefined;
-	}
-
-	/**
-	 * Estimated bytes an Auto switch would reclaim: the resident cost of every managed (non-foreign)
-	 * server. Sync flavour for render-path callers - uses the cached weight bytes only (conservative:
-	 * omits KV/runtime for models not yet estimated) and kicks off the full async estimate in the
-	 * background so the next call is accurate.
-	 */
-	private _evictableResidentBytesSync(): number {
-		let bytes = 0;
-		for (const [id, rec] of this.runningServers) {
-			if (rec.foreign) {
-				continue; // another window owns it; switching here doesn't free it
-			}
-			// Prefer the FULL resident cost (weights + KV + runtime) the async probe also credits, so the sync
-			// prospective figure and the request-time one agree. Fall back to the weight-only size until the full
-			// estimate has run once, and kick that estimate off in the background for the next caller (Q1).
-			const fullCost = this._modelCostCache.get(id);
-			if (fullCost !== undefined) {
-				bytes += fullCost;
-				continue;
-			}
-			const weights = this._modelSizeCache.get(id);
-			if (weights !== undefined) {
-				bytes += weights;
-			}
-			void this._estimateModelCost(id); // populate the full-cost cache for the next caller
-		}
-		return bytes;
-	}
-
-	getProspectiveAvailableRamGB(): number | undefined {
-		const available = this.getAvailableRamGB();
-		return available === undefined ? undefined : available + this._evictableResidentBytesSync() / (1024 ** 3);
-	}
-
-	async probeProspectiveAvailableRamGB(): Promise<number | undefined> {
-		const mem = await this._getMemoryStatus(); // maxAgeMs 0: force a fresh probe, never a stale snapshot
-		if (!mem) {
-			return undefined;
-		}
-		let evictableBytes = 0;
-		for (const [id, rec] of this.runningServers) {
-			if (!rec.foreign) {
-				evictableBytes += await this._estimateModelCost(id);
-			}
-		}
-		return (mem.availableBytes + evictableBytes) / (1024 ** 3);
 	}
 
 	/**
@@ -3686,16 +3609,44 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 	 * gate (models too big for total RAM).
 	 */
 	private async _memoryAllowsLaunch(modelId: string, interactive: boolean): Promise<boolean> {
+		const fit = await this._computeLaunchFit(modelId, interactive);
+		if (!fit || fit.fits) {
+			return true; // can't measure (never block on the unmeasurable), or it fits.
+		}
+		this._log(`[LoCoPilot Runner] ${modelId} would not fit free RAM: needs ~${fit.needGb}GB but only ~${fit.haveGb}GB is free right now (pressure=${fit.pressure}, evictable ~${fit.evictableGb}GB, interactive=${interactive}).`);
+		if (!interactive) {
+			this._recordLaunchBlocked(modelId, this._buildFitBlockedMessage(fit.name, fit.needGb, fit.haveGb, false));
+			this._endStarting(modelId); // background pre-warm: skip silently, no dialog/toast
+			return false;
+		}
+		// Transient shortfall (soft): eviction is already credited above, so "Run anyway" usually fits.
+		return this._promptRunAnyway(modelId, fit.name, fit.needGb, fit.haveGb, false);
+	}
+
+	async wouldModelFitForLaunch(modelId: string): Promise<boolean> {
+		// Read-only: same fit math as the interactive launch gate, no prompt / no recorded block / no start.
+		const fit = await this._computeLaunchFit(modelId, true);
+		return !fit || fit.fits;
+	}
+
+	/**
+	 * Pure, side-effect-free fit computation shared by {@link _memoryAllowsLaunch} and the read-only
+	 * {@link wouldModelFitForLaunch} predicate. Returns `undefined` when the fit can't be measured (non-RAM
+	 * backend, missing model, already force-launched, no live probe, unresolved path, or unknown footprint) -
+	 * every case the real gate treats as "don't block". Otherwise reports whether the model fits and the
+	 * numbers used, so callers can log / prompt without recomputing.
+	 */
+	private async _computeLaunchFit(modelId: string, interactive: boolean): Promise<{ fits: boolean; needGb: number; haveGb: number; name: string; pressure: MemoryPressureLevel; evictableGb: number } | undefined> {
 		const model = this.customLanguageModelsService.getCustomModels().find(m => m.id === modelId);
 		if (!model || !model.localPath || !this._useMemoryBudget()) {
-			return true; // discrete-GPU / CPU-VRAM-less reasoning, or missing model -> don't block
+			return undefined; // discrete-GPU / CPU-VRAM-less reasoning, or missing model -> don't block
 		}
 		if (this._forcedLaunch.has(modelId)) {
-			return true; // user already chose "Run anyway" for this model
+			return undefined; // user already chose "Run anyway" for this model
 		}
 		const mem = await this._getMemoryStatus();
 		if (!mem) {
-			return true; // no live probe -> never block on what we can't measure
+			return undefined; // no live probe -> never block on what we can't measure
 		}
 		const kind = await this._intendedServerKind(modelId);
 		const backend: LlamaBackend = kind === 'mlx' ? 'metal' : this.getBackend();
@@ -3703,7 +3654,7 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 		try {
 			modelPath = kind === 'mlx' ? await this.getMlxModelRootPath(model.localPath) : await this.resolveModelFilePath(model.localPath);
 		} catch {
-			return true;
+			return undefined;
 		}
 		// MLX commits a ~15%-of-RAM prompt cache alongside the weights; reserve it here so a model that leaves no
 		// headroom for its cache trips this SOFT "not enough free right now" gate (Run-anyway available) instead
@@ -3711,7 +3662,7 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 		const extraResidentBytes = kind === 'mlx' ? this._mlxRuntimeReserveBytes(mem.totalBytes) : 0;
 		const fit = await this._computeFit(modelPath, backend, undefined, extraResidentBytes);
 		if (!fit) {
-			return true; // unknown footprint -> don't block
+			return undefined; // unknown footprint -> don't block
 		}
 		// Credit only the RAM the launch's own eviction will ACTUALLY free. _enforceResidentBudget keeps the
 		// (maxResidentModels - 1) most-recently-used other servers and evicts the rest, so crediting EVERY
@@ -3737,22 +3688,15 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 		// whenever the editor + browser were holding reclaimable RAM (e.g. Gemma 4B on a 16 GB Mac). Background
 		// pre-warm keeps the strict full-footprint check - refusing an optional speculative load is harmless.
 		const requiredFreeNow = interactive ? Math.max(0, fit.requiredBytes - fit.weightBytes) : fit.requiredBytes;
-		if (mem.pressure !== 'critical' && requiredFreeNow <= availableNow) {
-			return true;
-		}
-
 		const GB = 1024 * 1024 * 1024;
-		const needGb = Math.ceil(requiredFreeNow / GB);
-		const haveGb = Math.max(0, Math.floor(availableNow / GB));
-		const name = model.displayName || model.modelName;
-		this._log(`[LoCoPilot Runner] ${modelId} would not fit free RAM: needs ~${needGb}GB but only ~${haveGb}GB is free right now (pressure=${mem.pressure}, evictable ~${Math.round(evictableBytes / GB)}GB, interactive=${interactive}).`);
-		if (!interactive) {
-			this._recordLaunchBlocked(modelId, this._buildFitBlockedMessage(name, needGb, haveGb, false));
-			this._endStarting(modelId); // background pre-warm: skip silently, no dialog/toast
-			return false;
-		}
-		// Transient shortfall (soft): eviction is already credited above, so "Run anyway" usually fits.
-		return this._promptRunAnyway(modelId, name, needGb, haveGb, false);
+		return {
+			fits: mem.pressure !== 'critical' && requiredFreeNow <= availableNow,
+			needGb: Math.ceil(requiredFreeNow / GB),
+			haveGb: Math.max(0, Math.floor(availableNow / GB)),
+			name: model.displayName || model.modelName,
+			pressure: mem.pressure,
+			evictableGb: Math.round(evictableBytes / GB),
+		};
 	}
 
 	/**

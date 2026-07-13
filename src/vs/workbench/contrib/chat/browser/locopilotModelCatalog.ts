@@ -998,8 +998,9 @@ export function findDraftPairing(repoId: string | undefined): { draftRepoId: str
 //
 // "Auto" is a picker mode (sentinel LOCOPILOT_AUTO_MODEL_ID, see customLanguageModelsService.ts), not a
 // model. The helpers below turn it into a concrete choice:
-//  - resolveAutoModel: which downloaded catalog model Auto uses for a request (the most capable model
-//    that fits the prospective RAM, with a warm running server as a within-tier tie-breaker).
+//  - resolveAutoModel: which downloaded catalog model Auto uses for a request (aspirational - the most
+//    capable model this machine's RAM tier supports; the live-RAM fit is deferred to the launch gate,
+//    which the provider's Auto path steps down against, with a warm running server as a tie-breaker).
 //  - getAutoStarterPicks: the labelled download suggestions shown in chat when NOTHING is downloaded yet.
 // Scope is deliberately catalog llama.cpp/MLX models only - cloud, Ollama, and user-added local models are
 // never auto-picked (they remain manually selectable).
@@ -1030,60 +1031,34 @@ export function isAutoCandidate(model: ICustomLanguageModel): boolean {
 }
 
 /**
- * Working-set headroom (GB) a model needs ON TOP of its weight bytes to run: KV cache + engine runtime
- * overhead. Scale-aware rather than a flat constant - the KV cache grows with model size, and agent
- * sessions carry long contexts, so a big model needs proportionally more headroom than a small one
- * (~1.5GB engine runtime + a KV/prompt-cache share that tracks the weights, floored at 1GB).
- */
-export function autoFitOverheadGB(weightsGB: number): number {
-	return 1.5 + Math.max(1.0, weightsGB * 0.25);
-}
-
-/** True when the entry's weights + its runtime footprint fit within `availableRamGB` right now. */
-export function autoEntryFitsAvailableRam(entry: ICatalogModel, availableRamGB: number): boolean {
-	const weightsGB = entry.approxSizeBytes / (1024 ** 3);
-	return weightsGB + autoFitOverheadGB(weightsGB) <= availableRamGB;
-}
-
-/**
- * RAM slack (GB) a model that is ALREADY RUNNING is allowed to run under before Auto switches away from it.
- * Available-RAM probes jitter by a gigabyte or two as other apps allocate/free, and a running model that
- * dips just below the fit line for one probe should not trigger a cold reload of a different model - that
- * churn (unload 16-20GB, load another 16-20GB) is exactly what heats the machine. So a running pick is kept
- * as long as it fits `available + this margin`; a fresh (not-yet-running) pick still uses the strict line.
- */
-export const AUTO_RUNNING_HYSTERESIS_GB = 2;
-
-/**
  * Resolve the Auto selection to a concrete downloaded model, or undefined when nothing qualifies (the
  * caller then shows the starter-picks download card).
  *
- * Selection is a two-level decision, admission before capability:
- *  1. ADMISSION - a candidate is "admitted" when its weights + runtime footprint fit the memory the model
- *     would ACTUALLY get (`availableRamGB`). This is the OOM/thermal guard: an admitted model runs smoothly
- *     today; a non-admitted one would launch straight into the availability warning / swap thrash. A model
- *     whose server is already RUNNING is admitted under a small slack ({@link AUTO_RUNNING_HYSTERESIS_GB})
- *     so RAM jitter doesn't churn it (see below).
- *  2. Among admitted candidates, the most capable wins (highest catalog RAM tier), but a currently-RUNNING
- *     admitted candidate is kept over a bigger not-running one (STICKINESS): re-resolving Auto every request
- *     must not cold-swap a working model just because RAM briefly freed. Ties fall to the curated "Best for
- *     you" repo, then architecture - MoE > MTP > MLX > plain GGUF (faster for equal quality).
+ * ASPIRATIONAL by design: Auto picks the most capable model this MACHINE can run - the highest catalog RAM
+ * tier whose `minRamGB` fits total system RAM - NOT the biggest that fits a momentary free-RAM probe. The
+ * live-RAM decision is deferred to the ONE place with ground truth: the launch gate (_memoryAllowsLaunch),
+ * which credits reclaimable file cache / compression / eviction and only requires the non-reclaimable
+ * working set to be physically free. Sizing Auto against the conservative available-RAM snapshot HERE used
+ * to strand a 16 GB Mac on a tiny model even with nothing else running, because that snapshot excludes the
+ * compressible/evictable memory a launch can reclaim. `minRamGB` already bakes in a comfortable-run headroom
+ * band, so the tier ceiling is the safety margin at pick time; the launch gate + watchdog are the runtime net.
  *
- * When NOTHING is admitted (every candidate is too big for the RAM free right now), Auto picks the SMALLEST
- * candidate rather than the biggest-by-tier: the small one has the best chance of launching without thrash,
- * where the biggest would just trip the launch gate. RAM unknown (`ramGB <= 0`) restricts to the 8 GB tier.
+ * Ranking among candidates that fit the hardware tier:
+ *  1. Capability: the highest `minRamGB` tier wins.
+ *  2. Stickiness: a currently-RUNNING model beats a bigger not-running rival (+200k clears the largest
+ *     realistic tier gap, 8->64 = 56k), so re-resolving Auto never cold-swaps a warm model just to gain a tier.
+ *  3. Ties: the curated "Best for you" repo, then architecture - MoE > MTP > MLX > plain GGUF.
  *
- * `availableRamGB` (optional): memory available AFTER an Auto switch - the runner's PROSPECTIVE figure
- * (live free + reclaimable + what evicting our resident servers frees), NOT the raw free number. The raw
- * figure is measured while the previous model's weights are still resident, which would systematically
- * push Auto to smaller models on every switch. When the figure is unknown, admission can't be evaluated and
- * the ranking degrades to the total-RAM tier order (capability first, running server as a warm tie-breaker).
+ * `maxSizeBytesExclusive` (optional): a STEP-DOWN ceiling. When set, only models strictly smaller than it are
+ * considered. The caller (see the provider's Auto path) lowers it to the size of a pick that failed the launch
+ * gate and re-resolves to get the next-smaller candidate, so a momentarily busy machine gets a smaller model
+ * instead of a hard fit failure. RAM unknown (`ramGB <= 0`) restricts to the 8 GB tier.
  */
 export function resolveAutoModel(
 	models: readonly ICustomLanguageModel[],
 	ramGB: number,
 	isServerActive: (modelId: string) => boolean,
-	availableRamGB?: number
+	maxSizeBytesExclusive?: number
 ): ICustomLanguageModel | undefined {
 	const candidates = models.filter(isAutoCandidate);
 	if (candidates.length === 0) {
@@ -1092,31 +1067,22 @@ export function resolveAutoModel(
 
 	const effectiveRam = ramGB > 0 ? ramGB : 8;
 	const recommendedRepoId = getRecommendedRepoId(ramGB);
-	const availKnown = availableRamGB !== undefined && availableRamGB > 0;
 
-	interface IScored { model: ICustomLanguageModel; entry: ICatalogModel; admitted: boolean; score: number }
+	interface IScored { model: ICustomLanguageModel; score: number }
 	const scored: IScored[] = [];
 	for (const model of candidates) {
 		const entry = findCatalogEntryByRepoId(model.modelName)!;
 		if (entry.minRamGB > effectiveRam) {
-			continue; // would OOM/thrash on this machine's TOTAL RAM - never auto-picked.
+			continue; // bigger than this machine's TOTAL RAM tier - never auto-picked.
+		}
+		if (maxSizeBytesExclusive !== undefined && entry.approxSizeBytes >= maxSizeBytesExclusive) {
+			continue; // step-down: this pick (or a bigger one) already failed the launch gate this pass.
 		}
 		const running = isServerActive(model.id);
-		// Admission: a fresh pick must fit the strict available figure; a running pick keeps a small slack so
-		// a one-probe dip below the line doesn't force a cold reload of a different model.
-		const admitted = availKnown && (
-			autoEntryFitsAvailableRam(entry, availableRamGB!)
-			|| (running && autoEntryFitsAvailableRam(entry, availableRamGB! + AUTO_RUNNING_HYSTERESIS_GB))
-		);
 
-		let score = entry.minRamGB * 1000; // capability: highest RAM tier that fits.
-		if (admitted) {
-			score += 1_000_000; // fits the RAM the model would actually get - dominates every capability step.
-		}
+		let score = entry.minRamGB * 1000; // capability: the highest RAM tier the hardware supports.
 		if (running) {
-			// Stickiness: a running model beats a bigger, not-running rival in the SAME admission class (the
-			// +200k clears the largest realistic tier gap, 8->64 = 56k) so re-resolving Auto keeps the warm
-			// model instead of cold-swapping. A non-admitted running model still loses to any admitted one.
+			// Stickiness: keep a warm model over a bigger cold rival so re-resolving Auto doesn't cold-swap.
 			score += 200_000;
 		}
 		if (entry.repoId === recommendedRepoId) {
@@ -1132,16 +1098,10 @@ export function resolveAutoModel(
 		if (entry.recommended) {
 			score += 50;
 		}
-		scored.push({ model, entry, admitted, score });
+		scored.push({ model, score });
 	}
 	if (scored.length === 0) {
 		return undefined;
-	}
-
-	// Nothing fits the RAM free right now (and we HAVE a reading): step down to the smallest candidate, the
-	// one most likely to launch without paging. The capability score rewards bigger, so pick min size directly.
-	if (availKnown && !scored.some(s => s.admitted)) {
-		return scored.reduce((best, s) => s.entry.approxSizeBytes < best.entry.approxSizeBytes ? s : best).model;
 	}
 	return scored.reduce((best, s) => s.score > best.score ? s : best).model;
 }

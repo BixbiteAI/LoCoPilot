@@ -1239,17 +1239,15 @@ export class LoCoPilotBuiltInAgent extends Disposable implements IChatAgentImple
 
 	/**
 	 * Resolve the "Auto" sentinel to a concrete downloaded catalog model, or undefined when none qualifies.
-	 * `prospectiveRamGB` lets the async request path pass a freshly-probed figure; sync callers (warming,
-	 * labels) fall back to the cached prospective snapshot.
+	 * Aspirational: the most capable model this machine's RAM tier supports (the live-RAM fit is deferred to
+	 * the launch gate, which the provider's request path steps down against - see resolveAutoModel). Used here
+	 * for warming/labels, which just need the intended pick.
 	 */
-	private _resolveAutoModel(prospectiveRamGB?: number): ICustomLanguageModel | undefined {
+	private _resolveAutoModel(): ICustomLanguageModel | undefined {
 		return resolveAutoModel(
 			this.customLanguageModelsService.getCustomModels(),
 			this._detectedRamGB(),
-			id => this.localModelRunner.isServerRunning(id) || this.localModelRunner.isServerStarting(id),
-			// PROSPECTIVE headroom (available + what evicting our resident servers frees), so Auto sizes
-			// against the RAM the new model would actually get after the switch.
-			prospectiveRamGB ?? this.localModelRunner.getProspectiveAvailableRamGB()
+			id => this.localModelRunner.isServerRunning(id) || this.localModelRunner.isServerStarting(id)
 		);
 	}
 
@@ -2299,13 +2297,12 @@ Message: ${firstMessage.substring(0, 500)}`;
 			modelId = LOCOPILOT_AUTO_MODEL_ID;
 		}
 
-		// "Auto" mode: resolve the sentinel to a concrete downloaded catalog model (running server wins,
-		// else the most capable model that fits this machine's RAM). When NOTHING suitable is downloaded
-		// yet, show the starter card - up to three labelled download suggestions - instead of an error.
+		// "Auto" mode: resolve the sentinel to a concrete downloaded catalog model (running server wins, else
+		// the most capable model this machine's RAM tier supports). When NOTHING suitable is downloaded yet,
+		// show the starter card - up to three labelled download suggestions - instead of an error. The live-RAM
+		// fit / step-down happens later in the language-model provider's request path (see resolveAutoModel).
 		if (modelId === LOCOPILOT_AUTO_MODEL_ID) {
-			// Force-fresh probe: a snapshot up to 15s old can predate a just-stopped server and misreport
-			// the headroom the new model would get, steering Auto to a smaller model than necessary.
-			const resolved = this._resolveAutoModel(await this.localModelRunner.probeProspectiveAvailableRamGB());
+			const resolved = this._resolveAutoModel();
 			if (!resolved) {
 				progress([{ kind: 'markdownContent', content: buildAutoStarterPicksMarkdown(this._detectedRamGB(), this.customLanguageModelsService.getCustomModels()) }]);
 				return {};

@@ -196,23 +196,22 @@ interface IModelPickerState {
 
 // ---- "Auto" picker mode ----------------------------------------------------------------------------
 // Auto is a pinned pseudo-entry at the top of the picker (sentinel LOCOPILOT_AUTO_MODEL_ID). Selecting it
-// stores the sentinel; the agent resolves it per request to a concrete downloaded catalog model (the most
-// capable model that fits the prospective RAM, warm server as tie-breaker - see resolveAutoModel). The picker
-// mirrors that same resolution so the label ("Auto (Qwen3.5 9B)"), the row description, and the row's
-// start/stop icon always show which model Auto is going to use.
+// stores the sentinel; the agent resolves it per request to a concrete downloaded catalog model (aspirational:
+// the most capable model this machine's RAM tier supports, warm server as tie-breaker - see resolveAutoModel).
+// The picker mirrors that aspirational choice for the label ("Auto (Qwen3.5 9B)"), row description, and
+// start/stop icon. It intentionally does NOT run the agent's async launch-gate step-down (a label must resolve
+// synchronously); in the rare case a send steps down to a smaller model, its now-running server wins the next
+// re-resolve via stickiness, so the label reconverges.
 
 /** Sits above Custom Models (order 100) and the standard categories, so Auto is always the first row. */
 const AUTO_PICKER_CATEGORY = { label: localize('chat.modelPicker.autoCategory', "Auto"), order: 0 };
 
-/** The model Auto currently resolves to, mirroring the agent's per-request resolution. */
+/** The model Auto currently resolves to, mirroring the agent's aspirational per-request resolution. */
 function resolveAutoModelForPicker(customLanguageModelsService: ICustomLanguageModelsService, localModelRunner: ILoCoPilotLocalModelRunner, timerService: ITimerService): ICustomLanguageModel | undefined {
 	return resolveAutoModel(
 		customLanguageModelsService.getCustomModels(),
 		detectedRamGB(timerService),
-		id => localModelRunner.isServerRunning(id) || localModelRunner.isServerStarting(id),
-		// PROSPECTIVE free-RAM figure (available + what evicting our resident servers frees) so the picker
-		// label previews the same fit-after-switch-aware choice the agent makes.
-		localModelRunner.getProspectiveAvailableRamGB()
+		id => localModelRunner.isServerRunning(id) || localModelRunner.isServerStarting(id)
 	);
 }
 
@@ -305,20 +304,12 @@ function modelDelegateToWidgetActionsProvider(delegate: IModelPickerDelegate, te
 							return;
 						}
 						customLanguageModelsService.setSelectedCustomModelId(LOCOPILOT_AUTO_MODEL_ID);
+						// Auto's pick is aspirational - the most capable model this machine's RAM tier supports -
+						// so it depends only on the downloaded set, total RAM, and which server is warm, none of
+						// which a memory probe changes. The label is therefore final at selection time; any
+						// request-time step-down to a smaller model surfaces later via the running-server
+						// re-resolve (stickiness), which the picker's normal state-change refresh already tracks.
 						delegate.setModel(buildAutoModelEntry(autoResolved));
-						// Picking Auto is a decision point: force a fresh memory probe (the cached snapshot can
-						// be up to 15s old and predate a just-stopped server) and re-resolve. If the fresh
-						// prospective headroom lands on a different - typically bigger - model, re-label so the
-						// user sees the model Auto will actually use.
-						void localModelRunner.probeProspectiveAvailableRamGB().then(() => {
-							if (customLanguageModelsService.getSelectedCustomModelId() !== LOCOPILOT_AUTO_MODEL_ID) {
-								return; // selection moved on while probing
-							}
-							const reResolved = resolveAutoModelForPicker(customLanguageModelsService, localModelRunner, timerService);
-							if (reResolved?.id !== autoResolved?.id) {
-								delegate.setModel(buildAutoModelEntry(reResolved));
-							}
-						});
 					}
 			};
 			const customModelActions: IActionWidgetDropdownAction[] = customModels.map(customModel => {
@@ -668,9 +659,9 @@ export class ModelPickerActionItem extends ChatInputPickerActionViewItem {
 			refreshAutoLabel();
 		}));
 
-		// Available RAM shifting can change which model Auto resolves to just as much as a server state change
-		// can (both feed the prospective-headroom figure), so re-derive the label - and refresh the open
-		// dropdown's rows - whenever the live memory probe lands a new reading.
+		// Available RAM shifting no longer changes Auto's aspirational pick (that depends only on the downloaded
+		// set, total RAM, and which server is warm), but the dropdown's per-model rows surface live fit hints, so
+		// refresh the open list - and re-derive the label defensively - whenever the memory probe lands a reading.
 		this._register(localModelRunner.onDidAvailableRamChange(() => {
 			actionWidgetService.refreshItems();
 			refreshAutoLabel();

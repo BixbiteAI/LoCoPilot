@@ -19,7 +19,7 @@ import { ILogService } from '../../../../platform/log/common/log.js';
 import { IRequestService } from '../../../../platform/request/common/request.js';
 import { IConfigurationService } from '../../../../platform/configuration/common/configuration.js';
 import { ChatConfiguration, ChatAgentLocation } from '../common/constants.js';
-import { getDefaultPickerRepoId, resolveAutoModel } from './locopilotModelCatalog.js';
+import { findCatalogEntryByRepoId, getDefaultPickerRepoId, resolveAutoModel } from './locopilotModelCatalog.js';
 import { ITimerService } from '../../../services/timer/browser/timerService.js';
 import { ILoCoPilotFileLog } from './locopilotFileLog.js';
 import { INotificationService } from '../../../../platform/notification/common/notification.js';
@@ -351,21 +351,7 @@ export class LoCoPilotLanguageModelProvider extends Disposable implements ILangu
 		// Safety net for the "Auto" sentinel: the agent path resolves it before reaching here, but any other
 		// caller (extension API, future paths) gets the same resolution instead of a "model not found" error.
 		if (modelId === LOCOPILOT_AUTO_MODEL_ID) {
-			// Fresh PROSPECTIVE headroom (live probe + what evicting our resident servers frees), so the
-			// choice reflects the RAM the new model would actually get after the switch - not a stale
-			// snapshot taken while the previous model's weights were still resident.
-			const prospectiveRamGB = await this.localModelRunner.probeProspectiveAvailableRamGB();
-			const resolved = resolveAutoModel(
-				this.customLanguageModelsService.getCustomModels(),
-				this._detectedRamGB(),
-				id => this.localModelRunner.isServerRunning(id) || this.localModelRunner.isServerStarting(id),
-				prospectiveRamGB
-			);
-			if (!resolved) {
-				throw new Error('Auto has no downloaded local model to use yet. Download one of the suggested models from the chat panel (or LoCoPilot Settings), then send your message again.');
-			}
-			this._log(`[LoCoPilot Provider] Auto resolved to model: ${getCustomModelListLabel(resolved)} (${resolved.id})`);
-			modelId = resolved.id;
+			modelId = await this._resolveAutoModelWithStepDown();
 		}
 		const customModel = this.customLanguageModelsService.getCustomModels().find(m => m.id === modelId);
 		if (!customModel) {
@@ -386,6 +372,53 @@ export class LoCoPilotLanguageModelProvider extends Disposable implements ILangu
 			stream: stream.asyncIterable,
 			result: resultPromise
 		};
+	}
+
+	/**
+	 * Resolve the "Auto" sentinel to a concrete downloaded model id, aspirational-then-verified:
+	 *  1. resolveAutoModel picks the most capable model this machine's RAM tier supports (see its doc).
+	 *  2. We then ask the launch gate's ground truth (wouldModelFitForLaunch) whether that pick can ACTUALLY
+	 *     fit the RAM free right now. If it can't, we step down by size and re-resolve, so a momentarily busy
+	 *     machine gets the next-smaller model instead of a fit failure at send time. The gate credits
+	 *     reclaimable/evictable RAM, so the top pick usually passes and the loop exits on the first iteration.
+	 *  3. If nothing fits cleanly, use the smallest candidate and let the launch path's "Run anyway?" dialog
+	 *     make the final call rather than refusing to pick a model at all.
+	 * Throws (as before) only when there is no downloaded catalog model to auto-pick.
+	 */
+	private async _resolveAutoModelWithStepDown(): Promise<string> {
+		const isActive = (id: string) => this.localModelRunner.isServerRunning(id) || this.localModelRunner.isServerStarting(id);
+		const ram = this._detectedRamGB();
+		let ceiling: number | undefined; // step-down size ceiling (exclusive), lowered on each gate refusal
+		let smallest: ICustomLanguageModel | undefined; // last (=smallest) pick seen, the fallback
+		// Bounded by the number of distinct downloaded catalog models: each step lowers the size ceiling
+		// strictly, so a fixed generous cap can never loop forever even if the catalog grows.
+		for (let step = 0; step < 32; step++) {
+			const resolved = resolveAutoModel(
+				this.customLanguageModelsService.getCustomModels(),
+				ram,
+				isActive,
+				ceiling
+			);
+			if (!resolved) {
+				break;
+			}
+			smallest = resolved;
+			if (await this.localModelRunner.wouldModelFitForLaunch(resolved.id)) {
+				this._log(`[LoCoPilot Provider] Auto resolved to model: ${getCustomModelListLabel(resolved)} (${resolved.id})`);
+				return resolved.id;
+			}
+			const entry = findCatalogEntryByRepoId(resolved.modelName);
+			if (!entry) {
+				break; // shouldn't happen (isAutoCandidate requires a catalog entry), but don't spin
+			}
+			this._log(`[LoCoPilot Provider] Auto pick ${getCustomModelListLabel(resolved)} won't fit right now; stepping down below ~${(entry.approxSizeBytes / (1024 ** 3)).toFixed(1)}GB.`);
+			ceiling = entry.approxSizeBytes;
+		}
+		if (smallest) {
+			this._log(`[LoCoPilot Provider] Auto: no pick fit cleanly; using smallest candidate ${getCustomModelListLabel(smallest)} (${smallest.id}) - the launch gate will offer "Run anyway".`);
+			return smallest.id;
+		}
+		throw new Error('Auto has no downloaded local model to use yet. Download one of the suggested models from the chat panel (or LoCoPilot Settings), then send your message again.');
 	}
 
 	/**
