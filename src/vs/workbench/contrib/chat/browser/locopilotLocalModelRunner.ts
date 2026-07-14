@@ -33,6 +33,8 @@ import {
 	metalOffloadBudgetBytes,
 	usableSystemMemoryBytes,
 	KV_BUDGET_FRACTION,
+	KV_CLAMP_BUDGET_FRACTION,
+	ADAPTIVE_Q4_KV_CONTEXT_FLOOR,
 	RUNTIME_OVERHEAD_BYTES,
 	DEFAULT_LLAMA_CONTEXT_SIZE,
 	MIN_CLAMPED_CONTEXT,
@@ -373,6 +375,8 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 	private _watchdogStrikes = 0;
 	/** Swap-in-use (bytes) at the previous watchdog sample, so the tick can detect ACTIVELY GROWING swap (paging). */
 	private _watchdogLastSwapBytes = -1;
+	/** True once we've shown the user the "memory low" warning for the CURRENT pressure episode; reset on recovery. */
+	private _watchdogWarnedThisEpisode = false;
 	/** Epoch ms until which automatic (pre-warm) launches stay suppressed after the watchdog tripped. */
 	private _watchdogCooldownUntil = 0;
 	/** Per-model count of OOM-crash degradation relaunches this session (see _reportServerCrash's OOM ladder). */
@@ -1807,12 +1811,12 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 			// below so the launch runs the same precision even after the clamp drops the window under the
 			// auto-quant threshold - otherwise the server would re-resolve 'auto' to f16 and use ~2x the KV the
 			// clamp budgeted (unsafe on a tight machine, and it wastes the extra window q8_0 was meant to buy).
-			const resolvedKvType = resolveKvCacheType(tuning.kvCacheType ?? 'auto', tuning.contextSize);
+			let resolvedKvType = resolveKvCacheType(tuning.kvCacheType ?? 'auto', tuning.contextSize);
 			const kvBytesPerElem = kvCacheBytesPerElem(resolvedKvType);
 			// Estimate KV bytes/token/layer from the model's attention geometry at the cache precision. When the
 			// GGUF lacks the attention keys, fall back to the conservative f16 default SCALED to the precision
 			// (q8_0 -> ~half), so a quantized cache actually grants ~2x the window instead of being sized as f16.
-			const perTokenPerLayer = kvBytesPerTokenPerLayer(info, kvBytesPerElem)
+			let perTokenPerLayer = kvBytesPerTokenPerLayer(info, kvBytesPerElem)
 				?? Math.round(DEFAULT_KV_BYTES_PER_TOKEN_PER_LAYER_F16 * kvBytesPerElem / 2);
 			let kvBudgetBytes: number | undefined;
 			if (budget && budget > 0) {
@@ -1824,15 +1828,40 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 				// (clampContextSize treats 0/undefined as "no budget known").
 				kvBudgetBytes = modelBytes > 0
 					? Math.max(1, computeKvBudgetBytes(budget, residentWeights))
-					: budget * KV_BUDGET_FRACTION;
+					: budget * KV_CLAMP_BUDGET_FRACTION;
 			}
-			const clamped = clampContextSize({
+			let clamped = clampContextSize({
 				requestedContext: tuning.contextSize,
 				modelContextLength: info.contextLength,
 				kvBudgetBytes,
 				layerCount: info.layerCount,
 				kvBytesPerTokenPerLayer: perTokenPerLayer,
 			});
+			// Adaptive KV precision (ONLY when the user left kvCacheType on 'auto'): if q8_0 still can't reach a
+			// usable window because the model's weights leave little room for KV, drop to 4-bit q4_0 - it roughly
+			// halves the per-token KV cost, turning a cramped window (e.g. ~22K on a 24B/32GB) into ~1.8x that at a
+			// modest quality cost. Gated on q8_0 landing BELOW the floor AND the user actually wanting more, so a
+			// model that already gets a comfortable q8_0 window keeps full quality. Big models are the beneficiaries;
+			// small models never reach this branch because q8_0 already clears the floor for them.
+			if ((tuning.kvCacheType ?? 'auto') === 'auto' && resolvedKvType === 'q8_0'
+				&& clamped < ADAPTIVE_Q4_KV_CONTEXT_FLOOR && clamped < tuning.contextSize && kvBudgetBytes && kvBudgetBytes > 0) {
+				const q4BytesPerElem = kvCacheBytesPerElem('q4_0');
+				const q4PerTokenPerLayer = kvBytesPerTokenPerLayer(info, q4BytesPerElem)
+					?? Math.round(DEFAULT_KV_BYTES_PER_TOKEN_PER_LAYER_F16 * q4BytesPerElem / 2);
+				const q4Clamped = clampContextSize({
+					requestedContext: tuning.contextSize,
+					modelContextLength: info.contextLength,
+					kvBudgetBytes,
+					layerCount: info.layerCount,
+					kvBytesPerTokenPerLayer: q4PerTokenPerLayer,
+				});
+				if (q4Clamped > clamped) {
+					this._log(`[LoCoPilot Runner] Adaptive KV: q8_0 window ${clamped} is below the ${ADAPTIVE_Q4_KV_CONTEXT_FLOOR}-token floor; switching to 4-bit q4_0 KV to reach ${q4Clamped}.`);
+					resolvedKvType = 'q4_0';
+					perTokenPerLayer = q4PerTokenPerLayer;
+					clamped = q4Clamped;
+				}
+			}
 			if (clamped < tuning.contextSize) {
 				this._log(`[LoCoPilot Runner] Clamped context ${tuning.contextSize} -> ${clamped} to fit the model/memory budget (KV ${resolvedKvType}, ~${perTokenPerLayer} B/tok/layer).`);
 				tuning.contextSize = clamped;
@@ -2085,6 +2114,14 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 	 * rather than waiting for a flat 1 GB, giving the breaker a useful head start.
 	 */
 	private static readonly WATCHDOG_AVAILABLE_FLOOR_FRACTION = 0.08;
+	/**
+	 * HARD near-OOM floor (bytes). Below this, allocations are about to fail no matter what the pressure/swap
+	 * signals say, so it is an INDEPENDENT kill condition (unlike the warn floor above, which only ARMS the
+	 * paging/advisory checks). Deliberately well below the warn floor - a deliberately-tight big model is meant
+	 * to sit under the warn floor while running fine, but sitting under ~1 GB reclaimable is genuine danger.
+	 */
+	private static readonly WATCHDOG_HARD_FLOOR_MIN = Math.round(0.6 * 1024 * 1024 * 1024); // 0.6 GiB
+	private static readonly WATCHDOG_HARD_FLOOR_FRACTION = 0.03;
 	/** Sample interval; two bad samples trip the breaker, so reaction time is ~2x this. */
 	private static readonly WATCHDOG_INTERVAL_MS = 5000;
 	/** How long automatic (pre-warm) launches stay suppressed after the breaker trips (or a first strike lands). */
@@ -2102,6 +2139,14 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 		);
 	}
 
+	/** HARD near-OOM floor (bytes): below this, a kill is warranted on its own (see {@link WATCHDOG_HARD_FLOOR_MIN}). */
+	private _watchdogHardFloor(totalBytes: number): number {
+		return Math.max(
+			LoCoPilotLocalModelRunner.WATCHDOG_HARD_FLOOR_MIN,
+			Math.floor(totalBytes * LoCoPilotLocalModelRunner.WATCHDOG_HARD_FLOOR_FRACTION)
+		);
+	}
+
 	/** True when this window owns at least one live server process (foreign attachments don't count). */
 	private _ownsResidentServer(): boolean {
 		for (const rec of this.runningServers.values()) {
@@ -2110,6 +2155,34 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 			}
 		}
 		return false;
+	}
+
+	/**
+	 * One-time, non-alarming heads-up that memory is tight, shown at most once per pressure episode (the latch is
+	 * cleared when memory recovers above the warn floor). Only when a SINGLE server is resident - with more than one
+	 * the watchdog sheds extras instead, so a warning would be premature. Deliberately reassures that the model keeps
+	 * running and is only stopped if the system actually starts paging, matching the kill logic in the tick.
+	 */
+	private _maybeWarnMemoryLow(): void {
+		if (this._watchdogWarnedThisEpisode || this._ownedServerCount() > 1) {
+			return;
+		}
+		this._watchdogWarnedThisEpisode = true;
+		this.notificationService.notify({
+			severity: Severity.Warning,
+			message: 'Your system is running low on memory. The local model will keep running - LoCoPilot will only stop it if the system starts paging to disk. Close other apps to free memory, or switch to a smaller model.',
+		});
+	}
+
+	/** Number of live server processes THIS window owns (foreign attachments excluded). */
+	private _ownedServerCount(): number {
+		let n = 0;
+		for (const rec of this.runningServers.values()) {
+			if (!rec.foreign) {
+				n++;
+			}
+		}
+		return n;
 	}
 
 	/**
@@ -2152,6 +2225,7 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 		}
 		this._watchdogStrikes = 0;
 		this._watchdogLastSwapBytes = -1;
+		this._watchdogWarnedThisEpisode = false;
 		this._watchdogTimer = mainWindow.setInterval(() => void this._memoryWatchdogTick(), LoCoPilotLocalModelRunner.WATCHDOG_INTERVAL_MS);
 		this._log('[LoCoPilot Runner] Memory watchdog armed (5s sampling while a local server is resident).');
 	}
@@ -2162,6 +2236,7 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 			this._watchdogTimer = undefined;
 			this._watchdogStrikes = 0;
 			this._watchdogLastSwapBytes = -1;
+			this._watchdogWarnedThisEpisode = false;
 		}
 	}
 
@@ -2178,45 +2253,70 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 			return; // probe unavailable this tick; keep sampling
 		}
 
-		// Trip on GENUINE thrash (or a thermal emergency), not a static "low memory" threshold - otherwise a
-		// model the user deliberately chose to Run Anyway (tight but stable) would be killed the moment it
-		// loaded, which contradicts their choice. On a memory-tight machine (e.g. 16 GB running a ~10 GB model)
-		// "available" is SUPPOSED to sit low - that alone is not thrashing. Two tiers:
-		//  - IMMEDIATE (single sample) = only a CRITICAL THERMAL sample: imminent throttle/thermal-shutdown is a
-		//    true emergency, so we don't wait another 5 s. Memory is deliberately NOT here - even the kernel's
-		//    "critical" pressure level can blip for one tick on a stably-tight machine, so killing on a single
-		//    memory sample is exactly the false-positive that stopped a healthy running model.
-		//  - TWO CONSECUTIVE SAMPLES (~10 s) = inferred thrash that must persist before we act: kernel CRITICAL
-		//    memory pressure, OR memory low AND swap actively GROWING (paging to disk now), OR memory low on a
-		//    platform with no pressure/swap signal at all (last resort), OR SERIOUS (not yet critical) thermal.
-		const floor = this._watchdogAvailableFloor(mem.totalBytes);
-		const lowAvailable = mem.availableBytes < floor;
+		// KILL ONLY WHEN REQUIRED. A big local model is SUPPOSED to run the machine tight - "available" sits low and
+		// macOS may report CRITICAL memory pressure the whole time, because it is compressing/reclaiming hard to keep
+		// the model's working set resident. That is not a freeze: compression is fast and the model runs fine (this
+		// is how a 27B fits a 32 GB Mac). What actually freezes a Mac is sustained PAGING TO DISK. So we trip only on
+		// signals that mean the machine is genuinely in trouble, and treat mere pressure/decline as an advisory:
+		//  - IMMEDIATE (1 sample): CRITICAL THERMAL - imminent throttle/shutdown, no time to wait another 5 s.
+		//  - TWO SAMPLES (~10 s): swap actively GROWING while memory is low (paging to disk NOW), OR available under
+		//    the HARD near-OOM floor (allocations about to fail regardless of other signals), OR a platform with no
+		//    pressure/swap signal at all that's low (last resort), OR SERIOUS thermal.
+		// NOTE: kernel CRITICAL memory pressure and a downward available-trend are deliberately NOT kill conditions -
+		// on their own they fire constantly for a deliberately-tight model (e.g. the KV cache filling on the first
+		// generation is a monotonic decline into headroom we already budgeted). They drive the ADVISORY warn instead.
+		const warnFloor = this._watchdogAvailableFloor(mem.totalBytes);
+		const hardFloor = this._watchdogHardFloor(mem.totalBytes);
+		const lowAvailable = mem.availableBytes < warnFloor;
+		const nearlyOut = mem.availableBytes < hardFloor;
 		const swapGrowing = mem.swapUsedBytes >= 0 && this._watchdogLastSwapBytes >= 0
 			&& (mem.swapUsedBytes - this._watchdogLastSwapBytes) > LoCoPilotLocalModelRunner.WATCHDOG_SWAP_GROWTH_BYTES;
+		const hasPressureSignal = mem.pressure !== 'unknown';
 		const noSignals = mem.pressure === 'unknown' && mem.swapUsedBytes < 0;
 		this._watchdogLastSwapBytes = mem.swapUsedBytes;
 
+		// Kill ONLY on genuine, CORROBORATED trouble. The hard lesson from small machines: on a 16 GB Mac running
+		// even a tiny 4B model, "available" routinely sits under the floor (the editor is itself an Electron app)
+		// and macOS swaps cold pages opportunistically with nothing wrong - so "low available + a swap tick" is NOT
+		// evidence of a problem and must never stop a model that is running fine. The trustworthy signal is the
+		// kernel's OWN verdict combined with actual paging:
+		//  - macOS / Linux (a pressure signal exists): CRITICAL memory pressure AND swap actively growing together =
+		//    a real paging spiral (what freezes the machine). Neither alone qualifies - critical pressure is normal
+		//    for a deliberately-tight big model, and swap growth alone is normal opportunistic paging.
+		//  - Signal-less platforms (Windows): fall back to low-available + swap growth, or low-available alone when
+		//    there's no swap figure either (last resort - it's all we have).
+		//  - nearlyOut (below the hard near-OOM floor) and SERIOUS thermal are independent last-resort kills.
 		const thermalEmergency = mem.thermalPressure === 'critical';
-		const softCritical = mem.pressure === 'critical'
-			|| (lowAvailable && swapGrowing)
-			|| (lowAvailable && noSignals)
+		const pagingSpiral = hasPressureSignal
+			? (mem.pressure === 'critical' && swapGrowing)
+			: (lowAvailable && (swapGrowing || noSignals));
+		const killCritical = pagingSpiral
+			|| nearlyOut
 			|| mem.thermalPressure === 'serious';
-		if (!thermalEmergency && !softCritical) {
+		if (!thermalEmergency && !killCritical) {
+			// Not in kill territory. Reset strikes; if the kernel reports CRITICAL pressure while we're low, give a
+			// ONE-TIME, non-escalating heads-up (the model keeps running). Clear the latch on recovery above the floor.
 			this._watchdogStrikes = 0;
+			if (lowAvailable && mem.pressure === 'critical') {
+				this._maybeWarnMemoryLow();
+			} else if (mem.availableBytes >= warnFloor) {
+				this._watchdogWarnedThisEpisode = false; // recovered - allow a fresh warning next episode
+			}
 			return;
 		}
 		this._watchdogStrikes++;
 		const GB = 1024 * 1024 * 1024;
-		this._log(`[LoCoPilot Runner] Memory watchdog: critical sample ${this._watchdogStrikes} (thermalEmergency=${thermalEmergency}, available ~${(mem.availableBytes / GB).toFixed(1)}GB, floor ~${(floor / GB).toFixed(1)}GB, pressure=${mem.pressure}, thermal=${mem.thermalPressure}, swap used ~${mem.swapUsedBytes >= 0 ? (mem.swapUsedBytes / GB).toFixed(1) + 'GB' : 'n/a'}).`);
+		this._log(`[LoCoPilot Runner] Memory watchdog: kill-critical sample ${this._watchdogStrikes} (thermalEmergency=${thermalEmergency}, available ~${(mem.availableBytes / GB).toFixed(1)}GB, warnFloor ~${(warnFloor / GB).toFixed(1)}GB, hardFloor ~${(hardFloor / GB).toFixed(1)}GB, nearlyOut=${nearlyOut}, swapGrowing=${swapGrowing}, pagingSpiral=${pagingSpiral}, pressure=${mem.pressure}, thermal=${mem.thermalPressure}, swap used ~${mem.swapUsedBytes >= 0 ? (mem.swapUsedBytes / GB).toFixed(1) + 'GB' : 'n/a'}).`);
 		// Only a thermal emergency trips on the first strike; every memory signal needs two consecutive samples.
 		if (!thermalEmergency && this._watchdogStrikes < 2) {
 			// GRACEFUL FIRST STRIKE: don't kill the user's model yet, but relieve pressure and stop making it
 			// worse. (1) Suppress automatic pre-warm launches right away so nothing new loads while we're tight.
 			// (2) If more than one of OUR servers is resident, evict the least-recently-used extras now, keeping
 			// the most-recently-used (the one the user is likely mid-conversation with). Often this alone clears
-			// the pressure so the second strike never lands and the active model survives.
+			// the pressure so the second strike never lands and the active model survives. (3) Single server: warn.
 			this._watchdogCooldownUntil = Date.now() + LoCoPilotLocalModelRunner.WATCHDOG_COOLDOWN_MS;
 			this._watchdogRelieveByEvictingExtras();
+			this._maybeWarnMemoryLow();
 			return;
 		}
 
@@ -3582,11 +3682,36 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 			: `**${name}** wasn't started: it needs about ${needGb} GB but only about ${haveGb} GB is free right now. Close other apps to free memory, pick a smaller model, or switch the picker to Auto - then send again.`;
 	}
 
+	/**
+	 * Honest, platform-specific description of what "Run anyway" risks, because the failure mode of overcommitting
+	 * memory differs by OS and a generic "may slow down" undersells it on the platform (macOS unified memory) where
+	 * it is worst. `hard` (model larger than the machine can hold) leads with a stronger warning than the transient
+	 * "not enough free right now" case. All variants end on the reassurance that the watchdog is the safety net.
+	 */
+	private _runAnywayConsequenceDetail(hard: boolean): string {
+		const lead = hard
+			? 'This model is larger than this computer can safely hold.'
+			: 'There isn\'t enough free memory for it right now.';
+		let mechanism: string;
+		if (isMacintosh) {
+			// Apple Silicon shares one memory pool between CPU and GPU, so overcommit can't be isolated to one app:
+			// the OS falls back to compressing/swapping pages and the WHOLE system beach-balls, not just LoCoPilot.
+			mechanism = 'On this Mac memory is shared with the GPU, so exceeding it forces heavy swapping and your entire system - not just LoCoPilot - can become slow or unresponsive until the model is stopped.';
+		} else if (isWindows) {
+			// Windows doesn't overcommit: an allocation past the commit limit fails outright, so the server tends to
+			// crash rather than degrade. Disk-backed paging also thrashes the machine before that point.
+			mechanism = 'On Windows, if memory runs out the model can fail to allocate and crash, and heavy paging to disk may make the system slow until it does.';
+		} else {
+			// Linux overcommits then invokes the OOM killer, which may reap a DIFFERENT process (browser, editor) -
+			// not necessarily the model - to reclaim memory.
+			mechanism = 'On Linux, if memory runs out the kernel may terminate this or another running application to reclaim it, and the system can slow badly from swapping first.';
+		}
+		return `${lead} ${mechanism} LoCoPilot will stop the model automatically if it detects the system is running out of memory.`;
+	}
+
 	private async _promptRunAnyway(modelId: string, name: string, needGb: number, haveGb: number, hard: boolean): Promise<boolean> {
 		const message = `"${name}" needs about ${needGb} GB of memory, but only about ${haveGb} GB is available.`;
-		const detail = hard
-			? 'This model is larger than this computer can safely hold. Running it anyway may make your system freeze, slow down badly, or overheat until you stop the model. LoCoPilot will stop it automatically if memory runs out.'
-			: 'Running it now may slow your system down until memory frees up. LoCoPilot will stop it automatically if memory runs out.';
+		const detail = this._runAnywayConsequenceDetail(hard);
 		const { result } = await this.dialogService.prompt<'run' | 'keep'>({
 			type: Severity.Warning,
 			message,

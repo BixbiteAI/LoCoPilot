@@ -22,7 +22,7 @@ import {
 	METAL_LARGE_RAM_THRESHOLD_BYTES,
 	USABLE_SYSTEM_MEMORY_FRACTION,
 	KV_AUTO_QUANT_CONTEXT_THRESHOLD,
-	KV_BUDGET_FRACTION,
+	KV_CLAMP_BUDGET_FRACTION,
 	RUNTIME_OVERHEAD_BYTES,
 	VULKAN_MIN_DEDICATED_VRAM_BYTES,
 	MIN_CLAMPED_CONTEXT,
@@ -64,10 +64,11 @@ suite('LoCoPilot llama.cpp server', () => {
 	});
 
 	suite('kvCacheBytesPerElem', () => {
-		test('f16 is 2 bytes; q8_0/q4_0 round up to 1', () => {
+		test('f16 is 2 bytes; q8_0 ~1; q4_0 ~0.56 (so the clamp grants q4_0 its larger window)', () => {
 			assert.strictEqual(kvCacheBytesPerElem('f16'), 2);
 			assert.strictEqual(kvCacheBytesPerElem('q8_0'), 1);
-			assert.strictEqual(kvCacheBytesPerElem('q4_0'), 1);
+			assert.strictEqual(kvCacheBytesPerElem('q4_0'), 0.5625);
+			assert.ok(kvCacheBytesPerElem('q4_0') < kvCacheBytesPerElem('q8_0'));
 		});
 	});
 
@@ -240,17 +241,17 @@ suite('LoCoPilot llama.cpp server', () => {
 		const GB = 1024 * 1024 * 1024;
 
 		test('small weights -> full fraction allowance', () => {
-			// ~10.6GB budget (16GB Mac wired), 4GB weights: remaining > 25% fraction (2.6GB) -> fraction wins.
+			// ~10.6GB budget (16GB Mac wired), 2GB weights: remaining (~7.1GB) > 50% clamp fraction (~5.3GB) -> fraction wins.
 			const budget = Math.floor(16 * GB * METAL_WIRED_MEMORY_FRACTION_SMALL);
-			assert.strictEqual(computeKvBudgetBytes(budget, 4 * GB), Math.floor(budget * KV_BUDGET_FRACTION));
+			assert.strictEqual(computeKvBudgetBytes(budget, 2 * GB), Math.floor(budget * KV_CLAMP_BUDGET_FRACTION));
 		});
 
 		test('weights near the budget -> only the true remainder, not the fraction', () => {
-			// ~10.6GB budget, 8.5GB weights: remaining = 10.6 - 8.5 - 1.5 = ~0.6GB < 2.6GB fraction.
+			// ~10.6GB budget, 8.5GB weights: remaining = 10.6 - 8.5 - 1.5 = ~0.6GB < ~5.3GB clamp fraction.
 			const budget = Math.floor(16 * GB * METAL_WIRED_MEMORY_FRACTION_SMALL);
 			const expected = budget - 8.5 * GB - RUNTIME_OVERHEAD_BYTES;
 			assert.strictEqual(computeKvBudgetBytes(budget, 8.5 * GB), expected);
-			assert.ok(expected < budget * KV_BUDGET_FRACTION);
+			assert.ok(expected < budget * KV_CLAMP_BUDGET_FRACTION);
 		});
 
 		test('weights beyond the budget -> 0 (caller floors context at the minimum)', () => {

@@ -190,14 +190,26 @@ export const DEFAULT_LLAMA_CONTEXT_SIZE = 16384;
 export const KV_AUTO_QUANT_CONTEXT_THRESHOLD = DEFAULT_LLAMA_CONTEXT_SIZE;
 
 /**
+ * When 'auto' KV precision is in effect and even a q8_0 cache can only fit a context BELOW this floor (a big
+ * model on a memory-tight machine), the runner drops to 4-bit q4_0 KV to roughly double the window. Above the
+ * floor, q8_0's comfortable window is kept for its near-lossless quality. 32K is the point where a cramped
+ * window starts to hurt long / agentic tasks, which is exactly when the extra context is worth q4_0's cost.
+ */
+export const ADAPTIVE_Q4_KV_CONTEXT_FLOOR = 32768;
+
+/**
  * Bytes-per-element the KV cache uses at a given precision, for sizing the context clamp so it matches what
- * the runtime will actually allocate. f16 = 2 bytes; q8_0/q4_0 are block-quantized (~1.06 / ~0.56 bytes with
- * their scale overhead) but we round up to 1 to stay on the safe side of the memory budget.
+ * the runtime will actually allocate. f16 = 2 bytes; q8_0 ~1.06 (rounded to 1); q4_0 ~0.5625 (4.5 bits with
+ * its block scale). Using the real q4_0 size is what lets the clamp grant the extra window q4_0 buys.
  */
 export function kvCacheBytesPerElem(kvCacheType: Exclude<KvCacheType, 'auto'>): number {
 	switch (kvCacheType) {
-		case 'q8_0':
 		case 'q4_0':
+			// 4-bit quants stored in blocks of 32 with a 16-bit scale: (32*4 + 16) / 32 = 4.5 bits = 0.5625 bytes/
+			// elem. Sizing it as 1 (the old value, shared with q8_0) made the clamp think q4_0 was no smaller than
+			// q8_0, so it granted NO extra context - defeating the point of using q4_0 for a longer window.
+			return 0.5625;
+		case 'q8_0':
 			return 1;
 		case 'f16':
 		default:
@@ -242,11 +254,26 @@ export const SYSTEM_MEMORY_RESERVE_MIN_BYTES = 2 * 1024 * 1024 * 1024;  // never
 export const SYSTEM_MEMORY_RESERVE_MAX_BYTES = 6 * 1024 * 1024 * 1024;  // never reserve more than 6 GB
 
 /**
- * Fraction of the memory budget reserved for the KV cache (the rest is for weights). Used both to size the
- * KV-cache context clamp AND to shrink the weight-offload budget, so a model close to the device limit
- * offloads experts/layers instead of wiring the full weights PLUS a large KV past the limit.
+ * Fraction of the memory budget reserved for the KV cache when deciding WEIGHT OFFLOAD: the weight-offload
+ * budget is `budget * (1 - KV_BUDGET_FRACTION)`, so a model close to the device limit offloads experts/layers
+ * to CPU instead of wiring the full weights PLUS a large KV past the limit. This is deliberately conservative
+ * (reserve 25% for KV) because misjudging it OOMs the device at decode. It is NOT the context-clamp cap - see
+ * {@link KV_CLAMP_BUDGET_FRACTION}, which is decoupled so a small model can use its spare room for context
+ * without also making a big model offload more weights than necessary.
  */
 export const KV_BUDGET_FRACTION = 0.25;
+
+/**
+ * Upper bound on the KV cache as a fraction of the memory budget, used ONLY by the context clamp
+ * ({@link computeKvBudgetBytes}). Higher than {@link KV_BUDGET_FRACTION} on purpose: the clamp's real safety
+ * bound is the weight-aware `remaining` term (budget - resident weights - runtime overhead), which already
+ * guarantees weights + KV + overhead stay inside the wired/system ceiling on every backend. This fraction is
+ * only a secondary guard against compute-buffer growth at very large contexts, so a low value needlessly
+ * throttles a SMALL model that has plenty of spare budget (e.g. clamping a 4B's 128K request to ~28K on a
+ * 16 GB Mac when ~2x that fits). 0.5 roughly doubles the context a small/medium model gets while leaving a
+ * margin; large models are unaffected because `remaining` binds first once weights fill most of the budget.
+ */
+export const KV_CLAMP_BUDGET_FRACTION = 0.5;
 
 /**
  * Usable unified-memory budget (bytes) for GPU offload on Apple Silicon (Metal): the wired working-set
@@ -300,10 +327,11 @@ export const RUNTIME_OVERHEAD_BYTES = Math.round(1.5 * 1024 * 1024 * 1024);
 
 /**
  * KV-cache byte allowance for the context clamp, sized so that weights + KV + runtime overhead stay inside
- * the memory budget: at most {@link KV_BUDGET_FRACTION} of the budget, and never more than what actually
- * remains after the weights that will reside in the same pool. Without the second bound, a model whose
- * weights already fill most of the budget still got a full 25% KV allowance on top - which is exactly how
- * a launch that passed the pre-flight gate could still bust the Metal wired ceiling at decode.
+ * the memory budget: at most {@link KV_CLAMP_BUDGET_FRACTION} of the budget, and never more than what actually
+ * remains after the weights that will reside in the same pool. The `remaining` bound is the real safety limit
+ * (weights + KV + overhead can never exceed the budget); the fraction is only a secondary guard. Without the
+ * `remaining` bound, a model whose weights already fill most of the budget would get a full KV allowance on
+ * top - which is exactly how a launch that passed the pre-flight gate could still bust the wired ceiling.
  *
  * `residentWeightBytes` is the weight bytes living in the budget's pool: full weights on Metal/CPU (one
  * unified/system pool), or `min(weights, offload budget)` on a discrete GPU where partial offload caps
@@ -315,7 +343,7 @@ export function computeKvBudgetBytes(budgetBytes: number, residentWeightBytes: n
 		return 0;
 	}
 	const remaining = budgetBytes - Math.max(0, residentWeightBytes) - Math.max(0, overheadBytes);
-	return Math.max(0, Math.min(Math.floor(budgetBytes * KV_BUDGET_FRACTION), remaining));
+	return Math.max(0, Math.min(Math.floor(budgetBytes * KV_CLAMP_BUDGET_FRACTION), remaining));
 }
 
 /**

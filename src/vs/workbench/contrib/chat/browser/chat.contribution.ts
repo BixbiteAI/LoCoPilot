@@ -659,12 +659,12 @@ configurationRegistry.registerConfiguration({
 			type: 'string',
 			enum: ['auto', 'f16', 'q8_0', 'q4_0'],
 			enumDescriptions: [
-				nls.localize('locopilot.llamaCpp.kv.auto', "Automatic (default): full-precision f16 for small context windows, 8-bit q8_0 once the context reaches 32K (where the KV cache dominates memory and q8_0's quality loss is negligible)."),
+				nls.localize('locopilot.llamaCpp.kv.auto', "Automatic (default): full-precision f16 for small context windows, 8-bit q8_0 at larger context (near-lossless). If a big model on a memory-tight machine still can't reach a ~32K window at q8_0, it drops to 4-bit q4_0 to roughly double the context for a modest quality cost."),
 				nls.localize('locopilot.llamaCpp.kv.f16', "Full-precision KV cache (always safe)."),
 				nls.localize('locopilot.llamaCpp.kv.q8_0', "8-bit KV cache: ~half the memory, slightly faster. Requires Flash Attention (auto-enabled)."),
 				nls.localize('locopilot.llamaCpp.kv.q4_0', "4-bit KV cache: smallest memory, fastest. May slightly reduce quality. Requires Flash Attention (auto-enabled)."),
 			],
-			markdownDescription: nls.localize('locopilot.llamaCpp.kvCacheType.description', "KV cache quantization (`--cache-type-k/v`) for the local llama.cpp server. Quantizing shrinks the cache so more context fits on the GPU. `auto` keeps full precision for small windows and switches to `q8_0` at large context (32K+). When quantized, Flash Attention is auto-enabled (required), so this never fails to start."),
+			markdownDescription: nls.localize('locopilot.llamaCpp.kvCacheType.description', "KV cache quantization (`--cache-type-k/v`) for the local llama.cpp server. Quantizing shrinks the cache so more context fits on the GPU. `auto` keeps full precision for small windows, switches to `q8_0` at large context, and drops to `q4_0` only when a big model would otherwise be stuck below ~32K (roughly doubling the window). When quantized, Flash Attention is auto-enabled (required), so this never fails to start."),
 			default: 'auto',
 		},
 		[ChatConfiguration.LocopilotLlamaCppMtp]: {
