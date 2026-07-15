@@ -3999,16 +3999,25 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 				// both to 1 to remove that multiplier with no real throughput loss.
 				mlxTuning.decodeConcurrency = 1;
 				mlxTuning.promptConcurrency = 1;
-				// Tight fit (little wired budget left after the weights): shrink the prefill chunk and hold fewer
-				// distinct KV caches so BOTH the transient peak and the resident cache stay small. Roomy fits keep
-				// the server defaults (fields left unset) for full prefill speed.
+				// KV-cache quantization, the MLX equivalent of llama.cpp's q8_0/q4_0 KV: 8-bit by default
+				// (near-lossless, ~half the KV memory), dropping to 4-bit on a tight fit to free the most headroom -
+				// mirrors the llama adaptive-q4 policy. Injected via the bootstrap's stream_generate wrapper, which
+				// no-ops on any mlx-lm that can't accept it. quantized_kv_start keeps the first 512 tokens full
+				// precision so the system prompt / early context stay lossless.
 				const leftoverAfterWeights = wiredBudget - weightBytes - RUNTIME_OVERHEAD_BYTES;
-				if (weightBytes > 0 && leftoverAfterWeights < MLX_TIGHT_FIT_HEADROOM_BYTES) {
+				const tightFit = weightBytes > 0 && leftoverAfterWeights < MLX_TIGHT_FIT_HEADROOM_BYTES;
+				mlxTuning.kvBits = tightFit ? 4 : 8;
+				mlxTuning.quantizedKvStart = 512;
+				mlxTuning.kvGroupSize = 64;
+				// Tight fit (little wired budget left after the weights): also shrink the prefill chunk and hold
+				// fewer distinct KV caches so BOTH the transient peak and the resident cache stay small. Roomy fits
+				// keep the server defaults (fields left unset) for full prefill speed.
+				if (tightFit) {
 					mlxTuning.prefillStepSize = 512;
 					mlxTuning.promptCacheCount = 2;
-					this._log(`[LoCoPilot Runner] MLX tight fit (~${(leftoverAfterWeights / 1e9).toFixed(1)}GB left after weights): prefill-step 512, prompt-cache-size 2.`);
+					this._log(`[LoCoPilot Runner] MLX tight fit (~${(leftoverAfterWeights / 1e9).toFixed(1)}GB left after weights): prefill-step 512, prompt-cache-size 2, KV 4-bit.`);
 				}
-				this._log(`[LoCoPilot Runner] MLX limits: set_memory_limit ~${Math.round(wiredBudget / 1e9)}GB, set_cache_limit ~${Math.round(mlxTuning.cacheLimitBytes / 1e9)}GB, prompt-cache ~${(mlxTuning.promptCacheBytes / 1e9).toFixed(1)}GB (weight-aware), decode/prompt concurrency 1.`);
+				this._log(`[LoCoPilot Runner] MLX limits: set_memory_limit ~${Math.round(wiredBudget / 1e9)}GB, set_cache_limit ~${Math.round(mlxTuning.cacheLimitBytes / 1e9)}GB, prompt-cache ~${(mlxTuning.promptCacheBytes / 1e9).toFixed(1)}GB (weight-aware), KV ${mlxTuning.kvBits}-bit, decode/prompt concurrency 1.`);
 			}
 			const draft = await this._resolvePairedDraft(model, 'mlx');
 			if (draft && await this._extrasFitBudget(modelDir, 'metal', undefined, draft.bytes)) {

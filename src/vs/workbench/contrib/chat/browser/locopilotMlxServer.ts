@@ -109,20 +109,52 @@ export interface MlxServerTuning {
 	prefillStepSize?: number;
 	/** Max distinct KV caches held across requests (`--prompt-cache-size`, server default 10). Fewer = less resident KV for a memory-tight big model. */
 	promptCacheCount?: number;
+	/**
+	 * KV-cache quantization bits (8 ~= llama's q8_0, 4 ~= q4_0), the MLX equivalent of `--cache-type-k/v`.
+	 * mlx_lm.server (through 0.31.3, the latest) has NO CLI flag for this even though the library's
+	 * `generate_step` supports it, so it is injected by monkeypatching `stream_generate` in
+	 * {@link MLX_MEMORY_LIMIT_BOOTSTRAP} - which self-checks the running mlx-lm's signatures and no-ops on any
+	 * version that can't accept the params (the user may run their own venv, not the bundled 0.31.3). 0 = off.
+	 */
+	kvBits?: number;
+	/** Token offset after which the KV cache is quantized (`quantized_kv_start`); earlier tokens stay full precision for quality. Only meaningful with {@link kvBits}. */
+	quantizedKvStart?: number;
+	/** Group size for KV quantization (`kv_group_size`, default 64). Only meaningful with {@link kvBits}. */
+	kvGroupSize?: number;
 }
 
 /**
- * One-line Python bootstrap that applies MLX memory limits, then hands over to `mlx_lm` exactly as
- * `python -m mlx_lm <args>` would. Invoked as: `python -c BOOTSTRAP <memLimit> <cacheLimit> server ...`.
- * `getattr` fallbacks make renamed/missing APIs a silent no-op (the server still starts) instead of a
- * crash, and the source uses single quotes ONLY so the runner's shell quoting (double quotes around an
- * arg with spaces) never needs escaping.
+ * One-line Python bootstrap that applies MLX memory limits AND (optionally) KV-cache quantization, then hands
+ * over to `mlx_lm` exactly as `python -m mlx_lm <args>` would. Invoked as:
+ *   `python -c BOOTSTRAP <memLimit> <cacheLimit> <kvBits> <quantizedKvStart> <kvGroupSize> server ...`
+ *
+ * The memory limits use `getattr` fallbacks so renamed/missing `mx` APIs are a silent no-op. The KV-quant
+ * injection is the workaround for `mlx_lm.server` having no `--kv-bits` flag (through 0.31.3, the latest):
+ * `generate_step` DOES accept `kv_bits`, and `stream_generate` forwards `**kwargs` to it, so we wrap the
+ * `stream_generate` name in the server module to inject the KV-quant kwargs. It is DEFENSIVE - it inspects
+ * the running mlx-lm's signatures and only patches when `generate_step` actually accepts `kv_bits` AND
+ * `stream_generate` takes `**kwargs`; on any other version (e.g. a user's own venv) it leaves the server
+ * untouched. Everything is simple statements + expressions (no `def`/`try` blocks) so it stays ONE line -
+ * the runner wraps it in double quotes for the terminal, and the source uses single quotes ONLY so that
+ * quoting never needs escaping.
  */
 export const MLX_MEMORY_LIMIT_BOOTSTRAP =
-	'import mlx.core as mx, runpy, sys; ' +
+	'import mlx.core as mx, runpy, sys, inspect, importlib; ' +
 	'getattr(mx, \'set_memory_limit\', lambda *_: None)(int(sys.argv[1])); ' +
 	'getattr(mx, \'set_cache_limit\', lambda *_: None)(int(sys.argv[2])); ' +
-	'sys.argv = [\'mlx_lm\'] + sys.argv[3:]; ' +
+	'_kvb = int(sys.argv[3]); _kvs = int(sys.argv[4]); _kvg = int(sys.argv[5]); ' +
+	'import mlx_lm.server as _S; ' +
+	// importlib.import_module gets the real submodule; `import mlx_lm.generate as _G` would bind _G to mlx_lm's
+	// TOP-LEVEL `generate` FUNCTION (the package __init__ re-exports it, shadowing the submodule attribute).
+	'_G = importlib.import_module(\'mlx_lm.generate\'); ' +
+	'_gs = getattr(_G, \'generate_step\', None); ' +
+	'_gp = set(inspect.signature(_gs).parameters) if callable(_gs) else set(); ' +
+	'_ss = getattr(_S, \'stream_generate\', None); ' +
+	'_sp = inspect.signature(_ss).parameters if callable(_ss) else {}; ' +
+	'_ok = (_kvb > 0) and (\'kv_bits\' in _gp) and callable(_ss) and any(getattr(p, \'kind\', None) == inspect.Parameter.VAR_KEYWORD for p in _sp.values()); ' +
+	'_inj = {k: v for k, v in [(\'kv_bits\', _kvb), (\'quantized_kv_start\', _kvs), (\'kv_group_size\', _kvg)] if k in _gp}; ' +
+	'_S.stream_generate = (lambda *a, **k: _ss(*a, **dict(_inj, **k))) if _ok else _ss; ' +
+	'sys.argv = [\'mlx_lm\'] + sys.argv[6:]; ' +
 	'runpy.run_module(\'mlx_lm\', run_name=\'__main__\')';
 
 /**
@@ -168,16 +200,20 @@ export function getMlxLmServerCommand(modelDir: string, port: number, pythonCmd:
 		serverArgs.push('--prefill-step-size', String(Math.floor(tuning.prefillStepSize)));
 	}
 
-	// With a memory/cache limit, launch through the bootstrap (mlx_lm.server has no CLI flag for these);
-	// otherwise keep the plain `-m mlx_lm server` form, safe for any mlx-lm/mlx version.
-	if ((tuning.memoryLimitBytes && tuning.memoryLimitBytes > 0) || (tuning.cacheLimitBytes && tuning.cacheLimitBytes > 0)) {
+	// With a memory/cache limit OR KV quantization, launch through the bootstrap (mlx_lm.server has no CLI
+	// flag for any of these); otherwise keep the plain `-m mlx_lm server` form, safe for any mlx-lm/mlx version.
+	const kvBits = tuning.kvBits && tuning.kvBits > 0 ? Math.floor(tuning.kvBits) : 0;
+	if ((tuning.memoryLimitBytes && tuning.memoryLimitBytes > 0) || (tuning.cacheLimitBytes && tuning.cacheLimitBytes > 0) || kvBits > 0) {
 		const memLimit = tuning.memoryLimitBytes && tuning.memoryLimitBytes > 0 ? Math.floor(tuning.memoryLimitBytes) : 0;
 		const cacheLimit = tuning.cacheLimitBytes && tuning.cacheLimitBytes > 0 ? Math.floor(tuning.cacheLimitBytes) : 0;
 		// 0 = leave that limit at the MLX default (the bootstrap's set-call with 0 would break allocation,
 		// so substitute the other limit's "no-op" by passing the default-preserving sentinel via max()).
 		const memArg = memLimit > 0 ? memLimit : Number.MAX_SAFE_INTEGER;
 		const cacheArg = cacheLimit > 0 ? cacheLimit : Number.MAX_SAFE_INTEGER;
-		return { command: cmd, args: ['-c', MLX_MEMORY_LIMIT_BOOTSTRAP, String(memArg), String(cacheArg), 'server', ...serverArgs] };
+		// KV-quant positional args (argv[3..5]); 0 bits = off (the bootstrap leaves stream_generate untouched).
+		const kvStart = tuning.quantizedKvStart && tuning.quantizedKvStart > 0 ? Math.floor(tuning.quantizedKvStart) : 0;
+		const kvGroup = tuning.kvGroupSize && tuning.kvGroupSize > 0 ? Math.floor(tuning.kvGroupSize) : 64;
+		return { command: cmd, args: ['-c', MLX_MEMORY_LIMIT_BOOTSTRAP, String(memArg), String(cacheArg), String(kvBits), String(kvStart), String(kvGroup), 'server', ...serverArgs] };
 	}
 	return { command: cmd, args: ['-m', 'mlx_lm', 'server', ...serverArgs] };
 }
