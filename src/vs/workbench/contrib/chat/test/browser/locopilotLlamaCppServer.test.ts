@@ -423,7 +423,7 @@ suite('LoCoPilot llama.cpp server', () => {
 			assert.strictEqual(args.indexOf('--num-draft-tokens'), -1);
 		});
 
-		test('memory/cache limits switch to the -c bootstrap with mem/cache/kv positional argv entries', () => {
+		test('memory/cache limits switch to the -c bootstrap with limits as the first two argv entries', () => {
 			const { args } = getMlxLmServerCommand('/models/qwen', 38462, 'python3', {
 				memoryLimitBytes: 11 * 1024 * 1024 * 1024,
 				cacheLimitBytes: 2 * 1024 * 1024 * 1024,
@@ -433,31 +433,12 @@ suite('LoCoPilot llama.cpp server', () => {
 			assert.strictEqual(args[1], MLX_MEMORY_LIMIT_BOOTSTRAP);
 			assert.strictEqual(args[2], String(11 * 1024 * 1024 * 1024));
 			assert.strictEqual(args[3], String(2 * 1024 * 1024 * 1024));
-			// KV-quant positional args (bits/start/group) come next; unset -> 0/0/64 (off), then the subcommand.
-			assert.strictEqual(args[4], '0');
-			assert.strictEqual(args[5], '0');
-			assert.strictEqual(args[6], '64');
-			assert.strictEqual(args[7], 'server');
+			assert.strictEqual(args[4], 'server');
 			// Server flags still present after the subcommand, and no -m form in this shape.
 			assert.strictEqual(argValue(args, '--prompt-cache-bytes'), '1024');
 			assert.strictEqual(args.indexOf('-m'), -1);
 			// The bootstrap must stay shell-safe under the runner's double-quote wrapping: single quotes only.
 			assert.strictEqual(MLX_MEMORY_LIMIT_BOOTSTRAP.indexOf('"'), -1);
-		});
-
-		test('kvBits alone triggers the bootstrap and passes the KV positional args', () => {
-			const { args } = getMlxLmServerCommand('/models/qwen', 38462, 'python3', {
-				kvBits: 4,
-				quantizedKvStart: 512,
-				kvGroupSize: 64,
-			});
-			assert.strictEqual(args[0], '-c');
-			assert.strictEqual(args[1], MLX_MEMORY_LIMIT_BOOTSTRAP);
-			// mem/cache default to the no-op sentinel; then bits=4, start=512, group=64, then the subcommand.
-			assert.strictEqual(args[4], '4');
-			assert.strictEqual(args[5], '512');
-			assert.strictEqual(args[6], '64');
-			assert.strictEqual(args[7], 'server');
 		});
 
 		test('no memory/cache limits -> classic -m mlx_lm server form', () => {
