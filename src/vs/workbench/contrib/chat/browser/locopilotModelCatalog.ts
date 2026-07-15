@@ -217,6 +217,12 @@ export const LOCOPILOT_DEFAULT_CATALOG: readonly ICatalogModel[] = [
 	// multimodal (image-text-to-text) checkpoint that mlx-lm cannot load. Use the GGUF build above.
 
 	// ---- Qwen 3.5 MTP (Alibaba) - GGUF builds with Multi-Token Prediction heads (llama.cpp --spec-type mtp) ----
+	// NOTE on minRamGB/tier for MTP entries: these are sized for the BASE model (single weight copy), NOT the
+	// doubled footprint MTP briefly needs. The current llama.cpp MTP path loads a second full weight copy for the
+	// draft context, but the runner auto-drops MTP -> zero-memory n-gram drafting when that copy won't fit (see the
+	// MTP fit gate in locopilotLocalModelRunner), so the model always RUNS at its base-model tier - it just skips the
+	// MTP speedup on machines too small for the draft. So do NOT raise these to cover the doubling: that would falsely
+	// mark a perfectly-runnable model 'too-big' and hide it from Auto. The runtime gate, not minRamGB, guards the OOM.
 	{
 		catalogId: 'qwen35-0_8b-mtp-gguf',
 		displayName: 'Qwen3.5 0.8B (MTP)',

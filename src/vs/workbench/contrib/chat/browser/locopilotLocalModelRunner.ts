@@ -3282,7 +3282,19 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 		let extraResidentBytes = mmprojBytes;
 		const userDraftPath = baseTuning.draftModelPath?.trim();
 		if (baseTuning.multiTokenPrediction) {
-			extraResidentBytes += weightBytesForBudget;
+			// MTP self-drafts from the same GGUF, but the current llama.cpp build loads a SECOND full copy of the
+			// weights for the draft context (the log shows `[spec] estimated memory usage of draft model is ~16 GiB`).
+			// On GPU backends that copy lands in the constrained Metal/VRAM working set, and on a memory-tight
+			// machine the doubling busts the ceiling at decode (kIOGPUCommandBufferCallbackErrorOutOfMemory). So keep
+			// MTP only when the machine still fits with the doubled weights loaded; otherwise drop it here and let the
+			// zero-memory n-gram drafting below take over - same speedup intent, no second weight copy, no OOM. This
+			// runs BEFORE the paired-draft / n-gram blocks, so clearing the flag lets one of them pick up the slack.
+			if (await this._extrasFitBudget(modelPath, backend, discreteVramBytes, mmprojBytes + weightBytesForBudget)) {
+				extraResidentBytes += weightBytesForBudget;
+			} else {
+				this._log(`[LoCoPilot Runner] MTP disabled for ${modelId}: its embedded draft would load a second ~${Math.round(weightBytesForBudget / 1e6)}MB weight copy that exceeds this machine's memory budget; falling back to n-gram drafting.`);
+				baseTuning.multiTokenPrediction = false;
+			}
 		} else if (userDraftPath) {
 			extraResidentBytes += (await this._fileBytes(userDraftPath)) || weightBytesForBudget;
 		}
