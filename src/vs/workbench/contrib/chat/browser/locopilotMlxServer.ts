@@ -53,6 +53,15 @@ export function getMlxServerBaseUrl(port: number): string {
  * because their flags are newer than the base command: an older bundled mlx-lm rejects unknown args
  * (argparse "unrecognized arguments" -> immediate exit), which the runner detects to relaunch without them.
  */
+/** Floor for the weight-aware MLX prompt (KV) cache, so a big model still keeps a usable cross-request cache. */
+export const MLX_MIN_PROMPT_CACHE_BYTES = 512 * 1024 * 1024; // 0.5 GiB
+/**
+ * Leftover wired budget (after weights + runtime overhead) below which an MLX launch is treated as a TIGHT
+ * fit: the runner then shrinks the prefill chunk and the number of held KV caches to keep the peak Metal
+ * command buffer under the ceiling. Above it, the server defaults are kept for full prefill speed.
+ */
+export const MLX_TIGHT_FIT_HEADROOM_BYTES = 6 * 1024 * 1024 * 1024; // 6 GiB
+
 export interface MlxServerTuning {
 	/**
 	 * Directory of a small same-family MLX model for speculative decoding (`--draft-model`). The draft
@@ -83,6 +92,23 @@ export interface MlxServerTuning {
 	 * prefill sit around holding GBs. A modest slice of RAM keeps the reuse win without hoarding.
 	 */
 	cacheLimitBytes?: number;
+	/**
+	 * Max requests decoded in parallel (`--decode-concurrency`, server default 32). Each parallel slot needs
+	 * its own KV cache + decode scratch, so the default is a large PEAK-memory multiplier - the top cause of
+	 * a Metal command-buffer OOM (kIOGPUCommandBufferCallbackErrorOutOfMemory) on a big model. LoCoPilot is a
+	 * single-user client (one request at a time), so 1 removes the multiplier with no real throughput loss.
+	 */
+	decodeConcurrency?: number;
+	/** Max prompts prefilled in parallel (`--prompt-concurrency`, server default 8). Same peak-memory concern; 1 for a single-user client. */
+	promptConcurrency?: number;
+	/**
+	 * Prefill chunk size (`--prefill-step-size`, server default 2048). A big prompt is processed in chunks of
+	 * this many tokens; the chunk sizes the peak prefill compute buffer (the allocation that OOMs). A smaller
+	 * step trades a little prefill speed for a much smaller peak, which is the right trade on a tight machine.
+	 */
+	prefillStepSize?: number;
+	/** Max distinct KV caches held across requests (`--prompt-cache-size`, server default 10). Fewer = less resident KV for a memory-tight big model. */
+	promptCacheCount?: number;
 }
 
 /**
@@ -126,6 +152,20 @@ export function getMlxLmServerCommand(modelDir: string, port: number, pythonCmd:
 	}
 	if (tuning.promptCacheBytes && tuning.promptCacheBytes > 0) {
 		serverArgs.push('--prompt-cache-bytes', String(Math.floor(tuning.promptCacheBytes)));
+	}
+	if (tuning.promptCacheCount && tuning.promptCacheCount > 0) {
+		serverArgs.push('--prompt-cache-size', String(Math.floor(tuning.promptCacheCount)));
+	}
+	// Peak-memory guards: cap parallel decode/prefill (a single-user client never batches) and shrink the
+	// prefill chunk, so the transient Metal command buffer stays well under the wired ceiling on a big model.
+	if (tuning.decodeConcurrency && tuning.decodeConcurrency > 0) {
+		serverArgs.push('--decode-concurrency', String(Math.floor(tuning.decodeConcurrency)));
+	}
+	if (tuning.promptConcurrency && tuning.promptConcurrency > 0) {
+		serverArgs.push('--prompt-concurrency', String(Math.floor(tuning.promptConcurrency)));
+	}
+	if (tuning.prefillStepSize && tuning.prefillStepSize > 0) {
+		serverArgs.push('--prefill-step-size', String(Math.floor(tuning.prefillStepSize)));
 	}
 
 	// With a memory/cache limit, launch through the bootstrap (mlx_lm.server has no CLI flag for these);

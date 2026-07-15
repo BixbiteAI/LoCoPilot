@@ -447,5 +447,25 @@ suite('LoCoPilot llama.cpp server', () => {
 			assert.strictEqual(args[1], 'mlx_lm');
 			assert.strictEqual(args[2], 'server');
 		});
+
+		test('peak-memory guards (concurrency / prefill / cache count) emitted when tuned', () => {
+			const { args } = getMlxLmServerCommand('/models/qwen', 38462, 'python3', {
+				decodeConcurrency: 1,
+				promptConcurrency: 1,
+				prefillStepSize: 512,
+				promptCacheCount: 2,
+			});
+			assert.strictEqual(argValue(args, '--decode-concurrency'), '1');
+			assert.strictEqual(argValue(args, '--prompt-concurrency'), '1');
+			assert.strictEqual(argValue(args, '--prefill-step-size'), '512');
+			assert.strictEqual(argValue(args, '--prompt-cache-size'), '2');
+		});
+
+		test('peak-memory guards omitted when not tuned (safe for older mlx-lm)', () => {
+			const { args } = getMlxLmServerCommand('/models/qwen', 38462, 'python3', { promptCacheBytes: 1024 });
+			assert.strictEqual(args.indexOf('--decode-concurrency'), -1);
+			assert.strictEqual(args.indexOf('--prefill-step-size'), -1);
+			assert.strictEqual(args.indexOf('--prompt-cache-size'), -1);
+		});
 	});
 });

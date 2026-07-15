@@ -59,6 +59,8 @@ import {
 	hfModelLooksLikeMlx,
 	isAppleSiliconMac,
 	shouldUseMlxServerForHfModel,
+	MLX_MIN_PROMPT_CACHE_BYTES,
+	MLX_TIGHT_FIT_HEADROOM_BYTES,
 	type MlxServerTuning,
 } from './locopilotMlxServer.js';
 import { findDraftPairing } from './locopilotModelCatalog.js';
@@ -3063,6 +3065,12 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 	private _endStarting(modelId: string, failureMessage?: string): void {
 		this.startingServers.delete(modelId);
 		if (failureMessage) {
+			// A launch that ended in a REAL failure (crash, OOM after the retry ladder, spawn/path error) must
+			// surface that concrete reason in chat too - not only in the notification toast. Record it so the
+			// provider's getRecentLaunchFailure returns it instead of the misleading "taking a moment to start"
+			// (which tells the user to wait and resend a model that has actually stopped). It carries the same
+			// 60s TTL as a fit-gate block and is cleared by the next launch attempt or a successful ready.
+			this._recordLaunchBlocked(modelId, failureMessage);
 			this._onDidServerStartFailed.fire({ modelId, message: failureMessage });
 		}
 		this._onDidServerStateChange.fire(modelId);
@@ -3967,16 +3975,40 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 		if (mlxAutoTune) {
 			const mem = await this._getSystemMemory();
 			if (mem?.totalmem && mem.totalmem > 0) {
-				mlxTuning.promptCacheBytes = Math.floor(mem.totalmem * 0.15);
 				// Cap MLX's total Metal allocation at the same wired budget the llama.cpp path uses. MLX's own
 				// default is ~95% of unified RAM - far past the wired ceiling - and mlx_lm.server only pins the
 				// wired limit, so nothing upstream stops a long prompt's KV growth from paging the machine.
 				// Applied via the -c bootstrap in getMlxLmServerCommand (no CLI flag exists); soft cap - MLX
 				// throttles allocation instead of hard-failing. Also cap the freed-buffer reuse cache, which
 				// otherwise defaults to the memory limit and can hoard GBs after a big prefill.
-				mlxTuning.memoryLimitBytes = metalOffloadBudgetBytes(mem.totalmem, (await this._getHardwareInfo())?.metalWiredLimitBytes);
+				const wiredBudget = metalOffloadBudgetBytes(mem.totalmem, (await this._getHardwareInfo())?.metalWiredLimitBytes);
+				mlxTuning.memoryLimitBytes = wiredBudget;
 				mlxTuning.cacheLimitBytes = Math.floor(mem.totalmem * 0.10);
-				this._log(`[LoCoPilot Runner] MLX memory limits: mx.set_memory_limit ~${Math.round(mlxTuning.memoryLimitBytes / 1e9)}GB (wired budget), mx.set_cache_limit ~${Math.round(mlxTuning.cacheLimitBytes / 1e9)}GB.`);
+				// Weight-aware prompt (KV) cache, mirroring llama.cpp's computeKvBudgetBytes: cap it so weights +
+				// cache + runtime overhead stay inside the wired budget, instead of a flat 15% of RAM that ignores
+				// the weights. A big model (e.g. 27B-4bit on 32GB) leaves little room, so this trims the cache that
+				// was previously booked ON TOP of the weights and helped bust the Metal ceiling at decode.
+				const weightBytes = await this._weightBytesOnDisk(modelDir);
+				const flatCache = Math.floor(mem.totalmem * 0.15);
+				const weightAwareCache = weightBytes > 0 && wiredBudget > 0 ? computeKvBudgetBytes(wiredBudget, weightBytes) : 0;
+				mlxTuning.promptCacheBytes = weightAwareCache > 0
+					? Math.max(MLX_MIN_PROMPT_CACHE_BYTES, Math.min(flatCache, weightAwareCache))
+					: flatCache;
+				// Single-user client: requests arrive one at a time, so the server's parallel batching (decode 32 /
+				// prompt 8) only multiplies the peak KV + scratch - the top cause of the command-buffer OOM. Pin
+				// both to 1 to remove that multiplier with no real throughput loss.
+				mlxTuning.decodeConcurrency = 1;
+				mlxTuning.promptConcurrency = 1;
+				// Tight fit (little wired budget left after the weights): shrink the prefill chunk and hold fewer
+				// distinct KV caches so BOTH the transient peak and the resident cache stay small. Roomy fits keep
+				// the server defaults (fields left unset) for full prefill speed.
+				const leftoverAfterWeights = wiredBudget - weightBytes - RUNTIME_OVERHEAD_BYTES;
+				if (weightBytes > 0 && leftoverAfterWeights < MLX_TIGHT_FIT_HEADROOM_BYTES) {
+					mlxTuning.prefillStepSize = 512;
+					mlxTuning.promptCacheCount = 2;
+					this._log(`[LoCoPilot Runner] MLX tight fit (~${(leftoverAfterWeights / 1e9).toFixed(1)}GB left after weights): prefill-step 512, prompt-cache-size 2.`);
+				}
+				this._log(`[LoCoPilot Runner] MLX limits: set_memory_limit ~${Math.round(wiredBudget / 1e9)}GB, set_cache_limit ~${Math.round(mlxTuning.cacheLimitBytes / 1e9)}GB, prompt-cache ~${(mlxTuning.promptCacheBytes / 1e9).toFixed(1)}GB (weight-aware), decode/prompt concurrency 1.`);
 			}
 			const draft = await this._resolvePairedDraft(model, 'mlx');
 			if (draft && await this._extrasFitBudget(modelDir, 'metal', undefined, draft.bytes)) {
