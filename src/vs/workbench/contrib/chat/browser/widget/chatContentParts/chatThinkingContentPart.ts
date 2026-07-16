@@ -125,6 +125,22 @@ function classifyThinkingActivity(raw: string): ThinkingActivity | undefined {
 }
 
 /**
+ * Turn a raw tool id into a readable action label for the reasoning header when a tool doesn't
+ * provide its own invocation message. `manage_todo_list` -> "Manage todo list", `web_search` ->
+ * "Web search". Much friendlier than the bare "Invoked `manage_todo_list`" fallback.
+ */
+function humanizeToolId(toolId: string): string {
+	const words = toolId
+		.replace(/([a-z0-9])([A-Z])/g, '$1 $2') // split camelCase
+		.replace(/[_-]+/g, ' ')                 // snake_case / kebab-case -> spaces
+		.replace(/\s+/g, ' ')
+		.trim()
+		.toLowerCase();
+	if (!words) { return toolId; }
+	return words.charAt(0).toUpperCase() + words.slice(1);
+}
+
+/**
  * Best-effort extraction of a filename from a label. Only treats a token as a filename when it has
  * an extension or path separator, so tool names like "modifyFile" are never surfaced as the file.
  */
@@ -1213,7 +1229,7 @@ export class ChatThinkingContentPart extends ChatCollapsibleContentPart implemen
 				toolCallLabel = localize('chat.thinking.editingFile', 'Edited file');
 			}
 		} else {
-			toolCallLabel = `Invoked \`${toolInvocationId}\``;
+			toolCallLabel = humanizeToolId(toolInvocationId);
 		}
 
 		// Add tool call to extracted titles for LLM title generation

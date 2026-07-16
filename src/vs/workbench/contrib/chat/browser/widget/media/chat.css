@@ -853,6 +853,20 @@ have to be updated for changes to the rules above, or to support more deeply nes
 .interactive-session .interactive-input-part > .chat-todo-list-widget-container:has(.chat-todo-list-widget.has-todos) + .chat-editing-session .chat-editing-session-container {
 	border-top-left-radius: 0;
 	border-top-right-radius: 0;
+	/* Visible divider between the todo list above and the file-changes box below. */
+	border-top: 1px solid var(--vscode-chat-checkpointSeparator, var(--vscode-input-border, transparent));
+}
+
+/* Don't paint a teal focus ring/border around the "N files changed" box on focus - it reads as noise. The file rows keep their own focus styling. */
+.interactive-session .chat-editing-session .chat-editing-session-container:focus,
+.interactive-session .chat-editing-session .chat-editing-session-container:focus-within {
+	outline: none;
+	border-color: var(--vscode-input-border, transparent);
+}
+
+/* And no focus outline on the "N files changed" summary toggle button itself. */
+.interactive-session .chat-editing-session .chat-editing-session-container .chat-editing-session-overview .working-set-title .monaco-button:focus {
+	outline: none;
 }
 
 .interactive-session .chat-editing-session .monaco-list-row .chat-collapsible-list-action-bar {
@@ -1287,7 +1301,7 @@ have to be updated for changes to the rules above, or to support more deeply nes
 	min-width: unset;
 }
 
-.interactive-session .interactive-input-part > .chat-todo-list-widget-container .chat-todo-list-widget .todo-list-expand .monaco-button:focus:not(:focus-visible) {
+.interactive-session .interactive-input-part > .chat-todo-list-widget-container .chat-todo-list-widget .todo-list-expand .monaco-button:focus {
 	outline: none;
 }
 

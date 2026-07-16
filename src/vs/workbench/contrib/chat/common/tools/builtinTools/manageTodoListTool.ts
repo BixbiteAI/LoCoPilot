@@ -157,13 +157,19 @@ export class ManageTodoListTool extends Disposable implements IToolImpl {
 		const currentTodoItems = this.chatTodoListService.getTodos(chatSessionResource);
 		let message: string | undefined;
 
+		// Mirror the write-time merge so the tool card's message/totals match what the widget will
+		// actually show (see handleWriteOperation for why completed todos are preserved).
+		const effectiveList = args.operation !== 'read' && args.todoList
+			? ManageTodoListTool.mergePreservingCompleted(currentTodoItems, args.todoList)
+			: undefined;
+
 		if (args.operation === 'read') {
 			message = localize('todo.readOperation', "Read todo list");
-		} else if (args.todoList) {
-			message = this.generatePastTenseMessage(currentTodoItems, args.todoList);
+		} else if (effectiveList) {
+			message = this.generatePastTenseMessage(currentTodoItems, effectiveList);
 		}
 
-		const items = args.todoList ?? currentTodoItems;
+		const items = effectiveList ?? currentTodoItems;
 		const todoList = items.map(todo => ({
 			id: todo.id.toString(),
 			title: todo.title,
@@ -172,12 +178,42 @@ export class ManageTodoListTool extends Disposable implements IToolImpl {
 		}));
 
 		return {
+			// Present-tense header shown in the reasoning block while the tool runs. Kept deliberately
+			// generic so it never misclassifies as a file read/edit (which would surface "Reading a file").
+			invocationMessage: new MarkdownString(localize('todo.invoking', "Managing todo list")),
 			pastTenseMessage: new MarkdownString(message ?? localize('todo.updatedList', "Updated todo list")),
 			toolSpecificData: {
 				kind: 'todoList',
 				todoList: todoList
 			}
 		};
+	}
+
+	/**
+	 * Models are told to send the COMPLETE todo list on every write, but they frequently send only
+	 * the *remaining* work, dropping items they already marked completed. That silently shrinks the
+	 * list mid-request (e.g. 3 todos collapsing to "2/2", then "1/1") and loses finished-task history.
+	 *
+	 * Re-attach any previously-completed todo the incoming list omitted, as long as its id doesn't
+	 * collide with an incoming item (so we never fight an intentional re-use of that id). Only
+	 * completed items are preserved: dropping a not-started/in-progress item is treated as an
+	 * intentional plan change. Merged items are ordered by id (ids are sequential from 1).
+	 */
+	private static mergePreservingCompleted(existing: IChatTodo[], incoming: IManageTodoListToolInputParams['todoList']): IChatTodo[] {
+		const incomingNormalized: IChatTodo[] = incoming.map(todo => ({
+			id: todo.id,
+			title: todo.title,
+			status: todo.status,
+			description: todo.description
+		}));
+
+		const incomingIds = new Set(incomingNormalized.map(todo => todo.id));
+		const preserved = existing.filter(todo => todo.status === 'completed' && !incomingIds.has(todo.id));
+		if (preserved.length === 0) {
+			return incomingNormalized;
+		}
+
+		return [...incomingNormalized, ...preserved].sort((a, b) => a.id - b.id);
 	}
 
 	private generatePastTenseMessage(currentTodos: IChatTodo[], newTodos: IManageTodoListToolInputParams['todoList']): string {
@@ -295,17 +331,22 @@ export class ManageTodoListTool extends Disposable implements IToolImpl {
 		}
 
 		const existingTodos = this.chatTodoListService.getTodos(chatSessionResource);
-		const changes = this.calculateTodoChanges(existingTodos, todoList);
 
-		this.chatTodoListService.setTodos(chatSessionResource, todoList);
-		const statusCounts = this.calculateStatusCounts(todoList);
+		// Preserve completed todos the model dropped from its rewrite so the list (and its counts)
+		// don't shrink mid-request. See mergePreservingCompleted for the full rationale.
+		const mergedTodoList = ManageTodoListTool.mergePreservingCompleted(existingTodos, args.todoList);
+
+		const changes = this.calculateTodoChanges(existingTodos, mergedTodoList);
+
+		this.chatTodoListService.setTodos(chatSessionResource, mergedTodoList);
+		const statusCounts = this.calculateStatusCounts(mergedTodoList);
 
 		// Build warnings
 		const warnings: string[] = [];
-		if (todoList.length < 3) {
+		if (mergedTodoList.length < 3) {
 			warnings.push('Warning: Small todo list (<3 items). This task might not need a todo list.');
 		}
-		else if (todoList.length > 10) {
+		else if (mergedTodoList.length > 10) {
 			warnings.push('Warning: Large todo list (>10 items). Consider keeping the list focused and actionable.');
 		}
 

@@ -5,7 +5,7 @@
 
 import { Color, RGBA } from '../../../../../base/common/color.js';
 import { localize } from '../../../../../nls.js';
-import { badgeBackground, badgeForeground, contrastBorder, editorBackground, editorWidgetBackground, foreground, registerColor, transparent } from '../../../../../platform/theme/common/colorRegistry.js';
+import { badgeBackground, badgeForeground, buttonBackground, contrastBorder, editorBackground, editorWidgetBackground, foreground, registerColor, transparent } from '../../../../../platform/theme/common/colorRegistry.js';
 
 export const chatRequestBorder = registerColor(
 	'chat.requestBorder',
@@ -73,3 +73,10 @@ export const chatLinesRemovedForeground = registerColor(
 	'chat.linesRemovedForeground',
 	{ dark: '#FC6A6A', light: '#BC2F32', hcDark: '#F48771', hcLight: '#B5200D' },
 	localize('chat.linesRemovedForeground', 'Foreground color of lines removed in chat code block pill.'), true);
+
+export const chatTodoInProgressForeground = registerColor(
+	'chat.todoInProgressForeground',
+	// Match the primary ("Keep") button color in every theme so the in-progress dot reads as the
+	// same brand teal as the action buttons.
+	buttonBackground,
+	localize('chat.todoInProgressForeground', 'Foreground color of the in-progress status icon in the chat todo list.'), true);

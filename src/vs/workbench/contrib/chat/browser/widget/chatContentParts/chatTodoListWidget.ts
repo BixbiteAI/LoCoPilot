@@ -101,7 +101,7 @@ class TodoListRenderer implements IListRenderer<IChatTodo, ITodoListTemplate> {
 			case 'completed':
 				return 'var(--vscode-charts-green)';
 			case 'in-progress':
-				return 'var(--vscode-charts-blue)';
+				return 'var(--vscode-chat-todoInProgressForeground, var(--vscode-button-background))';
 			case 'not-started':
 			default:
 				return 'var(--vscode-foreground)';
@@ -321,6 +321,17 @@ export class ChatTodoListWidget extends Disposable {
 
 		if (this._currentSessionResource) {
 			const todoList = this.chatTodoListService.getTodos(this._currentSessionResource);
+
+			// A virtualized WorkbenchList that was laid out while hidden (display:none) doesn't paint
+			// its rows - and therefore its status dots - until it's laid out again. Re-layout on expand
+			// so the todo items (and their progress icons) reliably show up.
+			if (this._isExpanded && this._todoList) {
+				const maxItemsShown = 6;
+				const height = Math.min(todoList.length, maxItemsShown) * 22;
+				this._todoList.getHTMLElement().style.height = `${height}px`;
+				this._todoList.layout(height);
+			}
+
 			this.updateTitleElement(this.titleElement, todoList);
 		}
 	}
@@ -384,7 +395,7 @@ export class ChatTodoListWidget extends Disposable {
 				const icon = dom.$('.codicon');
 				if (todoToShow === firstInProgressTodo) {
 					icon.classList.add('codicon-record');
-					icon.style.color = 'var(--vscode-charts-blue)';
+					icon.style.color = 'var(--vscode-chat-todoInProgressForeground, var(--vscode-button-background))';
 				} else {
 					icon.classList.add('codicon-circle-outline');
 					icon.style.color = 'var(--vscode-foreground)';
