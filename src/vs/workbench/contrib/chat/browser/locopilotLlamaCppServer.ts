@@ -347,6 +347,39 @@ export function computeKvBudgetBytes(budgetBytes: number, residentWeightBytes: n
 }
 
 /**
+ * Safety margin (fraction of the memory budget) held back for the warm-up / compute-graph peak when deciding
+ * whether `--swa-full` fits. Neither our KV clamp nor llama.cpp's own `-fit` fully models this transient peak,
+ * and it is exactly what tipped a "fits on paper" Gemma launch into a Metal command-buffer OOM.
+ */
+export const SWA_FULL_GRAPH_MARGIN_FRACTION = 0.08;
+
+/**
+ * Headroom (bytes, may be negative) left after placing everything `--swa-full` needs to hold a FULL-size KV
+ * cache on every sliding-window layer: the resident weights, that full KV, the host prompt cache, base runtime
+ * overhead, and a {@link SWA_FULL_GRAPH_MARGIN_FRACTION} compute-graph margin. `>= 0` means the full cache fits
+ * and `--swa-full` is safe to force; `< 0` means keep the far smaller windowed SWA cache instead (the model
+ * still runs at the same context, just without cross-turn prompt-cache reuse). `promptCacheReserveBytes` should
+ * be 0 on discrete GPUs, where the host prompt cache lives in system RAM, separate from the VRAM the KV occupies.
+ */
+export function swaFullKvHeadroomBytes(inputs: {
+	budgetBytes: number;
+	residentWeightBytes: number;
+	fullSwaKvBytes: number;
+	promptCacheReserveBytes: number;
+	overheadBytes?: number;
+	graphMarginFraction?: number;
+}): number {
+	const overhead = inputs.overheadBytes ?? RUNTIME_OVERHEAD_BYTES;
+	const graphMargin = Math.floor(Math.max(0, inputs.budgetBytes) * (inputs.graphMarginFraction ?? SWA_FULL_GRAPH_MARGIN_FRACTION));
+	return inputs.budgetBytes
+		- Math.max(0, inputs.residentWeightBytes)
+		- Math.max(0, inputs.fullSwaKvBytes)
+		- Math.max(0, overhead)
+		- Math.max(0, inputs.promptCacheReserveBytes)
+		- graphMargin;
+}
+
+/**
  * Resolves the concrete KV cache type to use. 'auto' chooses q8_0 once the context window reaches
  * {@link KV_AUTO_QUANT_CONTEXT_THRESHOLD}, else f16. A fixed type is returned unchanged.
  */

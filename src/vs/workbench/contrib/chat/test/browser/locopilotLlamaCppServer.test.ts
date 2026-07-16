@@ -9,6 +9,8 @@ import {
 	computeGpuLayers,
 	computeCpuMoeLayers,
 	computeKvBudgetBytes,
+	swaFullKvHeadroomBytes,
+	SWA_FULL_GRAPH_MARGIN_FRACTION,
 	clampContextSize,
 	getBundledLlamaServerPath,
 	getLlamaCppServerCommand,
@@ -260,6 +262,49 @@ suite('LoCoPilot llama.cpp server', () => {
 
 		test('unknown/zero budget -> 0', () => {
 			assert.strictEqual(computeKvBudgetBytes(0, 4 * GB), 0);
+		});
+	});
+
+	suite('swaFullKvHeadroomBytes', () => {
+		const GB = 1024 * 1024 * 1024;
+
+		test('small-weight model with a huge full-SWA KV -> negative headroom (keep windowed SWA)', () => {
+			// The real regression: ~25.5GB Metal budget, gemma-4-12B (~7.3GB weights) granted a ~114K context whose
+			// full-size SWA KV is ~12.75GB. Weights + full KV + 2GB prompt cache + 1.5GB overhead + 8% graph margin
+			// (~2GB) overflows the budget, so --swa-full must NOT be forced.
+			const headroom = swaFullKvHeadroomBytes({
+				budgetBytes: 25.5 * GB,
+				residentWeightBytes: 7.3 * GB,
+				fullSwaKvBytes: 12.75 * GB,
+				promptCacheReserveBytes: 2 * GB,
+			});
+			assert.ok(headroom < 0, `expected the full SWA cache NOT to fit, got headroom ${headroom}`);
+		});
+
+		test('same model with a modest windowed context -> positive headroom (force it on)', () => {
+			// A far smaller full-SWA KV (e.g. a short context) leaves room, so --swa-full is safe to enable.
+			const headroom = swaFullKvHeadroomBytes({
+				budgetBytes: 25.5 * GB,
+				residentWeightBytes: 7.3 * GB,
+				fullSwaKvBytes: 3 * GB,
+				promptCacheReserveBytes: 2 * GB,
+			});
+			assert.ok(headroom >= 0, `expected the full SWA cache to fit, got headroom ${headroom}`);
+		});
+
+		test('discrete GPU excludes the host prompt cache from the budget', () => {
+			// With promptCacheReserve 0 (host RAM, separate from VRAM) the same figures leave more room.
+			const withHostCache = swaFullKvHeadroomBytes({ budgetBytes: 16 * GB, residentWeightBytes: 8 * GB, fullSwaKvBytes: 4 * GB, promptCacheReserveBytes: 2 * GB });
+			const noHostCache = swaFullKvHeadroomBytes({ budgetBytes: 16 * GB, residentWeightBytes: 8 * GB, fullSwaKvBytes: 4 * GB, promptCacheReserveBytes: 0 });
+			assert.strictEqual(noHostCache - withHostCache, 2 * GB);
+		});
+
+		test('the graph safety margin scales with the budget', () => {
+			// Two otherwise-identical placements differ only by the fraction-of-budget graph margin.
+			const base = { residentWeightBytes: 4 * GB, fullSwaKvBytes: 4 * GB, promptCacheReserveBytes: 2 * GB };
+			const h = swaFullKvHeadroomBytes({ budgetBytes: 20 * GB, ...base });
+			const expected = 20 * GB - 4 * GB - 4 * GB - RUNTIME_OVERHEAD_BYTES - 2 * GB - Math.floor(20 * GB * SWA_FULL_GRAPH_MARGIN_FRACTION);
+			assert.strictEqual(h, expected);
 		});
 	});
 

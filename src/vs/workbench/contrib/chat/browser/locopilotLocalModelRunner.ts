@@ -43,6 +43,8 @@ import {
 	resolveKvCacheType,
 	kvCacheBytesPerElem,
 	DEFAULT_KV_BYTES_PER_TOKEN_PER_LAYER_F16,
+	DEFAULT_CLAMP_LAYER_COUNT,
+	swaFullKvHeadroomBytes,
 	type LlamaServerTuning,
 	type FlashAttentionMode,
 	type KvCacheType
@@ -387,6 +389,12 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 	private readonly _oomContextCap = new Map<string, number>();
 	/** Models whose OOM ladder also strips the memory-heavy extras (MTP self-draft / separate draft model). */
 	private readonly _oomStripExtras = new Set<string>();
+	/**
+	 * Models whose GPU backend wedged at compute while the process stayed alive (Metal command-buffer OOM ->
+	 * "backend is in error state"). Latched so {@link _handleWedgedBackend} tears down + relaunches ONCE per
+	 * resident server instead of on every torrential error line; cleared when a fresh launch starts.
+	 */
+	private readonly _wedgedBackends = new Set<string>();
 	/** Context size (-c) each model's LAST llama launch actually used, so the OOM ladder can halve it. */
 	private readonly _lastLaunchContext = new Map<string, number>();
 	/**
@@ -1600,22 +1608,7 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 		// per-model per-session; only after both attempts still OOM does the user see an actionable error.
 		const oomCrash = /out of memory|outofmemory|failed to allocate|unable to allocate|cudamalloc failed|kiogpucommandbuffercallbackerroroutofmemory|insufficient memory|not enough (?:memory|space)|ggml_backend.*buffer.*(?:fail|null)|std::bad_alloc/i.test(tail);
 		if (oomCrash) {
-			const attempts = this._oomRetryCount.get(modelId) ?? 0;
-			if (attempts < 2) {
-				this._oomRetryCount.set(modelId, attempts + 1);
-				const lastCtx = this._lastLaunchContext.get(modelId) ?? DEFAULT_LLAMA_CONTEXT_SIZE;
-				const newCap = attempts === 0
-					? Math.max(MIN_CLAMPED_CONTEXT, Math.floor(lastCtx / 2 / 1024) * 1024)
-					: MIN_CLAMPED_CONTEXT;
-				this._oomContextCap.set(modelId, newCap);
-				this._oomStripExtras.add(modelId);
-				this._log(`[LoCoPilot Runner] "${modelName}" ran out of memory (attempt ${attempts + 1}/2); relaunching with context capped at ${newCap} and speculative extras stripped.`);
-				this._endStarting(modelId);
-				timeout(6000).then(() => {
-					if (!this.runningServers.has(modelId) && !this.startingServers.has(modelId)) {
-						this.startServerInTerminal(modelId).catch(e => this._log(`[LoCoPilot Runner] OOM-degraded relaunch failed: ${e}`));
-					}
-				});
+			if (this._oomDegradedRelaunch(modelId, modelName)) {
 				return;
 			}
 			// Both degraded attempts still OOM-ed: this model genuinely doesn't fit right now. Be honest
@@ -1638,6 +1631,71 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 
 		this._endStarting(modelId, message);
 		this.notificationService.prompt(Severity.Error, message, actions);
+	}
+
+	/**
+	 * The OOM degradation ladder, shared by the crash-on-exit path ({@link _reportServerCrash}) and the
+	 * wedged-backend path ({@link _handleWedgedBackend}): a launch that ran out of memory is a footprint to
+	 * shrink, not a bug to report. Attempt 1 halves the last-used context AND strips the memory-heavy extras
+	 * (MTP self-draft / separate draft / `--swa-full`); attempt 2 floors the context at the minimum. Caps are
+	 * per-model per-session. Returns true when a relaunch was scheduled (caller should stop), false when both
+	 * attempts are exhausted (caller surfaces the honest "doesn't fit" error).
+	 */
+	private _oomDegradedRelaunch(modelId: string, modelName: string): boolean {
+		const attempts = this._oomRetryCount.get(modelId) ?? 0;
+		if (attempts >= 2) {
+			return false;
+		}
+		this._oomRetryCount.set(modelId, attempts + 1);
+		const lastCtx = this._lastLaunchContext.get(modelId) ?? DEFAULT_LLAMA_CONTEXT_SIZE;
+		const newCap = attempts === 0
+			? Math.max(MIN_CLAMPED_CONTEXT, Math.floor(lastCtx / 2 / 1024) * 1024)
+			: MIN_CLAMPED_CONTEXT;
+		this._oomContextCap.set(modelId, newCap);
+		this._oomStripExtras.add(modelId);
+		this._log(`[LoCoPilot Runner] "${modelName}" ran out of memory (attempt ${attempts + 1}/2); relaunching with context capped at ${newCap} and the memory-heavy extras (speculative draft / --swa-full) stripped.`);
+		this._endStarting(modelId);
+		timeout(6000).then(() => {
+			if (!this.runningServers.has(modelId) && !this.startingServers.has(modelId)) {
+				this.startServerInTerminal(modelId).catch(e => this._log(`[LoCoPilot Runner] OOM-degraded relaunch failed: ${e}`));
+			}
+		});
+		return true;
+	}
+
+	/**
+	 * Handles a GPU backend that failed at compute but left the *process alive* - the classic Metal OOM where
+	 * llama.cpp logs `command buffer ... failed` / `Insufficient Memory`, then `backend is in error state ...
+	 * recreate the backend to recover`, yet still prints `model loaded` / `server is listening` and keeps
+	 * running. onExit never fires (nothing crashed), so the OOM ladder never ran and every request came back
+	 * `Compute error` (`failed to decode, ret = -3`) - the model looked green but was permanently wedged, and
+	 * the memory watchdog was left fighting a broken-but-resident model (the warn <-> stop toast flicker).
+	 *
+	 * We detect the wedge from the log stream, tear the dead server down cleanly, and drive it through the same
+	 * OOM ladder as a crash-on-exit: relaunch smaller (and without --swa-full, whose full-size SWA KV cache is
+	 * the usual cause on sliding-window models like Gemma). Guarded to fire once per resident server.
+	 */
+	private async _handleWedgedBackend(modelId: string, modelName: string, logs: string[]): Promise<void> {
+		if (this._wedgedBackends.has(modelId) || this._intentionalStops.has(modelId)) {
+			return; // already handling this wedge, or the user/eviction is stopping it anyway
+		}
+		this._wedgedBackends.add(modelId);
+		const tail = logs.slice(-60).join('\n');
+		this._log(`[LoCoPilot Runner] "${modelName}" GPU backend is wedged (compute failed / backend in error state) while the process stayed alive; tearing it down and retrying with a smaller footprint. Last output:\n${tail}`);
+		// Drop the green "ready" state immediately so nothing keeps routing requests at a dead server while we
+		// tear it down. _stopServerAndWait marks the stop intentional (so the pending onExit stays silent) and
+		// waits for the weights/port to release before the ladder relaunches - avoiding a double-booked-RAM spike.
+		const rec = this.runningServers.get(modelId);
+		if (rec) {
+			rec.ready = false;
+			this._onDidServerStateChange.fire(modelId);
+		}
+		await this._stopServerAndWait(modelId);
+		if (!this._oomDegradedRelaunch(modelId, modelName)) {
+			const oomMessage = `"${modelName}" ran out of GPU memory while running, even with reduced settings. Close some applications to free up memory, or choose a smaller model.`;
+			this._endStarting(modelId, oomMessage);
+			this.notificationService.notify({ severity: Severity.Error, message: oomMessage });
+		}
 	}
 
 	/**
@@ -1797,6 +1855,12 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 			}
 		}
 
+		// Full-size KV estimate (bytes) for the --swa-full headroom gate below. The clamp sizes KV as if EVERY
+		// layer holds the full context (it doesn't model the SWA window reduction) - which is exactly what
+		// --swa-full allocates. Captured at the FINAL clamped context + precision so the gate can verify the full
+		// cache genuinely fits before forcing it on (vs. windowed SWA, which is far smaller on models like Gemma).
+		let fullSwaKvBytesEstimate: number | undefined;
+
 		// #5 Context clamp: never request more than the model supports, nor more than the KV budget can hold.
 		// The KV allowance is weight-aware (computeKvBudgetBytes): at most KV_BUDGET_FRACTION of the budget,
 		// and never more than what remains after the weights RESIDENT IN THE SAME POOL plus runtime overhead.
@@ -1871,27 +1935,55 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 			// Pin the precision the clamp sized for so getLlamaCppServerCommand doesn't re-resolve 'auto' from the
 			// (possibly now sub-threshold) clamped window and flip to f16. No-op when the user pinned a fixed type.
 			tuning.kvCacheType = resolvedKvType;
+			// Full-size KV the SWA layers would take with --swa-full, at the final context + precision. Mirrors
+			// clampContextSize's own layer-count fallback so the estimate matches what the clamp budgeted.
+			const layersForKv = info.layerCount && info.layerCount > 0 ? info.layerCount : DEFAULT_CLAMP_LAYER_COUNT;
+			fullSwaKvBytesEstimate = perTokenPerLayer * layersForKv * (tuning.contextSize ?? 0);
 		}
 
-		// SWA full cache: sliding-window models (Gemma 2/3) default to a window-sized KV for their SWA layers,
-		// which invalidates the server's prompt-cache checkpoints and forces a full prompt re-process every
-		// turn. `--swa-full` keeps the whole KV so cross-turn reuse works. Our context clamp above already
-		// sized `-c` assuming full KV across ALL layers (it doesn't model the SWA reduction), so a model that
-		// passed the clamp/fit gate already has room for the full cache - enabling it here is memory-consistent.
-		// Setting: 'auto' (on for SWA models when we have a memory budget to reason about), 'on' (force for SWA),
-		// 'off'. Skipped for the session once a build rejected the flag.
+		// SWA full cache: sliding-window models (Gemma 2/3/4) default to a window-sized KV for their SWA layers,
+		// which invalidates the server's prompt-cache checkpoints and forces a full prompt re-process every turn.
+		// `--swa-full` keeps the whole KV so cross-turn reuse works - but it pins a FULL-size KV cache on EVERY
+		// sliding-window layer instead of the small window, which on a heavily-SWA model (Gemma, window 512-1024)
+		// multiplies the KV cache several-fold and is the usual cause of the Metal command-buffer OOM. So we no
+		// longer force it purely because the clamp "budgeted for full KV": we only turn it on when that full cache
+		// genuinely fits (headroom gate below). Setting: 'auto' (on for SWA models when the full cache fits),
+		// 'on' (force regardless), 'off'. Skipped for the session once a build rejected the flag.
 		if (tuning.swaFull === undefined && !this._swaFullUnsupported) {
 			const mode = this.configurationService.getValue<'auto' | 'on' | 'off'>(ChatConfiguration.LocopilotLlamaCppSwaFull) ?? 'auto';
 			// 'on' forces --swa-full even when our GGUF SWA sniff didn't fire (detection can miss newer archs like
 			// gemma-4 whose sliding_window key we don't capture). llama.cpp harmlessly ignores it on non-SWA models,
 			// and if a build rejects the flag by name the launch-crash fallback strips it. 'auto' still needs a
-			// positively-detected SWA model + a memory budget.
+			// positively-detected SWA model + a memory budget AND enough room for the full-size KV cache.
 			if (mode === 'on') {
 				tuning.swaFull = true;
 				this._log(`[LoCoPilot Runner] Forcing --swa-full (mode=on, detectedSwa=${isSwaModelInfo(info)}, window=${info.slidingWindow ?? 'n/a'}).`);
 			} else if (mode === 'auto' && isSwaModelInfo(info) && budget !== undefined && budget > 0) {
-				tuning.swaFull = true;
-				this._log(`[LoCoPilot Runner] SWA model (window ${info.slidingWindow}); enabling --swa-full so the prompt cache survives across turns (mode=auto).`);
+				// Headroom gate: verify the full-size SWA KV cache fits alongside the resident weights, the host
+				// prompt cache, base runtime overhead AND a margin for the warm-up compute graph (the peak neither
+				// our clamp nor llama's -fit fully models). If it doesn't, keep the far smaller WINDOWED SWA cache -
+				// the model still runs at the same big context, it just re-processes the prompt each turn (a speed
+				// hit, not a correctness one). On discrete GPUs the host prompt cache lives in system RAM, separate
+				// from the VRAM the KV occupies, so it doesn't count against this budget.
+				const GB = 1024 * 1024 * 1024;
+				const isDiscreteGpu = backend === 'cuda' || backend === 'vulkan';
+				const residentWeights = isDiscreteGpu ? Math.min(modelBytes, offloadBudget) : modelBytes;
+				const promptCacheReserve = isDiscreteGpu ? 0 : 2 * GB;
+				const canEstimate = fullSwaKvBytesEstimate !== undefined && modelBytes > 0;
+				const headroom = canEstimate
+					? swaFullKvHeadroomBytes({
+						budgetBytes: budget,
+						residentWeightBytes: residentWeights,
+						fullSwaKvBytes: fullSwaKvBytesEstimate!,
+						promptCacheReserveBytes: promptCacheReserve,
+					})
+					: -1;
+				if (canEstimate && headroom >= 0) {
+					tuning.swaFull = true;
+					this._log(`[LoCoPilot Runner] SWA model (window ${info.slidingWindow}); enabling --swa-full - full-size SWA KV ~${(fullSwaKvBytesEstimate! / GB).toFixed(1)}GB fits with ~${(headroom / GB).toFixed(1)}GB headroom (mode=auto).`);
+				} else {
+					this._log(`[LoCoPilot Runner] SWA model (window ${info.slidingWindow}); keeping WINDOWED SWA cache - forcing --swa-full would need full-size KV ~${canEstimate ? (fullSwaKvBytesEstimate! / GB).toFixed(1) + 'GB' : 'unknown'} that doesn't fit the budget with margin (headroom ~${(headroom / GB).toFixed(1)}GB). Cross-turn prompt-cache reuse is off, but the model fits (mode=auto).`);
+				}
 			}
 		}
 
@@ -3261,6 +3353,11 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 		if (this._oomStripExtras.has(modelId)) {
 			baseTuning.multiTokenPrediction = false;
 			baseTuning.draftModelPath = undefined;
+			// Force --swa-full OFF for the relaunch. On sliding-window models (Gemma) it keeps a FULL-size KV
+			// cache for every SWA layer instead of the small window, which is the usual cause of the Metal
+			// command-buffer OOM. `false` (not undefined) so _augmentTuningWithHardware's auto-enable can't turn
+			// it back on. Trades cross-turn prompt-cache reuse for actually fitting - the right call under OOM.
+			baseTuning.swaFull = false;
 		}
 		// Vision: load the projector (`--mmproj`) ONLY when the user has explicitly enabled vision for this
 		// model. The projector is downloaded for every vision-capable model, but loading it wires ~1GB+ into
@@ -3415,6 +3512,7 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 			const logs: string[] = [];
 			this._crashedBeforeReady.delete(modelId);
 			this._intentionalStops.delete(modelId);
+			this._wedgedBackends.delete(modelId); // fresh launch: re-arm wedged-backend detection for this server
 			// This terminal now owns the model's lifecycle. Any previously-registered onExit (from an earlier
 			// start that was stopped/evicted/retried) will see a mismatch here and ignore its exit, so it can't
 			// clobber this record or raise a false crash for a model that is now running.
@@ -3425,6 +3523,15 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 				if (logs.length > LoCoPilotLocalModelRunner.MAX_LOG_LINES) {
 					logs.splice(0, logs.length - LoCoPilotLocalModelRunner.MAX_LOG_LINES);
 				}
+				// A GPU backend that failed at compute but left the PROCESS ALIVE (the classic Metal command-buffer
+				// OOM). These lines only ever print when compute has genuinely failed and, once the backend reports
+				// it is "in error state", it is unrecoverable - any following "model loaded"/"listening" is a lie and
+				// every decode returns Compute error. Tear it down and drive it through the OOM ladder (relaunch
+				// smaller, no --swa-full) instead of leaving a green-but-wedged server. _handleWedgedBackend latches
+				// so this fires once per resident server despite the torrential repeats in the log.
+				if (/backend is in error state|ggml_backend_sched_graph_compute_async failed|failed to compute graph|failed to decode, ret = -3/i.test(line)) {
+					void this._handleWedgedBackend(modelId, model.modelName, logs);
+				}
 				const rec = this.runningServers.get(modelId);
 				if (rec) {
 					const progress = this._parseLoadProgress(line);
@@ -3433,8 +3540,9 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 					}
 					// llama.cpp prints this once the HTTP endpoint is up and the model is loaded. Use it to flip
 					// the phase to 'ready' even for launches that don't go through ensureServerForModel (e.g. the
-					// manual Retry path), so the running indicator turns green promptly.
-					if (!rec.ready && /server is listening|HTTP server listening|all slots are idle|model loaded/i.test(line)) {
+					// manual Retry path), so the running indicator turns green promptly. Suppressed once the backend
+					// is known-wedged so a post-failure "model loaded" line can't re-green a dead server.
+					if (!rec.ready && !this._wedgedBackends.has(modelId) && /server is listening|HTTP server listening|all slots are idle|model loaded/i.test(line)) {
 						rec.ready = true;
 						rec.loadProgress = undefined;
 						this._onDidServerStateChange.fire(modelId);
