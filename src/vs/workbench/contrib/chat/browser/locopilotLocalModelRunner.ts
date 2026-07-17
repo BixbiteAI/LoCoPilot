@@ -93,8 +93,13 @@ export const ILoCoPilotLocalModelRunner = createDecorator<ILoCoPilotLocalModelRu
  */
 const MAX_SLOT_CACHE_ENTRIES = 10;
 
-/** How long a "launch blocked at the fit gate" reason stays relevant to the chat panel before it's treated as stale. */
-const LAUNCH_BLOCK_TTL_MS = 60_000;
+/**
+ * How long a "launch blocked at the fit gate / crashed" reason stays relevant to the chat panel before it's
+ * treated as stale. 5 minutes (was 60s): a model that terminally failed keeps reporting its real reason for a
+ * while instead of decaying back to the misleading "taking a moment to start". A fresh launch attempt or a
+ * successful ready still clears it immediately.
+ */
+const LAUNCH_BLOCK_TTL_MS = 300_000;
 
 /**
  * Lifecycle phase of a local model server:
@@ -173,8 +178,11 @@ export interface ILoCoPilotLocalModelRunner {
 	 * budget is reached) and waits until the OpenAI-compatible endpoint responds. Reusing a running
 	 * server also refreshes its keep-alive idle timer.
 	 * Returns the server base URL when ready, or undefined if it could not be started.
+	 * `interactive` (default true) mirrors startServerInTerminal's flag: true for a user action (send/Start),
+	 * where a non-fitting model may show the "Run anyway?" dialog; false for background pre-warm, where a
+	 * non-fitting model is skipped silently instead of interrupting the user with a modal.
 	 */
-	ensureServerForModel(modelId: string, token?: CancellationToken): Promise<string | undefined>;
+	ensureServerForModel(modelId: string, token?: CancellationToken, interactive?: boolean): Promise<string | undefined>;
 	/**
 	 * Restore a previously-saved KV cache slot (the warmed system+tools prefix) from disk into the running
 	 * llama.cpp server so the first real turn reuses it instead of re-prefilling. Returns true only when a
@@ -261,6 +269,8 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 	private readonly _foreignLogWatchers = new Map<string, IDisposable>();
 	/** Debounce timer for re-syncing local state after the shared active-server lock changes on disk. */
 	private _lockSyncTimer: ReturnType<typeof setTimeout> | undefined;
+	/** Periodic health re-probe of foreign records (servers owned by other windows) - see _updateForeignProbe. */
+	private _foreignProbeTimer: number | undefined;
 	/** Remaining probe retries for a lock that appeared but whose server is still loading (not healthy yet). */
 	private _lockSyncRetries = 0;
 	private runningServers = new Map<string, {
@@ -286,6 +296,13 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 		logs: string[];
 		/** Epoch ms of the last request/use; drives least-recently-used eviction and the idle timer. */
 		lastUsedAt: number;
+		/**
+		 * Epoch ms this record was promoted (the launch's terminal came up). The memory watchdog uses it for a
+		 * load-grace window: the RAM dip while multi-GB weights load is an expected, budgeted transient, so
+		 * soft kill signals (low-available / paging) are ignored for a short period after promotion - only the
+		 * hard near-OOM floor and thermal emergencies act during the load.
+		 */
+		startedAt: number;
 		/** True once the OpenAI endpoint answered 200 (phase 'ready'); false while still loading weights. */
 		ready: boolean;
 		/** Pending idle-unload timer; cleared/reset on each use. */
@@ -445,6 +462,7 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 			this._foreignLogWatchers.clear();
 			if (this._lockSyncTimer) { clearTimeout(this._lockSyncTimer); }
 			if (this._logMirrorTimer) { clearTimeout(this._logMirrorTimer); }
+			if (this._foreignProbeTimer) { mainWindow.clearInterval(this._foreignProbeTimer); }
 		}));
 	}
 
@@ -1030,6 +1048,17 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 
 	stopServer(modelId: string): void {
 		const running = this.runningServers.get(modelId);
+		if (!running && (this.startingServers.has(modelId) || this._activeLaunchTerminals.has(modelId) || this._startInFlight.has(modelId))) {
+			// Stop pressed while the model is still LAUNCHING (weights loading, not yet promoted to
+			// runningServers). The old code no-opped here, so the launch completed anyway and the model popped
+			// back to "running" moments after the user stopped it - the classic "I stopped it but it still shows
+			// running" race. Cancel the in-flight launch instead: dispose its terminal, drop launch ownership
+			// (the promotion guard then refuses to promote), and mark the stop intentional so no crash is reported.
+			// (The launch promise's own finally-block releases the cross-window claim if it was held.)
+			this._forcedLaunch.delete(modelId); // a stopped model re-prompts "Run anyway?" on its next launch
+			this._cancelStartingServer(modelId);
+			return;
+		}
 		if (running) {
 			if (running.idleTimer) {
 				clearTimeout(running.idleTimer);
@@ -1077,9 +1106,28 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 		} catch {
 			// processId unavailable -> we can still poll the health endpoint for the port to close
 		}
+		// Expected RAM this teardown should release (weights + runtime), so _waitForServerGone can verify the
+		// memory actually came back before the replacement launch commits against it.
+		const expectedFreedBytes = this._modelCostCache.get(modelId) ?? this._modelSizeCache.get(modelId) ?? 0;
 		this.stopServer(modelId);
 		if (typeof pid === 'number' && pid > 1) {
-			await this._waitForServerGone(port, kind, pid).catch(() => undefined);
+			await this._waitForServerGone(port, kind, pid, expectedFreedBytes).catch(() => undefined);
+		}
+	}
+
+	/**
+	 * Best-effort "is this pid still alive?" probe (signal 0 - no signal is delivered, only existence is
+	 * checked). Returns false when the process is gone OR when the probe can't run (no native host); callers
+	 * use it to stop waiting, so "can't tell" must not stall a switch.
+	 */
+	private async _isProcessAlive(pid: number): Promise<boolean> {
+		try {
+			await this.instantiationService.invokeFunction(accessor =>
+				// Signal 0 performs the standard POSIX/Node existence check without delivering a signal.
+				accessor.get(INativeHostService).killProcess(pid, 0 as unknown as string));
+			return true;
+		} catch {
+			return false; // ESRCH (gone) or no native host
 		}
 	}
 
@@ -1422,11 +1470,18 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 		}
 
 		const kind = await this._intendedServerKind(modelId);
-		// Context window the engine will actually allocate KV for (clamped like the launch path does).
-		const ctxTokens = Math.max(
-			MIN_CLAMPED_CONTEXT,
-			model.contextWindow && model.contextWindow > 0 ? model.contextWindow : DEFAULT_LLAMA_CONTEXT_SIZE
-		);
+		// Context window the engine will actually allocate KV for. Prefer the context the model's LAST real
+		// launch ran with (post memory-clamp / OOM cap) over the nominal window: sizing the estimate from the
+		// nominal window systematically over-counted long-context models (the launch clamps `-c` way down on a
+		// tight machine), which over-evicted on switches and made Auto step down further than needed.
+		const nominalCtx = model.contextWindow && model.contextWindow > 0 ? model.contextWindow : DEFAULT_LLAMA_CONTEXT_SIZE;
+		const launchedCtx = this._lastLaunchContext.get(modelId);
+		const oomCtxCap = this._oomContextCap.get(modelId);
+		let effectiveCtx = launchedCtx && launchedCtx > 0 ? Math.min(nominalCtx, launchedCtx) : nominalCtx;
+		if (oomCtxCap && oomCtxCap > 0) {
+			effectiveCtx = Math.min(effectiveCtx, oomCtxCap);
+		}
+		const ctxTokens = Math.max(MIN_CLAMPED_CONTEXT, effectiveCtx);
 		const GB = 1024 * 1024 * 1024;
 		// KV cache: sized from the model's REAL attention geometry (same source the pre-flight fit gate and the
 		// context clamp use), so this estimate and those gates agree instead of drifting apart. Falls back to a
@@ -1601,6 +1656,23 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 			return;
 		}
 
+		// Port-bind collision: another server process (a racing pre-warm, another window's launch that the
+		// lock coordination missed, or a not-yet-released dying server) already holds the port. This is a
+		// self-resolving race, not a user-actionable failure - the OTHER server is typically coming up fine
+		// (which is why users saw a scary "Couldn't start" toast and then the model started anyway). Log it,
+		// clear the spinner, and retry once after the port has had time to settle; never toast for it.
+		const bindFailed = /address already in use|EADDRINUSE|couldn'?t bind|failed to bind|bind: |error while binding/i.test(tail);
+		if (bindFailed) {
+			this._log(`[LoCoPilot Runner] llama-server for "${modelName}" could not bind its port (already in use); treating as a startup race and retrying once shortly.`);
+			this._endStarting(modelId);
+			timeout(6000).then(() => {
+				if (!this.runningServers.has(modelId) && !this.startingServers.has(modelId)) {
+					this.startServerInTerminal(modelId).catch(e => this._log(`[LoCoPilot Runner] Relaunch after port collision failed: ${e}`));
+				}
+			});
+			return;
+		}
+
 		// OOM degradation ladder (Ollama-style): a launch that died because memory ran out is not a bug to
 		// report, it's a footprint to shrink. Instead of surfacing a scary crash, retry with progressively
 		// smaller memory demands - attempt 1: halve the context window and strip the memory-heavy extras
@@ -1619,18 +1691,31 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 			return;
 		}
 
-		const actions: { label: string; run: () => void }[] = [];
-
 		// Keep the user-facing wording friendly and free of internal details (engine names, settings keys,
 		// file paths). The full diagnostic output is always written to the logs above and reachable via the
 		// "Show Logs" action below; the toast just needs to say it failed and that retrying / contacting
 		// support is the next step.
 		const message = `Couldn't start the local model "${modelName}". Please try again - if it keeps happening, restart LoCoPilot or contact LoCoPilot support.`;
 
-		actions.push({ label: 'Show Logs', run: () => this.commandService.executeCommand('workbench.action.toggleDevTools') });
-
-		this._endStarting(modelId, message);
-		this.notificationService.prompt(Severity.Error, message, actions);
+		// Clear the spinner now, but DELAY the scary toast a few seconds and re-check: startup races (a
+		// prewarm colliding with the embedder's GPU init, a double-start, a cross-window handoff this window
+		// couldn't classify) routinely crash one attempt while another trigger starts the very same model
+		// successfully moments later. Showing "Couldn't start" for a model that is visibly running seconds
+		// later is worse than a short delay on a genuine failure - so only surface it if the model is still
+		// neither running nor starting after the settle window.
+		this._endStarting(modelId);
+		timeout(5000).then(() => {
+			if (this.runningServers.has(modelId) || this.startingServers.has(modelId) || this._startInFlight.has(modelId)) {
+				this._log(`[LoCoPilot Runner] Suppressed "Couldn't start" for "${modelName}": the model is running/starting again after the crash.`);
+				return;
+			}
+			this._recordLaunchBlocked(modelId, message);
+			this._onDidServerStartFailed.fire({ modelId, message });
+			this._onDidServerStateChange.fire(modelId);
+			this.notificationService.prompt(Severity.Error, message, [
+				{ label: 'Show Logs', run: () => this.commandService.executeCommand('workbench.action.toggleDevTools') },
+			]);
+		});
 	}
 
 	/**
@@ -2337,6 +2422,27 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 	/** Swap growth (bytes/tick) that counts as active paging - the machine is spilling RAM to disk. */
 	private static readonly WATCHDOG_SWAP_GROWTH_BYTES = 256 * 1024 * 1024; // 256 MiB per ~5s sample
 
+	/**
+	 * Load-grace window after a server is promoted. Loading multi-GB weights (and a switch's brief
+	 * old-model/new-model overlap) is an EXPECTED, budgeted memory transient: available RAM craters, macOS may
+	 * page opportunistically, and swap ticks up - none of which means the machine is in trouble. During this
+	 * window (server not yet ready, or ready for less than this long) the soft kill/warn signals are ignored;
+	 * only the hard near-OOM floor and thermal emergencies still act, since those mean allocations are about to
+	 * fail regardless. Without this the watchdog routinely killed the NEW model mid-load right after a switch.
+	 */
+	private static readonly WATCHDOG_LOAD_GRACE_MS = 45_000;
+
+	/** True while any owned server is inside its load-grace window (still loading, or freshly promoted). */
+	private _inLoadGraceWindow(): boolean {
+		const now = Date.now();
+		for (const rec of this.runningServers.values()) {
+			if (!rec.foreign && (!rec.ready || now - rec.startedAt < LoCoPilotLocalModelRunner.WATCHDOG_LOAD_GRACE_MS)) {
+				return true;
+			}
+		}
+		return false;
+	}
+
 	private async _memoryWatchdogTick(): Promise<void> {
 		if (!this._ownsResidentServer()) {
 			this._stopMemoryWatchdog();
@@ -2381,9 +2487,13 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 		//    there's no swap figure either (last resort - it's all we have).
 		//  - nearlyOut (below the hard near-OOM floor) and SERIOUS thermal are independent last-resort kills.
 		const thermalEmergency = mem.thermalPressure === 'critical';
-		const pagingSpiral = hasPressureSignal
+		// Load-grace: while a server is still loading (or was promoted <45s ago), the RAM dip / paging tick is
+		// the expected cost of the load itself - the fit gate already budgeted for it. Soft signals are ignored
+		// during that window (no strikes, no warn toast); the hard near-OOM floor and thermal remain live.
+		const inLoadGrace = this._inLoadGraceWindow();
+		const pagingSpiral = !inLoadGrace && (hasPressureSignal
 			? (mem.pressure === 'critical' && swapGrowing)
-			: (lowAvailable && (swapGrowing || noSignals));
+			: (lowAvailable && (swapGrowing || noSignals)));
 		const killCritical = pagingSpiral
 			|| nearlyOut
 			|| mem.thermalPressure === 'serious';
@@ -2391,7 +2501,7 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 			// Not in kill territory. Reset strikes; if the kernel reports CRITICAL pressure while we're low, give a
 			// ONE-TIME, non-escalating heads-up (the model keeps running). Clear the latch on recovery above the floor.
 			this._watchdogStrikes = 0;
-			if (lowAvailable && mem.pressure === 'critical') {
+			if (lowAvailable && mem.pressure === 'critical' && !inLoadGrace) {
 				this._maybeWarnMemoryLow();
 			} else if (mem.availableBytes >= warnFloor) {
 				this._watchdogWarnedThisEpisode = false; // recovered - allow a fresh warning next episode
@@ -2400,7 +2510,7 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 		}
 		this._watchdogStrikes++;
 		const GB = 1024 * 1024 * 1024;
-		this._log(`[LoCoPilot Runner] Memory watchdog: kill-critical sample ${this._watchdogStrikes} (thermalEmergency=${thermalEmergency}, available ~${(mem.availableBytes / GB).toFixed(1)}GB, warnFloor ~${(warnFloor / GB).toFixed(1)}GB, hardFloor ~${(hardFloor / GB).toFixed(1)}GB, nearlyOut=${nearlyOut}, swapGrowing=${swapGrowing}, pagingSpiral=${pagingSpiral}, pressure=${mem.pressure}, thermal=${mem.thermalPressure}, swap used ~${mem.swapUsedBytes >= 0 ? (mem.swapUsedBytes / GB).toFixed(1) + 'GB' : 'n/a'}).`);
+		this._log(`[LoCoPilot Runner] Memory watchdog: kill-critical sample ${this._watchdogStrikes} (thermalEmergency=${thermalEmergency}, available ~${(mem.availableBytes / GB).toFixed(1)}GB, warnFloor ~${(warnFloor / GB).toFixed(1)}GB, hardFloor ~${(hardFloor / GB).toFixed(1)}GB, nearlyOut=${nearlyOut}, swapGrowing=${swapGrowing}, pagingSpiral=${pagingSpiral}, inLoadGrace=${inLoadGrace}, pressure=${mem.pressure}, thermal=${mem.thermalPressure}, swap used ~${mem.swapUsedBytes >= 0 ? (mem.swapUsedBytes / GB).toFixed(1) + 'GB' : 'n/a'}).`);
 		// Only a thermal emergency trips on the first strike; every memory signal needs two consecutive samples.
 		if (!thermalEmergency && this._watchdogStrikes < 2) {
 			// GRACEFUL FIRST STRIKE: don't kill the user's model yet, but relieve pressure and stop making it
@@ -2414,8 +2524,16 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 			return;
 		}
 
-		// Trip the breaker: free our memory NOW and tell the user why their model stopped.
+		// Trip the breaker: free our memory NOW and tell the user why their model stopped. In-flight launches
+		// (still loading, not yet promoted) are cancelled too - they are the ones actively allocating.
 		const stoppedNames: string[] = [];
+		for (const id of Array.from(this.startingServers)) {
+			if (!this.runningServers.has(id)) {
+				const model = this.customLanguageModelsService.getCustomModels().find(m => m.id === id);
+				stoppedNames.push(model?.displayName || model?.modelName || id);
+				this._cancelStartingServer(id);
+			}
+		}
 		for (const [id, rec] of Array.from(this.runningServers.entries())) {
 			if (rec.foreign) {
 				continue;
@@ -2809,9 +2927,18 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 	 * new server races the dying one: the old process still holds the port and (worse) the GPU/Metal working set
 	 * for a moment after SIGTERM, so the fresh launch fails to bind / can't fit params to device memory and exits
 	 * with a crash toast. Polls the health endpoint until it stops answering, escalates to SIGKILL if the process
-	 * ignores SIGTERM, then adds a short grace for the OS to reclaim the freed GPU memory.
+	 * ignores SIGTERM, then waits for the PROCESS itself to die and (best-effort) for the RAM to come back.
+	 *
+	 * The port closing is NOT the end of teardown: llama.cpp closes its listener early in shutdown while still
+	 * holding multi-GB of wired Metal/heap memory, and on a tight machine the release takes seconds. The old
+	 * flat 600ms grace let a switch proceed while the dying model's weights were still resident, double-booking
+	 * RAM - which is what made the freshly-launched replacement trip the memory watchdog ("stopped because your
+	 * system was running out of memory") on a switch that would have been fine two seconds later. So after the
+	 * port closes we (1) poll the pid until the process is actually gone, then (2) when `expectedFreedBytes` is
+	 * known, poll the live memory snapshot until a meaningful share of it is visible as available again (bounded;
+	 * macOS can lag reclaiming wired pages). Every wait is bounded so a stuck teardown can never hang a switch.
 	 */
-	private async _waitForServerGone(port: number, kind: 'llama' | 'mlx', pid: number): Promise<void> {
+	private async _waitForServerGone(port: number, kind: 'llama' | 'mlx', pid: number, expectedFreedBytes: number = 0): Promise<void> {
 		const deadline = Date.now() + 8000;
 		let escalated = false;
 		while (Date.now() < deadline) {
@@ -2825,7 +2952,33 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 			}
 			await timeout(250);
 		}
-		// Grace for the OS to release the GPU/Metal memory and the socket the old process held.
+		// Phase 2: the listener is closed, but the process may still be alive releasing its working set.
+		// Wait (bounded) for the pid to actually disappear; escalate once if it lingers.
+		const pidDeadline = Date.now() + 7000;
+		let pidEscalated = escalated;
+		while (Date.now() < pidDeadline && await this._isProcessAlive(pid)) {
+			if (!pidEscalated && Date.now() > pidDeadline - 3000) {
+				pidEscalated = true;
+				await this._killForeignServer(pid, 'SIGKILL');
+			}
+			await timeout(250);
+		}
+		// Phase 3: verify the RAM actually came back before the caller launches the replacement. The freed
+		// figure is an estimate and the OS reclaims lazily, so accept a third of it as "released" and give up
+		// after a few seconds rather than stalling the switch.
+		if (expectedFreedBytes > 0) {
+			const baseline = this._lastMemoryStatus?.availableBytes;
+			const target = Math.min(expectedFreedBytes / 3, 4 * 1024 * 1024 * 1024);
+			const memDeadline = Date.now() + 5000;
+			while (Date.now() < memDeadline) {
+				const mem = await this._getMemoryStatus();
+				if (!mem || baseline === undefined || (mem.availableBytes - baseline) >= target) {
+					break; // recovered enough, or we can't measure - don't stall on the unmeasurable
+				}
+				await timeout(500);
+			}
+		}
+		// Final grace for the OS to release the GPU/Metal memory and the socket the old process held.
 		await timeout(600);
 	}
 
@@ -2972,13 +3125,49 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 			servedModelId: lock.servedModelId,
 			logs: ['This model was started in another LoCoPilot window; showing its mirrored server logs.'],
 			lastUsedAt: Date.now(),
+			startedAt: Date.now(),
 			ready: true,
 		});
 		this._watchForeignLogs(lock.modelId);
 		await this._loadForeignLogs(lock.modelId);
 		this._onDidServerStateChange.fire(lock.modelId);
 		this._onDidLogUpdate.fire(lock.modelId);
+		this._updateForeignProbe();
 		this._log(`[LoCoPilot Runner] Attached to model ${lock.modelId} running in another window on port ${lock.port}.`);
+	}
+
+	/**
+	 * Arms a periodic (30s) health re-probe while any FOREIGN record is held. A foreign record shows as
+	 * "running" in this window but its process belongs to another window - if that window (or its server)
+	 * dies without cleaning the shared lock, the indicator here would stay green forever and the next send
+	 * would "restart a running model". The probe detaches dead foreign handles proactively so the UI stays
+	 * honest. The tick disarms itself once no foreign record remains.
+	 */
+	private _updateForeignProbe(): void {
+		if (this._foreignProbeTimer) {
+			return; // already armed; the tick disarms itself when no foreign record remains
+		}
+		this._foreignProbeTimer = mainWindow.setInterval(async () => {
+			const foreign = Array.from(this.runningServers.entries()).filter(([, rec]) => rec.foreign);
+			if (foreign.length === 0) {
+				if (this._foreignProbeTimer) {
+					mainWindow.clearInterval(this._foreignProbeTimer);
+					this._foreignProbeTimer = undefined;
+				}
+				return;
+			}
+			for (const [id, rec] of foreign) {
+				if (!await this._probeServerHealth(rec.port, rec.kind)) {
+					// Only detach if the record is still the same foreign one (it may have been replaced meanwhile).
+					if (this.runningServers.get(id) === rec) {
+						this._disposeForeignLogWatcher(id);
+						this.runningServers.delete(id);
+						this._onDidServerStateChange.fire(id);
+						this._log(`[LoCoPilot Runner] Foreign server for ${id} stopped answering; detached (periodic probe).`);
+					}
+				}
+			}
+		}, 30_000);
 	}
 
 	/** Debounced entry point for lock-file changes; also used for the "server still loading" probe retries. */
@@ -3289,6 +3478,10 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 				}
 				// Both gates passed (or the user chose "Run anyway"): NOW evict the previous model to make room.
 				await this._enforceResidentBudget(modelId);
+				// Re-probe live memory after the eviction actually released its RAM, so the snapshot the
+				// watchdog / Auto label / later gates read reflects post-eviction reality, not the pre-switch
+				// figure (which is what made a clean switch look like "still out of memory").
+				await this._getMemoryStatus();
 				await this._startMlxServerInTerminal(modelId, model as ICustomLanguageModel & { localPath: string });
 				return;
 			}
@@ -3439,6 +3632,9 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 		// Both gates passed (or the user chose "Run anyway"): NOW evict the previous model to make room. Doing
 		// this only here - after the fit dialog - means "Keep current model" leaves the previous server running.
 		await this._enforceResidentBudget(modelId);
+		// Re-probe live memory after the eviction actually released its RAM, so the snapshot the watchdog /
+		// Auto label / later gates read reflects post-eviction reality, not the pre-switch figure.
+		await this._getMemoryStatus();
 
 		const port = await this.findAvailablePort(LOCOPILOT_LLAMA_SERVER_PORT);
 		// Make sure the slot-save dir exists before launch: llama.cpp only touches it on save/restore, but
@@ -3633,7 +3829,7 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 			}
 
 			this.startingServers.delete(modelId); // running state replaces starting state
-			this.runningServers.set(modelId, { port, terminal, kind: 'llama', logs, lastUsedAt: Date.now(), ready: false });
+			this.runningServers.set(modelId, { port, terminal, kind: 'llama', logs, lastUsedAt: Date.now(), startedAt: Date.now(), ready: false });
 			this._releaseReservedPort(port); // now tracked via runningServers; reservation no longer needed
 			// Advertise this server to other windows so they attach to it instead of launching a duplicate.
 			void this._publishActiveServerLock(port, 'llama', terminal, modelId);
@@ -3662,7 +3858,7 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 	 * but first frees memory by evicting the least-recently-used server when the resident-model budget is
 	 * reached, then waits until the server's OpenAI endpoint actually responds so the caller can send immediately.
 	 */
-	async ensureServerForModel(modelId: string, token: CancellationToken = CancellationToken.None): Promise<string | undefined> {
+	async ensureServerForModel(modelId: string, token: CancellationToken = CancellationToken.None, interactive: boolean = true): Promise<string | undefined> {
 		// Already running AND ready - reuse as-is, and refresh its LRU/idle state so it isn't evicted while
 		// in use. A record that exists but is not yet ready (weights still loading, e.g. a pre-warm that just
 		// launched) must NOT be returned here: doing so would let the caller fire a request the server rejects
@@ -3691,8 +3887,9 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 			// Launch (no-op if another caller already kicked it off; startServerInTerminal guards on runningServers).
 			// The resident-model budget (LRU eviction, singleActiveModel -> 1) is enforced inside the launch itself
 			// (_doStartServerInTerminal), so every start path - manual button, Retry, picker, auto-start - is bounded.
-			// interactive=true: this runs on the user's send/use action, so a too-big model prompts "Run anyway?".
-			await this.startServerInTerminal(modelId, true);
+			// interactive is true on the user's send/use action (a too-big model prompts "Run anyway?") and false
+			// for background pre-warm, which must never interrupt the user with the fit dialog.
+			await this.startServerInTerminal(modelId, interactive);
 		}
 
 		const baseUrl = this.getServerBaseUrl(modelId);
@@ -3773,8 +3970,9 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 			}
 		}
 		// First attempt is silent on crash - we retry, so don't alarm the user with a notification yet.
+		// interactive=false: a background pre-warm must never pop the "Run anyway?" fit dialog.
 		this._suppressCrashNotice.add(modelId);
-		const baseUrl = await this.ensureServerForModel(modelId);
+		const baseUrl = await this.ensureServerForModel(modelId, undefined, false);
 		this._suppressCrashNotice.delete(modelId);
 		// Success, or it failed for a real reason already surfaced by ensureServerForModel (missing binary,
 		// unsupported MLX, ...) - in which case it isn't flagged as a startup crash, so don't retry.
@@ -3788,7 +3986,8 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 			return; // a real request (or another trigger) already (re)started it in the meantime
 		}
 		// Second attempt is NOT suppressed: if it still crashes, surface the real failure to the user.
-		await this.ensureServerForModel(modelId);
+		// Still interactive=false - it remains a background pre-warm, so no fit dialog.
+		await this.ensureServerForModel(modelId, undefined, false);
 	}
 
 	/**
@@ -4245,7 +4444,7 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 			}
 
 			this.startingServers.delete(modelId);
-			this.runningServers.set(modelId, { port, terminal, kind: 'mlx', servedModelId: modelDir, logs, lastUsedAt: Date.now(), ready: false });
+			this.runningServers.set(modelId, { port, terminal, kind: 'mlx', servedModelId: modelDir, logs, lastUsedAt: Date.now(), startedAt: Date.now(), ready: false });
 			this._releaseReservedPort(port); // now tracked via runningServers; reservation no longer needed
 			// Advertise this server to other windows so they attach to it instead of launching a duplicate.
 			void this._publishActiveServerLock(port, 'mlx', terminal, modelId, modelDir);
@@ -4330,7 +4529,7 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 			const logs: string[] = [];
 			this.startingServers.delete(modelId);
 			// For Ollama, we don't manage the port, it's always the baseUrl port, but we track the terminal
-			this.runningServers.set(modelId, { port: 11434, terminal, kind: 'llama', logs, lastUsedAt: Date.now(), ready: true });
+			this.runningServers.set(modelId, { port: 11434, terminal, kind: 'llama', logs, lastUsedAt: Date.now(), startedAt: Date.now(), ready: true });
 			this._onDidServerStateChange.fire(modelId);
 
 			this._register(terminal.onLineData(line => {

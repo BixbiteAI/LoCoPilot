@@ -19,7 +19,7 @@ import { ILogService } from '../../../../platform/log/common/log.js';
 import { IRequestService } from '../../../../platform/request/common/request.js';
 import { IConfigurationService } from '../../../../platform/configuration/common/configuration.js';
 import { ChatConfiguration, ChatAgentLocation } from '../common/constants.js';
-import { findCatalogEntryByRepoId, getDefaultPickerRepoId, resolveAutoModel } from './locopilotModelCatalog.js';
+import { findCatalogEntryByRepoId, getDefaultPickerRepoId, isAutoCandidate, resolveAutoModel } from './locopilotModelCatalog.js';
 import { ITimerService } from '../../../services/timer/browser/timerService.js';
 import { ILoCoPilotFileLog } from './locopilotFileLog.js';
 import { INotificationService } from '../../../../platform/notification/common/notification.js';
@@ -192,10 +192,12 @@ export class LoCoPilotLanguageModelProvider extends Disposable implements ILangu
 	}
 
 	/**
-	 * Chat error panel renders this as Markdown. This shows when the model's server isn't ready yet - often
-	 * just a slow first launch (weights still loading) rather than a hard failure, and the server keeps coming
-	 * up in the background. There is no manual "start" action in the chat panel, so we tell the user to simply
-	 * wait a moment and resend; we still link My Models in case they want to inspect the server logs.
+	 * Chat error panel renders this as Markdown. This shows when the model's server isn't ready AND we don't
+	 * have a concrete reason recorded. That is genuinely ambiguous from here: it may be a slow first launch
+	 * (weights still loading, coming up fine) OR the server may have failed and will never come up. The old
+	 * wording only claimed the first ("taking a moment... just wait and resend"), which was actively wrong for
+	 * a model that had already died - so the message now states both possibilities and points at My Models,
+	 * where the logs and the Start button live.
 	 */
 	private _getLocalLlamaServerNotRunningMessage(modelName: string, displayName?: string): string {
 		const label = displayName?.trim() || modelName;
@@ -204,7 +206,7 @@ export class LoCoPilotLanguageModelProvider extends Disposable implements ILangu
 			id: 'workbench.action.chat.openLoCoPilotSettings',
 			arguments: [{ section: LOCOPILOT_SETTINGS_SECTION_LIST_MODELS }],
 		});
-		return `**${label}** is taking a moment to start. Please wait a few seconds and send your message again. If it keeps happening, open ${openModels} to view its logs.`;
+		return `**${label}** isn't running yet. It may still be starting - wait a few seconds and send your message again - or it may have failed to start. If resending doesn't help, open ${openModels} to check its logs and start it from there, or switch to a smaller model.`;
 	}
 
 	/**
@@ -364,6 +366,13 @@ export class LoCoPilotLanguageModelProvider extends Disposable implements ILangu
 		// caller (extension API, future paths) gets the same resolution instead of a "model not found" error.
 		if (modelId === LOCOPILOT_AUTO_MODEL_ID) {
 			modelId = await this._resolveAutoModelWithStepDown();
+		} else if (this.customLanguageModelsService.getSelectedCustomModelId() === LOCOPILOT_AUTO_MODEL_ID
+			&& modelId === this.customLanguageModelsService.getPinnedAutoModelId()) {
+			// Agent path: Auto was already resolved upstream to the session pin (a concrete id), which skipped
+			// this method - and with it the live-RAM step-down. Re-run the step-down here so an Auto send whose
+			// pinned model can't fit RIGHT NOW steps down to a smaller model (and re-pins it) instead of running
+			// into the launch gate's failure. When the pin still fits, this returns it immediately.
+			modelId = await this._resolveAutoModelWithStepDown();
 		}
 		const customModel = this.customLanguageModelsService.getCustomModels().find(m => m.id === modelId);
 		if (!customModel) {
@@ -400,6 +409,18 @@ export class LoCoPilotLanguageModelProvider extends Disposable implements ILangu
 	private async _resolveAutoModelWithStepDown(): Promise<string> {
 		const isActive = (id: string) => this.localModelRunner.isServerRunning(id) || this.localModelRunner.isServerStarting(id);
 		const ram = this._detectedRamGB();
+		// Session pin first (see resolveAutoModelPinned): if Auto is already pinned to a valid candidate that
+		// is running or still fits the launch gate, use it - this is what keeps the picker label, the warmed
+		// server, and the request on the SAME model. Only when the pin can't fit does the step-down below run,
+		// and it re-pins whatever it lands on so every other consumer follows.
+		const pinnedId = this.customLanguageModelsService.getPinnedAutoModelId();
+		if (pinnedId) {
+			const pinned = this.customLanguageModelsService.getCustomModels().find(m => m.id === pinnedId);
+			if (pinned && isAutoCandidate(pinned) && (isActive(pinnedId) || await this.localModelRunner.wouldModelFitForLaunch(pinnedId))) {
+				this._log(`[LoCoPilot Provider] Auto using pinned model: ${getCustomModelListLabel(pinned)} (${pinnedId})`);
+				return pinnedId;
+			}
+		}
 		let ceiling: number | undefined; // step-down size ceiling (exclusive), lowered on each gate refusal
 		let smallest: ICustomLanguageModel | undefined; // last (=smallest) pick seen, the fallback
 		// Bounded by the number of distinct downloaded catalog models: each step lowers the size ceiling
@@ -417,6 +438,7 @@ export class LoCoPilotLanguageModelProvider extends Disposable implements ILangu
 			smallest = resolved;
 			if (await this.localModelRunner.wouldModelFitForLaunch(resolved.id)) {
 				this._log(`[LoCoPilot Provider] Auto resolved to model: ${getCustomModelListLabel(resolved)} (${resolved.id})`);
+				this.customLanguageModelsService.setPinnedAutoModelId(resolved.id); // pin so label/warming follow
 				return resolved.id;
 			}
 			const entry = findCatalogEntryByRepoId(resolved.modelName);
@@ -428,6 +450,7 @@ export class LoCoPilotLanguageModelProvider extends Disposable implements ILangu
 		}
 		if (smallest) {
 			this._log(`[LoCoPilot Provider] Auto: no pick fit cleanly; using smallest candidate ${getCustomModelListLabel(smallest)} (${smallest.id}) - the launch gate will offer "Run anyway".`);
+			this.customLanguageModelsService.setPinnedAutoModelId(smallest.id); // pin so label/warming follow
 			return smallest.id;
 		}
 		throw new Error('Auto has no downloaded local model to use yet. Download one of the suggested models from the chat panel (or LoCoPilot Settings), then send your message again.');

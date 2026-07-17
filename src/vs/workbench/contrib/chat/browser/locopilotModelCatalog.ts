@@ -3,7 +3,7 @@
  *  Licensed under the MIT License. See License.txt in the project root for license information.
  *--------------------------------------------------------------------------------------------*/
 
-import { ICustomLanguageModel } from '../common/customLanguageModelsService.js';
+import { ICustomLanguageModel, ICustomLanguageModelsService } from '../common/customLanguageModelsService.js';
 
 /**
  * Built-in model catalog: a curated set of local (HuggingFace) models that are seeded into a fresh
@@ -1110,6 +1110,38 @@ export function resolveAutoModel(
 		return undefined;
 	}
 	return scored.reduce((best, s) => s.score > best.score ? s : best).model;
+}
+
+/**
+ * PIN-AWARE Auto resolution - the one every consumer (picker label/rows, selection pre-warm, prefix
+ * warming, the per-request path) should use so they all agree on the SAME concrete model.
+ *
+ * Auto used to be re-resolved independently at each of those sites, each at a different moment over
+ * different live inputs (which server happened to be running/starting for the stickiness bonus, momentary
+ * free RAM for the step-down), so the label could say one model, selecting Auto warmed another, and the
+ * send used a third. This wrapper funnels them through a session pin held on the service: the first
+ * resolution pins its pick, later calls return the pin as long as it is still a valid Auto candidate
+ * (downloaded, visible, in the catalog). The pin is cleared when the selection moves off Auto (service
+ * side), and the request path re-pins when its launch-gate step-down lands on a smaller model - after
+ * which every consumer follows along.
+ */
+export function resolveAutoModelPinned(
+	service: ICustomLanguageModelsService,
+	ramGB: number,
+	isServerActive: (modelId: string) => boolean
+): ICustomLanguageModel | undefined {
+	const models = service.getCustomModels();
+	const pinnedId = service.getPinnedAutoModelId();
+	if (pinnedId) {
+		const pinned = models.find(m => m.id === pinnedId);
+		if (pinned && isAutoCandidate(pinned)) {
+			return pinned;
+		}
+		service.setPinnedAutoModelId(undefined); // pinned model was deleted/hidden - re-resolve below
+	}
+	const resolved = resolveAutoModel(models, ramGB, isServerActive);
+	service.setPinnedAutoModelId(resolved?.id);
+	return resolved;
 }
 
 export type AutoStarterSlot = 'best' | 'balanced' | 'fast';

@@ -28,7 +28,7 @@ import { DEFAULT_MODEL_PICKER_CATEGORY } from '../../../common/widget/input/mode
 import { ChatInputPickerActionViewItem, IChatInputPickerOptions } from './chatInputPickerActionItem.js';
 import { ICustomLanguageModelsService, ICustomLanguageModel, getCustomModelListLabel, LOCOPILOT_AUTO_MODEL_ID } from '../../../common/customLanguageModelsService.js';
 import { LOCOPILOT_SETTINGS_SECTION_LIST_MODELS } from '../../chatManagement/locopilotSettingsEditorInput.js';
-import { getRecommendedRepoId, resolveAutoModel } from '../../locopilotModelCatalog.js';
+import { getRecommendedRepoId, resolveAutoModelPinned } from '../../locopilotModelCatalog.js';
 import { ITimerService } from '../../../../../services/timer/browser/timerService.js';
 import { ExtensionIdentifier } from '../../../../../../platform/extensions/common/extensions.js';
 import { ILoCoPilotLocalModelRunner } from '../../locopilotLocalModelRunner.js';
@@ -206,10 +206,14 @@ interface IModelPickerState {
 /** Sits above Custom Models (order 100) and the standard categories, so Auto is always the first row. */
 const AUTO_PICKER_CATEGORY = { label: localize('chat.modelPicker.autoCategory', "Auto"), order: 0 };
 
-/** The model Auto currently resolves to, mirroring the agent's aspirational per-request resolution. */
+/**
+ * The model Auto currently resolves to. Pin-aware (see resolveAutoModelPinned): the label, the selection
+ * pre-warm, and the per-request resolution all read the SAME session pin, so the picker can no longer show
+ * one model while the send uses another.
+ */
 function resolveAutoModelForPicker(customLanguageModelsService: ICustomLanguageModelsService, localModelRunner: ILoCoPilotLocalModelRunner, timerService: ITimerService): ICustomLanguageModel | undefined {
-	return resolveAutoModel(
-		customLanguageModelsService.getCustomModels(),
+	return resolveAutoModelPinned(
+		customLanguageModelsService,
 		detectedRamGB(timerService),
 		id => localModelRunner.isServerRunning(id) || localModelRunner.isServerStarting(id)
 	);

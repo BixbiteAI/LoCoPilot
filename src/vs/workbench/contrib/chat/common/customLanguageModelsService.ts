@@ -217,6 +217,17 @@ export interface ICustomLanguageModelsService {
 	getChatSelectableCustomModels(): ICustomLanguageModel[];
 	getSelectedCustomModelId(): string | undefined;
 	setSelectedCustomModelId(id: string | undefined): void;
+	/**
+	 * The concrete model id the "Auto" picker mode is currently PINNED to, or undefined when unresolved.
+	 * Auto used to be re-resolved independently by the picker label, the selection/pre-warm path, and the
+	 * per-request path - each at a different moment over different live state (which server happens to be
+	 * warm, momentary free RAM), so the three could disagree and Auto visibly bounced between models. The
+	 * first resolver pins its pick here and every consumer reads the pin; only the request path's launch-gate
+	 * step-down re-pins (to the smaller model it actually used). Session-only state (never persisted).
+	 * Cleared automatically when the selection moves off Auto, so re-selecting Auto re-resolves fresh.
+	 */
+	getPinnedAutoModelId(): string | undefined;
+	setPinnedAutoModelId(id: string | undefined): void;
 	addCustomModel(model: Omit<ICustomLanguageModel, 'id' | 'createdAt'>): Promise<ICustomLanguageModel>;
 	removeCustomModel(id: string): Promise<void>;
 	updateCustomModel(id: string, updates: Partial<Omit<ICustomLanguageModel, 'id' | 'createdAt'>>): Promise<void>;
@@ -259,6 +270,8 @@ export class CustomLanguageModelsService extends Disposable implements ICustomLa
 
 	private models: ICustomLanguageModel[] = [];
 	private selectedCustomModelId: string | undefined;
+	/** Session-only concrete pick for the "Auto" mode (see getPinnedAutoModelId). Never persisted. */
+	private pinnedAutoModelId: string | undefined;
 
 	constructor(
 		@IStorageService private readonly storageService: IStorageService,
@@ -382,7 +395,23 @@ export class CustomLanguageModelsService extends Disposable implements ICustomLa
 	setSelectedCustomModelId(id: string | undefined): void {
 		if (this.selectedCustomModelId !== id) {
 			this.selectedCustomModelId = id;
+			if (id !== LOCOPILOT_AUTO_MODEL_ID) {
+				// Selection moved off Auto: drop the pin so a future Auto selection re-resolves fresh.
+				this.pinnedAutoModelId = undefined;
+			}
 			this.storageService.store(STORAGE_KEY_SELECTED, id ?? '', StorageScope.APPLICATION, StorageTarget.MACHINE);
+			this._onDidChangeCustomModels.fire();
+		}
+	}
+
+	getPinnedAutoModelId(): string | undefined {
+		return this.pinnedAutoModelId;
+	}
+
+	setPinnedAutoModelId(id: string | undefined): void {
+		if (this.pinnedAutoModelId !== id) {
+			this.pinnedAutoModelId = id;
+			// Fire the models-changed event so Auto-label consumers (picker button/rows) re-render with the pin.
 			this._onDidChangeCustomModels.fire();
 		}
 	}

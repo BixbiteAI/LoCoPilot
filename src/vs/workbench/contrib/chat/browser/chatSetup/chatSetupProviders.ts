@@ -37,7 +37,7 @@ import { IChatRequestToolEntry, IChatRequestVariableEntry, isPromptFileVariableE
 import { ChatAgentLocation, ChatConfiguration, ChatModeKind } from '../../common/constants.js';
 import { ChatMessageRole, IChatMessage, ILanguageModelsService } from '../../common/languageModels.js';
 import { ICustomLanguageModelsService, ICustomLanguageModel, getCustomModelListLabel, needsDownloadOrPullRetry, LOCOPILOT_AUTO_MODEL_ID } from '../../common/customLanguageModelsService.js';
-import { findCatalogEntry, getAutoStarterPicks, resolveAutoModel, IAutoStarterPick } from '../locopilotModelCatalog.js';
+import { findCatalogEntry, getAutoStarterPicks, resolveAutoModelPinned, IAutoStarterPick } from '../locopilotModelCatalog.js';
 import { ITimerService } from '../../../../services/timer/browser/timerService.js';
 import { LOCOPILOT_SETTINGS_SECTION_LIST_MODELS } from '../chatManagement/locopilotSettingsEditorInput.js';
 import { IFileService } from '../../../../../platform/files/common/files.js';
@@ -1241,13 +1241,12 @@ export class LoCoPilotBuiltInAgent extends Disposable implements IChatAgentImple
 
 	/**
 	 * Resolve the "Auto" sentinel to a concrete downloaded catalog model, or undefined when none qualifies.
-	 * Aspirational: the most capable model this machine's RAM tier supports (the live-RAM fit is deferred to
-	 * the launch gate, which the provider's request path steps down against - see resolveAutoModel). Used here
-	 * for warming/labels, which just need the intended pick.
+	 * PIN-AWARE (see resolveAutoModelPinned): reads/sets the same session pin as the picker label and the
+	 * language-model provider, so warming, the label, and the actual request all target the SAME model.
 	 */
 	private _resolveAutoModel(): ICustomLanguageModel | undefined {
-		return resolveAutoModel(
-			this.customLanguageModelsService.getCustomModels(),
+		return resolveAutoModelPinned(
+			this.customLanguageModelsService,
 			this._detectedRamGB(),
 			id => this.localModelRunner.isServerRunning(id) || this.localModelRunner.isServerStarting(id)
 		);
@@ -1330,7 +1329,8 @@ export class LoCoPilotBuiltInAgent extends Disposable implements IChatAgentImple
 				// Boot the server and wait for it to be ready BEFORE attempting the restore. The warm can be
 				// triggered on model SELECTION (before any server exists), and restoreSlotCache hard-requires a
 				// present+ready server - without this it always bailed with present=false and we re-prefilled.
-				await this.localModelRunner.ensureServerForModel(modelId, CancellationToken.None);
+				// interactive=false: this is background warming; it must never pop the "Run anyway?" fit dialog.
+				await this.localModelRunner.ensureServerForModel(modelId, CancellationToken.None, false);
 				// Try the persisted slot cache first: on a hit the prefix KV is already resident, so we skip
 				// the (multi-thousand-token) prefill entirely. The restore is keyed by (model, mode) so a
 				// different mode never restores the wrong prefix.
