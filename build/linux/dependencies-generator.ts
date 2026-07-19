@@ -3,6 +3,7 @@
  *  Licensed under the MIT License. See License.txt in the project root for license information.
  *--------------------------------------------------------------------------------------------*/
 import { spawnSync } from 'child_process';
+import { existsSync } from 'fs';
 import path from 'path';
 import { getChromiumSysroot, getVSCodeSysroot } from './debian/install-sysroot.ts';
 import { generatePackageDeps as generatePackageDepsDebian } from './debian/calculate-deps.ts';
@@ -55,7 +56,7 @@ export async function getDependencies(packageType: 'deb' | 'rpm', buildDir: stri
 
 	const appPath = path.join(buildDir, applicationName);
 	// Add the native modules
-	const files = findResult.stdout.toString().trimEnd().split('\n')
+	const files: string[] = findResult.stdout.toString().trimEnd().split('\n')
 		// onnxruntime-node ships its own private libonnxruntime.so.* next to the
 		// binding and links it via an $ORIGIN RPATH. dpkg-shlibdeps cannot resolve
 		// $ORIGIN while analyzing the build tree in-place, so it errors out on this
@@ -63,8 +64,13 @@ export async function getDependencies(packageType: 'deb' | 'rpm', buildDir: stri
 		// required by the main executable, and the private lib is bundled and loads
 		// via $ORIGIN at runtime, so skipping it from the scan loses no dependency.
 		.filter(file => file && !file.includes(`${path.sep}onnxruntime-node${path.sep}`));
-	// Add the tunnel binary.
-	files.push(path.join(buildDir, 'bin', product.tunnelApplicationName));
+	// Add the tunnel binary if present. It is produced by the Rust CLI build step,
+	// which the minimal package build may skip; scanning a missing file makes
+	// dpkg-shlibdeps fail outright, so only include it when it actually exists.
+	const tunnelPath = path.join(buildDir, 'bin', product.tunnelApplicationName);
+	if (existsSync(tunnelPath)) {
+		files.push(tunnelPath);
+	}
 	// Add the main executable.
 	files.push(appPath);
 	// Add chrome sandbox and crashpad handler.
