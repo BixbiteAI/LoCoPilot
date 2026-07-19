@@ -86,6 +86,29 @@ jobs:
           ls -la ../LoCoPilot-linux-x64/resources/app/node_modules >/dev/null
           echo "OK: app folder built"
 
+      - name: Prune foreign-arch native bindings before packaging
+        run: |
+          set -e
+          APP=../LoCoPilot-linux-x64/resources/app/node_modules
+          # onnxruntime-node (and possibly others) bundle prebuilt bindings for every
+          # platform/arch. The Debian/RPM dep scanner runs `find -name '*.node'` across
+          # ALL of them, and dpkg-shlibdeps errors on the foreign-arch ELF files
+          # (e.g. linux/arm64). A single-arch x64 package must contain only x64 bindings.
+          ORT="$APP/onnxruntime-node/bin/napi-v3"
+          if [ -d "$ORT" ]; then
+            rm -rf "$ORT/darwin" "$ORT/win32" "$ORT/linux/arm64" "$ORT/linux/arm" 2>/dev/null || true
+          fi
+          # Generic safety net: remove any remaining non-x86-64 .node binary.
+          removed=0
+          while IFS= read -r f; do
+            if ! file -b "$f" | grep -q 'x86-64'; then
+              echo "Removing foreign-arch binding: $f"
+              rm -f "$f"; removed=$((removed+1))
+            fi
+          done < <(find "$APP" -name '*.node')
+          echo "Pruned $removed foreign-arch .node file(s)."
+          echo "Remaining onnxruntime bindings:"; find "$APP/onnxruntime-node" -name '*.node' 2>/dev/null || true
+
       - name: Package .deb + .rpm
         run: ./scripts/build-and-ship-linux.sh
 
