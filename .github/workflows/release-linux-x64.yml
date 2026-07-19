@@ -1,0 +1,104 @@
+# Builds the LoCoPilot Linux x64 installers (.deb + .rpm) on a GitHub-hosted runner.
+#
+# This is the FIRST target in the "build everything in CI" effort. Once this is
+# green, the same pattern is copied to linux-arm64, then Windows and macOS.
+#
+# Unsigned for now — signing is a later phase. Artifacts are uploaded to the run
+# (Actions → this run → Artifacts), not attached to a Release yet.
+#
+# Recipe mirrors the proven manual EC2 flow in Docs/BUILD_COMMANDS.md §5.
+name: Build Linux x64
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ ci/release-builds ]
+    paths: [ '.github/workflows/release-linux-x64.yml' ]
+
+jobs:
+  build-linux-x64:
+    name: Build Linux x64 (.deb + .rpm)
+    runs-on: ubuntu-22.04       # match the Ubuntu 22.04 recipe; broad glibc compat
+    timeout-minutes: 90
+    env:
+      npm_config_arch: x64
+      VSCODE_ARCH: x64
+      ELECTRON_SKIP_BINARY_DOWNLOAD: 1
+      PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: 1
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Free up disk space
+        run: |
+          set -e
+          echo "Before:"; df -h /
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android \
+            /usr/local/share/boost "$AGENT_TOOLSDIRECTORY" \
+            /usr/local/lib/node_modules 2>/dev/null || true
+          echo "After:"; df -h /
+
+      - name: Add swap (build peaks >8 GB; avoids OOM "Killed")
+        run: |
+          set -e
+          sudo fallocate -l 12G /mnt/swapfile
+          sudo chmod 600 /mnt/swapfile
+          sudo mkswap /mnt/swapfile
+          sudo swapon /mnt/swapfile
+          free -h
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+
+      - name: Install system build dependencies
+        run: |
+          set -e
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential fakeroot rpm \
+            libx11-dev libxkbfile-dev libsecret-1-dev libkrb5-dev \
+            libgtk-3-0 libgbm1 python3 pkg-config
+
+      - name: Fetch llama.cpp engine binary (linux-x64)
+        run: node scripts/fetch-llama-binaries.mjs linux-x64
+
+      - name: Fetch embedding model
+        run: node scripts/fetch-embedding-model.mjs
+
+      - name: Install dependencies (npm ci, with retries)
+        run: |
+          set -e
+          for i in 1 2 3 4 5; do
+            npm ci && break
+            if [ $i -eq 5 ]; then echo "npm ci failed 5x" >&2; exit 1; fi
+            echo "npm ci attempt $i failed, retrying..."; sleep 5
+          done
+
+      - name: Build app folder (vscode-linux-x64-min)
+        run: npm run gulp vscode-linux-x64-min
+
+      - name: Sanity check — app folder produced
+        run: |
+          set -e
+          ls -la ../LoCoPilot-linux-x64/resources/app/node_modules >/dev/null
+          echo "OK: app folder built"
+
+      - name: Package .deb + .rpm
+        run: ./scripts/build-and-ship-linux.sh
+
+      - name: Collect artifacts
+        run: |
+          set -e
+          mkdir -p dist
+          find .build/linux \( -name "*.deb" -o -name "*.rpm" \) -exec cp -v {} dist/ \;
+          ls -la dist
+
+      - name: Upload installers
+        uses: actions/upload-artifact@v4
+        with:
+          name: locopilot-linux-x64
+          path: dist/*
+          if-no-files-found: error
