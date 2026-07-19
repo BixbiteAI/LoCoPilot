@@ -55,7 +55,14 @@ export async function getDependencies(packageType: 'deb' | 'rpm', buildDir: stri
 
 	const appPath = path.join(buildDir, applicationName);
 	// Add the native modules
-	const files = findResult.stdout.toString().trimEnd().split('\n');
+	const files = findResult.stdout.toString().trimEnd().split('\n')
+		// onnxruntime-node ships its own private libonnxruntime.so.* next to the
+		// binding and links it via an $ORIGIN RPATH. dpkg-shlibdeps cannot resolve
+		// $ORIGIN while analyzing the build tree in-place, so it errors out on this
+		// binding. Its system deps (libc/libstdc++/libm/libgcc_s) are already
+		// required by the main executable, and the private lib is bundled and loads
+		// via $ORIGIN at runtime, so skipping it from the scan loses no dependency.
+		.filter(file => file && !file.includes(`${path.sep}onnxruntime-node${path.sep}`));
 	// Add the tunnel binary.
 	files.push(path.join(buildDir, 'bin', product.tunnelApplicationName));
 	// Add the main executable.
