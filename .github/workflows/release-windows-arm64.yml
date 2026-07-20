@@ -1,0 +1,84 @@
+# Builds the LoCoPilot Windows arm64 installers (user + system setup .exe) by
+# cross-compiling on a GitHub-hosted x64 Windows runner. Unsigned.
+# Mirrors Docs/BUILD_COMMANDS.md §4.
+#
+# NOTE: arm64 is cross-compiled on an x64 runner (npm_config_arch=arm64). This
+# is the target most likely to need iteration on its first real run.
+name: Build Windows arm64
+
+# Manual trigger only. See Docs/CI_BUILDS.md.
+#   gh workflow run "Build Windows arm64" --repo BixbiteAI/LoCoPilot --ref main
+on:
+  workflow_dispatch:
+
+jobs:
+  build-windows-arm64:
+    name: Build Windows arm64 (user + system .exe)
+    runs-on: windows-latest
+    timeout-minutes: 120
+    env:
+      npm_config_arch: arm64
+      VSCODE_ARCH: arm64
+      PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: 1
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+
+      - name: Install Inno Setup (provides ISCC.exe)
+        shell: pwsh
+        run: choco install innosetup -y --no-progress
+
+      - name: Fetch llama.cpp engine binary (win32-arm64)
+        shell: pwsh
+        run: node scripts/fetch-llama-binaries.mjs win32-arm64
+
+      - name: Fetch embedding model
+        shell: pwsh
+        run: node scripts/fetch-embedding-model.mjs
+
+      - name: Install dependencies (npm ci, with retries)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          for ($i = 1; $i -le 5; $i++) {
+            npm ci
+            if ($LASTEXITCODE -eq 0) { break }
+            if ($i -eq 5) { throw "npm ci failed after 5 attempts" }
+            Write-Host "npm ci attempt $i failed, retrying..."
+            Start-Sleep -Seconds 5
+          }
+
+      - name: Build app folder (vscode-win32-arm64-min)
+        shell: pwsh
+        run: npm run gulp vscode-win32-arm64-min
+
+      - name: Build inno-updater + user + system installers
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          npm run gulp vscode-win32-arm64-inno-updater
+          npm run gulp vscode-win32-arm64-user-setup
+          npm run gulp vscode-win32-arm64-system-setup
+
+      - name: Collect artifacts
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Get-ChildItem -Recurse -Path .build\win32-arm64\user-setup,.build\win32-arm64\system-setup -Filter *.exe |
+            ForEach-Object { Copy-Item $_.FullName dist\ -Verbose }
+          Get-ChildItem dist
+
+      - name: Upload installers
+        uses: actions/upload-artifact@v4
+        with:
+          name: locopilot-windows-arm64
+          path: dist/*
+          if-no-files-found: error

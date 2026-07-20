@@ -1,0 +1,80 @@
+# Builds the LoCoPilot Windows x64 installers (user + system setup .exe) on a
+# GitHub-hosted Windows runner. Unsigned. Artifacts uploaded to the run.
+# Mirrors Docs/BUILD_COMMANDS.md §3 (+ scripts/build-and-ship-win.bat).
+name: Build Windows x64
+
+# Manual trigger only. See Docs/CI_BUILDS.md.
+#   gh workflow run "Build Windows x64" --repo BixbiteAI/LoCoPilot --ref main
+on:
+  workflow_dispatch:
+
+jobs:
+  build-windows-x64:
+    name: Build Windows x64 (user + system .exe)
+    runs-on: windows-latest
+    timeout-minutes: 120
+    env:
+      npm_config_arch: x64
+      VSCODE_ARCH: x64
+      PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: 1
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+
+      - name: Install Inno Setup (provides ISCC.exe)
+        shell: pwsh
+        run: choco install innosetup -y --no-progress
+
+      - name: Fetch llama.cpp engine binary (win32-x64)
+        shell: pwsh
+        run: node scripts/fetch-llama-binaries.mjs win32-x64
+
+      - name: Fetch embedding model
+        shell: pwsh
+        run: node scripts/fetch-embedding-model.mjs
+
+      - name: Install dependencies (npm ci, with retries)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          for ($i = 1; $i -le 5; $i++) {
+            npm ci
+            if ($LASTEXITCODE -eq 0) { break }
+            if ($i -eq 5) { throw "npm ci failed after 5 attempts" }
+            Write-Host "npm ci attempt $i failed, retrying..."
+            Start-Sleep -Seconds 5
+          }
+
+      - name: Build app folder (vscode-win32-x64-min)
+        shell: pwsh
+        run: npm run gulp vscode-win32-x64-min
+
+      - name: Build user + system installers
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          npm run gulp vscode-win32-x64-user-setup
+          npm run gulp vscode-win32-x64-system-setup
+
+      - name: Collect artifacts
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Get-ChildItem -Recurse -Path .build\win32-x64\user-setup,.build\win32-x64\system-setup -Filter *.exe |
+            ForEach-Object { Copy-Item $_.FullName dist\ -Verbose }
+          Get-ChildItem dist
+
+      - name: Upload installers
+        uses: actions/upload-artifact@v4
+        with:
+          name: locopilot-windows-x64
+          path: dist/*
+          if-no-files-found: error

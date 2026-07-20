@@ -1,0 +1,65 @@
+# Builds LoCoPilot for macOS Intel (x64) on a GitHub-hosted Intel mac.
+# Produces an UNSIGNED .app, zipped. Mirrors Docs/BUILD_COMMANDS.md §1.
+#
+# NOTE: macos-13 is the Intel runner. If GitHub retires it, switch to
+# cross-compiling x64 on macos-14 (arch -x86_64 + npm_config_arch=x64).
+name: Build macOS x64
+
+# Manual trigger only. See Docs/CI_BUILDS.md.
+#   gh workflow run "Build macOS x64" --repo BixbiteAI/LoCoPilot --ref main
+on:
+  workflow_dispatch:
+
+jobs:
+  build-macos-x64:
+    name: Build macOS x64 (unsigned .app zip)
+    runs-on: macos-13           # Intel runner
+    timeout-minutes: 120
+    env:
+      npm_config_arch: x64
+      VSCODE_ARCH: x64
+      PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: 1
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+
+      - name: Fetch llama.cpp engine binary (darwin-x64)
+        run: node scripts/fetch-llama-binaries.mjs darwin-x64
+
+      - name: Fetch embedding model
+        run: node scripts/fetch-embedding-model.mjs
+
+      - name: Install dependencies (npm ci, with retries)
+        run: |
+          set -e
+          for i in 1 2 3 4 5; do
+            npm ci && break
+            if [ $i -eq 5 ]; then echo "npm ci failed 5x" >&2; exit 1; fi
+            echo "npm ci attempt $i failed, retrying..."; sleep 5
+          done
+
+      - name: Build app (vscode-darwin-x64-min)
+        run: npm run gulp vscode-darwin-x64-min
+
+      - name: Zip the .app (unsigned)
+        run: |
+          set -e
+          mkdir -p dist
+          ditto -c -k --sequesterRsrc --keepParent \
+            ../LoCoPilot-darwin-x64/LoCoPilot.app \
+            dist/LoCoPilot-darwin-x64.zip
+          ls -la dist
+
+      - name: Upload build
+        uses: actions/upload-artifact@v4
+        with:
+          name: locopilot-macos-x64
+          path: dist/*
+          if-no-files-found: error

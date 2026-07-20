@@ -1,28 +1,26 @@
-# Builds the LoCoPilot Linux x64 installers (.deb + .rpm) on a GitHub-hosted runner.
+# Builds the LoCoPilot Linux arm64 installers (.deb + .rpm) on a GitHub-hosted
+# arm64 runner. Unsigned. Artifacts are uploaded to the run.
 #
-# This is the FIRST target in the "build everything in CI" effort. Once this is
-# green, the same pattern is copied to linux-arm64, then Windows and macOS.
-#
-# Unsigned for now — signing is a later phase. Artifacts are uploaded to the run
-# (Actions → this run → Artifacts), not attached to a Release yet.
-#
-# Recipe mirrors the proven manual EC2 flow in Docs/BUILD_COMMANDS.md §5.
-name: Build Linux x64
+# NOTE: there is no official prebuilt llama.cpp arm64 Linux binary (see
+# scripts/fetch-llama-binaries.mjs). The engine-fetch step is therefore
+# best-effort and non-fatal: the app still builds, but bundled local-model
+# inference won't work on arm64 Linux until an engine binary is provided in
+# resources/bin/linux-arm64/. Everything else mirrors the linux-x64 workflow.
+name: Build Linux arm64
 
-# Manual trigger only. Run it from the Actions tab ("Run workflow") or with:
-#   gh workflow run "Build Linux x64" --repo BixbiteAI/LoCoPilot --ref main
-# See Docs/CI_BUILDS.md for full instructions.
+# Manual trigger only. See Docs/CI_BUILDS.md.
+#   gh workflow run "Build Linux arm64" --repo BixbiteAI/LoCoPilot --ref main
 on:
   workflow_dispatch:
 
 jobs:
-  build-linux-x64:
-    name: Build Linux x64 (.deb + .rpm)
-    runs-on: ubuntu-22.04       # match the Ubuntu 22.04 recipe; broad glibc compat
-    timeout-minutes: 90
+  build-linux-arm64:
+    name: Build Linux arm64 (.deb + .rpm)
+    runs-on: ubuntu-24.04-arm     # GitHub-hosted arm64 Linux runner
+    timeout-minutes: 120
     env:
-      npm_config_arch: x64
-      VSCODE_ARCH: x64
+      npm_config_arch: arm64
+      VSCODE_ARCH: arm64
       ELECTRON_SKIP_BINARY_DOWNLOAD: 1
       PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: 1
       GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -33,13 +31,12 @@ jobs:
       - name: Free up disk space
         run: |
           set -e
-          echo "Before:"; df -h /
           sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android \
             /usr/local/share/boost "$AGENT_TOOLSDIRECTORY" \
             /usr/local/lib/node_modules 2>/dev/null || true
-          echo "After:"; df -h /
+          df -h /
 
-      - name: Add swap (build peaks >8 GB; avoids OOM "Killed")
+      - name: Add swap (avoids OOM "Killed")
         run: |
           set -e
           sudo fallocate -l 12G /mnt/swapfile
@@ -52,7 +49,7 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version-file: .nvmrc
-          cache: npm       # cache ~/.npm to speed up npm ci downloads
+          cache: npm
 
       - name: Install system build dependencies
         run: |
@@ -63,8 +60,11 @@ jobs:
             libx11-dev libxkbfile-dev libsecret-1-dev libkrb5-dev \
             libgtk-3-0 libgbm1 python3 pkg-config
 
-      - name: Fetch llama.cpp engine binary (linux-x64)
-        run: node scripts/fetch-llama-binaries.mjs linux-x64
+      - name: Fetch llama.cpp engine binary (linux-arm64, best-effort)
+        continue-on-error: true
+        run: |
+          node scripts/fetch-llama-binaries.mjs linux-arm64 \
+            || echo "::warning::No prebuilt llama.cpp arm64 Linux binary; building without bundled engine."
 
       - name: Fetch embedding model
         run: node scripts/fetch-embedding-model.mjs
@@ -78,40 +78,40 @@ jobs:
             echo "npm ci attempt $i failed, retrying..."; sleep 5
           done
 
-      - name: Build app folder (vscode-linux-x64-min)
-        run: npm run gulp vscode-linux-x64-min
+      - name: Build app folder (vscode-linux-arm64-min)
+        run: npm run gulp vscode-linux-arm64-min
 
       - name: Sanity check — app folder produced
         run: |
           set -e
-          ls -la ../LoCoPilot-linux-x64/resources/app/node_modules >/dev/null
+          ls -la ../LoCoPilot-linux-arm64/resources/app/node_modules >/dev/null
           echo "OK: app folder built"
 
       - name: Prune foreign-arch native bindings before packaging
         run: |
           set -e
-          APP=../LoCoPilot-linux-x64/resources/app/node_modules
-          # onnxruntime-node (and possibly others) bundle prebuilt bindings for every
-          # platform/arch. The Debian/RPM dep scanner runs `find -name '*.node'` across
-          # ALL of them, and dpkg-shlibdeps errors on the foreign-arch ELF files
-          # (e.g. linux/arm64). A single-arch x64 package must contain only x64 bindings.
+          APP=../LoCoPilot-linux-arm64/resources/app/node_modules
           ORT="$APP/onnxruntime-node/bin/napi-v3"
           if [ -d "$ORT" ]; then
-            rm -rf "$ORT/darwin" "$ORT/win32" "$ORT/linux/arm64" "$ORT/linux/arm" 2>/dev/null || true
+            rm -rf "$ORT/darwin" "$ORT/win32" "$ORT/linux/x64" 2>/dev/null || true
           fi
-          # Generic safety net: remove any remaining non-x86-64 .node binary.
+          # Generic safety net: remove any non-aarch64 .node binary.
           removed=0
           while IFS= read -r f; do
-            if ! file -b "$f" | grep -q 'x86-64'; then
+            if ! file -b "$f" | grep -qi 'aarch64\|arm64'; then
               echo "Removing foreign-arch binding: $f"
               rm -f "$f"; removed=$((removed+1))
             fi
           done < <(find "$APP" -name '*.node')
           echo "Pruned $removed foreign-arch .node file(s)."
-          echo "Remaining onnxruntime bindings:"; find "$APP/onnxruntime-node" -name '*.node' 2>/dev/null || true
 
-      - name: Package .deb + .rpm
-        run: ./scripts/build-and-ship-linux.sh
+      - name: Package .deb + .rpm (arm64)
+        run: |
+          set -e
+          npm run gulp vscode-linux-arm64-prepare-deb
+          npm run gulp vscode-linux-arm64-build-deb
+          npm run gulp vscode-linux-arm64-prepare-rpm
+          npm run gulp vscode-linux-arm64-build-rpm
 
       - name: Collect artifacts
         run: |
@@ -123,6 +123,6 @@ jobs:
       - name: Upload installers
         uses: actions/upload-artifact@v4
         with:
-          name: locopilot-linux-x64
+          name: locopilot-linux-arm64
           path: dist/*
           if-no-files-found: error
