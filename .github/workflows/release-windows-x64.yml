@@ -63,13 +63,16 @@ jobs:
           npm run gulp vscode-win32-x64-user-setup
           npm run gulp vscode-win32-x64-system-setup
 
-      - name: Collect artifacts
+      - name: Collect artifacts (canonical names)
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
           New-Item -ItemType Directory -Force dist | Out-Null
-          Get-ChildItem -Recurse -Path .build\win32-x64\user-setup,.build\win32-x64\system-setup -Filter *.exe |
-            ForEach-Object { Copy-Item $_.FullName dist\ -Verbose }
+          $user   = Get-ChildItem -Recurse .build\win32-x64\user-setup   -Filter *.exe | Select-Object -First 1
+          $system = Get-ChildItem -Recurse .build\win32-x64\system-setup -Filter *.exe | Select-Object -First 1
+          if (-not $user -or -not $system) { throw "Setup .exe not found" }
+          Copy-Item $user.FullName   dist\LoCoPilotUserSetup-x64.exe   -Verbose
+          Copy-Item $system.FullName dist\LoCoPilotSystemSetup-x64.exe -Verbose
           Get-ChildItem dist
 
       - name: Upload installers

@@ -50,13 +50,14 @@ jobs:
       - name: Build app (vscode-darwin-arm64-min)
         run: npm run gulp vscode-darwin-arm64-min
 
-      - name: Zip the .app (unsigned)
+      - name: Create .dmg (unsigned, canonical name)
         run: |
           set -e
-          mkdir -p dist
-          ditto -c -k --sequesterRsrc --keepParent \
-            ../LoCoPilot-darwin-arm64/LoCoPilot.app \
-            dist/LoCoPilot-darwin-arm64.zip
+          mkdir -p dist dmgroot
+          cp -R ../LoCoPilot-darwin-arm64/LoCoPilot.app dmgroot/
+          ln -s /Applications dmgroot/Applications
+          hdiutil create -volname "LoCoPilot" -srcfolder dmgroot -ov -format UDZO \
+            dist/LoCoPilot-darwin-arm64.dmg
           ls -la dist
 
       - name: Upload build

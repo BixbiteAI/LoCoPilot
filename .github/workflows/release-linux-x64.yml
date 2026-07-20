@@ -113,11 +113,15 @@ jobs:
       - name: Package .deb + .rpm
         run: ./scripts/build-and-ship-linux.sh
 
-      - name: Collect artifacts
+      - name: Collect artifacts (canonical names)
         run: |
           set -e
           mkdir -p dist
-          find .build/linux \( -name "*.deb" -o -name "*.rpm" \) -exec cp -v {} dist/ \;
+          # Portable tarball (matches the app's download URLs), like VS Code ships.
+          tar -czf dist/LoCoPilot-linux-x64.tar.gz -C .. LoCoPilot-linux-x64
+          # deb + rpm, renamed to canonical names (no manual rename needed).
+          cp -v "$(find .build/linux -name '*.deb' | head -1)" dist/LoCoPilot-linux-x64.deb
+          cp -v "$(find .build/linux -name '*.rpm' | head -1)" dist/LoCoPilot-linux-x64.rpm
           ls -la dist
 
       - name: Upload installers

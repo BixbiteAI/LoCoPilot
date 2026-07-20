@@ -113,11 +113,13 @@ jobs:
           npm run gulp vscode-linux-arm64-prepare-rpm
           npm run gulp vscode-linux-arm64-build-rpm
 
-      - name: Collect artifacts
+      - name: Collect artifacts (canonical names)
         run: |
           set -e
           mkdir -p dist
-          find .build/linux \( -name "*.deb" -o -name "*.rpm" \) -exec cp -v {} dist/ \;
+          tar -czf dist/LoCoPilot-linux-arm64.tar.gz -C .. LoCoPilot-linux-arm64
+          cp -v "$(find .build/linux -name '*.deb' | head -1)" dist/LoCoPilot-linux-arm64.deb
+          cp -v "$(find .build/linux -name '*.rpm' | head -1)" dist/LoCoPilot-linux-arm64.rpm
           ls -la dist
 
       - name: Upload installers
