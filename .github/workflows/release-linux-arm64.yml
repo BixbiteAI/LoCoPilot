@@ -17,7 +17,9 @@ jobs:
   build-linux-arm64:
     name: Build Linux arm64 (.deb + .rpm)
     runs-on: ubuntu-24.04-arm     # GitHub-hosted arm64 Linux runner
-    timeout-minutes: 120
+    # arm64 runners are slower; the compile step can run ~2h. Give generous
+    # headroom so runner-speed variance doesn't cancel a good build.
+    timeout-minutes: 240
     env:
       npm_config_arch: arm64
       VSCODE_ARCH: arm64
