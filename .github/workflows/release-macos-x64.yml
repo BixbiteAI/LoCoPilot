@@ -1,8 +1,9 @@
-# Builds LoCoPilot for macOS Intel (x64) on a GitHub-hosted Intel mac.
-# Produces an UNSIGNED .app, zipped. Mirrors Docs/BUILD_COMMANDS.md §1.
+# Builds LoCoPilot for macOS Intel (x64) by cross-compiling on an Apple Silicon
+# runner (macos-14). Produces an UNSIGNED .dmg. Mirrors Docs/BUILD_COMMANDS.md §1.
 #
-# NOTE: macos-13 is the Intel runner. If GitHub retires it, switch to
-# cross-compiling x64 on macos-14 (arch -x86_64 + npm_config_arch=x64).
+# Why cross-compile: GitHub is retiring the Intel `macos-13` runner. VS Code builds
+# its Intel app on Apple Silicon by running the build as x86_64 (under Rosetta) with
+# an x64 Node, so native modules both BUILD and LOAD as x64. We do the same here.
 name: Build macOS x64
 
 # Manual trigger only. See Docs/CI_BUILDS.md.
@@ -12,11 +13,12 @@ on:
 
 jobs:
   build-macos-x64:
-    name: Build macOS x64 (unsigned .app zip)
-    runs-on: macos-13           # Intel runner
-    timeout-minutes: 120
+    name: Build macOS x64 (unsigned .dmg, cross-compiled on arm64)
+    runs-on: macos-14           # Apple Silicon; we cross-build x64 on it
+    timeout-minutes: 150
     env:
       npm_config_arch: x64
+      npm_config_target_arch: x64
       VSCODE_ARCH: x64
       PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: 1
       GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -24,11 +26,25 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version-file: .nvmrc
-          cache: npm
+      - name: Install Rosetta 2 (to run x64 Node on Apple Silicon)
+        run: softwareupdate --install-rosetta --agree-to-license
+
+      - name: Install x64 Node.js (matches .nvmrc, runs under Rosetta)
+        run: |
+          set -e
+          NODE_VER="$(tr -d 'v[:space:]' < .nvmrc)"
+          echo "Installing x64 Node v${NODE_VER}"
+          curl -fsSL "https://nodejs.org/dist/v${NODE_VER}/node-v${NODE_VER}-darwin-x64.tar.gz" -o /tmp/node-x64.tar.gz
+          sudo mkdir -p /usr/local/node-x64
+          sudo tar -xzf /tmp/node-x64.tar.gz -C /usr/local/node-x64 --strip-components=1
+          echo "/usr/local/node-x64/bin" >> "$GITHUB_PATH"
+
+      - name: Verify Node is x64
+        run: |
+          set -e
+          which node
+          node -v
+          test "$(node -p process.arch)" = "x64" || { echo "Node is not x64!"; exit 1; }
 
       - name: Fetch llama.cpp engine binary (darwin-x64)
         run: node scripts/fetch-llama-binaries.mjs darwin-x64
