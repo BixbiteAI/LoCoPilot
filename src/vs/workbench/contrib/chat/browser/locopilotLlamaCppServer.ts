@@ -516,9 +516,19 @@ export interface LlamaServerTuning {
 	 * tensors in system RAM while attention/dense weights stay on the GPU. For Mixture-of-Experts models
 	 * (only a few experts are active per token) this lets a large model fit a small GPU at near-full speed.
 	 * Emitted only when > 0; meaningless on dense models (they have no expert tensors). See
-	 * {@link computeCpuMoeLayers} for the fit heuristic.
+	 * {@link computeCpuMoeLayers} for the fit heuristic. Ignored when {@link overrideTensors} is set (both
+	 * place expert tensors; the finer `-ot` override wins).
 	 */
 	cpuMoeLayers?: number;
+	/**
+	 * Fine-grained tensor placement (`--override-tensor` / `-ot`), one entry per flag. Each is a
+	 * `<name-regex>=<device>` rule (e.g. `blk\.(3|4|5)\.ffn_.*_exps\.=CPU`) that pins the matching tensors to
+	 * a device. This is the tensor-level generalisation of `--n-cpu-moe`: instead of "the top N blocks", it can
+	 * offload the experts of EXACTLY the blocks the fit planner chose (sized from per-layer weight bytes), which
+	 * squeezes more model onto the same GPU. When non-empty the arg builder emits an `-ot` per entry and skips
+	 * `--n-cpu-moe` (they'd both place expert tensors). `-ot` is a long-standing llama.cpp flag; no self-heal needed.
+	 */
+	overrideTensors?: string[];
 	/**
 	 * Prompt-lookup / n-gram speculative decoding (build-specific, OPT-IN, default off). Drafts tokens by
 	 * matching n-grams already present in the context - no separate draft model - which is a large win on
@@ -573,6 +583,19 @@ export interface GpuLayerInputs {
 	systemRamBytes?: number;
 	/** Fraction of VRAM/RAM the model may use before we offload only part of it. Defaults to 0.9. */
 	budgetFraction?: number;
+	/**
+	 * Per-block weight bytes from the GGUF tensor section, indexed by block number. When present, the split is
+	 * packed from each block's REAL size (largest-index-first, mirroring llama.cpp's own offload order) instead
+	 * of the uniform `modelBytes / layerCount`, so an uneven-layer model gets an accurate count. Falls back to
+	 * the uniform estimate when absent.
+	 */
+	perLayerWeightBytes?: readonly number[];
+	/**
+	 * Weight bytes not attached to any block (embeddings, output head). With `-ngl N`, llama.cpp keeps these on
+	 * the GPU too, so they're charged as a fixed cost against the VRAM budget before layers are packed. 0 when
+	 * unknown.
+	 */
+	nonLayerWeightBytes?: number;
 }
 
 /**
@@ -603,6 +626,25 @@ export function computeGpuLayers(inputs: GpuLayerInputs): number | undefined {
 	if (modelBytes <= budget) {
 		return undefined; // whole model fits in VRAM -> full offload.
 	}
+
+	// Per-layer packing when real block sizes are known: charge the always-resident non-layer weights first,
+	// then pack blocks (largest index first, as llama.cpp offloads) until the VRAM budget is exhausted. This
+	// beats the uniform estimate on models whose blocks differ in size.
+	const perLayer = inputs.perLayerWeightBytes;
+	if (perLayer && perLayer.length > 0 && perLayer.some(b => b > 0)) {
+		let remaining = budget - Math.max(0, inputs.nonLayerWeightBytes ?? 0);
+		let offloaded = 0;
+		for (let layer = perLayer.length - 1; layer >= 0; layer--) {
+			const bytes = perLayer[layer] ?? 0;
+			if (bytes > remaining) {
+				break; // this block (and any lower one, which we haven't reached) won't fit
+			}
+			remaining -= bytes;
+			offloaded++;
+		}
+		return Math.max(0, Math.min(layerCount, offloaded));
+	}
+
 	const perLayerBytes = modelBytes / layerCount;
 	if (perLayerBytes <= 0) {
 		return undefined;
@@ -663,6 +705,80 @@ export function computeCpuMoeLayers(inputs: CpuMoeInputs): number | undefined {
 	// Move enough whole blocks' experts to CPU to cover the overflow (round up to be safe).
 	const layersToOffload = Math.ceil(overBytes / perLayerBytes);
 	return Math.max(1, Math.min(layerCount, layersToOffload));
+}
+
+/** Inputs for {@link planMoeExpertOffload}: real per-layer sizes plus the memory budget to fit into. */
+export interface MoeOffloadPlanInputs {
+	backend: LlamaBackend;
+	/** On-disk weight size in bytes (from a file stat; the authoritative total). */
+	modelBytes: number;
+	/** The routed-expert (`ffn_*_exps`) slice of each block's bytes - what an expert offload actually moves. */
+	perLayerExpertBytes: readonly number[] | undefined;
+	/** Dedicated VRAM (CUDA/Vulkan) or unified-memory budget (Metal) the weights may use, in bytes. */
+	memoryBudgetBytes: number | undefined;
+	/** Fraction of the budget usable before offloading. Defaults to 0.9. */
+	budgetFraction?: number;
+}
+
+/**
+ * Per-layer MoE offload planner: picks the EXACT set of transformer blocks whose routed-expert tensors to
+ * move to CPU so the model fits `memoryBudgetBytes`, using each block's real expert-weight size instead of
+ * the uniform `modelBytes / layerCount` estimate that {@link computeCpuMoeLayers} falls back to.
+ *
+ * Returns the sorted block indices to offload (rendered as an `-ot` rule by {@link buildExpertOffloadOverride}),
+ * or `undefined` when it doesn't apply (dense model, already fits, or the per-layer data is missing - in which
+ * case the caller uses the coarse `--n-cpu-moe N` path). We offload from the HIGHEST block index downward to
+ * mirror llama.cpp's own `--n-cpu-moe` ordering (dense/attention-heavy early blocks stay on the GPU), summing
+ * each block's expert bytes until the overflow is covered.
+ */
+export function planMoeExpertOffload(inputs: MoeOffloadPlanInputs): number[] | undefined {
+	const { backend, modelBytes, perLayerExpertBytes, memoryBudgetBytes } = inputs;
+	if (backend === 'cpu') {
+		return undefined; // everything already on CPU
+	}
+	if (!perLayerExpertBytes || perLayerExpertBytes.length === 0 || modelBytes <= 0 || !memoryBudgetBytes || memoryBudgetBytes <= 0) {
+		return undefined; // no per-layer data -> caller uses the uniform --n-cpu-moe estimate
+	}
+	const hasExperts = perLayerExpertBytes.some(b => b > 0);
+	if (!hasExperts) {
+		return undefined; // no routed-expert tensors -> not a MoE model (or dense variant)
+	}
+	const fraction = inputs.budgetFraction && inputs.budgetFraction > 0 ? inputs.budgetFraction : 0.9;
+	const budget = memoryBudgetBytes * fraction;
+	if (modelBytes <= budget) {
+		return undefined; // fits as-is
+	}
+	const overBytes = modelBytes - budget;
+	const chosen: number[] = [];
+	let moved = 0;
+	// Highest block first: matches --n-cpu-moe's "top N" convention and keeps the early dense blocks on GPU.
+	for (let layer = perLayerExpertBytes.length - 1; layer >= 0 && moved < overBytes; layer--) {
+		const expertBytes = perLayerExpertBytes[layer] ?? 0;
+		if (expertBytes <= 0) {
+			continue; // dense block (no experts) - nothing to move here
+		}
+		chosen.push(layer);
+		moved += expertBytes;
+	}
+	if (chosen.length === 0) {
+		return undefined;
+	}
+	return chosen.sort((a, b) => a - b);
+}
+
+/**
+ * Renders a set of transformer-block indices into a llama.cpp `-ot` rule that pins those blocks' routed-expert
+ * FFN tensors to the CPU: `blk\.(<i>|<j>|...)\.ffn_(gate|up|down)_exps\.=CPU`. The trailing `\.` after the
+ * index group anchors the match so e.g. block `3` never also matches `blk.13.`. Returns undefined for an empty
+ * set. One compact rule (single `-ot`) rather than one flag per block keeps the command line small.
+ */
+export function buildExpertOffloadOverride(layerIndices: readonly number[]): string | undefined {
+	const uniqueSorted = Array.from(new Set(layerIndices.filter(n => Number.isInteger(n) && n >= 0))).sort((a, b) => a - b);
+	if (uniqueSorted.length === 0) {
+		return undefined;
+	}
+	const group = uniqueSorted.join('|');
+	return `blk\\.(${group})\\.ffn_(gate|up|down)_exps\\.=CPU`;
 }
 
 /**
@@ -740,9 +856,19 @@ export function getLlamaCppServerCommand(modelPath: string, backend: LlamaBacken
 		}
 	}
 
+	// Fine-grained tensor placement (`-ot`): the tensor-level generalisation of --n-cpu-moe. When the runner
+	// has real per-layer weight sizes it offloads the experts of EXACTLY the chosen blocks via these rules,
+	// which fits more model on the same GPU than the coarse "top N blocks". Each entry is one `-ot` flag.
+	const overrideTensors = (tuning.overrideTensors ?? []).map(s => s.trim()).filter(s => s.length > 0);
+	for (const rule of overrideTensors) {
+		args.push('-ot', rule);
+	}
+
 	// MoE expert offload: keep N blocks' expert FFN tensors in system RAM while attention stays on the GPU.
 	// Only meaningful for Mixture-of-Experts models; the runner sizes this from GGUF expert_count + memory.
-	if (tuning.cpuMoeLayers && tuning.cpuMoeLayers > 0) {
+	// Skipped when `-ot` rules are present: both place expert tensors, and mixing them double-counts the
+	// offload (the -ot rules already move the experts the planner selected).
+	if (overrideTensors.length === 0 && tuning.cpuMoeLayers && tuning.cpuMoeLayers > 0) {
 		args.push('--n-cpu-moe', String(Math.floor(tuning.cpuMoeLayers)));
 	}
 

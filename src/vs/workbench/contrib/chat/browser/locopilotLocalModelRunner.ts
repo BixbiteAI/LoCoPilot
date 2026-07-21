@@ -27,6 +27,8 @@ import {
 	getLlamaServerRootUrl,
 	computeGpuLayers,
 	computeCpuMoeLayers,
+	planMoeExpertOffload,
+	buildExpertOffloadOverride,
 	computeKvBudgetBytes,
 	clampContextSize,
 	shouldUseBundledVulkan,
@@ -1581,12 +1583,23 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 	 * too as belt-and-suspenders - especially for user-supplied builds whose libs sit in a sibling
 	 * dir. `strictEnv` is left false so this merges over the inherited VS Code environment.
 	 */
-	private _serverLaunchEnv(serverPath: string): { [key: string]: string | null } | undefined {
+	private _serverLaunchEnv(serverPath: string, tuning?: LlamaServerTuning): { [key: string]: string | null } | undefined {
+		const env: { [key: string]: string | null } = {};
 		const dir = dirname(serverPath);
-		if (!dir) { return undefined; }
-		if (isMacintosh) { return { DYLD_LIBRARY_PATH: dir }; }
-		if (isWindows) { return undefined; } // Windows loads DLLs from the exe's own directory automatically.
-		return { LD_LIBRARY_PATH: dir };
+		if (dir) {
+			if (isMacintosh) { env.DYLD_LIBRARY_PATH = dir; }
+			else if (!isWindows) { env.LD_LIBRARY_PATH = dir; } // Windows loads DLLs from the exe's own dir automatically.
+		}
+		// GGML_OP_OFFLOAD_MIN_BATCH: when a MoE model keeps its routed experts on CPU, lowering the batch-size
+		// threshold at which ggml offloads a whole op to the GPU pushes more of prompt PROCESSING onto the GPU
+		// (rather than the slow CPU experts), cutting time-to-first-token on long prompts. The build default is
+		// 32; 8 offloads more aggressively during prefill. Only set when experts are actually offloaded - it is
+		// pointless (though harmless) otherwise.
+		const expertsOffloaded = (tuning?.cpuMoeLayers ?? 0) > 0 || (tuning?.overrideTensors?.length ?? 0) > 0;
+		if (expertsOffloaded) {
+			env.GGML_OP_OFFLOAD_MIN_BATCH = '8';
+		}
+		return Object.keys(env).length > 0 ? env : undefined;
 	}
 
 	/**
@@ -1816,6 +1829,17 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 				const v = cfg.getValue<number>(ChatConfiguration.LocopilotLlamaCppCpuMoeLayers);
 				return typeof v === 'number' && v >= 0 ? Math.floor(v) : undefined;
 			})(),
+			// Fine-grained tensor placement (`-ot`): power-user override, one rule per line. When set it wins over
+			// the automatic per-layer MoE plan (see _augmentTuningWithHardware, which skips its own -ot when this
+			// is non-empty). Empty/unset leaves automatic placement in charge.
+			overrideTensors: (() => {
+				const raw = cfg.getValue<string>(ChatConfiguration.LocopilotLlamaCppOverrideTensor);
+				if (!raw || !raw.trim()) {
+					return undefined;
+				}
+				const rules = raw.split(/\r?\n/).map(s => s.trim()).filter(s => s.length > 0);
+				return rules.length > 0 ? rules : undefined;
+			})(),
 			promptLookup: cfg.getValue<boolean>(ChatConfiguration.LocopilotLlamaCppPromptLookup),
 			promptLookupArgs: cfg.getValue<string>(ChatConfiguration.LocopilotLlamaCppPromptLookupArgs),
 			// Default to our managed KV-cache dir (created lazily before launch) so slot save/restore works
@@ -1924,18 +1948,42 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 		// room for KV - otherwise we wire full weights PLUS a large KV past the limit and page/OOM.
 		const modelBytes = await this._weightBytesOnDisk(modelPath);
 		const offloadBudget = budget && budget > 0 ? Math.floor(budget * (1 - KV_BUDGET_FRACTION)) : 0;
+		const userSetOverride = (tuning.overrideTensors?.length ?? 0) > 0;
 		if (backend !== 'cpu' && budget && budget > 0) {
-			if (isMoeModelInfo(info) && tuning.cpuMoeLayers === undefined) {
-				const moe = computeCpuMoeLayers({ backend, modelBytes, layerCount: info.layerCount, expertCount: info.expertCount, memoryBudgetBytes: offloadBudget });
-				if (moe !== undefined) {
-					tuning.cpuMoeLayers = moe;
-					this._log(`[LoCoPilot Runner] MoE model (${Math.round(modelBytes / 1e9)}GB, ${info.expertCount} experts) exceeds the ${Math.round(offloadBudget / 1e9)}GB weight budget; offloading experts of ${moe}/${info.layerCount} blocks to CPU (--n-cpu-moe).`);
+			if (isMoeModelInfo(info) && tuning.cpuMoeLayers === undefined && !userSetOverride) {
+				// Per-layer accounting: when the GGUF tensor section gave us real per-block expert sizes, offload
+				// the experts of EXACTLY the blocks needed to fit (rendered as one `-ot` rule) instead of the coarse
+				// "top N blocks" that --n-cpu-moe forces. Fall back to the uniform --n-cpu-moe estimate when the
+				// per-layer data is absent (older reader path / unknown quant type).
+				const plan = planMoeExpertOffload({
+					backend,
+					modelBytes,
+					perLayerExpertBytes: info.perLayerExpertBytes,
+					memoryBudgetBytes: offloadBudget,
+				});
+				const rule = plan ? buildExpertOffloadOverride(plan) : undefined;
+				if (plan && rule) {
+					tuning.overrideTensors = [rule];
+					this._log(`[LoCoPilot Runner] MoE model (${Math.round(modelBytes / 1e9)}GB, ${info.expertCount} experts) exceeds the ${Math.round(offloadBudget / 1e9)}GB weight budget; per-layer accounting offloads the experts of ${plan.length} block(s) [${plan[0]}..${plan[plan.length - 1]}] to CPU via -ot.`);
+				} else {
+					const moe = computeCpuMoeLayers({ backend, modelBytes, layerCount: info.layerCount, expertCount: info.expertCount, memoryBudgetBytes: offloadBudget });
+					if (moe !== undefined) {
+						tuning.cpuMoeLayers = moe;
+						this._log(`[LoCoPilot Runner] MoE model (${Math.round(modelBytes / 1e9)}GB, ${info.expertCount} experts) exceeds the ${Math.round(offloadBudget / 1e9)}GB weight budget; offloading experts of ${moe}/${info.layerCount} blocks to CPU (--n-cpu-moe, uniform estimate).`);
+					}
 				}
 			} else if (!isMoeModelInfo(info) && tuning.gpuLayers === undefined && (backend === 'cuda' || backend === 'vulkan')) {
-				const layers = computeGpuLayers({ backend, modelBytes, layerCount: info.layerCount, vramBytes: offloadBudget });
+				const layers = computeGpuLayers({
+					backend,
+					modelBytes,
+					layerCount: info.layerCount,
+					vramBytes: offloadBudget,
+					perLayerWeightBytes: info.perLayerWeightBytes,
+					nonLayerWeightBytes: info.nonLayerWeightBytes,
+				});
 				if (layers !== undefined) {
 					tuning.gpuLayers = layers;
-					this._log(`[LoCoPilot Runner] Dense model (${Math.round(modelBytes / 1e9)}GB) exceeds the ${Math.round(offloadBudget / 1e9)}GB VRAM weight budget; offloading ${layers}/${info.layerCount} layers to GPU, rest on CPU.`);
+					this._log(`[LoCoPilot Runner] Dense model (${Math.round(modelBytes / 1e9)}GB) exceeds the ${Math.round(offloadBudget / 1e9)}GB VRAM weight budget; offloading ${layers}/${info.layerCount} layers to GPU, rest on CPU${info.perLayerWeightBytes ? ' (per-layer accounting)' : ''}.`);
 				}
 			}
 		}
@@ -2089,11 +2137,21 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 		// already keeps the model within budget. CPU is left alone (large batches don't help and cost RAM).
 		// Only applied when the user hasn't pinned these.
 		if (backend === 'cuda' || backend === 'vulkan' || backend === 'metal') {
+			// MoE-aware bump: a Mixture-of-Experts model offloading experts to CPU (discrete GPU) benefits from a
+			// larger prefill batch - it keeps the GPU fed while expert activations stream over PCIe, which is the
+			// slow part of prompt processing for these models. Bump to 4096 there. The offload logic above already
+			// sized the split to leave VRAM headroom, so the bigger compute buffer stays within budget. Metal
+			// (unified/wired memory) keeps the conservative 2048/1024 - a 4096 ubatch there risks the wired ceiling.
+			const expertsOffloaded = (tuning.cpuMoeLayers ?? 0) > 0 || (tuning.overrideTensors?.length ?? 0) > 0;
+			const moeBoost = isMoeModelInfo(info) && expertsOffloaded && (backend === 'cuda' || backend === 'vulkan');
 			if (!tuning.batchSize || tuning.batchSize <= 0) {
-				tuning.batchSize = 2048;
+				tuning.batchSize = moeBoost ? 4096 : 2048;
 			}
 			if (!tuning.ubatchSize || tuning.ubatchSize <= 0) {
-				tuning.ubatchSize = 1024;
+				tuning.ubatchSize = moeBoost ? 4096 : 1024;
+			}
+			if (moeBoost) {
+				this._log(`[LoCoPilot Runner] MoE with CPU-offloaded experts on ${backend}: raising prefill batch to -b ${tuning.batchSize} -ub ${tuning.ubatchSize} for faster prompt processing.`);
 			}
 		}
 
@@ -3674,7 +3732,7 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 		// PowerShell gotcha where a quoted path (e.g. an install under "C:\Program Files\...") is echoed
 		// as a string literal instead of executed, so llama-server.exe never starts and the port stays
 		// closed. Passing args as a string[] lets the pty escape them correctly on every platform.
-		const launchEnv = this._serverLaunchEnv(serverPath);
+		const launchEnv = this._serverLaunchEnv(serverPath, tuning);
 		const cmdLineForLog = [command, ...args].join(' ');
 		this._log(`[LoCoPilot Runner] Executing: ${cmdLineForLog}`);
 		const isBundled = serverPath === getBundledLlamaServerPath(this._appRoot) || serverPath === getBundledLlamaServerPath(this._appRoot, 'vulkan');

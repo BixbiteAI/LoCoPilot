@@ -84,6 +84,8 @@ export enum ChatConfiguration {
 	LocopilotLlamaCppSwaFull = 'locopilot.llamaCpp.swaFull',
 	/** MoE expert CPU offload (`--n-cpu-moe`). -1 = auto (size from VRAM/RAM), 0 = off, N = offload N blocks. */
 	LocopilotLlamaCppCpuMoeLayers = 'locopilot.llamaCpp.cpuMoeLayers',
+	/** Fine-grained tensor placement (`-ot`), one `<regex>=<device>` rule per line. Empty = automatic. */
+	LocopilotLlamaCppOverrideTensor = 'locopilot.llamaCpp.overrideTensor',
 	/** Prompt-lookup / n-gram speculative decoding (build-specific, opt-in). */
 	LocopilotLlamaCppPromptLookup = 'locopilot.llamaCpp.promptLookup',
 	/** Flags appended when promptLookup is on (build-specific). */

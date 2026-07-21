@@ -15,7 +15,7 @@ import * as nls from '../../../../nls.js';
 import { AccessibleViewRegistry } from '../../../../platform/accessibility/browser/accessibleViewRegistry.js';
 import { registerAction2 } from '../../../../platform/actions/common/actions.js';
 import { ICommandService } from '../../../../platform/commands/common/commands.js';
-import { Extensions as ConfigurationExtensions, ConfigurationScope, IConfigurationNode, IConfigurationRegistry } from '../../../../platform/configuration/common/configurationRegistry.js';
+import { Extensions as ConfigurationExtensions, ConfigurationScope, EditPresentationTypes, IConfigurationNode, IConfigurationRegistry } from '../../../../platform/configuration/common/configurationRegistry.js';
 import { SyncDescriptor } from '../../../../platform/instantiation/common/descriptors.js';
 import { InstantiationType, registerSingleton } from '../../../../platform/instantiation/common/extensions.js';
 import { IInstantiationService } from '../../../../platform/instantiation/common/instantiation.js';
@@ -749,6 +749,12 @@ configurationRegistry.registerConfiguration({
 			minimum: -1,
 			markdownDescription: nls.localize('locopilot.llamaCpp.cpuMoeLayers.description', "Mixture-of-Experts (MoE) expert offload (`--n-cpu-moe`) for the local llama.cpp server. Keeps the expert tensors of N transformer blocks in system RAM while attention stays on the GPU, so a large MoE model (e.g. a 35B-A3B) can run on a small GPU at near-full speed. `-1` (default) is **automatic**: LoCoPilot detects MoE models from their metadata and offloads only as many blocks as needed to fit your GPU/Metal memory. `0` disables offload (force full GPU). A positive value offloads exactly that many blocks. No effect on dense (non-MoE) models."),
 			default: -1,
+		},
+		[ChatConfiguration.LocopilotLlamaCppOverrideTensor]: {
+			type: 'string',
+			editPresentation: EditPresentationTypes.Multiline,
+			markdownDescription: nls.localize('locopilot.llamaCpp.overrideTensor.description', "Fine-grained tensor placement (`--override-tensor` / `-ot`) for the local llama.cpp server, **one rule per line**. Each rule is `<tensor-name-regex>=<device>` and pins the matching tensors to a device (e.g. `blk\\.(1[0-9])\\.ffn_.*_exps\\.=CPU` keeps the routed experts of blocks 10-19 in system RAM). This is the tensor-level version of `#locopilot.llamaCpp.cpuMoeLayers#`: it can fit more model onto the same GPU by offloading exactly the blocks you choose. **Leave empty (default) for automatic placement** - LoCoPilot sizes an expert offload from each block's real weight size. When set, these rules take over and `--n-cpu-moe` is not emitted. Advanced; invalid regexes or device names can prevent the server from starting."),
+			default: '',
 		},
 		[ChatConfiguration.LocopilotLlamaCppPromptLookup]: {
 			type: 'boolean',
