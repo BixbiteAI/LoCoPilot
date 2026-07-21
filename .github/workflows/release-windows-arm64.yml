@@ -14,7 +14,10 @@ on:
 jobs:
   build-windows-arm64:
     name: Build Windows arm64 (user + system .exe)
-    runs-on: windows-latest
+    # Pinned to windows-2022 (VS 2022 / v17). windows-latest moved to a newer
+    # image with Visual Studio 18, which the repo's node-gyp can't detect,
+    # breaking native-module builds during npm ci.
+    runs-on: windows-2022
     timeout-minutes: 120
     env:
       npm_config_arch: arm64
