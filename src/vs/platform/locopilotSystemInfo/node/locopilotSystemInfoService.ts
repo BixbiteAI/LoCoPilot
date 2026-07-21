@@ -377,6 +377,15 @@ export class LoCoPilotSystemInfoService implements ILoCoPilotSystemInfoService {
 				for (const m of out.matchAll(/AdapterRAM=(\d+)/gi)) {
 					vram = Math.max(vram, parseInt(m[1], 10) || 0);
 				}
+				// Win32_VideoController.AdapterRAM is a 32-bit field and wraps/caps around 4 GiB. Prefer the
+				// display driver's QWORD registry value when present so 8/12/16/24 GiB cards are sized correctly.
+				const registry = await tryExec('reg', ['query', 'HKLM\\SYSTEM\\CurrentControlSet\\Control\\Video', '/s', '/v', 'HardwareInformation.qwMemorySize']);
+				for (const m of registry.matchAll(/HardwareInformation\.qwMemorySize\s+REG_QWORD\s+0x([0-9a-f]+)/gi)) {
+					const bytes = Number.parseInt(m[1], 16);
+					if (Number.isSafeInteger(bytes) && bytes > 0) {
+						vram = Math.max(vram, bytes);
+					}
+				}
 				return { vendor, totalVramBytes: vram };
 			}
 		} catch {

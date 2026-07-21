@@ -38,6 +38,7 @@ import {
 	KV_BUDGET_FRACTION,
 	KV_CLAMP_BUDGET_FRACTION,
 	RUNTIME_OVERHEAD_BYTES,
+	runtimeOverheadBytesForTuning,
 	DEFAULT_LLAMA_CONTEXT_SIZE,
 	MIN_CLAMPED_CONTEXT,
 	LOCOPILOT_LLAMA_SERVER_PORT,
@@ -588,6 +589,36 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 			return 'vulkan';
 		}
 		return top; // unknown vendor -> keep the static recommendation
+	}
+
+	/**
+	 * Side-effect-free prediction used by Auto's fit check. Mirrors `_resolveServerLaunch` without offering or
+	 * downloading an engine: only an already-installed CUDA engine or already-bundled Vulkan binary is selected.
+	 */
+	private async _resolveBackendForFit(): Promise<LlamaBackend> {
+		if (this._hasCustomServerPath()) {
+			return this._resolveBackendForLaunch();
+		}
+		if (this.getBackend() === 'metal') {
+			return 'metal';
+		}
+		const engine = this.configurationService.getValue<'auto' | 'cpu' | 'gpu'>(ChatConfiguration.LocopilotLlamaCppEngine) ?? 'auto';
+		if (engine === 'cpu') {
+			return 'cpu';
+		}
+		if (await this._installedCudaServerPath()) {
+			const hw = await this._getHardwareInfo();
+			if (hw?.gpus.some(g => g.vendor === 'nvidia')) {
+				return 'cuda';
+			}
+		}
+		const hw = await this._getHardwareInfo();
+		const wantsVulkan = engine === 'gpu' || (!!hw && shouldUseBundledVulkan(hw.gpus));
+		const vulkanPath = getBundledLlamaServerPath(this._appRoot, 'vulkan');
+		if (wantsVulkan && vulkanPath && await this._isExistingFile(vulkanPath)) {
+			return 'vulkan';
+		}
+		return 'cpu';
 	}
 
 	/** True when a path on disk points at an existing file (best-effort; false on any error). */
@@ -1363,13 +1394,12 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 	}
 
 	/**
-	 * True when the memory-aware budget should be consulted: only on backends that keep weights in system RAM
-	 * (Metal on Apple Silicon, or CPU). CUDA/Vulkan keep weights in VRAM, which we can't size reliably here, so
-	 * those fall back to the count budget alone.
+	 * System-memory budgeting is useful on every backend. CUDA/Vulkan still retain mmap'd weights, CPU-offloaded
+	 * layers, prompt caches and runtime buffers in host RAM; skipping this budget entirely allowed a VRAM-safe
+	 * partial offload to exhaust system RAM. Unknown estimates remain zero and therefore never block a launch.
 	 */
 	private _useMemoryBudget(): boolean {
-		const backend = this.getBackend();
-		return backend === 'metal' || backend === 'cpu';
+		return true;
 	}
 
 	/**
@@ -1529,16 +1559,20 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 		// conservative ~128 KiB/token (a typical 7-13B f16 k+v across all layers) when the GGUF can't be parsed.
 		let runtime = await this._kvBytesForContext(model.localPath, kind, ctxTokens);
 		if (kind === 'llama') {
-			runtime += 2 * GB; // conservative slice of llama.cpp's host-RAM prompt cache (default --cache-ram 8 GiB).
+			// Match the launch's actual --cache-ram cap instead of always crediting 2 GiB on eviction. The old
+			// flat estimate overstated reclaim on small machines and understated an unsupported old build's
+			// uncapped default. When stats are unavailable, retain the conservative 2 GiB fallback.
+			const mem = await this._getSystemMemory();
+			runtime += mem?.totalmem
+				? Math.min(2 * GB, Math.floor(mem.totalmem * 0.10))
+				: 2 * GB;
 			const tuning = this._getLlamaTuning(model);
 			const sepDraft = tuning.draftModelPath?.trim();
 			if (tuning.multiTokenPrediction) {
-				// MTP self-draft points `--model-draft` at the SAME GGUF, which llama.cpp mmaps - the weight pages
-				// are SHARED with the main model, so there is no second full copy in RSS. The real added cost is
-				// the draft decode path's small KV/context, not another weights-worth. The old `+= weightBytes`
-				// doubled a 20 GB MTP model to ~40 GB, which over-evicted AND - since this same figure feeds the
-				// "evictable" reclaim estimate - made Auto believe unloading it frees ~2x the RAM it actually does.
-				runtime += Math.min(weightBytes * 0.1, GB); // draft KV/context slack, never a whole weights copy.
+				// Current llama.cpp creates a separate draft context and reports approximately another full
+				// weights-worth of committed memory. Keep this identical to the launch extras gate; divergent
+				// accounting previously admitted MTP at launch but under-evicted by almost one whole model later.
+				runtime += weightBytes;
 			} else if (sepDraft) {
 				// A separate draft costs its own (much smaller) file; full weights only when it can't be statted.
 				runtime += (await this._fileBytes(sepDraft)) || weightBytes;
@@ -1907,6 +1941,17 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 		return this._hardwareInfo;
 	}
 
+	/** Largest VRAM pool that the selected backend can actually target (never an unrelated adapter). */
+	private _discreteVramBytes(backend: LlamaBackend, hw: ISystemHardwareInfo | undefined): number | undefined {
+		const candidates = (hw?.gpus ?? []).filter(g => {
+			if (backend === 'cuda') {
+				return g.vendor === 'nvidia';
+			}
+			return backend === 'vulkan' && g.vendor !== 'apple';
+		}).map(g => g.totalVramBytes).filter(v => v > 0);
+		return candidates.length ? Math.max(...candidates) : undefined;
+	}
+
 	/** Reads (and caches) GGUF model info (layer/expert count, context length) for a resolved file path. */
 	private async _getModelInfo(modelPath: string): Promise<IGgufModelInfo> {
 		const cached = this._modelInfoCache.get(modelPath);
@@ -1933,8 +1978,7 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 	 */
 	private async _memoryBudgetBytes(backend: LlamaBackend, hw: ISystemHardwareInfo): Promise<number | undefined> {
 		if (backend === 'cuda' || backend === 'vulkan') {
-			const vram = hw.gpus.map(g => g.totalVramBytes).filter(v => v > 0);
-			return vram.length ? Math.max(...vram) : undefined;
+			return this._discreteVramBytes(backend, hw);
 		}
 		const mem = await this._getSystemMemory();
 		if (!mem?.totalmem) {
@@ -1963,11 +2007,13 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 			return base;
 		}
 		const tuning: LlamaServerTuning = { ...base };
+		const performanceProfile = this.configurationService.getValue<'performance' | 'balanced' | 'quiet'>(ChatConfiguration.LocopilotLocalPerformanceProfile) ?? 'performance';
 
 		// Thread auto-tuning: only when the user left it on auto (0/unset).
 		if ((!tuning.threads || tuning.threads <= 0) && hw.physicalCoreCount > 0) {
-			tuning.threads = hw.physicalCoreCount;
-			this._log(`[LoCoPilot Runner] Auto-set --threads to ${hw.physicalCoreCount} (physical cores).`);
+			const threadFraction = performanceProfile === 'quiet' ? 0.5 : (performanceProfile === 'balanced' ? 0.75 : 1);
+			tuning.threads = Math.max(1, Math.ceil(hw.physicalCoreCount * threadFraction));
+			this._log(`[LoCoPilot Runner] Auto-set --threads to ${tuning.threads}/${hw.physicalCoreCount} physical cores (profile=${performanceProfile}).`);
 		}
 
 		const info = await this._getModelInfo(modelPath);
@@ -2040,6 +2086,13 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 		// ~85% of the wired budget still claim a full 25% KV on top - past the ceiling, straight into paging.
 		if (tuning.contextSize && tuning.contextSize > 0) {
 			let kvBudgetBytes: number | undefined;
+			const expertsOffloadedForBatch = (tuning.cpuMoeLayers ?? 0) > 0 || (tuning.overrideTensors?.length ?? 0) > 0;
+			const plannedUbatch = tuning.ubatchSize && tuning.ubatchSize > 0
+				? tuning.ubatchSize
+				: (performanceProfile === 'performance' && isMoeModelInfo(info) && expertsOffloadedForBatch && (backend === 'cuda' || backend === 'vulkan')
+					? 4096
+					: (performanceProfile === 'quiet' || backend === 'cpu' ? 512 : 1024));
+			const runtimeOverhead = runtimeOverheadBytesForTuning({ ...tuning, ubatchSize: plannedUbatch }, backend);
 			if (budget && budget > 0) {
 				// Discrete GPUs: partial offload caps the weights that land in VRAM at the offload budget;
 				// Metal/CPU: the full weights share the one unified/system pool with the KV cache.
@@ -2048,7 +2101,7 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 				// zero-remainder budget still CLAMPS to the minimum context instead of skipping the clamp
 				// (clampContextSize treats 0/undefined as "no budget known").
 				kvBudgetBytes = modelBytes > 0
-					? Math.max(1, computeKvBudgetBytes(budget, residentWeights))
+					? Math.max(1, computeKvBudgetBytes(budget, residentWeights, runtimeOverhead))
 					: budget * KV_CLAMP_BUDGET_FRACTION;
 			}
 			// Compare every automatic precision against the same exact model geometry and weight-aware budget.
@@ -2129,6 +2182,7 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 						residentWeightBytes: residentWeights,
 						fullSwaKvBytes: fullSwaKvBytesEstimate!,
 						promptCacheReserveBytes: promptCacheReserve,
+						overheadBytes: runtimeOverheadBytesForTuning(tuning, backend),
 					})
 					: -1;
 				if (canEstimate && headroom >= 0) {
@@ -2164,13 +2218,16 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 			// (unified/wired memory) keeps the conservative 2048/1024 - a 4096 ubatch there risks the wired ceiling.
 			const expertsOffloaded = (tuning.cpuMoeLayers ?? 0) > 0 || (tuning.overrideTensors?.length ?? 0) > 0;
 			const moeBoost = isMoeModelInfo(info) && expertsOffloaded && (backend === 'cuda' || backend === 'vulkan');
+			const profileBatch = performanceProfile === 'quiet' ? 1024 : 2048;
+			const profileUbatch = performanceProfile === 'quiet' ? 512 : 1024;
+			const allowMoeBoost = performanceProfile === 'performance' && moeBoost;
 			if (!tuning.batchSize || tuning.batchSize <= 0) {
-				tuning.batchSize = moeBoost ? 4096 : 2048;
+				tuning.batchSize = allowMoeBoost ? 4096 : profileBatch;
 			}
 			if (!tuning.ubatchSize || tuning.ubatchSize <= 0) {
-				tuning.ubatchSize = moeBoost ? 4096 : 1024;
+				tuning.ubatchSize = allowMoeBoost ? 4096 : profileUbatch;
 			}
-			if (moeBoost) {
+			if (allowMoeBoost) {
 				this._log(`[LoCoPilot Runner] MoE with CPU-offloaded experts on ${backend}: raising prefill batch to -b ${tuning.batchSize} -ub ${tuning.ubatchSize} for faster prompt processing.`);
 			}
 		}
@@ -2579,9 +2636,9 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 		// the expected cost of the load itself - the fit gate already budgeted for it. Soft signals are ignored
 		// during that window (no strikes, no warn toast); the hard near-OOM floor and thermal remain live.
 		const inLoadGrace = this._inLoadGraceWindow();
-		const pagingSpiral = !inLoadGrace && (hasPressureSignal
+		const pagingSpiral = hasPressureSignal
 			? (mem.pressure === 'critical' && swapGrowing)
-			: (lowAvailable && (swapGrowing || noSignals)));
+			: (lowAvailable && (swapGrowing || noSignals));
 		const seriousThermal = mem.thermalPressure === 'serious';
 		const killCritical = pagingSpiral || nearlyOut || seriousThermal;
 		if (!thermalEmergency && !killCritical) {
@@ -2605,7 +2662,9 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 			requiredStrikes = Math.min(requiredStrikes, 2);
 		}
 		if (pagingSpiral) {
-			requiredStrikes = Math.min(requiredStrikes, this._hasActiveOwnedRequest() ? 3 : 2);
+			// Loading legitimately causes one or two sharp paging samples. Keep the signal active rather than
+			// disabling the watchdog for 45s, but require 20s of sustained evidence during that grace window.
+			requiredStrikes = Math.min(requiredStrikes, inLoadGrace ? 4 : (this._hasActiveOwnedRequest() ? 3 : 2));
 		}
 		if (seriousThermal) {
 			requiredStrikes = Math.min(requiredStrikes, 6);
@@ -2688,11 +2747,19 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 				return;
 			}
 			try {
-				const res = await this.requestService.request({ type: 'GET', url: probeUrl }, token);
-				const status = res.res.statusCode ?? 0;
-				if (status === 200) {
-					up = true;
-					break;
+				const cts = new CancellationTokenSource(token);
+				const timer = setTimeout(() => cts.cancel(), 2000);
+				try {
+					const res = await this.requestService.request({ type: 'GET', url: probeUrl }, cts.token);
+					const status = res.res.statusCode ?? 0;
+					await streamToBuffer(res.stream).catch(() => undefined);
+					if (status === 200) {
+						up = true;
+						break;
+					}
+				} finally {
+					clearTimeout(timer);
+					cts.dispose();
 				}
 			} catch {
 				// not up yet
@@ -2704,18 +2771,26 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 			return;
 		}
 		try {
+			const cts = new CancellationTokenSource(token);
+			const timer = setTimeout(() => cts.cancel(), 15_000);
 			const body = JSON.stringify({
 				model: requestModel,
 				messages: [{ role: 'user', content: 'ping' }],
 				max_tokens: 1,
 				stream: false,
 			});
-			await this.requestService.request({
-				type: 'POST',
-				url: `${baseUrl}/chat/completions`,
-				headers: { 'Content-Type': 'application/json' },
-				data: body,
-			}, token);
+			try {
+				const res = await this.requestService.request({
+					type: 'POST',
+					url: `${baseUrl}/chat/completions`,
+					headers: { 'Content-Type': 'application/json' },
+					data: body,
+				}, cts.token);
+				await streamToBuffer(res.stream).catch(() => undefined);
+			} finally {
+				clearTimeout(timer);
+				cts.dispose();
+			}
 			this._log(`[LoCoPilot Runner] Warm-up request completed for ${kind} server on port ${port}.`);
 			// A completed generation is the strongest readiness signal there is (for MLX it is the ONLY
 			// reliable one - see above). Flip the phase so the UI turns green without waiting for a real
@@ -3538,16 +3613,6 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 			return;
 		}
 
-		// Availability guard - EVERY launch path reaches here (message send, manual Start, Retry, picker,
-		// pre-warm). Refuse to start a model that won't fit the RAM free RIGHT NOW, rather than loading it
-		// into a swap/thrash hang. Placed BEFORE eviction so the RAM that stopping our other resident servers
-		// will free is credited (a model that fits after the switch is not blocked). Shows a toast pointing at
-		// Auto / a smaller model. The capability gate (too big for TOTAL RAM) runs later per backend; this is
-		// the transient "not right now" companion.
-		if (!await this._memoryAllowsLaunch(modelId, interactive)) {
-			return;
-		}
-
 		// NOTE: the resident-model budget (eviction of the previous model) is enforced LATER, only AFTER the
 		// per-backend capability gate has passed - see the _enforceResidentBudget calls in each launch branch
 		// below. It must not run before that gate: if the user answers "Keep current model" at the fit dialog,
@@ -3567,6 +3632,9 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 		if (model.provider === 'huggingface' && isAppleSiliconMac()) {
 			const hasGguf = await this.pathResolvesToGguf(model.localPath);
 			if (shouldUseMlxServerForHfModel(model, hasGguf, true)) {
+				if (!await this._memoryAllowsLaunch(modelId, interactive, 'metal')) {
+					return;
+				}
 				// Same pre-flight fit check as the llama.cpp path: MLX runs on Apple Silicon unified memory via
 				// Metal, so there is no separate VRAM pool and the same ~70% wired working-set ceiling applies -
 				// pass 'metal' so the gate uses that ceiling rather than the looser 85% system figure. Size the
@@ -3619,6 +3687,11 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 			);
 			return;
 		}
+		// Use the backend selected for this exact binary, not the static recommendation. This matters on
+		// Windows/Linux where an installed CUDA engine or bundled Vulkan engine differs from getBackend().
+		if (!await this._memoryAllowsLaunch(modelId, interactive, backend)) {
+			return;
+		}
 
 		const modelPath = await this.resolveModelFilePath(model.localPath);
 
@@ -3628,8 +3701,7 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 		let discreteVramBytes: number | undefined;
 		if (backend === 'cuda' || backend === 'vulkan') {
 			const hw = await this._getHardwareInfo();
-			const vram = (hw?.gpus ?? []).map(g => g.totalVramBytes).filter(v => v > 0);
-			discreteVramBytes = vram.length ? Math.max(...vram) : undefined;
+			discreteVramBytes = this._discreteVramBytes(backend, hw);
 		}
 
 		// Build the base tuning and resolve the vision projector FIRST, so both the pre-flight fit check and
@@ -4190,8 +4262,8 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 	 * a model that fits AFTER the switch is never blocked. This is the transient companion to the capability
 	 * gate (models too big for total RAM).
 	 */
-	private async _memoryAllowsLaunch(modelId: string, interactive: boolean): Promise<boolean> {
-		const fit = await this._computeLaunchFit(modelId, interactive);
+	private async _memoryAllowsLaunch(modelId: string, interactive: boolean, backend?: LlamaBackend): Promise<boolean> {
+		const fit = await this._computeLaunchFit(modelId, interactive, backend);
 		if (!fit || fit.fits) {
 			return true; // can't measure (never block on the unmeasurable), or it fits.
 		}
@@ -4218,10 +4290,10 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 	 * every case the real gate treats as "don't block". Otherwise reports whether the model fits and the
 	 * numbers used, so callers can log / prompt without recomputing.
 	 */
-	private async _computeLaunchFit(modelId: string, interactive: boolean): Promise<{ fits: boolean; needGb: number; haveGb: number; name: string; pressure: MemoryPressureLevel; evictableGb: number } | undefined> {
+	private async _computeLaunchFit(modelId: string, interactive: boolean, resolvedBackend?: LlamaBackend): Promise<{ fits: boolean; needGb: number; haveGb: number; name: string; pressure: MemoryPressureLevel; evictableGb: number } | undefined> {
 		const model = this.customLanguageModelsService.getCustomModels().find(m => m.id === modelId);
-		if (!model || !model.localPath || !this._useMemoryBudget()) {
-			return undefined; // discrete-GPU / CPU-VRAM-less reasoning, or missing model -> don't block
+		if (!model || !model.localPath) {
+			return undefined;
 		}
 		if (this._forcedLaunch.has(modelId)) {
 			return undefined; // user already chose "Run anyway" for this model
@@ -4231,7 +4303,7 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 			return undefined; // no live probe -> never block on what we can't measure
 		}
 		const kind = await this._intendedServerKind(modelId);
-		const backend: LlamaBackend = kind === 'mlx' ? 'metal' : this.getBackend();
+		const backend: LlamaBackend = kind === 'mlx' ? 'metal' : (resolvedBackend ?? await this._resolveBackendForFit());
 		let modelPath: string;
 		try {
 			modelPath = kind === 'mlx' ? await this.getMlxModelRootPath(model.localPath) : await this.resolveModelFilePath(model.localPath);
@@ -4242,7 +4314,9 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 		// headroom for its cache trips this SOFT "not enough free right now" gate (Run-anyway available) instead
 		// of thrashing after launch. llama.cpp's growable KV is bounded by the context clamp instead, so 0 there.
 		const extraResidentBytes = kind === 'mlx' ? this._mlxRuntimeReserveBytes(mem.totalBytes) : 0;
-		const fit = await this._computeFit(modelPath, backend, undefined, extraResidentBytes);
+		const hw = await this._getHardwareInfo();
+		const discreteVramBytes = this._discreteVramBytes(backend, hw);
+		const fit = await this._computeFit(modelPath, backend, discreteVramBytes, extraResidentBytes);
 		if (!fit) {
 			return undefined; // unknown footprint -> don't block
 		}
@@ -4261,15 +4335,25 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 			evictableBytes += await this._estimateModelCost(id);
 		}
 		const availableNow = mem.availableBytes + evictableBytes;
-		// Only the NON-RECLAIMABLE working set must be physically free at launch: KV cache + compute/graph
-		// overhead (+ the MLX prompt-cache reserve folded into requiredBytes via extraResidentBytes). The
-		// weights do NOT need to be free right now - on CPU they are mmap-pageable, and on Metal they are wired
-		// only up to the ceiling the pre-flight CAPABILITY gate (_checkModelFitsOrNotify) already verified, which
-		// macOS satisfies by reclaiming file cache / compressing cold pages. Gating an interactive launch on the
-		// whole footprint (weights included) is exactly what falsely refused a model that fits the machine
-		// whenever the editor + browser were holding reclaimable RAM (e.g. Gemma 4B on a 16 GB Mac). Background
-		// pre-warm keeps the strict full-footprint check - refusing an optional speculative load is harmless.
-		const requiredFreeNow = interactive ? Math.max(0, fit.requiredBytes - fit.weightBytes) : fit.requiredBytes;
+		// availableBytes already includes reclaimable file cache, so excluding all weights double-counted that
+		// reclaimability and admitted launches that had room for KV but not for the weights they were about to
+		// touch. Metal weights become wired: charge 90%. CPU mmap can page cold tensors, but a sustained decode
+		// touches most layers: charge 70% (100% with --mlock). On a discrete GPU charge only the portion that
+		// remains in host RAM after the conservative VRAM weight allowance.
+		const nonWeightBytes = Math.max(0, fit.requiredBytes - fit.weightBytes);
+		let residentWeightBytes: number;
+		if (!interactive) {
+			residentWeightBytes = fit.weightBytes;
+		} else if (backend === 'metal') {
+			residentWeightBytes = fit.weightBytes * 0.9;
+		} else if (backend === 'cpu') {
+			const mlock = this.configurationService.getValue<boolean>(ChatConfiguration.LocopilotLlamaCppMlock) === true;
+			residentWeightBytes = fit.weightBytes * (mlock ? 1 : 0.7);
+		} else {
+			const vramWeightAllowance = (discreteVramBytes ?? 0) * (1 - KV_BUDGET_FRACTION) * 0.9;
+			residentWeightBytes = Math.max(0, fit.weightBytes - vramWeightAllowance);
+		}
+		const requiredFreeNow = nonWeightBytes + residentWeightBytes;
 		const GB = 1024 * 1024 * 1024;
 		return {
 			fits: mem.pressure !== 'critical' && requiredFreeNow <= availableNow,
@@ -4301,6 +4385,37 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 		return undefined;
 	}
 
+	/** MLX `/models` becomes available before its worker has loaded weights; a tiny generation is readiness. */
+	private async _probeMlxGenerationReady(baseUrl: string, modelId: string, token: CancellationToken): Promise<boolean> {
+		const rec = this.runningServers.get(modelId);
+		if (!rec || rec.kind !== 'mlx' || !rec.servedModelId) {
+			return false;
+		}
+		const cts = new CancellationTokenSource(token);
+		const timer = setTimeout(() => cts.cancel(), 10_000);
+		try {
+			const res = await this.requestService.request({
+				type: 'POST',
+				url: `${baseUrl}/chat/completions`,
+				headers: { 'Content-Type': 'application/json' },
+				data: JSON.stringify({
+					model: rec.servedModelId,
+					messages: [{ role: 'user', content: 'ping' }],
+					max_tokens: 1,
+					stream: false,
+				}),
+			}, cts.token);
+			const status = res.res.statusCode ?? 0;
+			await streamToBuffer(res.stream).catch(() => undefined);
+			return status >= 200 && status < 300;
+		} catch {
+			return false;
+		} finally {
+			clearTimeout(timer);
+			cts.dispose();
+		}
+	}
+
 	/**
 	 * Polls the OpenAI-compatible `/models` endpoint (served by both llama.cpp and mlx-lm) until it
 	 * responds 200 or the timeout/cancellation hits. Engine-agnostic readiness check.
@@ -4324,9 +4439,21 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 				return false;
 			}
 			try {
-				const res = await this.requestService.request({ type: 'GET', url }, token);
-				if ((res.res.statusCode ?? 0) === 200) {
-					return true;
+				const cts = new CancellationTokenSource(token);
+				const timer = setTimeout(() => cts.cancel(), 2000);
+				try {
+					const res = await this.requestService.request({ type: 'GET', url }, cts.token);
+					const status = res.res.statusCode ?? 0;
+					await streamToBuffer(res.stream).catch(() => undefined);
+					if (status === 200) {
+						const rec = modelId ? this.runningServers.get(modelId) : undefined;
+						if (rec?.kind !== 'mlx' || (modelId && await this._probeMlxGenerationReady(baseUrl, modelId, token))) {
+							return true;
+						}
+					}
+				} finally {
+					clearTimeout(timer);
+					cts.dispose();
 				}
 			} catch {
 				// not up yet
@@ -4383,6 +4510,10 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 		const modelDir = await this.getMlxModelRootPath(localPath!);
 		const port = await this.findAvailablePort(LOCOPILOT_MLX_SERVER_PORT);
 		const pythonCmd = await this.resolveMlxPython();
+		const requestedContext = model.contextWindow && model.contextWindow > 0
+			? model.contextWindow
+			: (this.configurationService.getValue<number>(ChatConfiguration.LocopilotLlamaCppContextSize) || DEFAULT_LLAMA_CONTEXT_SIZE);
+		this._lastLaunchContext.set(modelId, requestedContext);
 
 		// Automatic mlx-lm tuning (default on): cap the server's cross-request prompt cache to a slice of
 		// total RAM (upstream default is unbounded, which lets cached KV crowd out a small machine), and use
@@ -4413,7 +4544,18 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 				const weightAwareCache = weightBytes > 0 && wiredBudget > 0 ? computeKvBudgetBytes(wiredBudget, weightBytes) : 0;
 				mlxTuning.promptCacheBytes = weightAwareCache > 0
 					? Math.max(MLX_MIN_PROMPT_CACHE_BYTES, Math.min(flatCache, weightAwareCache))
-					: flatCache;
+					: MLX_MIN_PROMPT_CACHE_BYTES;
+				// MLX has no llama.cpp-style `-c` hard limit, so expose a conservative effective context to the
+				// provider/context manager. This prevents a nominal 128K/256K model from being fed a prompt whose
+				// KV cannot fit the same weight-aware wired budget. The 128 KiB/token fallback is shared with the
+				// resident estimator for non-GGUF models.
+				const MLX_KV_BYTES_PER_TOKEN = 128 * 1024;
+				const maxContextByMemory = Math.max(MIN_CLAMPED_CONTEXT, Math.floor(weightAwareCache / MLX_KV_BYTES_PER_TOKEN / 1024) * 1024);
+				const effectiveContext = Math.max(MIN_CLAMPED_CONTEXT, Math.min(requestedContext, maxContextByMemory));
+				this._lastLaunchContext.set(modelId, effectiveContext);
+				if (effectiveContext < requestedContext) {
+					this._log(`[LoCoPilot Runner] Clamped MLX effective context ${requestedContext} -> ${effectiveContext} tokens to fit the weight-aware wired-memory budget.`);
+				}
 				// Single-user client: requests arrive one at a time, so the server's parallel batching (decode 32 /
 				// prompt 8) only multiplies the peak KV + scratch - the top cause of the command-buffer OOM. Pin
 				// both to 1 to remove that multiplier with no real throughput loss.
@@ -4425,10 +4567,17 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 				// CLI flags - no monkeypatching. KV quantization was tried here but reverted; see the bootstrap.)
 				const leftoverAfterWeights = wiredBudget - weightBytes - RUNTIME_OVERHEAD_BYTES;
 				const tightFit = weightBytes > 0 && leftoverAfterWeights < MLX_TIGHT_FIT_HEADROOM_BYTES;
+				const performanceProfile = this.configurationService.getValue<'performance' | 'balanced' | 'quiet'>(ChatConfiguration.LocopilotLocalPerformanceProfile) ?? 'performance';
 				if (tightFit) {
 					mlxTuning.prefillStepSize = 512;
 					mlxTuning.promptCacheCount = 2;
 					this._log(`[LoCoPilot Runner] MLX tight fit (~${(leftoverAfterWeights / 1e9).toFixed(1)}GB left after weights): prefill-step 512, prompt-cache-size 2.`);
+				}
+				if (performanceProfile === 'quiet') {
+					mlxTuning.prefillStepSize = 256;
+					mlxTuning.promptCacheCount = 1;
+				} else if (performanceProfile === 'balanced' && !tightFit) {
+					mlxTuning.prefillStepSize = 512;
 				}
 				this._log(`[LoCoPilot Runner] MLX limits: set_memory_limit ~${Math.round(wiredBudget / 1e9)}GB, set_cache_limit ~${Math.round(mlxTuning.cacheLimitBytes / 1e9)}GB, prompt-cache ~${(mlxTuning.promptCacheBytes / 1e9).toFixed(1)}GB (weight-aware), decode/prompt concurrency 1.`);
 			}

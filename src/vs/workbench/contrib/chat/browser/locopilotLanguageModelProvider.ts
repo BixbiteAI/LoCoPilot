@@ -1323,7 +1323,10 @@ export class LoCoPilotLanguageModelProvider extends Disposable implements ILangu
 		const url = `${baseUrl}/chat/completions`;
 		const mappedMessages = messages.flatMap(m => this._mapMessageToOpenAI(m));
 		const isLocalModel = model.provider === 'huggingface' || model.provider === 'localhost' || model.provider === 'ollama';
-		const { maxOutputTokens } = deriveTokenLimits(model.contextWindow ?? defaultContextWindow(isLocalModel), isLocalModel);
+		const effectiveContext = this.localModelRunner.getLaunchedContextWindow(model.id)
+			?? model.contextWindow
+			?? defaultContextWindow(isLocalModel);
+		const { maxOutputTokens } = deriveTokenLimits(effectiveContext, isLocalModel);
 		// The request's `model` field must match what the local server actually loaded with (its `--model`
 		// value), not the catalog/HF repo name. mlx_lm.server is per-request model-aware: a mismatched id
 		// makes it try to (re)load a different model, which silently stalls the request forever. llama.cpp

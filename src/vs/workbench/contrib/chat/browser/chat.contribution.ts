@@ -858,6 +858,17 @@ configurationRegistry.registerConfiguration({
 			markdownDescription: nls.localize('locopilot.local.backgroundPriority.description', "Run local model server processes at a lower scheduling priority so the editor and the rest of the system stay responsive while a model is loading or generating. On Apple Silicon this also lets macOS prefer efficiency cores under load, which runs cooler. The model still gets full speed when the machine is otherwise idle."),
 			default: true,
 		},
+		[ChatConfiguration.LocopilotLocalPerformanceProfile]: {
+			type: 'string',
+			enum: ['performance', 'balanced', 'quiet'],
+			enumDescriptions: [
+				nls.localize('locopilot.local.performanceProfile.performance', "Maximum throughput using all detected performance cores and the largest safe prefill batches."),
+				nls.localize('locopilot.local.performanceProfile.balanced', "Use about 75% of CPU cores and moderate prefill batches for lower sustained heat with a small speed trade-off."),
+				nls.localize('locopilot.local.performanceProfile.quiet', "Use about half the CPU cores and small prefill batches for the lowest heat and power consumption."),
+			],
+			markdownDescription: nls.localize('locopilot.local.performanceProfile.description', "Power and thermal profile for sustained local inference. `performance` preserves maximum speed. Choose `balanced` or `quiet` on laptops or passively cooled systems to reduce heat and throttling during long sessions."),
+			default: 'performance',
+		},
 		[ChatConfiguration.LocopilotShowToolDetails]: {
 			type: 'boolean',
 			default: false,

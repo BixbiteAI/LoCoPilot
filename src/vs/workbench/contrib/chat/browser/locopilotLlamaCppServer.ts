@@ -191,7 +191,7 @@ export const KV_AUTO_QUANT_CONTEXT_THRESHOLD = DEFAULT_LLAMA_CONTEXT_SIZE;
 
 /**
  * Bytes-per-element the KV cache uses at a given precision, for sizing the context clamp so it matches what
- * the runtime will actually allocate. f16 = 2 bytes; q8_0 ~1.06 (rounded to 1); q4_0 ~0.5625 (4.5 bits with
+ * the runtime will actually allocate. f16 = 2 bytes; q8_0 = 1.0625; q4_0 ~0.5625 (4.5 bits with
  * its block scale). Using the real q4_0 size is what lets the clamp grant the extra window q4_0 buys.
  */
 export function kvCacheBytesPerElem(kvCacheType: Exclude<KvCacheType, 'auto'>): number {
@@ -202,7 +202,10 @@ export function kvCacheBytesPerElem(kvCacheType: Exclude<KvCacheType, 'auto'>): 
 			// q8_0, so it granted NO extra context - defeating the point of using q4_0 for a longer window.
 			return 0.5625;
 		case 'q8_0':
-			return 1;
+			// 8-bit quants stored in blocks of 32 with a 16-bit scale: (32*8 + 16) / 32 = 8.5 bits.
+			// Counting only the payload byte underestimates a long KV cache by 6.25%, enough to consume the
+			// final safety margin on memory-tight devices.
+			return 1.0625;
 		case 'f16':
 		default:
 			return 2;
@@ -316,6 +319,23 @@ export function usableSystemMemoryBytes(totalmemBytes: number): number {
  * answer "does it fit?" with the same arithmetic.
  */
 export const RUNTIME_OVERHEAD_BYTES = Math.round(1.5 * 1024 * 1024 * 1024);
+
+/**
+ * Estimates transient runtime/compute allocations that grow beyond the flat base allowance. This is
+ * deliberately modest: it charges the knobs that materially grow prefill peaks without taking usable
+ * context away for allocations already represented by weights, KV, prompt cache, or draft/projector extras.
+ */
+export function runtimeOverheadBytesForTuning(tuning: Pick<LlamaServerTuning, 'contextSize' | 'parallelSlots' | 'ubatchSize'>, backend: LlamaBackend): number {
+	const MiB = 1024 * 1024;
+	const context = Math.max(DEFAULT_LLAMA_CONTEXT_SIZE, tuning.contextSize ?? DEFAULT_LLAMA_CONTEXT_SIZE);
+	const slots = Math.max(1, Math.floor(tuning.parallelSlots ?? 1));
+	const ubatch = Math.max(512, Math.floor(tuning.ubatchSize ?? 512));
+	const gpuDriver = backend === 'cpu' ? 0 : 256 * MiB;
+	const contextGraph = Math.ceil(Math.max(0, context - DEFAULT_LLAMA_CONTEXT_SIZE) / 32768) * 128 * MiB;
+	const batchGraph = Math.ceil(Math.max(0, ubatch - 512) / 1024) * 256 * MiB;
+	const parallelGraph = Math.max(0, slots - 1) * 128 * MiB;
+	return RUNTIME_OVERHEAD_BYTES + gpuDriver + contextGraph + batchGraph + parallelGraph;
+}
 
 /**
  * KV-cache byte allowance for the context clamp, sized so that weights + KV + runtime overhead stay inside

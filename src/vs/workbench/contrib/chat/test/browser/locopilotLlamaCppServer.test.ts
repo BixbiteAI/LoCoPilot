@@ -27,6 +27,7 @@ import {
 	KV_AUTO_QUANT_CONTEXT_THRESHOLD,
 	KV_CLAMP_BUDGET_FRACTION,
 	RUNTIME_OVERHEAD_BYTES,
+	runtimeOverheadBytesForTuning,
 	VULKAN_MIN_DEDICATED_VRAM_BYTES,
 	MIN_CLAMPED_CONTEXT,
 	DEFAULT_CLAMP_LAYER_COUNT,
@@ -67,9 +68,9 @@ suite('LoCoPilot llama.cpp server', () => {
 	});
 
 	suite('kvCacheBytesPerElem', () => {
-		test('f16 is 2 bytes; q8_0 ~1; q4_0 ~0.56 (so the clamp grants q4_0 its larger window)', () => {
+		test('includes block scales in f16/q8_0/q4_0 byte costs', () => {
 			assert.strictEqual(kvCacheBytesPerElem('f16'), 2);
-			assert.strictEqual(kvCacheBytesPerElem('q8_0'), 1);
+			assert.strictEqual(kvCacheBytesPerElem('q8_0'), 1.0625);
 			assert.strictEqual(kvCacheBytesPerElem('q4_0'), 0.5625);
 			assert.ok(kvCacheBytesPerElem('q4_0') < kvCacheBytesPerElem('q8_0'));
 		});
@@ -90,7 +91,7 @@ suite('LoCoPilot llama.cpp server', () => {
 		test('prefers near-lossless q8_0 for a normal context when it fits', () => {
 			assert.deepStrictEqual(selectAutomaticKvCache({
 				requestedContext: 32768,
-				kvBudgetBytes: 2 * GB,
+				kvBudgetBytes: 2.25 * GB,
 				...geometry,
 			}), { kvCacheType: 'q8_0', contextSize: 32768 });
 		});
@@ -110,6 +111,15 @@ suite('LoCoPilot llama.cpp server', () => {
 				kvBudgetBytes: 2 * GB,
 				...geometry,
 			}), { kvCacheType: 'f16', contextSize: 8192 });
+		});
+	});
+
+	suite('runtimeOverheadBytesForTuning', () => {
+		test('charges GPU, long-context, large-ubatch, and parallel graph growth', () => {
+			const base = runtimeOverheadBytesForTuning({ contextSize: 16384, ubatchSize: 512, parallelSlots: 1 }, 'cpu');
+			const heavy = runtimeOverheadBytesForTuning({ contextSize: 131072, ubatchSize: 4096, parallelSlots: 4 }, 'metal');
+			assert.strictEqual(base, RUNTIME_OVERHEAD_BYTES);
+			assert.ok(heavy > base);
 		});
 	});
 

@@ -122,6 +122,8 @@ export enum ChatConfiguration {
 	LocopilotLocalMemoryWatchdog = 'locopilot.local.memoryWatchdog',
 	/** Run local model server processes at below-normal scheduling priority so the UI stays responsive. */
 	LocopilotLocalBackgroundPriority = 'locopilot.local.backgroundPriority',
+	/** Sustained inference profile: performance, balanced, or quiet (lower threads/batches for less heat). */
+	LocopilotLocalPerformanceProfile = 'locopilot.local.performanceProfile',
 	/** Whether to show tool call parameters and results in the chat UI. */
 	LocopilotShowToolDetails = 'locopilot.chat.showToolDetails',
 }
