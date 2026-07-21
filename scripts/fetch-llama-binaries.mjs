@@ -67,7 +67,14 @@ function currentTarget() {
 async function exists(p) { try { await stat(p); return true; } catch { return false; } }
 
 async function fetchJson(url) {
-	const res = await fetch(url, { headers: { 'Accept': 'application/vnd.github+json', 'User-Agent': 'locopilot-build' } });
+	const headers = { 'Accept': 'application/vnd.github+json', 'User-Agent': 'locopilot-build' };
+	// Authenticate GitHub API calls when a token is available (e.g. GITHUB_TOKEN in
+	// CI). Unauthenticated requests are rate-limited to 60/hour per IP, which shared
+	// CI runner IPs blow through quickly and get HTTP 403. A token raises this to
+	// 5000/hour. Purely optional; omitted locally, where the rate limit is fine.
+	const token = process.env.GITHUB_TOKEN || process.env.GH_TOKEN;
+	if (token) { headers['Authorization'] = `Bearer ${token}`; }
+	const res = await fetch(url, { headers });
 	if (!res.ok) { throw new Error(`HTTP ${res.status} for ${url}`); }
 	return res.json();
 }
