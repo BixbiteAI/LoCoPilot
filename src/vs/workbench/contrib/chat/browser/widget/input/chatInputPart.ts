@@ -628,6 +628,12 @@ export class ChatInputPart extends Disposable implements IHistoryNavigationWidge
 			const selectedModelNotAvailable = this._currentLanguageModel && (!selectedModel?.metadata.isUserSelectable);
 			if (!this.currentLanguageModel || selectedModelNotAvailable) {
 				this.setCurrentLanguageModelToDefault();
+			} else if (selectedModel && this._currentLanguageModel.get()?.metadata !== selectedModel.metadata) {
+				// Provider metadata can change while the selected identifier stays the same. LoCoPilot does this
+				// after a local server starts and its memory-clamped context becomes known (e.g. nominal 131K ->
+				// effective 65K). Refresh the selected model object so the context gauge and every observable UI
+				// consumer use the new maxInputTokens instead of retaining the stale pre-launch metadata.
+				this.setCurrentLanguageModel(selectedModel);
 			}
 		}));
 
