@@ -551,6 +551,8 @@ export const LOCOPILOT_DEFAULT_CATALOG: readonly ICatalogModel[] = [
 	},
 
 	// ---- Tier 3: 32 GB+ (power users) ----
+	// SUPERSEDED (commented out 2026-07): Devstral Small 2507 -> Devstral Small 2 (2512). Uncomment to restore.
+	/*
 	{
 		catalogId: 'devstral-small-24b-gguf',
 		displayName: 'Devstral Small 24B',
@@ -564,6 +566,21 @@ export const LOCOPILOT_DEFAULT_CATALOG: readonly ICatalogModel[] = [
 		minRamGB: 32,
 		tier: '32 GB+',
 		contextWindow: 131072,
+	},
+	*/
+	{
+		catalogId: 'devstral-small-2-24b-gguf',
+		displayName: 'Devstral Small 2 24B',
+		vendor: 'Mistral',
+		blurb: 'Latest agentic coder (68% SWE-bench); tools + vision. Fits 32 GB.',
+		repoId: 'unsloth/Devstral-Small-2-24B-Instruct-2512-GGUF',
+		supportsVision: true,
+		format: 'Q4_K_M',
+		engine: 'gguf',
+		approxSizeBytes: Math.round(14.3 * GB),
+		minRamGB: 32,
+		tier: '32 GB+',
+		contextWindow: 262144,
 	},
 	{
 		catalogId: 'mistral-small-24b-gguf',
@@ -716,6 +733,92 @@ export const LOCOPILOT_DEFAULT_CATALOG: readonly ICatalogModel[] = [
 		tier: '64 GB+',
 		defaultHidden: true,
 		contextWindow: 131072,
+	},
+
+	// =========================================================================================
+	// July 2026 additions: Devstral Small 2 (above), Ministral 3 edge ladder, Nemotron 3 Nano-Omni.
+	// Repo ids verified as public HuggingFace GGUF repos (Unsloth Q4_K_M / UD-Q4_K_M).
+	// =========================================================================================
+
+	// ---- Ministral 3 Instruct (Mistral) - multimodal edge models; 3B/8B/14B ----
+	{
+		catalogId: 'ministral-3-3b-gguf',
+		displayName: 'Ministral 3 3B',
+		vendor: 'Mistral',
+		blurb: 'Tiny multimodal Ministral; tools + vision on 8 GB.',
+		repoId: 'unsloth/Ministral-3-3B-Instruct-2512-GGUF',
+		supportsVision: true,
+		format: 'Q4_K_M',
+		engine: 'gguf',
+		approxSizeBytes: Math.round(2.1 * GB),
+		minRamGB: 8,
+		tier: '8 GB',
+		contextWindow: 262144,
+		defaultHidden: true,
+	},
+	{
+		catalogId: 'ministral-3-8b-gguf',
+		displayName: 'Ministral 3 8B',
+		vendor: 'Mistral',
+		blurb: 'Edge multimodal Ministral; strong tools + vision for 16 GB.',
+		repoId: 'unsloth/Ministral-3-8B-Instruct-2512-GGUF',
+		supportsVision: true,
+		format: 'Q4_K_M',
+		engine: 'gguf',
+		approxSizeBytes: Math.round(5.2 * GB),
+		minRamGB: 16,
+		tier: '16 GB',
+		contextWindow: 262144,
+		defaultHidden: true,
+	},
+	{
+		catalogId: 'ministral-3-14b-gguf',
+		displayName: 'Ministral 3 14B',
+		vendor: 'Mistral',
+		blurb: 'Largest Ministral 3 Instruct; multimodal tools + vision. Fits 16 GB.',
+		repoId: 'unsloth/Ministral-3-14B-Instruct-2512-GGUF',
+		supportsVision: true,
+		format: 'Q4_K_M',
+		engine: 'gguf',
+		approxSizeBytes: Math.round(8.2 * GB),
+		minRamGB: 16,
+		tier: '16 GB',
+		contextWindow: 262144,
+		defaultHidden: true,
+	},
+
+	// ---- Nemotron 3 Nano-Omni (NVIDIA) - 30B/~3B MoE multimodal reasoner ----
+	{
+		catalogId: 'nemotron-3-nano-omni-30b-a3b-gguf',
+		displayName: 'Nemotron 3 Nano-Omni 30B-A3B',
+		vendor: 'NVIDIA',
+		blurb: 'NVIDIA MoE (30B total, ~3B active); multimodal agentic reasoning. Fits 32 GB.',
+		repoId: 'unsloth/NVIDIA-Nemotron-3-Nano-Omni-30B-A3B-Reasoning-GGUF',
+		supportsVision: true,
+		format: 'Q4_K_M',
+		engine: 'gguf',
+		approxSizeBytes: Math.round(23.9 * GB),
+		minRamGB: 32,
+		tier: '32 GB+',
+		contextWindow: 32768,
+		defaultHidden: true,
+	},
+
+	// ---- GLM-4.7-Flash (Zhipu) - ~30B MoE / ~3.6B active; strong coding, fast ----
+	{
+		catalogId: 'glm-4_7-flash-gguf',
+		displayName: 'GLM-4.7-Flash',
+		vendor: 'Zhipu (GLM)',
+		blurb: 'Fast coding MoE (~30B total, ~3.6B active). Fits 32 GB.',
+		repoId: 'unsloth/GLM-4.7-Flash-GGUF',
+		supportsVision: false,
+		format: 'Q4_K_M',
+		engine: 'gguf',
+		approxSizeBytes: Math.round(18.3 * GB),
+		minRamGB: 32,
+		tier: '32 GB+',
+		contextWindow: 202752,
+		defaultHidden: true,
 	},
 
 	// =========================================================================================
@@ -873,7 +976,7 @@ const DEFAULT_VISIBLE_CATALOG_IDS: ReadonlySet<string> = new Set([
 	// picker shows one clean generation with no duplicates. Users can still surface them via Show in My Models.
 	'gemma4-12b-gguf',
 	'qwen36-27b-gguf',
-	'devstral-small-24b-gguf',
+	'devstral-small-2-24b-gguf',
 	'qwen35-0_8b-mtp-gguf',
 	'qwen35-4b-mtp-gguf',
 	'qwen35-9b-mtp-gguf',
