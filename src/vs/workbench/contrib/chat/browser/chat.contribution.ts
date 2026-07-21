@@ -659,12 +659,12 @@ configurationRegistry.registerConfiguration({
 			type: 'string',
 			enum: ['auto', 'f16', 'q8_0', 'q4_0'],
 			enumDescriptions: [
-				nls.localize('locopilot.llamaCpp.kv.auto', "Automatic (default): full-precision f16 for small context windows, 8-bit q8_0 at larger context (near-lossless). If a big model on a memory-tight machine still can't reach a ~32K window at q8_0, it drops to 4-bit q4_0 to roughly double the context for a modest quality cost."),
+				nls.localize('locopilot.llamaCpp.kv.auto', "Automatic (default): evaluates the model's GGUF attention geometry, weights, requested context and hardware memory budget at launch. It keeps f16 for small windows, prefers near-lossless q8_0 for larger windows, and uses q4_0 when that materially extends a context that q8_0 cannot fit."),
 				nls.localize('locopilot.llamaCpp.kv.f16', "Full-precision KV cache (always safe)."),
 				nls.localize('locopilot.llamaCpp.kv.q8_0', "8-bit KV cache: ~half the memory, slightly faster. Requires Flash Attention (auto-enabled)."),
 				nls.localize('locopilot.llamaCpp.kv.q4_0', "4-bit KV cache: smallest memory, fastest. May slightly reduce quality. Requires Flash Attention (auto-enabled)."),
 			],
-			markdownDescription: nls.localize('locopilot.llamaCpp.kvCacheType.description', "KV cache quantization (`--cache-type-k/v`) for the local llama.cpp server. Quantizing shrinks the cache so more context fits on the GPU. `auto` keeps full precision for small windows, switches to `q8_0` at large context, and drops to `q4_0` only when a big model would otherwise be stuck below ~32K (roughly doubling the window). When quantized, Flash Attention is auto-enabled (required), so this never fails to start."),
+			markdownDescription: nls.localize('locopilot.llamaCpp.kvCacheType.description', "KV cache quantization (`--cache-type-k/v`) for the local llama.cpp server. Quantizing shrinks the cache so more context fits on the GPU. `auto` dynamically compares f16, q8_0 and q4_0 using the selected model's real attention geometry and the launch memory budget: f16 for small windows, near-lossless q8_0 for normal/large windows, or q4_0 when it grants a larger safe context. When quantized, Flash Attention is auto-enabled (required), so this never fails to start."),
 			default: 'auto',
 		},
 		[ChatConfiguration.LocopilotLlamaCppMtp]: {
@@ -741,8 +741,8 @@ configurationRegistry.registerConfiguration({
 				nls.localize('locopilot.llamaCpp.swaFull.on', "Always keep the full SWA cache. Faster reuse on Gemma-class models, but uses more memory."),
 				nls.localize('locopilot.llamaCpp.swaFull.off', "Never keep the full SWA cache (llama.cpp default). Lowest memory, but every turn re-processes the whole prompt on these models."),
 			],
-			markdownDescription: nls.localize('locopilot.llamaCpp.swaFull.description', "Keep a **full-size KV cache** for sliding-window attention models (`--swa-full`), such as Gemma 2/3. These models otherwise keep only a small window of KV cache, which makes the local server discard its prompt cache and re-process the entire prompt on every turn - very slow on long agent conversations. `auto` turns the full cache on only for sliding-window models that still fit your memory budget with it; `on` (default) forces it; `off` uses the llama.cpp default. No effect on non-sliding-window models (most Llama/Qwen/Mistral builds). Newer llama.cpp flag - builds that don't support it are detected at launch and relaunched without it."),
-			default: 'on',
+			markdownDescription: nls.localize('locopilot.llamaCpp.swaFull.description', "Keep a **full-size KV cache** for sliding-window attention models (`--swa-full`), such as Gemma 2/3. These models otherwise keep only a small window of KV cache, which makes the local server discard its prompt cache and re-process the entire prompt on every turn - very slow on long agent conversations. `auto` (default) turns the full cache on only for sliding-window models that still fit your memory budget with it; `on` forces it; `off` uses the llama.cpp default. No effect on non-sliding-window models (most Llama/Qwen/Mistral builds). Newer llama.cpp flag - builds that don't support it are detected at launch and relaunched without it."),
+			default: 'auto',
 		},
 		[ChatConfiguration.LocopilotLlamaCppCpuMoeLayers]: {
 			type: 'number',

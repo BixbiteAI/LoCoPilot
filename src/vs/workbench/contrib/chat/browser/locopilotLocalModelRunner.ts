@@ -31,12 +31,12 @@ import {
 	buildExpertOffloadOverride,
 	computeKvBudgetBytes,
 	clampContextSize,
+	selectAutomaticKvCache,
 	shouldUseBundledVulkan,
 	metalOffloadBudgetBytes,
 	usableSystemMemoryBytes,
 	KV_BUDGET_FRACTION,
 	KV_CLAMP_BUDGET_FRACTION,
-	ADAPTIVE_Q4_KV_CONTEXT_FLOOR,
 	RUNTIME_OVERHEAD_BYTES,
 	DEFAULT_LLAMA_CONTEXT_SIZE,
 	MIN_CLAMPED_CONTEXT,
@@ -186,6 +186,13 @@ export interface ILoCoPilotLocalModelRunner {
 	 */
 	ensureServerForModel(modelId: string, token?: CancellationToken, interactive?: boolean): Promise<string | undefined>;
 	/**
+	 * Marks a foreground request as active so idle-unload cannot stop its server mid-stream. Calls must be
+	 * balanced with {@link endModelRequest}, normally from a `finally` block.
+	 */
+	beginModelRequest(modelId: string): void;
+	/** Marks a foreground request complete and starts keep-alive from completion of the final active request. */
+	endModelRequest(modelId: string): void;
+	/**
 	 * Restore a previously-saved KV cache slot (the warmed system+tools prefix) from disk into the running
 	 * llama.cpp server so the first real turn reuses it instead of re-prefilling. Returns true only when a
 	 * matching cache file existed and the server loaded it. No-op (false) for MLX/non-llama servers, when
@@ -307,6 +314,8 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 		startedAt: number;
 		/** True once the OpenAI endpoint answered 200 (phase 'ready'); false while still loading weights. */
 		ready: boolean;
+		/** Number of requests currently streaming through this server; idle-unload is suspended while non-zero. */
+		activeRequests?: number;
 		/** Pending idle-unload timer; cleared/reset on each use. */
 		idleTimer?: ReturnType<typeof setTimeout>;
 		/** Latest parsed load-progress line shown in the loading UI. */
@@ -394,7 +403,7 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 	private _memoryStatusInFlight: Promise<IMemoryStatus | undefined> | undefined;
 	/** Periodic memory watchdog while owned servers are resident (see _updateMemoryWatchdog). */
 	private _watchdogTimer: number | undefined;
-	/** Consecutive watchdog samples that looked critical; the breaker trips at 2 (~10s) to skip one-tick blips. */
+	/** Consecutive watchdog samples that looked critical; required duration depends on cause and active use. */
 	private _watchdogStrikes = 0;
 	/** Swap-in-use (bytes) at the previous watchdog sample, so the tick can detect ACTIVELY GROWING swap (paging). */
 	private _watchdogLastSwapBytes = -1;
@@ -1166,7 +1175,34 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 		}
 		running.lastUsedAt = Date.now();
 		this._lastReadyModelId = modelId; // the model actively in use; "Keep current" reverts selection here
-		this._armIdleTimer(modelId);
+		if ((running.activeRequests ?? 0) === 0) {
+			this._armIdleTimer(modelId);
+		}
+	}
+
+	beginModelRequest(modelId: string): void {
+		const running = this.runningServers.get(modelId);
+		if (!running) {
+			return;
+		}
+		running.activeRequests = (running.activeRequests ?? 0) + 1;
+		running.lastUsedAt = Date.now();
+		if (running.idleTimer) {
+			clearTimeout(running.idleTimer);
+			running.idleTimer = undefined;
+		}
+	}
+
+	endModelRequest(modelId: string): void {
+		const running = this.runningServers.get(modelId);
+		if (!running) {
+			return;
+		}
+		running.activeRequests = Math.max(0, (running.activeRequests ?? 0) - 1);
+		running.lastUsedAt = Date.now();
+		if (running.activeRequests === 0) {
+			this._armIdleTimer(modelId);
+		}
 	}
 
 	/**
@@ -1181,6 +1217,9 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 		if (running.foreign) {
 			return; // idle-unload is the owning window's job; we only hold a read-only handle
 		}
+		if ((running.activeRequests ?? 0) > 0) {
+			return; // keep-alive starts when the final in-flight request completes
+		}
 		if (running.idleTimer) {
 			clearTimeout(running.idleTimer);
 			running.idleTimer = undefined;
@@ -1192,7 +1231,7 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 		}
 		running.idleTimer = setTimeout(() => {
 			const still = this.runningServers.get(modelId);
-			if (still && Date.now() - still.lastUsedAt >= ms) {
+			if (still && (still.activeRequests ?? 0) === 0 && Date.now() - still.lastUsedAt >= ms) {
 				this._log(`[LoCoPilot Runner] Unloading idle model ${modelId} after ${minutes} min of inactivity.`);
 				this.stopServer(modelId);
 			}
@@ -2000,23 +2039,6 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 		// The fraction-only allowance (the old behavior) let a dense Metal model whose weights already filled
 		// ~85% of the wired budget still claim a full 25% KV on top - past the ceiling, straight into paging.
 		if (tuning.contextSize && tuning.contextSize > 0) {
-			// Size the KV estimate at the SAME precision the server will actually allocate. 'auto' picks q8_0
-			// for the default window and larger (~half the bytes of f16), so estimating at that precision lets
-			// the clamp grant roughly twice the context for the same budget instead of over-clamping on an f16
-			// assumption. Resolve from the requested window; getLlamaCppServerCommand re-resolves from the
-			// clamped window for the actual flag (a negligible diff only right at the quant threshold).
-			// Resolve the KV precision from the REQUESTED window (before the clamp shrinks it). A long-context
-			// catalog model (e.g. 131K/256K) resolves to q8_0; we size the clamp at that precision AND pin it
-			// below so the launch runs the same precision even after the clamp drops the window under the
-			// auto-quant threshold - otherwise the server would re-resolve 'auto' to f16 and use ~2x the KV the
-			// clamp budgeted (unsafe on a tight machine, and it wastes the extra window q8_0 was meant to buy).
-			let resolvedKvType = resolveKvCacheType(tuning.kvCacheType ?? 'auto', tuning.contextSize);
-			const kvBytesPerElem = kvCacheBytesPerElem(resolvedKvType);
-			// Estimate KV bytes/token/layer from the model's attention geometry at the cache precision. When the
-			// GGUF lacks the attention keys, fall back to the conservative f16 default SCALED to the precision
-			// (q8_0 -> ~half), so a quantized cache actually grants ~2x the window instead of being sized as f16.
-			let perTokenPerLayer = kvBytesPerTokenPerLayer(info, kvBytesPerElem)
-				?? Math.round(DEFAULT_KV_BYTES_PER_TOKEN_PER_LAYER_F16 * kvBytesPerElem / 2);
 			let kvBudgetBytes: number | undefined;
 			if (budget && budget > 0) {
 				// Discrete GPUs: partial offload caps the weights that land in VRAM at the offload budget;
@@ -2029,38 +2051,36 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 					? Math.max(1, computeKvBudgetBytes(budget, residentWeights))
 					: budget * KV_CLAMP_BUDGET_FRACTION;
 			}
-			let clamped = clampContextSize({
-				requestedContext: tuning.contextSize,
-				modelContextLength: info.contextLength,
-				kvBudgetBytes,
-				layerCount: info.layerCount,
-				kvBytesPerTokenPerLayer: perTokenPerLayer,
-			});
-			// Adaptive KV precision (ONLY when the user left kvCacheType on 'auto'): if q8_0 still can't reach a
-			// usable window because the model's weights leave little room for KV, drop to 4-bit q4_0 - it roughly
-			// halves the per-token KV cost, turning a cramped window (e.g. ~22K on a 24B/32GB) into ~1.8x that at a
-			// modest quality cost. Gated on q8_0 landing BELOW the floor AND the user actually wanting more, so a
-			// model that already gets a comfortable q8_0 window keeps full quality. Big models are the beneficiaries;
-			// small models never reach this branch because q8_0 already clears the floor for them.
-			if ((tuning.kvCacheType ?? 'auto') === 'auto' && resolvedKvType === 'q8_0'
-				&& clamped < ADAPTIVE_Q4_KV_CONTEXT_FLOOR && clamped < tuning.contextSize && kvBudgetBytes && kvBudgetBytes > 0) {
-				const q4BytesPerElem = kvCacheBytesPerElem('q4_0');
-				const q4PerTokenPerLayer = kvBytesPerTokenPerLayer(info, q4BytesPerElem)
-					?? Math.round(DEFAULT_KV_BYTES_PER_TOKEN_PER_LAYER_F16 * q4BytesPerElem / 2);
-				const q4Clamped = clampContextSize({
+			// Compare every automatic precision against the same exact model geometry and weight-aware budget.
+			// This makes q4 useful whenever it materially extends a requested long context, rather than only below
+			// a fixed 32K threshold, while preserving f16 for small windows and near-lossless q8 when it already fits.
+			const f16PerTokenPerLayer = kvBytesPerTokenPerLayer(info, kvCacheBytesPerElem('f16'))
+				?? DEFAULT_KV_BYTES_PER_TOKEN_PER_LAYER_F16;
+			let resolvedKvType: Exclude<KvCacheType, 'auto'>;
+			let clamped: number;
+			if ((tuning.kvCacheType ?? 'auto') === 'auto') {
+				const selection = selectAutomaticKvCache({
 					requestedContext: tuning.contextSize,
 					modelContextLength: info.contextLength,
 					kvBudgetBytes,
 					layerCount: info.layerCount,
-					kvBytesPerTokenPerLayer: q4PerTokenPerLayer,
+					kvBytesPerTokenPerLayerF16: f16PerTokenPerLayer,
 				});
-				if (q4Clamped > clamped) {
-					this._log(`[LoCoPilot Runner] Adaptive KV: q8_0 window ${clamped} is below the ${ADAPTIVE_Q4_KV_CONTEXT_FLOOR}-token floor; switching to 4-bit q4_0 KV to reach ${q4Clamped}.`);
-					resolvedKvType = 'q4_0';
-					perTokenPerLayer = q4PerTokenPerLayer;
-					clamped = q4Clamped;
-				}
+				resolvedKvType = selection.kvCacheType;
+				clamped = selection.contextSize;
+				this._log(`[LoCoPilot Runner] Dynamic KV selected ${resolvedKvType} for ${clamped}/${tuning.contextSize} requested tokens from the model-specific memory budget.`);
+			} else {
+				resolvedKvType = tuning.kvCacheType as Exclude<KvCacheType, 'auto'>;
+				const fixedPerTokenPerLayer = f16PerTokenPerLayer * kvCacheBytesPerElem(resolvedKvType) / kvCacheBytesPerElem('f16');
+				clamped = clampContextSize({
+					requestedContext: tuning.contextSize,
+					modelContextLength: info.contextLength,
+					kvBudgetBytes,
+					layerCount: info.layerCount,
+					kvBytesPerTokenPerLayer: fixedPerTokenPerLayer,
+				});
 			}
+			const perTokenPerLayer = f16PerTokenPerLayer * kvCacheBytesPerElem(resolvedKvType) / kvCacheBytesPerElem('f16');
 			if (clamped < tuning.contextSize) {
 				this._log(`[LoCoPilot Runner] Clamped context ${tuning.contextSize} -> ${clamped} to fit the model/memory budget (KV ${resolvedKvType}, ~${perTokenPerLayer} B/tok/layer).`);
 				tuning.contextSize = clamped;
@@ -2422,6 +2442,16 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 		return n;
 	}
 
+	/** True while this window is streaming at least one request through an owned local server. */
+	private _hasActiveOwnedRequest(): boolean {
+		for (const rec of this.runningServers.values()) {
+			if (!rec.foreign && (rec.activeRequests ?? 0) > 0) {
+				return true;
+			}
+		}
+		return false;
+	}
+
 	/**
 	 * Graceful first-strike relief: evict our least-recently-used OWNED servers while keeping the most-recently
 	 * -used one resident. Only acts when more than one owned server is up (the multi-resident case, e.g.
@@ -2552,9 +2582,8 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 		const pagingSpiral = !inLoadGrace && (hasPressureSignal
 			? (mem.pressure === 'critical' && swapGrowing)
 			: (lowAvailable && (swapGrowing || noSignals)));
-		const killCritical = pagingSpiral
-			|| nearlyOut
-			|| mem.thermalPressure === 'serious';
+		const seriousThermal = mem.thermalPressure === 'serious';
+		const killCritical = pagingSpiral || nearlyOut || seriousThermal;
 		if (!thermalEmergency && !killCritical) {
 			// Not in kill territory. Reset strikes; if the kernel reports CRITICAL pressure while we're low, give a
 			// ONE-TIME, non-escalating heads-up (the model keeps running). Clear the latch on recovery above the floor.
@@ -2567,10 +2596,24 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 			return;
 		}
 		this._watchdogStrikes++;
+		// Hard near-OOM remains strict at two samples (~10s). Paging gets one extra sample while a request is
+		// actively streaming, avoiding a short allocation/prefill burst without ever masking sustained thrash.
+		// macOS "serious" thermal means throttling, not imminent shutdown: retain critical=immediate, but allow
+		// serious pressure 30s to recover under utility QoS before unloading the model.
+		let requiredStrikes = Number.POSITIVE_INFINITY;
+		if (nearlyOut) {
+			requiredStrikes = Math.min(requiredStrikes, 2);
+		}
+		if (pagingSpiral) {
+			requiredStrikes = Math.min(requiredStrikes, this._hasActiveOwnedRequest() ? 3 : 2);
+		}
+		if (seriousThermal) {
+			requiredStrikes = Math.min(requiredStrikes, 6);
+		}
 		const GB = 1024 * 1024 * 1024;
-		this._log(`[LoCoPilot Runner] Memory watchdog: kill-critical sample ${this._watchdogStrikes} (thermalEmergency=${thermalEmergency}, available ~${(mem.availableBytes / GB).toFixed(1)}GB, warnFloor ~${(warnFloor / GB).toFixed(1)}GB, hardFloor ~${(hardFloor / GB).toFixed(1)}GB, nearlyOut=${nearlyOut}, swapGrowing=${swapGrowing}, pagingSpiral=${pagingSpiral}, inLoadGrace=${inLoadGrace}, pressure=${mem.pressure}, thermal=${mem.thermalPressure}, swap used ~${mem.swapUsedBytes >= 0 ? (mem.swapUsedBytes / GB).toFixed(1) + 'GB' : 'n/a'}).`);
-		// Only a thermal emergency trips on the first strike; every memory signal needs two consecutive samples.
-		if (!thermalEmergency && this._watchdogStrikes < 2) {
+		this._log(`[LoCoPilot Runner] Memory watchdog: kill-critical sample ${this._watchdogStrikes}/${requiredStrikes} (thermalEmergency=${thermalEmergency}, activeRequest=${this._hasActiveOwnedRequest()}, available ~${(mem.availableBytes / GB).toFixed(1)}GB, warnFloor ~${(warnFloor / GB).toFixed(1)}GB, hardFloor ~${(hardFloor / GB).toFixed(1)}GB, nearlyOut=${nearlyOut}, swapGrowing=${swapGrowing}, pagingSpiral=${pagingSpiral}, inLoadGrace=${inLoadGrace}, pressure=${mem.pressure}, thermal=${mem.thermalPressure}, swap used ~${mem.swapUsedBytes >= 0 ? (mem.swapUsedBytes / GB).toFixed(1) + 'GB' : 'n/a'}).`);
+		// Critical thermal is immediate. Other causes must persist for their cause-specific recovery window.
+		if (!thermalEmergency && this._watchdogStrikes < requiredStrikes) {
 			// GRACEFUL FIRST STRIKE: don't kill the user's model yet, but relieve pressure and stop making it
 			// worse. (1) Suppress automatic pre-warm launches right away so nothing new loads while we're tight.
 			// (2) If more than one of OUR servers is resident, evict the least-recently-used extras now, keeping

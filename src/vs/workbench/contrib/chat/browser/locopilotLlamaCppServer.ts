@@ -190,14 +190,6 @@ export const DEFAULT_LLAMA_CONTEXT_SIZE = 16384;
 export const KV_AUTO_QUANT_CONTEXT_THRESHOLD = DEFAULT_LLAMA_CONTEXT_SIZE;
 
 /**
- * When 'auto' KV precision is in effect and even a q8_0 cache can only fit a context BELOW this floor (a big
- * model on a memory-tight machine), the runner drops to 4-bit q4_0 KV to roughly double the window. Above the
- * floor, q8_0's comfortable window is kept for its near-lossless quality. 32K is the point where a cramped
- * window starts to hurt long / agentic tasks, which is exactly when the extra context is worth q4_0's cost.
- */
-export const ADAPTIVE_Q4_KV_CONTEXT_FLOOR = 32768;
-
-/**
  * Bytes-per-element the KV cache uses at a given precision, for sizing the context clamp so it matches what
  * the runtime will actually allocate. f16 = 2 bytes; q8_0 ~1.06 (rounded to 1); q4_0 ~0.5625 (4.5 bits with
  * its block scale). Using the real q4_0 size is what lets the clamp grant the extra window q4_0 buys.
@@ -455,6 +447,59 @@ export function clampContextSize(inputs: ContextClampInputs): number {
 	// Round down to a 1024 multiple and never go below the floor.
 	ctx = Math.floor(ctx / 1024) * 1024;
 	return Math.max(MIN_CLAMPED_CONTEXT, ctx);
+}
+
+export interface AutomaticKvCacheSelectionInputs extends ContextClampInputs {
+	/**
+	 * Model-specific f16 KV bytes per token per layer from GGUF attention geometry. Quantized candidates
+	 * are derived from this value, ensuring all precisions are compared against exactly the same model.
+	 */
+	kvBytesPerTokenPerLayerF16?: number;
+}
+
+export interface AutomaticKvCacheSelection {
+	kvCacheType: Exclude<KvCacheType, 'auto'>;
+	contextSize: number;
+}
+
+/**
+ * Selects automatic KV precision from the model's real geometry and memory budget. Small contexts retain
+ * f16 when it fits; normal/large contexts prefer near-lossless q8_0; q4_0 is selected only when it grants
+ * more of the requested context than q8_0. Selection happens before launch and remains stable for the
+ * server lifetime, so an active conversation never loses its cache to a precision change.
+ */
+export function selectAutomaticKvCache(inputs: AutomaticKvCacheSelectionInputs): AutomaticKvCacheSelection {
+	const targetContext = clampContextSize({
+		requestedContext: inputs.requestedContext,
+		modelContextLength: inputs.modelContextLength,
+	});
+	const preferred: Exclude<KvCacheType, 'auto'>[] = targetContext < KV_AUTO_QUANT_CONTEXT_THRESHOLD
+		? ['f16', 'q8_0', 'q4_0']
+		: ['q8_0', 'q4_0'];
+	const f16Bytes = inputs.kvBytesPerTokenPerLayerF16 && inputs.kvBytesPerTokenPerLayerF16 > 0
+		? inputs.kvBytesPerTokenPerLayerF16
+		: (inputs.kvBytesPerTokenPerLayer && inputs.kvBytesPerTokenPerLayer > 0
+			? inputs.kvBytesPerTokenPerLayer
+			: DEFAULT_KV_BYTES_PER_TOKEN_PER_LAYER_F16);
+	let best: AutomaticKvCacheSelection | undefined;
+	for (const kvCacheType of preferred) {
+		const perTokenPerLayer = f16Bytes * kvCacheBytesPerElem(kvCacheType) / kvCacheBytesPerElem('f16');
+		const contextSize = clampContextSize({
+			requestedContext: inputs.requestedContext,
+			modelContextLength: inputs.modelContextLength,
+			kvBudgetBytes: inputs.kvBudgetBytes,
+			layerCount: inputs.layerCount,
+			kvBytesPerTokenPerLayer: perTokenPerLayer,
+		});
+		const candidate = { kvCacheType, contextSize };
+		if (contextSize >= targetContext) {
+			return candidate;
+		}
+		if (!best || contextSize > best.contextSize) {
+			best = candidate;
+		}
+	}
+	return best ?? { kvCacheType: resolveKvCacheType('auto', targetContext), contextSize: targetContext };
 }
 
 /**

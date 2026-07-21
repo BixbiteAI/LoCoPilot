@@ -1408,6 +1408,9 @@ export class LoCoPilotLanguageModelProvider extends Disposable implements ILangu
 		// the arguments are still generating. Gated to the built-in agent's requests so extension
 		// consumers of the LM API never see the extra part types.
 		const streamToolCallParts = options.locopilotStreamToolCalls === true;
+		// Suspend idle-unload for the complete streamed request. The matching finally below also runs for
+		// cancellation, connection errors and tool fallbacks, so keep-alive always starts from true completion.
+		this.localModelRunner.beginModelRequest(model.id);
 		try {
 			const accumulatedToolCalls: Map<number, { id?: string; name?: string; args: string; startEmitted?: boolean }> = new Map();
 			// Full assistant content seen so far. We buffer it so that if a local model emits a tool call as
@@ -1598,6 +1601,8 @@ export class LoCoPilotLanguageModelProvider extends Disposable implements ILangu
 				? this._getLocalServerUnavailableMessage(model)
 				: `Local model "${model.modelName}" error: ${errMsg}`;
 			throw new Error(msg);
+		} finally {
+			this.localModelRunner.endModelRequest(model.id);
 		}
 	}
 

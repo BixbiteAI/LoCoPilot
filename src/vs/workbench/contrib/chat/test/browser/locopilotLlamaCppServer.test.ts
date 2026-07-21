@@ -15,6 +15,7 @@ import {
 	getBundledLlamaServerPath,
 	getLlamaCppServerCommand,
 	resolveKvCacheType,
+	selectAutomaticKvCache,
 	kvCacheBytesPerElem,
 	shouldUseBundledVulkan,
 	metalOffloadBudgetBytes,
@@ -71,6 +72,44 @@ suite('LoCoPilot llama.cpp server', () => {
 			assert.strictEqual(kvCacheBytesPerElem('q8_0'), 1);
 			assert.strictEqual(kvCacheBytesPerElem('q4_0'), 0.5625);
 			assert.ok(kvCacheBytesPerElem('q4_0') < kvCacheBytesPerElem('q8_0'));
+		});
+	});
+
+	suite('selectAutomaticKvCache', () => {
+		const GB = 1024 * 1024 * 1024;
+		const geometry = { layerCount: 32, kvBytesPerTokenPerLayerF16: 4096 };
+
+		test('keeps f16 for a small context when it fits', () => {
+			assert.deepStrictEqual(selectAutomaticKvCache({
+				requestedContext: 8192,
+				kvBudgetBytes: 2 * GB,
+				...geometry,
+			}), { kvCacheType: 'f16', contextSize: 8192 });
+		});
+
+		test('prefers near-lossless q8_0 for a normal context when it fits', () => {
+			assert.deepStrictEqual(selectAutomaticKvCache({
+				requestedContext: 32768,
+				kvBudgetBytes: 2 * GB,
+				...geometry,
+			}), { kvCacheType: 'q8_0', contextSize: 32768 });
+		});
+
+		test('selects q4_0 when it materially extends a long context beyond q8_0', () => {
+			assert.deepStrictEqual(selectAutomaticKvCache({
+				requestedContext: 65536,
+				kvBudgetBytes: 2 * GB,
+				...geometry,
+			}), { kvCacheType: 'q4_0', contextSize: 57344 });
+		});
+
+		test('uses the trained model window when deciding that f16 is sufficient', () => {
+			assert.deepStrictEqual(selectAutomaticKvCache({
+				requestedContext: 65536,
+				modelContextLength: 8192,
+				kvBudgetBytes: 2 * GB,
+				...geometry,
+			}), { kvCacheType: 'f16', contextSize: 8192 });
 		});
 	});
 
