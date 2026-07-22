@@ -58,6 +58,19 @@ jobs:
             Start-Sleep -Seconds 5
           }
 
+      - name: Prune foreign-platform native bindings
+        shell: pwsh
+        run: |
+          # onnxruntime-node ships prebuilt bindings for every platform/arch. The
+          # win32 packaging step runs rcedit over .node files and fails to load the
+          # foreign (linux/darwin) ELF bindings. Keep only win32/arm64.
+          $ort = "node_modules\onnxruntime-node\bin\napi-v3"
+          if (Test-Path $ort) {
+            Remove-Item -Recurse -Force -ErrorAction SilentlyContinue "$ort\linux","$ort\darwin","$ort\win32\x64"
+            Write-Host "Remaining onnxruntime bindings:"
+            Get-ChildItem -Recurse $ort -Filter *.node | ForEach-Object { $_.FullName }
+          }
+
       - name: Build app folder (vscode-win32-arm64-min)
         shell: pwsh
         run: npm run gulp vscode-win32-arm64-min
