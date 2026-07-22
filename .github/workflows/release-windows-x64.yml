@@ -72,10 +72,14 @@ jobs:
         shell: pwsh
         run: npm run gulp vscode-win32-x64-min
 
-      - name: Build user + system installers
+      - name: Build inno-updater + user + system installers
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
+          # inno-updater populates the app's tools\ folder (inno_updater.exe +
+          # vcruntime140.dll); code.iss requires it, or setup fails with
+          # "No files found matching ...\tools\*".
+          npm run gulp vscode-win32-x64-inno-updater
           npm run gulp vscode-win32-x64-user-setup
           npm run gulp vscode-win32-x64-system-setup
 
