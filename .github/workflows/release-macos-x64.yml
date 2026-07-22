@@ -15,7 +15,9 @@ jobs:
   build-macos-x64:
     name: Build macOS x64 (unsigned .dmg, cross-compiled on arm64)
     runs-on: macos-14           # Apple Silicon; we cross-build x64 on it
-    timeout-minutes: 150
+    # Free macos-14 runners have ~7 GB RAM but the compile uses an 8 GB Node heap,
+    # so it swaps and runs slowly (cross-compile under Rosetta is slower still).
+    timeout-minutes: 240
     env:
       npm_config_arch: x64
       npm_config_target_arch: x64
