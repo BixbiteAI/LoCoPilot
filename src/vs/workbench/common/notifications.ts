@@ -316,7 +316,7 @@ export interface INotificationViewItem {
 	readonly onDidChangeContent: Event<INotificationViewItemContentChangeEvent>;
 	readonly onDidClose: Event<void>;
 
-	expand(): void;
+	expand(skipEvents?: boolean): void;
 	collapse(skipEvents?: boolean): void;
 	toggle(): void;
 
@@ -680,13 +680,16 @@ export class NotificationViewItem extends Disposable implements INotificationVie
 		}
 	}
 
-	expand(): void {
+	expand(skipEvents?: boolean): void {
 		if (this._expanded || !this.canCollapse) {
 			return;
 		}
 
 		this._expanded = true;
-		this._onDidChangeExpansion.fire();
+
+		if (!skipEvents) {
+			this._onDidChangeExpansion.fire();
+		}
 	}
 
 	collapse(skipEvents?: boolean): void {

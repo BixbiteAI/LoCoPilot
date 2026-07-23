@@ -49,15 +49,31 @@ export class NotificationsListDelegate implements IListVirtualDelegate<INotifica
 	}
 
 	getHeight(notification: INotificationViewItem): number {
+		// Auto-expand when the message needs more than one line so the full text is
+		// visible without requiring the user to click the expand chevron. Skip events
+		// because we are already computing the height that the expansion implies.
 		if (!notification.expanded) {
-			return NotificationsListDelegate.ROW_HEIGHT; // return early if there are no more rows to show
+			if (!notification.canCollapse) {
+				return NotificationsListDelegate.ROW_HEIGHT;
+			}
+
+			const preferredMessageHeight = this.computePreferredHeight(notification);
+			if (NotificationsListDelegate.LINE_HEIGHT >= preferredMessageHeight) {
+				return NotificationsListDelegate.ROW_HEIGHT;
+			}
+
+			notification.expand(true /* skip events, height computed below */);
+			return this.computeExpandedHeight(notification, preferredMessageHeight);
 		}
 
+		return this.computeExpandedHeight(notification);
+	}
+
+	private computeExpandedHeight(notification: INotificationViewItem, preferredMessageHeight = this.computePreferredHeight(notification)): number {
 		// First row: message and actions
 		let expandedHeight = NotificationsListDelegate.ROW_HEIGHT;
 
 		// Dynamic height: if message overflows
-		const preferredMessageHeight = this.computePreferredHeight(notification);
 		const messageOverflows = NotificationsListDelegate.LINE_HEIGHT < preferredMessageHeight;
 		if (messageOverflows) {
 			const overflow = preferredMessageHeight - NotificationsListDelegate.LINE_HEIGHT;
