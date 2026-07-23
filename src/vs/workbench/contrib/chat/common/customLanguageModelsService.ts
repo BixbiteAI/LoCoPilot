@@ -58,6 +58,20 @@ export function needsDownloadOrPullRetry(model: ICustomLanguageModel): boolean {
 	return false;
 }
 
+/**
+ * True when Delete can offer "Remove download" (weights on disk / pulled in Ollama) while keeping the list entry.
+ * Cloud and localhost models have nothing to unload from disk.
+ */
+export function hasRemovableLocalDownload(model: ICustomLanguageModel): boolean {
+	if (model.type !== 'local' || model.isDownloading) {
+		return false;
+	}
+	if (model.provider === 'huggingface' || model.provider === 'ollama') {
+		return !needsDownloadOrPullRetry(model);
+	}
+	return false;
+}
+
 /** Default context window for newly added cloud models (modern safe floor: GPT-4o, Llama 3.1, Mistral). */
 export const DEFAULT_CONTEXT_WINDOW_CLOUD = 128000;
 /** Default context window for newly added local models. Newer local models (Llama 3.x, Qwen) handle this;

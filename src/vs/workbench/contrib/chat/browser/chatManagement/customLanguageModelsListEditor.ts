@@ -17,12 +17,14 @@ import { IThemeService } from '../../../../../platform/theme/common/themeService
 import { IEditorGroup } from '../../../../services/editor/common/editorGroupsService.js';
 import { CancellationToken } from '../../../../../base/common/cancellation.js';
 import { localize } from '../../../../../nls.js';
-import { ICustomLanguageModelsService, ICustomLanguageModel, getCustomModelListLabel } from '../../common/customLanguageModelsService.js';
+import { ICustomLanguageModelsService, ICustomLanguageModel, getCustomModelListLabel, hasRemovableLocalDownload } from '../../common/customLanguageModelsService.js';
 import { IDialogService } from '../../../../../platform/dialogs/common/dialogs.js';
+import Severity from '../../../../../base/common/severity.js';
 import { ICommandService } from '../../../../../platform/commands/common/commands.js';
 import { Codicon } from '../../../../../base/common/codicons.js';
 import { renderIcon } from '../../../../../base/browser/ui/iconLabel/iconLabels.js';
 import { CustomLanguageModelsListEditorInput } from './customLanguageModelsListEditorInput.js';
+import { ILoCoPilotLocalModelRunner } from '../locopilotLocalModelRunner.js';
 import './media/customLanguageModelsListEditor.css';
 
 const $ = DOM.$;
@@ -44,6 +46,7 @@ export class CustomLanguageModelsListEditor extends EditorPane {
 		@ICustomLanguageModelsService private readonly customLanguageModelsService: ICustomLanguageModelsService,
 		@IDialogService private readonly dialogService: IDialogService,
 		@ICommandService private readonly commandService: ICommandService,
+		@ILoCoPilotLocalModelRunner private readonly localModelRunner: ILoCoPilotLocalModelRunner,
 	) {
 		super(CustomLanguageModelsListEditor.ID, group, telemetryService, themeService, storageService);
 	}
@@ -135,20 +138,68 @@ export class CustomLanguageModelsListEditor extends EditorPane {
 		const deleteButton = this._register(new Button(actionsContainer, { ...defaultButtonStyles, secondary: true }));
 		deleteButton.label = localize('customLanguageModels.delete', 'Delete');
 		this._register(deleteButton.onDidClick(async () => {
-			const confirmed = await this.dialogService.confirm({
-				title: localize('customLanguageModels.delete.confirm.title', 'Delete Model'),
-				message: localize('customLanguageModels.delete.confirm.message', 'Are you sure you want to delete "{0}"?', getCustomModelListLabel(model)),
-				primaryButton: localize('delete', 'Delete'),
-				type: 'warning'
-			});
-
-			if (confirmed.confirmed) {
-				await this.deleteModelWithAnimation(model.id, itemContainer);
-			}
+			await this.onDeleteModelClicked(model, itemContainer);
 		}));
 	}
 
+	private async onDeleteModelClicked(model: ICustomLanguageModel, itemContainer: HTMLElement): Promise<void> {
+		const label = getCustomModelListLabel(model);
+		if (hasRemovableLocalDownload(model)) {
+			const { result } = await this.dialogService.prompt({
+				type: Severity.Warning,
+				title: localize('customLanguageModels.remove.title', 'Remove "{0}"?', label),
+				message: localize('customLanguageModels.remove.downloaded.message', 'How do you want to remove "{0}"?', label),
+				detail: localize('customLanguageModels.remove.downloaded.detail', 'Remove download deletes its files and keeps it in My Models so you can download it again. Delete from list removes "{0}" completely.', label),
+				// Cancel is a normal last button (not cancelButton) so macOS/Linux keep it on the leading
+				// side; using cancelButton would force it into the middle of a 3-button row.
+				buttons: [
+					{
+						label: localize('customLanguageModels.removeDownload', 'Remove download'),
+						run: () => 'remove-download' as const,
+					},
+					{
+						label: localize('customLanguageModels.deleteFromList', 'Delete from list'),
+						run: () => 'delete-from-list' as const,
+					},
+					{
+						label: localize('cancel', 'Cancel'),
+						run: () => undefined,
+					},
+				],
+			});
+			if (result === 'remove-download') {
+				this.stopModelServerIfNeeded(model.id);
+				try {
+					await this.commandService.executeCommand('locopilot.removeModelDownload', model.id);
+				} catch {
+					// Non-fatal
+				}
+			} else if (result === 'delete-from-list') {
+				await this.deleteModelWithAnimation(model.id, itemContainer);
+			}
+			return;
+		}
+
+		const confirmed = await this.dialogService.confirm({
+			title: localize('customLanguageModels.remove.title', 'Remove "{0}"?', label),
+			message: localize('customLanguageModels.remove.notDownloaded.message', 'Remove "{0}" from My Models?', label),
+			primaryButton: localize('customLanguageModels.removeFromList', 'Remove'),
+			cancelButton: localize('cancel', 'Cancel'),
+			type: 'warning',
+		});
+		if (confirmed.confirmed) {
+			await this.deleteModelWithAnimation(model.id, itemContainer);
+		}
+	}
+
+	private stopModelServerIfNeeded(modelId: string): void {
+		if (this.localModelRunner.isServerRunning(modelId) || this.localModelRunner.isServerStarting(modelId)) {
+			this.localModelRunner.stopServer(modelId);
+		}
+	}
+
 	private async deleteModelWithAnimation(modelId: string, element: HTMLElement): Promise<void> {
+		this.stopModelServerIfNeeded(modelId);
 		// Add slide-out animation
 		element.style.transition = 'transform 0.3s ease-out, opacity 0.3s ease-out';
 		element.style.transform = 'translateX(-100%)';

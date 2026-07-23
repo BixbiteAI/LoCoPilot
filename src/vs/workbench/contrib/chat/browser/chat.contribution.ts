@@ -821,7 +821,7 @@ configurationRegistry.registerConfiguration({
 			type: 'number',
 			minimum: 0,
 			markdownDescription: nls.localize('locopilot.local.prewarmStartupDelayMs.description', "Extra delay, in milliseconds, before a background pre-warm launches after the window has finished loading. Used when a pre-warm is triggered while the workbench is still settling (for example a very early model pick). App start/restart no longer auto-starts the last-selected model; picking a model in the dropdown still warms promptly once the window is idle. Set to `0` to disable the extra delay."),
-			default: 4000,
+			default: 500,
 		},
 		[ChatConfiguration.LocopilotLocalKeepAliveMinutes]: {
 			type: 'number',

@@ -8,7 +8,7 @@
 import { CancellationToken, CancellationTokenSource } from '../../../../base/common/cancellation.js';
 import { listenStream } from '../../../../base/common/stream.js';
 import { Disposable } from '../../../../base/common/lifecycle.js';
-import { joinPath } from '../../../../base/common/resources.js';
+import { dirname, isEqual, isEqualOrParent, joinPath } from '../../../../base/common/resources.js';
 import { URI } from '../../../../base/common/uri.js';
 import { generateUuid } from '../../../../base/common/uuid.js';
 import { localize } from '../../../../nls.js';
@@ -340,6 +340,14 @@ export class LoCoPilotModelDownloadService extends Disposable implements IWorkbe
 		});
 		registerAction2(class extends Action2 {
 			constructor() {
+				super({ id: 'locopilot.removeModelDownload', title: 'Remove Model Download' });
+			}
+			async run(accessor: ServicesAccessor, modelId: string): Promise<void> {
+				await self.removeModelDownload(modelId);
+			}
+		});
+		registerAction2(class extends Action2 {
+			constructor() {
 				super({ id: 'locopilot.cancelModelDownload', title: 'Stop download' });
 			}
 			run(accessor: ServicesAccessor, modelId: string): void {
@@ -385,13 +393,54 @@ export class LoCoPilotModelDownloadService extends Disposable implements IWorkbe
 			return;
 		}
 		const uri = URI.file(model.localPath);
+		const modelsRoot = joinPath(this.environmentService.cacheHome, LoCoPilotModelDownloadService.MODELS_DIR);
+		let toDelete = uri;
+		// localPath often points at a single GGUF file; delete the whole install folder so mmproj/sidecar
+		// files are removed too (only when that folder lives under our models cache).
 		try {
-			await this.fileService.del(uri, { recursive: true });
-			this._log(`[LoCoPilot Download] Deleted local files for ${model.modelName}: ${model.localPath}`);
+			const stat = await this.fileService.stat(uri);
+			if (!stat.isDirectory) {
+				const parent = dirname(uri);
+				if (isEqualOrParent(parent, modelsRoot) && !isEqual(parent, modelsRoot)) {
+					toDelete = parent;
+				}
+			}
+		} catch {
+			// Path may already be gone; still attempt delete below.
+		}
+		try {
+			await this.fileService.del(toDelete, { recursive: true });
+			this._log(`[LoCoPilot Download] Deleted local files for ${model.modelName}: ${toDelete.fsPath}`);
 		} catch (e) {
 			this._log(`[LoCoPilot Download] Failed to delete local files for ${model.modelName}: ${e}`);
-			// Non-fatal: model will still be removed from list
+			// Non-fatal: model will still be removed from list / marked not downloaded
 		}
+	}
+
+	/**
+	 * Deletes on-disk (or Ollama) weights but keeps the list entry so the user can download again.
+	 * Hugging Face: clears `localPath`. Ollama: sets `ollamaPullComplete` false (URL stays in `localPath`).
+	 */
+	async removeModelDownload(modelId: string): Promise<void> {
+		const model = this.customLanguageModelsService.getCustomModels().find(m => m.id === modelId);
+		if (!model) {
+			return;
+		}
+		await this.deleteModelFiles(modelId);
+		if (model.provider === 'ollama') {
+			await this.customLanguageModelsService.updateCustomModel(modelId, {
+				isDownloading: false,
+				downloadProgress: undefined,
+				ollamaPullComplete: false,
+			});
+		} else if (model.provider === 'huggingface') {
+			await this.customLanguageModelsService.updateCustomModel(modelId, {
+				isDownloading: false,
+				downloadProgress: undefined,
+				localPath: undefined,
+			});
+		}
+		this._log(`[LoCoPilot Download] Removed download for ${model.modelName}; kept list entry.`);
 	}
 
 	async checkDiskSpace(): Promise<boolean> {

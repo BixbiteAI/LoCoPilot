@@ -36,8 +36,9 @@ import { defaultButtonStyles, getInputBoxStyle, getSelectBoxStyles, defaultToggl
 import { settingsSelectBackground, settingsSelectBorder, settingsSelectForeground, settingsSelectListBorder, settingsTextInputBackground, settingsTextInputBorder, settingsTextInputForeground } from '../../../preferences/common/settingsEditorColorRegistry.js';
 import { Toggle } from '../../../../../base/browser/ui/toggle/toggle.js';
 import { SelectBox, ISelectOptionItem, ISelectData } from '../../../../../base/browser/ui/selectBox/selectBox.js';
-import { ICustomLanguageModelsService, ICustomLanguageModel, getCustomModelListLabel, customModelSupportsVision, customModelVisionEnabled, needsDownloadOrPullRetry, DEFAULT_CONTEXT_WINDOW_CLOUD, DEFAULT_CONTEXT_WINDOW_LOCAL, MIN_CONTEXT_WINDOW, MAX_CONTEXT_WINDOW } from '../../common/customLanguageModelsService.js';
+import { ICustomLanguageModelsService, ICustomLanguageModel, getCustomModelListLabel, customModelSupportsVision, customModelVisionEnabled, needsDownloadOrPullRetry, hasRemovableLocalDownload, DEFAULT_CONTEXT_WINDOW_CLOUD, DEFAULT_CONTEXT_WINDOW_LOCAL, MIN_CONTEXT_WINDOW, MAX_CONTEXT_WINDOW } from '../../common/customLanguageModelsService.js';
 import { IDialogService } from '../../../../../platform/dialogs/common/dialogs.js';
+import Severity from '../../../../../base/common/severity.js';
 import { IClipboardService } from '../../../../../platform/clipboard/common/clipboardService.js';
 import { ICommandService } from '../../../../../platform/commands/common/commands.js';
 import { ILogService } from '../../../../../platform/log/common/log.js';
@@ -1204,23 +1205,7 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 			const deleteButton = this._register(new Button(actionsContainer, { ...defaultButtonStyles, secondary: true, supportIcons: true }));
 			deleteButton.label = '$(trash) ' + localize('customLanguageModels.delete', 'Delete');
 			this._register(deleteButton.onDidClick(async () => {
-				const confirmed = await this.dialogService.confirm({
-					title: localize('customLanguageModels.delete.confirm.title', 'Delete Model'),
-					message: localize('customLanguageModels.delete.confirm.message', 'Are you sure you want to delete "{0}"?', getCustomModelListLabel(model)),
-					primaryButton: localize('delete', 'Delete'),
-					type: 'warning'
-				});
-				if (confirmed.confirmed) {
-					itemContainer.classList.add('slide-out');
-					const ANIMATION_MS = 300;
-					await new Promise<void>(resolve => setTimeout(resolve, ANIMATION_MS));
-					try {
-						await this.commandService.executeCommand('locopilot.deleteModelFiles', model.id);
-					} catch {
-						// Ignore; model will still be removed from list
-					}
-					await this.customLanguageModelsService.removeCustomModel(model.id);
-				}
+				await this._onDeleteModelClicked(model, itemContainer);
 			}));
 		}
 
@@ -1466,6 +1451,79 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 	 * name once its server is ready. The starting/loading phases are intentionally left to the server-controls
 	 * spinner so we don't show two loaders. Re-rendered by onDidServerStateChange.
 	 */
+	/**
+	 * Delete button: downloaded local models get a choice dialog (remove download vs delete from list);
+	 * everything else gets a simple remove-from-list confirm.
+	 */
+	private async _onDeleteModelClicked(model: ICustomLanguageModel, itemContainer: HTMLElement): Promise<void> {
+		const label = getCustomModelListLabel(model);
+		if (hasRemovableLocalDownload(model)) {
+			const { result } = await this.dialogService.prompt({
+				type: Severity.Warning,
+				title: localize('customLanguageModels.remove.title', 'Remove "{0}"?', label),
+				message: localize('customLanguageModels.remove.downloaded.message', 'How do you want to remove "{0}"?', label),
+				detail: localize('customLanguageModels.remove.downloaded.detail', 'Remove download deletes its files and keeps it in My Models so you can download it again. Delete from list removes "{0}" completely.', label),
+				// Cancel is a normal last button (not cancelButton) so macOS/Linux keep it on the leading
+				// side; using cancelButton would force it into the middle of a 3-button row.
+				buttons: [
+					{
+						label: localize('customLanguageModels.removeDownload', 'Remove download'),
+						run: () => 'remove-download' as const,
+					},
+					{
+						label: localize('customLanguageModels.deleteFromList', 'Delete from list'),
+						run: () => 'delete-from-list' as const,
+					},
+					{
+						label: localize('cancel', 'Cancel'),
+						run: () => undefined,
+					},
+				],
+			});
+			if (result === 'remove-download') {
+				this._stopModelServerIfNeeded(model.id);
+				try {
+					await this.commandService.executeCommand('locopilot.removeModelDownload', model.id);
+				} catch {
+					// Non-fatal; list will refresh from service state if partial success
+				}
+			} else if (result === 'delete-from-list') {
+				await this._deleteModelFromList(model, itemContainer);
+			}
+			return;
+		}
+
+		const confirmed = await this.dialogService.confirm({
+			title: localize('customLanguageModels.remove.title', 'Remove "{0}"?', label),
+			message: localize('customLanguageModels.remove.notDownloaded.message', 'Remove "{0}" from My Models?', label),
+			primaryButton: localize('customLanguageModels.removeFromList', 'Remove'),
+			cancelButton: localize('cancel', 'Cancel'),
+			type: 'warning',
+		});
+		if (confirmed.confirmed) {
+			await this._deleteModelFromList(model, itemContainer);
+		}
+	}
+
+	private _stopModelServerIfNeeded(modelId: string): void {
+		if (this.localModelRunner.isServerRunning(modelId) || this.localModelRunner.isServerStarting(modelId)) {
+			this.localModelRunner.stopServer(modelId);
+		}
+	}
+
+	private async _deleteModelFromList(model: ICustomLanguageModel, itemContainer: HTMLElement): Promise<void> {
+		this._stopModelServerIfNeeded(model.id);
+		itemContainer.classList.add('slide-out');
+		const ANIMATION_MS = 300;
+		await new Promise<void>(resolve => setTimeout(resolve, ANIMATION_MS));
+		try {
+			await this.commandService.executeCommand('locopilot.deleteModelFiles', model.id);
+		} catch {
+			// Ignore; model will still be removed from list
+		}
+		await this.customLanguageModelsService.removeCustomModel(model.id);
+	}
+
 	private _renderRunningIndicator(modelId: string, nameLabel: HTMLElement): void {
 		// Only show this for a fully-ready server. While starting/loading, the server controls already show a
 		// spinner, so there is no second indicator.
