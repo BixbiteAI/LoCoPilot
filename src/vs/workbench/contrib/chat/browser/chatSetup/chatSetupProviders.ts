@@ -1319,6 +1319,13 @@ export class LoCoPilotBuiltInAgent extends Disposable implements IChatAgentImple
 		if (!model || model.type !== 'local' || needsDownloadOrPullRetry(model) || model.isDownloading) {
 			return;
 		}
+		// Never cold-start a server just to warm the prefix - that used to relaunch the last-selected
+		// model on every app start/restart (agent init + selection restore). Servers still start from
+		// select/switch prewarm, first chat send, manual Start, and crash-recovery relaunch; when those
+		// reach ready, _onServerStateChange re-enters here.
+		if (this.localModelRunner.getServerPhase(modelId) !== 'ready') {
+			return;
+		}
 		// Claim SYNCHRONOUSLY (before the async work) so concurrent callers - the other five agent instances,
 		// or the selection trigger racing the server-ready hook - see it taken and skip.
 		LoCoPilotBuiltInAgent._warmedPrefixKeys.add(warmKey);
@@ -1326,14 +1333,9 @@ export class LoCoPilotBuiltInAgent extends Disposable implements IChatAgentImple
 		// excluded (it lives in the user turn), so this prefix matches the real turn's prefix and hits cache.
 		(async () => {
 			try {
-				// Boot the server and wait for it to be ready BEFORE attempting the restore. The warm can be
-				// triggered on model SELECTION (before any server exists), and restoreSlotCache hard-requires a
-				// present+ready server - without this it always bailed with present=false and we re-prefilled.
-				// interactive=false: this is background warming; it must never pop the "Run anyway?" fit dialog.
-				await this.localModelRunner.ensureServerForModel(modelId, CancellationToken.None, false);
-				// Try the persisted slot cache first: on a hit the prefix KV is already resident, so we skip
-				// the (multi-thousand-token) prefill entirely. The restore is keyed by (model, mode) so a
-				// different mode never restores the wrong prefix.
+				// Server is already ready (gated above). Try the persisted slot cache first: on a hit the
+				// prefix KV is already resident, so we skip the (multi-thousand-token) prefill entirely.
+				// The restore is keyed by (model, mode) so a different mode never restores the wrong prefix.
 				const restored = await this.localModelRunner.restoreSlotCache(modelId, warmKey, CancellationToken.None);
 				if (restored) {
 					return;

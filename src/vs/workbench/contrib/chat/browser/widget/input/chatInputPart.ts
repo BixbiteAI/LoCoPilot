@@ -708,8 +708,11 @@ export class ChatInputPart extends Disposable implements IHistoryNavigationWidge
 			if (model) {
 				// Only restore the model if it wasn't the default at the time of storing or it is now the default
 				if (!persistedAsDefault || model.metadata.isDefaultForLocation[this.location]) {
-					// This is the user's resolved persisted selection - pre-warm it so it's ready at startup.
-					this.setCurrentLanguageModel(model, true /* prewarm resolved selection */);
+					// Restore the picker selection only - do NOT pre-warm on app start/restart. Starting the
+					// local server here raced with UI restore and felt like models "auto-switching". The
+					// server still starts on explicit select/switch (prewarmOnSelect), first send
+					// (autoStartServer), manual Start, or crash-recovery relaunch.
+					this.setCurrentLanguageModel(model, false /* no startup prewarm */);
 					this.checkModelSupported();
 				}
 			} else {
@@ -721,8 +724,8 @@ export class ChatInputPart extends Disposable implements IHistoryNavigationWidge
 						// Only restore the model if it wasn't the default at the time of storing or it is now the default
 						if (!persistedAsDefault || persistedModel.isDefaultForLocation[this.location]) {
 							if (persistedModel.isUserSelectable) {
-								// Resolved persisted selection (arrived asynchronously) - pre-warm it.
-								this.setCurrentLanguageModel({ metadata: persistedModel, identifier: persistedSelection }, true /* prewarm resolved selection */);
+								// Same as the sync path: restore selection without launching a local server.
+								this.setCurrentLanguageModel({ metadata: persistedModel, identifier: persistedSelection }, false /* no startup prewarm */);
 								this.checkModelSupported();
 							}
 						}
@@ -992,10 +995,10 @@ export class ChatInputPart extends Disposable implements IHistoryNavigationWidge
 		this._currentLanguageModel.set(model, undefined);
 
 		// Eagerly pre-warm LoCoPilot local models so they load into memory before the first message and the
-		// cold start is hidden. Fired for a genuine user pick AND for the user's resolved persisted selection
-		// at startup - but NOT for the transient default the picker sets before that selection resolves, so we
-		// don't warm a model the user didn't choose. The runner waits for the terminal backend to be connected
-		// before spawning, so the startup launch no longer gets torn down. Best-effort, fire-and-forget.
+		// cold start is hidden. Fired for a genuine user pick (select/switch) - but NOT for restoring the
+		// persisted selection at app start/restart, and NOT for the transient default the picker sets before
+		// that selection resolves, so we don't warm a model the user didn't choose this session. The runner
+		// waits for the terminal backend to be connected before spawning. Best-effort, fire-and-forget.
 		if (prewarmSelection && model.metadata.vendor === 'locopilot') {
 			this.commandService.executeCommand('locopilot.prewarmModel', model.metadata.id)
 				.catch(err => this.logService.trace(`[chat] prewarm hint failed: ${err}`));

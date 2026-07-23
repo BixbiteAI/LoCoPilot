@@ -640,6 +640,13 @@ export class ModelPickerActionItem extends ChatInputPickerActionViewItem {
 		super(actionWithLabel, widgetOptions ?? modelPickerActionWidgetOptions, pickerOptions, actionWidgetService, keybindingService, contextKeyService, telemetryService);
 		this.currentModel = initialModel;
 
+		// If Start (or another outside path) already pinned a custom model before this picker mounted,
+		// push it into the chat input now - onDidChangeCustomModels won't re-fire for that earlier write.
+		if (initialCustomModelId && initialCustomModelId !== LOCOPILOT_AUTO_MODEL_ID
+			&& initialModel?.identifier !== initialCustomModelId) {
+			selectCustomModelInChat(delegate, customLanguageModelsService, initialCustomModelId);
+		}
+
 		// Re-derive the "Auto (<model>)" button label from the current inputs. Only meaningful while Auto is
 		// selected; a no-op otherwise. Keeps the collapsed button label in sync with the dropdown row and the
 		// actual per-request resolution, all of which call resolveAutoModel over the same live figures (Q1).
@@ -757,6 +764,12 @@ export class ModelPickerActionItem extends ChatInputPickerActionViewItem {
 							modelPickerCategory: { label: 'Custom Models', order: 100 }
 						}
 					};
+					// Selection changed outside this picker (e.g. Start from Manage Models, Keep-current
+					// revert). Push it into the chat input's real selected model so requests route there -
+					// the picker label above alone is not enough (dual selection store).
+					if (model?.identifier !== selectedCustomModelId) {
+						selectCustomModelInChat(delegate, customLanguageModelsService, selectedCustomModelId);
+					}
 				} else {
 					// Model was deleted or hidden or not ready for chat, clear selection
 					customLanguageModelsService.setSelectedCustomModelId(undefined);

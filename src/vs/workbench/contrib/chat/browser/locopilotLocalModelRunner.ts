@@ -486,7 +486,11 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 			}
 			async run(accessor: ServicesAccessor, modelId?: string): Promise<void> {
 				if (modelId) {
-					await self.startServerInTerminal(modelId, true); // explicit user action (Start/Retry) -> may prompt "Run anyway?"
+					// Kick off the interactive launch first so any picker pre-warm from the chat-panel
+					// selection sync joins this in-flight promise (and keeps the "Run anyway?" path).
+					const launch = self.startServerInTerminal(modelId, true); // explicit user action (Start/Retry) -> may prompt "Run anyway?"
+					self._selectStartedModelInChatPanel(modelId);
+					await launch;
 				}
 			}
 		});
@@ -496,7 +500,9 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 			}
 			async run(accessor: ServicesAccessor, modelId?: string): Promise<void> {
 				if (modelId) {
-					await self.runOllamaModelInTerminal(modelId);
+					const run = self.runOllamaModelInTerminal(modelId);
+					self._selectStartedModelInChatPanel(modelId);
+					await run;
 				}
 			}
 		});
@@ -4233,6 +4239,25 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 	}
 
 	/**
+	 * Explicit user Start (model list / picker play / Ollama Run): pin that model as the chat panel's
+	 * selected model so the picker label and subsequent requests target it. Only updates
+	 * `selectedCustomModelId` here; the chat input's `_currentLanguageModel` is synced by the model
+	 * picker when it sees the selection change (see modelPickerActionItem). Must run AFTER the
+	 * interactive launch is already in `_startInFlight` so a picker pre-warm joins that launch.
+	 */
+	private _selectStartedModelInChatPanel(modelId: string): void {
+		const model = this.customLanguageModelsService.getCustomModels().find(m => m.id === modelId);
+		if (!model) {
+			return;
+		}
+		if (this.customLanguageModelsService.getSelectedCustomModelId() === modelId) {
+			return;
+		}
+		this.customLanguageModelsService.setSelectedCustomModelId(modelId);
+		this._log(`[LoCoPilot Runner] Selected started model ${modelId} in chat panel.`);
+	}
+
+	/**
 	 * "Keep current model": if the declined model is the one currently SELECTED (the user just picked it),
 	 * put the selection back so the picker label matches what is actually running. Reverts to the owned server
 	 * still resident (the model in use), else the last model that was used, else leaves the selection alone.
@@ -4805,7 +4830,9 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 	}
 
 	runModel(modelId: string): void {
-		this.startServerInTerminal(modelId, true); // explicit user "Run" action -> may prompt "Run anyway?"
+		const launch = this.startServerInTerminal(modelId, true); // explicit user "Run" action -> may prompt "Run anyway?"
+		this._selectStartedModelInChatPanel(modelId);
+		void launch;
 	}
 
 	private _log(msg: string, ...args: unknown[]): void {

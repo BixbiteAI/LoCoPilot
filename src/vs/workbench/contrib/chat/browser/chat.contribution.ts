@@ -820,7 +820,7 @@ configurationRegistry.registerConfiguration({
 		[ChatConfiguration.LocopilotLocalPrewarmStartupDelayMs]: {
 			type: 'number',
 			minimum: 0,
-			markdownDescription: nls.localize('locopilot.local.prewarmStartupDelayMs.description', "Extra delay, in milliseconds, before the pre-warm of your last-selected model launches at app start/restart. The pre-warm always waits until the window has finished loading first; this adds a short additional pause so loading the model's weights (heavy disk and GPU/Metal work) doesn't make the mouse and UI stutter while the window is still settling. Only applies to the startup pre-warm - picking a model later in the dropdown still warms immediately. Set to `0` to disable the extra delay."),
+			markdownDescription: nls.localize('locopilot.local.prewarmStartupDelayMs.description', "Extra delay, in milliseconds, before a background pre-warm launches after the window has finished loading. Used when a pre-warm is triggered while the workbench is still settling (for example a very early model pick). App start/restart no longer auto-starts the last-selected model; picking a model in the dropdown still warms promptly once the window is idle. Set to `0` to disable the extra delay."),
 			default: 4000,
 		},
 		[ChatConfiguration.LocopilotLocalKeepAliveMinutes]: {
