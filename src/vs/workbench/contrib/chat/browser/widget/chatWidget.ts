@@ -236,10 +236,17 @@ export class ChatWidget extends Disposable implements IChatWidget {
 	private requestInProgress: IContextKey<boolean>;
 	/** Tracks the rising edge of an active request so we can reset live server stats once per turn. */
 	private _liveStatsTimerActive = false;
+	/**
+	 * Session that owns the in-flight (or just-finished) live-stats turn. The live-stats service is
+	 * global; we pin attribution to this id when a turn starts so mlx_lm's final-chunk `usage` (which
+	 * often arrives with no mid-stream view-model tick still marked in-progress) is still credited to
+	 * the right session - even if the user switched chats before the gauge refreshed.
+	 */
+	private _liveStatsOwnerSessionId: string | undefined;
 	// Per-session context-window usage (sessionId -> last prompt-token count), so the input indicator is
 	// scoped to each session: the live-stats service is global, so without keying by session a freshly
-	// opened session would show the previous session's numbers. Recorded only while a session is actively
-	// generating (so the global figure is never mis-attributed), and read back by session on every change.
+	// opened session would show the previous session's numbers. Credited to {@link _liveStatsOwnerSessionId}
+	// whenever the server reports prompt tokens (mid-stream for llama.cpp, final chunk for mlx_lm).
 	private readonly _contextUsageBySession = new Map<string, number>();
 	private agentInInput: IContextKey<boolean>;
 	private currentRequest: Promise<void> | undefined;
@@ -392,6 +399,11 @@ export class ChatWidget extends Disposable implements IChatWidget {
 		ChatContextKeys.inQuickChat.bindTo(contextKeyService).set(isQuickChat(this));
 		this.agentInInput = ChatContextKeys.inputHasAgent.bindTo(contextKeyService);
 		this.requestInProgress = ChatContextKeys.requestInProgress.bindTo(contextKeyService);
+
+		// mlx_lm only reports prompt_tokens on the final SSE usage chunk (no mid-stream timings). Refresh
+		// the context-usage gauge as soon as live stats change so that chunk isn't missed if the view
+		// model has already left the in-progress state by the next content tick.
+		this._register(this.liveStatsService.onDidChange(() => this._syncContextUsageFromLiveStats()));
 
 		this._register(this.chatEntitlementService.onDidChangeAnonymous(() => this.renderWelcomeViewContentIfNeeded()));
 
@@ -1736,6 +1748,30 @@ export class ChatWidget extends Disposable implements IChatWidget {
 		this.container.style.setProperty('--vscode-chat-list-background', this.themeService.getColorTheme().getColor(this.styles.listBackground)?.toString() ?? '');
 	}
 
+	/**
+	 * Credit the live-stats prompt-token count to the turn's owner session and refresh the input
+	 * indicator for the currently viewed session. Safe to call without a view model (no-op on the
+	 * gauge); attribution still lands in the map so switching back to the owner session shows it.
+	 *
+	 * Attribution is not gated on `timerActive`: mlx_lm only emits `usage.prompt_tokens` on the final
+	 * SSE chunk, which often lands after the last in-progress view-model tick. The owner session id
+	 * (pinned at turn start) keeps that late figure from being dropped or mis-attributed.
+	 */
+	private _syncContextUsageFromLiveStats(): void {
+		const promptTokens = this.liveStatsService.get()?.promptTokens;
+		const ownerId = this._liveStatsOwnerSessionId;
+		if (ownerId && typeof promptTokens === 'number' && promptTokens > 0) {
+			this._contextUsageBySession.set(ownerId, promptTokens);
+		}
+		const sessionId = this.viewModel?.model.sessionId;
+		if (!sessionId) {
+			return;
+		}
+		this.inputPart.updateContextUsage(
+			this._contextUsageBySession.get(sessionId),
+			this.input.selectedLanguageModel.get()?.metadata.maxInputTokens,
+		);
+	}
 
 	setModel(model: IChatModel | undefined): void {
 		if (!this.container) {
@@ -1802,22 +1838,16 @@ export class ChatWidget extends Disposable implements IChatWidget {
 				// here - reliable regardless of which onDidChange event batch we're in, unlike keying off the
 				// 'addRequest' event, which can land on a different tick than the timer start and would otherwise
 				// let the previous turn's totals linger during the next prompt's long processing phase.
+				this._liveStatsOwnerSessionId = this.viewModel.model.sessionId;
 				this.liveStatsService.reset();
 			}
 			this._liveStatsTimerActive = timerActive;
-			// Context-usage indicator, scoped per session. Record the live-stats prompt count under this
-			// session's id only while it is actively generating (so the global figure can't be attributed
-			// to a different session being viewed), then feed the indicator this session's own stored value
-			// (undefined -> hidden), so a new/other session never shows the previous session's usage.
-			const sessionId = this.viewModel.model.sessionId;
-			const promptTokens = this.liveStatsService.get()?.promptTokens;
-			if (timerActive && typeof promptTokens === 'number' && promptTokens > 0) {
-				this._contextUsageBySession.set(sessionId, promptTokens);
-			}
-			this.inputPart.updateContextUsage(
-				this._contextUsageBySession.get(sessionId),
-				this.input.selectedLanguageModel.get()?.metadata.maxInputTokens,
-			);
+			// Context-usage indicator, scoped per session. Credit live-stats prompt tokens to the turn's
+			// owner session (see _liveStatsOwnerSessionId), then feed the indicator this session's stored
+			// value (undefined -> hidden). llama.cpp reports prompt size mid-stream; mlx_lm only on the
+			// final usage chunk - _syncContextUsageFromLiveStats also runs from liveStats.onDidChange so
+			// that late chunk still lands in the map.
+			this._syncContextUsageFromLiveStats();
 			this.inputPart.setRequestInProgress(timerActive, () => {
 				const last = vm.getItems().findLast(item => isResponseVM(item)) as { response?: { value: ReadonlyArray<{ kind: string; value?: string | string[] }> }; contentUpdateTimings?: { lastWordCount: number; impliedWordLoadRate: number } } | undefined;
 				const timings = last?.contentUpdateTimings;

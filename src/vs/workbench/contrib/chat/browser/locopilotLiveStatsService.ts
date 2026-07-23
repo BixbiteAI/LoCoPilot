@@ -3,6 +3,7 @@
  *  Licensed under the MIT License. See License.txt in the project root for license information.
  *--------------------------------------------------------------------------------------------*/
 
+import { Emitter, Event } from '../../../../base/common/event.js';
 import { Disposable } from '../../../../base/common/lifecycle.js';
 import { createDecorator } from '../../../../platform/instantiation/common/instantiation.js';
 
@@ -43,6 +44,13 @@ export const ILoCoPilotLiveStatsService = createDecorator<ILoCoPilotLiveStatsSer
 
 export interface ILoCoPilotLiveStatsService {
 	readonly _serviceBrand: undefined;
+	/**
+	 * Fires when server-reported stats change (e.g. a new `usage` / `timings` chunk). Used by the chat
+	 * panel to refresh the context-usage gauge immediately - important for mlx_lm, which only emits
+	 * `prompt_tokens` on the final SSE chunk (no mid-stream `timings`), so there may be no view-model
+	 * content update that would otherwise refresh the indicator.
+	 */
+	readonly onDidChange: Event<void>;
 	/** Clear all stats at the start of a new user turn so the timer bar never shows a previous turn's numbers. */
 	reset(): void;
 	/**
@@ -66,6 +74,9 @@ export interface ILoCoPilotLiveStatsService {
 
 export class LoCoPilotLiveStatsService extends Disposable implements ILoCoPilotLiveStatsService {
 	declare readonly _serviceBrand: undefined;
+
+	private readonly _onDidChange = this._register(new Emitter<void>());
+	readonly onDidChange = this._onDidChange.event;
 
 	/** Whether any local call this turn has reported real stats; gates `get()` so remote turns return undefined. */
 	private _active = false;
@@ -118,14 +129,28 @@ export class LoCoPilotLiveStatsService extends Disposable implements ILoCoPilotL
 
 	update(stats: ILoCoPilotServerStatsUpdate): void {
 		this._active = true;
+		let changed = false;
 		if (typeof stats.completionTokens === 'number') {
 			if (stats.completionTokens !== this._curCompletion) { this._serverCountChangedAt = Date.now(); }
 			this._curCompletion = stats.completionTokens;
 			this._sawServerCount = true;
+			changed = true;
 		}
-		if (typeof stats.promptTokens === 'number') { this._curPrompt = stats.promptTokens; }
-		if (typeof stats.tokensPerSecond === 'number') { this._curRate = stats.tokensPerSecond; }
-		if (typeof stats.cachedTokens === 'number') { this._curCached = stats.cachedTokens; }
+		if (typeof stats.promptTokens === 'number' && stats.promptTokens !== this._curPrompt) {
+			this._curPrompt = stats.promptTokens;
+			changed = true;
+		}
+		if (typeof stats.tokensPerSecond === 'number' && stats.tokensPerSecond !== this._curRate) {
+			this._curRate = stats.tokensPerSecond;
+			changed = true;
+		}
+		if (typeof stats.cachedTokens === 'number' && stats.cachedTokens !== this._curCached) {
+			this._curCached = stats.cachedTokens;
+			changed = true;
+		}
+		if (changed) {
+			this._onDidChange.fire();
+		}
 	}
 
 	recordClientToken(): void {
