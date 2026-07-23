@@ -69,7 +69,7 @@ import {
 	type MlxServerTuning,
 } from './locopilotMlxServer.js';
 import { findDraftPairing } from './locopilotModelCatalog.js';
-import { LoCoPilotModelDownloadService, modelDownloadDirName } from './locopilotModelDownloadService.js';
+import { LoCoPilotModelDownloadService, modelDownloadDirName, isMmprojGgufPath } from './locopilotModelDownloadService.js';
 import { joinPath } from '../../../../base/common/resources.js';
 import { streamToBuffer, VSBuffer } from '../../../../base/common/buffer.js';
 import { generateUuid } from '../../../../base/common/uuid.js';
@@ -2893,27 +2893,34 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 		return 'python3';
 	}
 
-	/** Resolves localPath to a .gguf file path (if it's a directory, finds first .gguf). */
+	/** Resolves localPath to a language-model .gguf (if it's a directory, finds first weight GGUF; never mmproj). */
 	private async resolveModelFilePath(localPath: string): Promise<string> {
 		const uri = URI.file(localPath);
 		try {
 			const stat = await this.fileService.stat(uri);
 			if (stat.isFile && localPath.toLowerCase().endsWith('.gguf')) {
+				// A prior download bug could persist mmproj as localPath; recover by picking a sibling weight GGUF.
+				if (!isMmprojGgufPath(localPath)) {
+					return localPath;
+				}
+				const sibling = await this._firstWeightGgufInDir(dirname(localPath));
+				if (sibling) {
+					this._log(`[LoCoPilot Runner] localPath pointed at mmproj; using sibling weights instead: ${sibling}`);
+					return sibling;
+				}
 				return localPath;
 			}
 			if (stat.isDirectory) {
-				const dirStat = await this.fileService.resolve(uri);
-				const children = dirStat.children ?? [];
-				const gguf = children.find(c => c.name.toLowerCase().endsWith('.gguf'));
-				if (gguf) {
-					return gguf.resource.fsPath;
+				const fromDir = await this._firstWeightGgufInDir(localPath);
+				if (fromDir) {
+					return fromDir;
 				}
-				for (const c of children) {
+				const dirStat = await this.fileService.resolve(uri);
+				for (const c of dirStat.children ?? []) {
 					if (c.isDirectory) {
-						const subStat = await this.fileService.resolve(c.resource);
-						const subGguf = (subStat.children ?? []).find(x => x.name.toLowerCase().endsWith('.gguf'));
-						if (subGguf) {
-							return subGguf.resource.fsPath;
+						const sub = await this._firstWeightGgufInDir(c.resource.fsPath);
+						if (sub) {
+							return sub;
 						}
 					}
 				}
@@ -2922,6 +2929,17 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 			// ignore
 		}
 		return localPath;
+	}
+
+	/** First non-mmproj `.gguf` in a directory, or undefined. */
+	private async _firstWeightGgufInDir(dirPath: string): Promise<string | undefined> {
+		try {
+			const resolved = await this.fileService.resolve(URI.file(dirPath));
+			const gguf = (resolved.children ?? []).find(c => c.isFile && c.name.toLowerCase().endsWith('.gguf') && !isMmprojGgufPath(c.name));
+			return gguf?.resource.fsPath;
+		} catch {
+			return undefined;
+		}
 	}
 
 	/**
@@ -2935,7 +2953,7 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 			const stat = await this.fileService.stat(URI.file(localPath));
 			const modelDir = stat.isDirectory ? localPath : dirname(localPath);
 			const resolved = await this.fileService.resolve(URI.file(modelDir));
-			const match = (resolved.children ?? []).find(c => c.isFile && /^mmproj.*\.gguf$/i.test(c.name));
+			const match = (resolved.children ?? []).find(c => c.isFile && isMmprojGgufPath(c.name));
 			return match?.resource.fsPath;
 		} catch {
 			return undefined;

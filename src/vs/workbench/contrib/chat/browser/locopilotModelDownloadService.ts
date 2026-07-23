@@ -75,14 +75,31 @@ export function quantQualityScore(filename: string): number {
 }
 
 /**
+ * True for multimodal projector files (`mmproj-*.gguf`). These sit next to language weights in vision
+ * GGUF repos and must NEVER be chosen as the main `-m` model - llama.cpp rejects them with
+ * `unsupported model architecture: 'clip'`. Exported for the runner's directory scan.
+ */
+export function isMmprojGgufPath(path: string): boolean {
+	return /(^|\/)mmproj[^/]*\.gguf$/i.test(path);
+}
+
+/** Weight GGUFs only (excludes mmproj / CLIP projectors). */
+function isWeightGgufPath(path: string): boolean {
+	return path.toLowerCase().endsWith('.gguf') && !isMmprojGgufPath(path);
+}
+
+/**
  * Picks the GGUF file to download given the machine's memory budget: the **highest-quality quant whose file
  * fits** `budgetBytes` (after a safety fraction), and when none fit, the **smallest** file so the model can
  * at least run. Returns undefined when there are no GGUF files or no sizes are known (caller falls back to
  * the static priority pick). `files` are {path,size}; entries without a size are treated as unknown and only
  * used as a last-resort smallest pick.
+ *
+ * Multimodal projectors (`mmproj-*.gguf`) are ignored - they are tiny and would otherwise win the
+ * "smallest fallback" path on memory-tight machines, which then fails at launch as architecture `clip`.
  */
 export function pickBestGgufForBudget(files: readonly { path: string; size?: number }[], budgetBytes: number): string | undefined {
-	const gguf = files.filter(f => f.path.toLowerCase().endsWith('.gguf'));
+	const gguf = files.filter(f => isWeightGgufPath(f.path));
 	if (gguf.length === 0) {
 		return undefined;
 	}
@@ -97,7 +114,7 @@ export function pickBestGgufForBudget(files: readonly { path: string; size?: num
 		fitting.sort((a, b) => (quantQualityScore(b.path) - quantQualityScore(a.path)) || (b.size - a.size));
 		return fitting[0].path;
 	}
-	// Nothing fits -> smallest file so the model is at least runnable (with paging / partial offload).
+	// Nothing fits -> smallest weight file so the model is at least runnable (with paging / partial offload).
 	sized.sort((a, b) => a.size - b.size);
 	return sized[0].path;
 }
@@ -115,7 +132,7 @@ export function modelDownloadDirName(repoId: string): string {
 }
 
 function pickBestGGUFFile(paths: string[], preferredQuant?: string): string | undefined {
-	const gguf = paths.filter(p => p.toLowerCase().endsWith('.gguf'));
+	const gguf = paths.filter(isWeightGgufPath);
 	if (gguf.length === 0) return undefined;
 
 	// If user specified a specific quantization (e.g. "Q4_K_M")
@@ -130,7 +147,7 @@ function pickBestGGUFFile(paths: string[], preferredQuant?: string): string | un
 		const found = gguf.find(f => f.includes(q) || f.toUpperCase().includes(q));
 		if (found) return found;
 	}
-	// Otherwise smallest file name often indicates a specific quant (e.g. one file)
+	// Otherwise shortest file name often indicates a specific quant (e.g. one file)
 	return gguf.sort((a, b) => a.length - b.length)[0];
 }
 
@@ -141,7 +158,7 @@ function pickBestGGUFFile(paths: string[], preferredQuant?: string): string | un
  * Returns undefined when the repo ships no projector (i.e. the model is text-only).
  */
 function pickMmprojFile(paths: string[]): string | undefined {
-	const mmproj = paths.filter(p => /(^|\/)mmproj[^/]*\.gguf$/i.test(p));
+	const mmproj = paths.filter(isMmprojGgufPath);
 	if (mmproj.length === 0) {
 		return undefined;
 	}
@@ -169,7 +186,7 @@ function filterPathsByFormat(paths: string[], format: string): string[] {
 	// If user provided a specific GGUF quantization
 	if (GGUF_QUANT_PRIORITY.some(q => f.toUpperCase().includes(q)) || f.includes('gguf')) {
 		const best = pickBestGGUFFile(paths, f.includes('gguf') ? undefined : f);
-		return best ? [best] : paths.filter(p => p.toLowerCase().endsWith('.gguf'));
+		return best ? [best] : paths.filter(isWeightGgufPath);
 	}
 
 	if (f === 'safetensors') {
@@ -809,7 +826,7 @@ export class LoCoPilotModelDownloadService extends Disposable implements IWorkbe
 				}
 				// For single GGUF download, use this file as the main model path for llama.cpp. The mmproj
 				// projector is also a .gguf but must NOT be treated as the main weights, so skip it here.
-				const isMmproj = relPath === mmprojRelPath;
+				const isMmproj = isMmprojGgufPath(relPath) || relPath === mmprojRelPath;
 				if (!isMmproj && total === 1 && relPath.toLowerCase().endsWith('.gguf')) {
 					mainModelFileUri = fileUri;
 				} else if (!isMmproj && relPath.toLowerCase().endsWith('.gguf')) {
@@ -820,7 +837,18 @@ export class LoCoPilotModelDownloadService extends Disposable implements IWorkbe
 				this._log(`[LoCoPilot Download] ${repoId} progress: ${pct}% (${i + 1}/${total})`);
 			}
 
-			// Prefer full path to a single GGUF file so llama.cpp server can load it directly; otherwise store directory
+			// Prefer full path to a single weight GGUF so llama.cpp can load it as `-m`. Never persist an
+			// mmproj path here - that launches as architecture `clip` and exits immediately.
+			if (mainModelFileUri && isMmprojGgufPath(mainModelFileUri.fsPath)) {
+				mainModelFileUri = undefined;
+			}
+			if (!mainModelFileUri && toDownload.some(isWeightGgufPath) === false) {
+				throw new Error(localize(
+					'locopilot.download.error.noWeightGguf',
+					'No language-model GGUF was selected for "{0}" (only a vision projector was available). Try again or pick a smaller quant.',
+					repoId
+				));
+			}
 			const localPath = mainModelFileUri ? mainModelFileUri.fsPath : baseDir.fsPath;
 			await this.customLanguageModelsService.updateCustomModel(modelId, {
 				isDownloading: false,
