@@ -235,10 +235,15 @@ export interface ICustomLanguageModelsService {
 	 * The concrete model id the "Auto" picker mode is currently PINNED to, or undefined when unresolved.
 	 * Auto used to be re-resolved independently by the picker label, the selection/pre-warm path, and the
 	 * per-request path - each at a different moment over different live state (which server happens to be
-	 * warm, momentary free RAM), so the three could disagree and Auto visibly bounced between models. The
-	 * first resolver pins its pick here and every consumer reads the pin; only the request path's launch-gate
+	 * warm, momentary free RAM), so the three could disagree and Auto visibly bounced between models. A
+	 * resolver pins its pick here and every consumer reads the pin; only the request path's launch-gate
 	 * step-down re-pins (to the smaller model it actually used). Session-only state (never persisted).
-	 * Cleared automatically when the selection moves off Auto, so re-selecting Auto re-resolves fresh.
+	 *
+	 * ONLY WRITTEN BY COMMIT PATHS, and only HONOURED WHILE THE PINNED MODEL'S SERVER IS WARM - see
+	 * warmPinnedAutoModel in locopilotModelCatalog.ts, which is the contract every reader goes through.
+	 * Rendering a label must never pin (it would let a hand-started model capture Auto), and a cold pin must
+	 * never be honoured (Auto would keep starting a model it would never pick fresh). Also cleared here when
+	 * the selection moves off Auto, so re-selecting Auto re-resolves fresh.
 	 */
 	getPinnedAutoModelId(): string | undefined;
 	setPinnedAutoModelId(id: string | undefined): void;

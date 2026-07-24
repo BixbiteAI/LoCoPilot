@@ -28,7 +28,7 @@ import { DEFAULT_MODEL_PICKER_CATEGORY } from '../../../common/widget/input/mode
 import { ChatInputPickerActionViewItem, IChatInputPickerOptions } from './chatInputPickerActionItem.js';
 import { ICustomLanguageModelsService, ICustomLanguageModel, getCustomModelListLabel, LOCOPILOT_AUTO_MODEL_ID } from '../../../common/customLanguageModelsService.js';
 import { LOCOPILOT_SETTINGS_SECTION_LIST_MODELS } from '../../chatManagement/locopilotSettingsEditorInput.js';
-import { getRecommendedRepoId, resolveAutoModelPinned } from '../../locopilotModelCatalog.js';
+import { getRecommendedRepoId, peekAutoModel, resolveAutoModelPinned } from '../../locopilotModelCatalog.js';
 import { ITimerService } from '../../../../../services/timer/browser/timerService.js';
 import { ExtensionIdentifier } from '../../../../../../platform/extensions/common/extensions.js';
 import { ILoCoPilotLocalModelRunner } from '../../locopilotLocalModelRunner.js';
@@ -202,21 +202,38 @@ interface IModelPickerState {
 // start/stop icon. It intentionally does NOT run the agent's async launch-gate step-down (a label must resolve
 // synchronously); in the rare case a send steps down to a smaller model, its now-running server wins the next
 // re-resolve via stickiness, so the label reconverges.
+// The name is shown whenever Auto has a model to name (even when Auto is NOT the current selection) because
+// the displayed pick is now always live: rendering peeks rather than pins, so it re-derives from the current
+// downloaded set / RAM tier / warm server every time instead of echoing a stale captured choice.
 
 /** Sits above Custom Models (order 100) and the standard categories, so Auto is always the first row. */
 const AUTO_PICKER_CATEGORY = { label: localize('chat.modelPicker.autoCategory', "Auto"), order: 0 };
 
+/** Warm = running or starting; the tie-breaker resolveAutoModel scores and the pin's validity condition. */
+function isServerWarm(localModelRunner: ILoCoPilotLocalModelRunner): (id: string) => boolean {
+	return id => localModelRunner.isServerRunning(id) || localModelRunner.isServerStarting(id);
+}
+
 /**
- * The model Auto currently resolves to. Pin-aware (see resolveAutoModelPinned): the label, the selection
- * pre-warm, and the per-request resolution all read the SAME session pin, so the picker can no longer show
- * one model while the send uses another.
+ * The model Auto would use right now, for DISPLAY only (button label, row description, start/stop target).
+ *
+ * Read-only by design (see peekAutoModel). The Auto row is drawn on every dropdown open even when Auto is
+ * NOT selected, so a resolving-and-pinning render used to let whatever server happened to be warm at that
+ * moment capture Auto's pick: hand-selecting a small model made the very next render pin it, and stopping
+ * it afterwards left Auto stuck on - and starting - that small model. Rendering now observes; only
+ * pickAutoModelForPicker (below) and the request path commit.
  */
-function resolveAutoModelForPicker(customLanguageModelsService: ICustomLanguageModelsService, localModelRunner: ILoCoPilotLocalModelRunner, timerService: ITimerService): ICustomLanguageModel | undefined {
-	return resolveAutoModelPinned(
-		customLanguageModelsService,
-		detectedRamGB(timerService),
-		id => localModelRunner.isServerRunning(id) || localModelRunner.isServerStarting(id)
-	);
+function peekAutoModelForPicker(customLanguageModelsService: ICustomLanguageModelsService, localModelRunner: ILoCoPilotLocalModelRunner, timerService: ITimerService): ICustomLanguageModel | undefined {
+	return peekAutoModel(customLanguageModelsService, detectedRamGB(timerService), isServerWarm(localModelRunner));
+}
+
+/**
+ * COMMIT counterpart of {@link peekAutoModelForPicker}: resolve AND pin, for the moment the user actually
+ * selects Auto. Pins the pick so the pre-warm and the send target the same model the label just showed.
+ * Call only after the selection has been stored as Auto.
+ */
+function pickAutoModelForPicker(customLanguageModelsService: ICustomLanguageModelsService, localModelRunner: ILoCoPilotLocalModelRunner, timerService: ITimerService): ICustomLanguageModel | undefined {
+	return resolveAutoModelPinned(customLanguageModelsService, detectedRamGB(timerService), isServerWarm(localModelRunner));
 }
 
 /** Picker-button label for Auto: "Auto (<resolved model>)", or plain "Auto" when nothing is downloaded yet. */
@@ -270,7 +287,7 @@ function modelDelegateToWidgetActionsProvider(delegate: IModelPickerDelegate, te
 			// Pinned "Auto" row (always first). Shows which model Auto currently resolves to; when Auto is
 			// selected and that model is startable, the row gets the same start/stop control a selected
 			// local model row has, so the server can be started/stopped straight from the Auto row.
-			const autoResolved = resolveAutoModelForPicker(customLanguageModelsService, localModelRunner, timerService);
+			const autoResolved = peekAutoModelForPicker(customLanguageModelsService, localModelRunner, timerService);
 			const isAutoSelected = selectedCustomModelId === LOCOPILOT_AUTO_MODEL_ID;
 			const autoStartStop = isAutoSelected && autoResolved && isStartableLocalModel(autoResolved)
 				? buildStartStopControl(localModelRunner, actionWidgetService, commandService, autoResolved.id)
@@ -308,12 +325,27 @@ function modelDelegateToWidgetActionsProvider(delegate: IModelPickerDelegate, te
 							return;
 						}
 						customLanguageModelsService.setSelectedCustomModelId(LOCOPILOT_AUTO_MODEL_ID);
+						// Selection committed, so now COMMIT the pick too (the row above only peeked - see
+						// peekAutoModelForPicker). Pinning here is what makes the pre-warm and the send target the
+						// model this row just advertised. Same inputs as the peek, so the same model, but re-run
+						// rather than reusing `autoResolved` in case the confirmation dialog above sat open a while.
+						const picked = pickAutoModelForPicker(customLanguageModelsService, localModelRunner, timerService);
 						// Auto's pick is aspirational - the most capable model this machine's RAM tier supports -
 						// so it depends only on the downloaded set, total RAM, and which server is warm, none of
 						// which a memory probe changes. The label is therefore final at selection time; any
 						// request-time step-down to a smaller model surfaces later via the running-server
 						// re-resolve (stickiness), which the picker's normal state-change refresh already tracks.
-						delegate.setModel(buildAutoModelEntry(autoResolved));
+						delegate.setModel(buildAutoModelEntry(picked));
+						// Pre-warm, exactly as picking a concrete local model does. setCurrentLanguageModel's own
+						// prewarm hook can't do it for us: it fires on vendor 'locopilot' and passes the entry's
+						// id, and Auto's synthetic entry is vendor 'locopilot-auto' carrying the sentinel id - not
+						// a real model to load. So warm the CONCRETE model Auto just committed to. prewarmModel
+						// already no-ops when that server is running/starting (which, thanks to stickiness, is the
+						// case whenever any candidate is warm), honours the prewarm-on-select setting and the
+						// watchdog cooldown, and never pops the "Run anyway?" fit dialog for a background launch.
+						if (picked) {
+							localModelRunner.prewarmModel(picked.id);
+						}
 					}
 			};
 			const customModelActions: IActionWidgetDropdownAction[] = customModels.map(customModel => {
@@ -606,7 +638,7 @@ export class ModelPickerActionItem extends ChatInputPickerActionViewItem {
 		let initialLabel = localize('chat.modelPicker.auto', "Auto");
 
 		if (initialCustomModelId === LOCOPILOT_AUTO_MODEL_ID) {
-			initialLabel = autoDisplayName(resolveAutoModelForPicker(customLanguageModelsService, localModelRunner, timerService));
+			initialLabel = autoDisplayName(peekAutoModelForPicker(customLanguageModelsService, localModelRunner, timerService));
 		} else if (initialCustomModelId) {
 			const customModel = customLanguageModelsService.getCustomModels().find(m => m.id === initialCustomModelId);
 			if (customModel && !customModel.hidden) {
@@ -654,7 +686,7 @@ export class ModelPickerActionItem extends ChatInputPickerActionViewItem {
 			if (customLanguageModelsService.getSelectedCustomModelId() !== LOCOPILOT_AUTO_MODEL_ID) {
 				return;
 			}
-			this.currentModel = buildAutoModelEntry(resolveAutoModelForPicker(customLanguageModelsService, localModelRunner, timerService));
+			this.currentModel = buildAutoModelEntry(peekAutoModelForPicker(customLanguageModelsService, localModelRunner, timerService));
 			this.updateTooltip();
 			if (this.element) {
 				this.renderLabel(this.element);
@@ -686,7 +718,7 @@ export class ModelPickerActionItem extends ChatInputPickerActionViewItem {
 			// Auto mode: the sentinel is not a stored model - synthesize its entry (label shows the
 			// currently-resolved model) and never fall through to the "model was deleted" cleanup.
 			if (selectedCustomModelId === LOCOPILOT_AUTO_MODEL_ID) {
-				this.currentModel = buildAutoModelEntry(resolveAutoModelForPicker(customLanguageModelsService, localModelRunner, timerService));
+				this.currentModel = buildAutoModelEntry(peekAutoModelForPicker(customLanguageModelsService, localModelRunner, timerService));
 				this.updateTooltip();
 				if (this.element) {
 					this.renderLabel(this.element);
@@ -738,7 +770,7 @@ export class ModelPickerActionItem extends ChatInputPickerActionViewItem {
 
 			// Auto mode: re-resolve (a finished download or deletion changes what Auto uses) and re-label.
 			if (selectedCustomModelId === LOCOPILOT_AUTO_MODEL_ID) {
-				this.currentModel = buildAutoModelEntry(resolveAutoModelForPicker(customLanguageModelsService, localModelRunner, timerService));
+				this.currentModel = buildAutoModelEntry(peekAutoModelForPicker(customLanguageModelsService, localModelRunner, timerService));
 				if (this.element) {
 					this.renderLabel(this.element);
 				}

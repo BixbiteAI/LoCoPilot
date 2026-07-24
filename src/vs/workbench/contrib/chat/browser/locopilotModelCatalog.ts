@@ -1181,13 +1181,20 @@ export function resolveAutoModel(
 	const scored: IScored[] = [];
 	for (const model of candidates) {
 		const entry = findCatalogEntryByRepoId(model.modelName)!;
-		if (entry.minRamGB > effectiveRam) {
-			continue; // bigger than this machine's TOTAL RAM tier - never auto-picked.
+		const running = isServerActive(model.id);
+		if (entry.minRamGB > effectiveRam && !running) {
+			// Bigger than this machine's TOTAL RAM tier - never auto-picked... unless it is ALREADY RUNNING.
+			// The tier ceiling is an aspiration guard for COLD picks; a loaded server has empirically proven
+			// it runs here, so excluding it would make Auto name (and switch to) a different model than the
+			// one in memory - the opposite of the stickiness rule below, and a guaranteed pointless cold swap.
+			// This matters most when `ramGB` is unknown: detectedRamGB reads timerService.startupMetrics,
+			// which THROWS until startup finishes, so it reports 0 and effectiveRam falls back to the 8 GB
+			// tier - which used to exclude every running 16/32 GB-tier model outright.
+			continue;
 		}
 		if (maxSizeBytesExclusive !== undefined && entry.approxSizeBytes >= maxSizeBytesExclusive) {
 			continue; // step-down: this pick (or a bigger one) already failed the launch gate this pass.
 		}
-		const running = isServerActive(model.id);
 
 		let score = entry.minRamGB * 1000; // capability: the highest RAM tier the hardware supports.
 		if (running) {
@@ -1216,35 +1223,72 @@ export function resolveAutoModel(
 }
 
 /**
- * PIN-AWARE Auto resolution - the one every consumer (picker label/rows, selection pre-warm, prefix
- * warming, the per-request path) should use so they all agree on the SAME concrete model.
+ * The pinned Auto model, but only while the pin is still WORTH HONOURING - i.e. its model is a valid Auto
+ * candidate AND its server is running/starting. Returns undefined otherwise, meaning "re-resolve from live
+ * state". Pure: never writes the pin, so both the commit and the render wrapper below can share it.
+ *
+ * Warmth is the whole point of the pin. It exists so Auto does not bounce off a model that is already
+ * loaded (the label, the pre-warm and the send must agree on the model actually in memory); once that
+ * server is stopped there is nothing left to preserve, and honouring the pin would strand Auto on a model
+ * it would never pick fresh. That was the bug: hand-selecting a small model let a picker render pin it (it
+ * wins resolveAutoModel's stickiness bonus while warm), and after stopping it Auto still resolved to - and
+ * started - that small model instead of the larger one this machine can run.
+ */
+function warmPinnedAutoModel(
+	service: ICustomLanguageModelsService,
+	isServerActive: (modelId: string) => boolean
+): ICustomLanguageModel | undefined {
+	const pinnedId = service.getPinnedAutoModelId();
+	if (!pinnedId || !isServerActive(pinnedId)) {
+		return undefined; // no pin, or the pinned model is cold - nothing worth preserving
+	}
+	const pinned = service.getCustomModels().find(m => m.id === pinnedId);
+	return pinned && isAutoCandidate(pinned) ? pinned : undefined; // deleted/hidden pin also re-resolves
+}
+
+/**
+ * PIN-AWARE Auto resolution for COMMIT paths - selecting Auto in the picker, prefix warming, and the
+ * per-request resolution - so they all agree on the SAME concrete model. Render paths (labels, row
+ * descriptions) must use {@link peekAutoModel}: resolving for display must never mutate session state.
  *
  * Auto used to be re-resolved independently at each of those sites, each at a different moment over
  * different live inputs (which server happened to be running/starting for the stickiness bonus, momentary
  * free RAM for the step-down), so the label could say one model, selecting Auto warmed another, and the
- * send used a third. This wrapper funnels them through a session pin held on the service: the first
- * resolution pins its pick, later calls return the pin as long as it is still a valid Auto candidate
- * (downloaded, visible, in the catalog). The pin is cleared when the selection moves off Auto (service
- * side), and the request path re-pins when its launch-gate step-down lands on a smaller model - after
- * which every consumer follows along.
+ * send used a third. This wrapper funnels them through a session pin held on the service: a resolution
+ * pins its pick, later calls reuse it while it stays warm (see warmPinnedAutoModel), and the request path
+ * re-pins when its launch-gate step-down lands on a smaller model - after which every consumer follows.
+ * The pin is also cleared when the selection moves off Auto (service side).
  */
 export function resolveAutoModelPinned(
 	service: ICustomLanguageModelsService,
 	ramGB: number,
 	isServerActive: (modelId: string) => boolean
 ): ICustomLanguageModel | undefined {
-	const models = service.getCustomModels();
-	const pinnedId = service.getPinnedAutoModelId();
-	if (pinnedId) {
-		const pinned = models.find(m => m.id === pinnedId);
-		if (pinned && isAutoCandidate(pinned)) {
-			return pinned;
-		}
-		service.setPinnedAutoModelId(undefined); // pinned model was deleted/hidden - re-resolve below
+	const warm = warmPinnedAutoModel(service, isServerActive);
+	if (warm) {
+		return warm;
 	}
-	const resolved = resolveAutoModel(models, ramGB, isServerActive);
+	const resolved = resolveAutoModel(service.getCustomModels(), ramGB, isServerActive);
 	service.setPinnedAutoModelId(resolved?.id);
 	return resolved;
+}
+
+/**
+ * READ-ONLY Auto resolution for render paths: what Auto would use if it ran right now, without pinning.
+ *
+ * Rendering must not pin, because the picker draws the Auto row (and its "Uses <model>" description) even
+ * when Auto is NOT the selection - a render that pinned would let whatever model happens to be warm at
+ * that moment capture Auto's pick behind the user's back. Agreement with {@link resolveAutoModelPinned} is
+ * structural, not coincidental: both prefer the same warm pin and otherwise run the same deterministic
+ * resolveAutoModel over the same live inputs.
+ */
+export function peekAutoModel(
+	service: ICustomLanguageModelsService,
+	ramGB: number,
+	isServerActive: (modelId: string) => boolean
+): ICustomLanguageModel | undefined {
+	return warmPinnedAutoModel(service, isServerActive)
+		?? resolveAutoModel(service.getCustomModels(), ramGB, isServerActive);
 }
 
 export type AutoStarterSlot = 'best' | 'balanced' | 'fast';

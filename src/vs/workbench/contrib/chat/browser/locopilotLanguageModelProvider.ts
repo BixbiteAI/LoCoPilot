@@ -409,14 +409,17 @@ export class LoCoPilotLanguageModelProvider extends Disposable implements ILangu
 	private async _resolveAutoModelWithStepDown(): Promise<string> {
 		const isActive = (id: string) => this.localModelRunner.isServerRunning(id) || this.localModelRunner.isServerStarting(id);
 		const ram = this._detectedRamGB();
-		// Session pin first (see resolveAutoModelPinned): if Auto is already pinned to a valid candidate that
-		// is running or still fits the launch gate, use it - this is what keeps the picker label, the warmed
-		// server, and the request on the SAME model. Only when the pin can't fit does the step-down below run,
-		// and it re-pins whatever it lands on so every other consumer follows.
+		// Session pin first (see resolveAutoModelPinned): if Auto is pinned to a valid candidate whose server
+		// is WARM, use it - that is what keeps the picker label, the warmed server, and the request on the
+		// SAME model. A COLD pin is deliberately ignored (matching warmPinnedAutoModel, which the picker's
+		// label reads): the pin only exists to avoid swapping away from a loaded model, so once that server is
+		// stopped, honouring it would make Auto start a model it would never pick fresh - e.g. a small model
+		// the user had selected and stopped by hand, instead of the larger one this machine can run. The
+		// step-down below then re-resolves from live state and re-pins, so every other consumer follows.
 		const pinnedId = this.customLanguageModelsService.getPinnedAutoModelId();
-		if (pinnedId) {
+		if (pinnedId && isActive(pinnedId)) {
 			const pinned = this.customLanguageModelsService.getCustomModels().find(m => m.id === pinnedId);
-			if (pinned && isAutoCandidate(pinned) && (isActive(pinnedId) || await this.localModelRunner.wouldModelFitForLaunch(pinnedId))) {
+			if (pinned && isAutoCandidate(pinned)) {
 				this._log(`[LoCoPilot Provider] Auto using pinned model: ${getCustomModelListLabel(pinned)} (${pinnedId})`);
 				return pinnedId;
 			}
