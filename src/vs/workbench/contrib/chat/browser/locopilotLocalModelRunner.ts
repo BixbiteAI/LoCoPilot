@@ -103,6 +103,13 @@ const MAX_SLOT_CACHE_ENTRIES = 10;
  * successful ready still clears it immediately.
  */
 const LAUNCH_BLOCK_TTL_MS = 300_000;
+/**
+ * The pre-launch footprint is necessarily an estimate: mmap residency, driver scratch and reclaimable file
+ * cache vary by engine/OS. Treat a shortfall within 10% (at least 512 MiB) as estimator noise rather than
+ * interrupting the user. The hard total-capability gate and runtime watchdog still bound unsafe launches.
+ */
+const LAUNCH_FIT_TOLERANCE_FRACTION = 0.10;
+const LAUNCH_FIT_TOLERANCE_MIN_BYTES = 512 * 1024 * 1024;
 
 /**
  * Lifecycle phase of a local model server:
@@ -1411,9 +1418,11 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 	/**
 	 * Extra RESIDENT bytes an MLX launch commits beyond weights+KV, so the fit gates reserve for them the same
 	 * way the llama.cpp path reserves for its MTP/draft/mmproj extras (the two engines must reason alike - Q4).
-	 * MLX auto-tune pins a cross-request prompt cache at ~15% of total RAM (mirrors `promptCacheBytes` in
-	 * {@link _startMlxServerInTerminal}); the paired speculative draft is NOT included here because it is loaded
-	 * only after its own {@link _extrasFitBudget} check at launch. Returns 0 when auto-tune is off / unsupported.
+	 * The launch gate only charges MLX's guaranteed minimum prompt cache. The configured cache is a growable
+	 * upper bound (and MLX's total allocation is separately capped at the Metal wired limit), so charging the
+	 * full ~15%-of-RAM cap here produced false-positive "Run anyway" prompts for models whose startup working
+	 * set fits comfortably. The paired speculative draft is handled by its own fit check at launch.
+	 * Returns 0 when auto-tune is off / unsupported.
 	 */
 	private _mlxRuntimeReserveBytes(totalMemBytes: number): number {
 		const autoTune = this.configurationService.getValue<boolean>(ChatConfiguration.LocopilotMlxAutoTune) !== false
@@ -1421,7 +1430,7 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 		if (!autoTune || !(totalMemBytes > 0)) {
 			return 0;
 		}
-		return Math.floor(totalMemBytes * 0.15);
+		return MLX_MIN_PROMPT_CACHE_BYTES;
 	}
 
 	/** Reads total/free system RAM via the native host. Returns undefined on web or if the query fails. */
@@ -2242,12 +2251,12 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 	}
 
 	/**
-	 * Minimum resident footprint vs usable memory for running `modelPath` on `backend`, or undefined when a
-	 * required figure (weight size, RAM stats) is unknown - callers treat undefined as "fits" so we never
-	 * block or degrade a launch we can't reason about. Shared by the pre-flight fit gate and the
-	 * auto-speculation draft gate, so both answer "does X more resident bytes still fit?" identically.
+	 * Resident footprint vs usable memory for running `modelPath` on `backend`, or undefined when a required
+	 * figure (weight size, RAM stats) is unknown. With a finalized llama.cpp tuning this measures the actual
+	 * clamped context and resolved KV precision; without one it measures the conservative minimum footprint.
+	 * Callers treat undefined as "fits" so we never block or degrade a launch we can't reason about.
 	 */
-	private async _computeFit(modelPath: string, backend: LlamaBackend, discreteVramBytes: number | undefined, extraResidentBytes: number = 0): Promise<{ requiredBytes: number; usableBytes: number; weightBytes: number } | undefined> {
+	private async _computeFit(modelPath: string, backend: LlamaBackend, discreteVramBytes: number | undefined, extraResidentBytes: number = 0, tuning?: LlamaServerTuning): Promise<{ requiredBytes: number; usableBytes: number; weightBytes: number } | undefined> {
 		const weightBytes = await this._weightBytesOnDisk(modelPath);
 		if (weightBytes <= 0) {
 			return undefined; // unknown size -> can't reason about it.
@@ -2257,22 +2266,36 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 			return undefined; // no RAM stats (e.g. web).
 		}
 
-		// Minimum resident footprint: weights + the smallest KV cache we'd ever allocate + a runtime slice.
-		// The GGUF probe is best-effort (it does not apply to MLX directories); fall back to safe defaults.
+		// Resident footprint: weights + launch-plan KV cache + runtime slice. The GGUF probe is best-effort
+		// (it does not apply to MLX directories); fall back to safe defaults.
 		let info: IGgufModelInfo | undefined;
 		try {
 			info = await this._getModelInfo(modelPath);
 		} catch {
 			info = undefined;
 		}
-		const perTokenPerLayer = (info && kvBytesPerTokenPerLayer(info, 2)) || 4096;
+		// When the final llama.cpp tuning is available, account for the context and KV precision that will
+		// actually be launched. In particular, treating every launch as f16 made q8/q4 configurations look up to
+		// 2-3.5x larger than they really are and prompted "Run anyway" even after auto-tuning made them fit.
+		// Callers without a finalized plan (MLX / speculative-extra screening) retain the conservative minimum.
+		const contextTokens = tuning
+			? Math.max(MIN_CLAMPED_CONTEXT, tuning.contextSize ?? DEFAULT_LLAMA_CONTEXT_SIZE)
+			: MIN_CLAMPED_CONTEXT;
+		const kvType = tuning
+			? resolveKvCacheType(tuning.kvCacheType ?? 'auto', contextTokens)
+			: 'f16';
+		const kvBytesPerElement = kvCacheBytesPerElem(kvType);
+		const perTokenPerLayer = (info && kvBytesPerTokenPerLayer(info, kvBytesPerElement))
+			|| DEFAULT_KV_BYTES_PER_TOKEN_PER_LAYER_F16 * kvBytesPerElement / kvCacheBytesPerElem('f16');
 		const layerCount = info?.layerCount && info.layerCount > 0 ? info.layerCount : 32;
-		const kvMinBytes = MIN_CLAMPED_CONTEXT * perTokenPerLayer * layerCount;
-		const runtimeOverhead = RUNTIME_OVERHEAD_BYTES; // host buffers / compute scratch; shared with the KV-budget sizing.
+		const kvBytes = contextTokens * perTokenPerLayer * layerCount;
+		const runtimeOverhead = tuning
+			? runtimeOverheadBytesForTuning(tuning, backend)
+			: RUNTIME_OVERHEAD_BYTES;
 		// extraResidentBytes covers a draft/MTP model (a second copy of the weights) and the mmproj projector
 		// when vision is enabled - both are loaded ON TOP of the weights+KV and previously went uncounted here,
 		// so an MTP + vision model passed this gate and then OOM-ed the GPU at decode.
-		const requiredBytes = weightBytes + kvMinBytes + runtimeOverhead + Math.max(0, extraResidentBytes);
+		const requiredBytes = weightBytes + kvBytes + runtimeOverhead + Math.max(0, extraResidentBytes);
 
 		// Usable memory:
 		//  - metal (Apple Silicon): the WIRED working-set ceiling (~70% of unified RAM). macOS caps a Metal
@@ -2343,15 +2366,15 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 	 * is the guard that stops an oversized model from launching straight into the swap/OOM death spiral
 	 * (UI freeze -> 100% GPU -> heat -> thermal shutdown) that a too-big GGUF causes on a memory-tight machine.
 	 *
-	 * Honest-but-lenient: we only block when even the SMALLEST viable footprint (weights + a minimum KV cache
-	 * + a runtime slice) exceeds usable memory, so a model that merely needs context/offload tuning still
-	 * launches (the budget/clamp logic handles it). Any missing input (unknown weight size, no RAM stats, web)
-	 * returns true so we never block a launch we can't reason about.
+	 * Honest-but-lenient: llama.cpp callers pass their FINAL auto-tuned footprint (clamped context, resolved
+	 * q8/q4 KV and selected extras), so a model that tuning made safe launches without a false warning. MLX is
+	 * measured at its minimum viable footprint. Any missing input returns true so we never block a launch we
+	 * can't reason about.
 	 *
 	 * `discreteVramBytes`: dedicated VRAM (CUDA/Vulkan) that can hold offloaded weights ON TOP of system RAM;
 	 * undefined on unified-memory (Metal) / CPU, where weights live in system RAM regardless of any offload.
 	 */
-	private async _checkModelFitsOrNotify(modelId: string, modelPath: string, backend: LlamaBackend, discreteVramBytes: number | undefined, interactive: boolean, extraResidentBytes: number = 0): Promise<boolean> {
+	private async _checkModelFitsOrNotify(modelId: string, modelPath: string, backend: LlamaBackend, discreteVramBytes: number | undefined, interactive: boolean, extraResidentBytes: number = 0, tuning?: LlamaServerTuning): Promise<boolean> {
 		const model = this.customLanguageModelsService.getCustomModels().find(m => m.id === modelId);
 		if (!model) {
 			return true;
@@ -2359,10 +2382,10 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 		if (this._forcedLaunch.has(modelId)) {
 			return true; // user already chose "Run anyway" for this model
 		}
-		const fit = await this._computeFit(modelPath, backend, discreteVramBytes, extraResidentBytes);
+		const fit = await this._computeFit(modelPath, backend, discreteVramBytes, extraResidentBytes, tuning);
 		if (fit && fit.requiredBytes > fit.usableBytes) {
-			// CAPABILITY failure: even the minimum footprint exceeds what this machine can EVER offer (total
-			// usable RAM), so this model cannot safely run here. Unlike the transient gate this is a HARD
+			// CAPABILITY failure: even the final reduced footprint exceeds what this machine can safely offer
+			// (total usable RAM). Unlike the transient gate this is a HARD
 			// shortfall, so the "Run anyway" dialog warns more strongly (it may freeze/overheat the machine);
 			// the watchdog is the backstop if the user proceeds anyway.
 			const GB = 1024 * 1024 * 1024;
@@ -3711,12 +3734,6 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 			);
 			return;
 		}
-		// Use the backend selected for this exact binary, not the static recommendation. This matters on
-		// Windows/Linux where an installed CUDA engine or bundled Vulkan engine differs from getBackend().
-		if (!await this._memoryAllowsLaunch(modelId, interactive, backend)) {
-			return;
-		}
-
 		const modelPath = await this.resolveModelFilePath(model.localPath);
 
 		// Pre-flight fit check: refuse (with a clear toast) a model that can't fit this machine, rather than
@@ -3822,7 +3839,14 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 			extraResidentBytes = mmprojBytes;
 		}
 
-		if (!await this._checkModelFitsOrNotify(modelId, modelPath, backend, discreteVramBytes, interactive, extraResidentBytes)) {
+		// Finalize all automatic reductions BEFORE either user-facing memory gate. The gate must assess the
+		// configuration we will really launch (clamped context, q8/q4 KV, offload plan, stripped extras), not an
+		// earlier worst-case approximation that can warn even though auto-tuning has already made the model fit.
+		const tuning = await this._augmentTuningWithHardware(modelPath, backend, baseTuning, extraResidentBytes);
+		if (!await this._memoryAllowsLaunch(modelId, interactive, backend, tuning, extraResidentBytes)) {
+			return;
+		}
+		if (!await this._checkModelFitsOrNotify(modelId, modelPath, backend, discreteVramBytes, interactive, extraResidentBytes, tuning)) {
 			return;
 		}
 
@@ -3837,7 +3861,6 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 		// Make sure the slot-save dir exists before launch: llama.cpp only touches it on save/restore, but
 		// creating it up front keeps the --slot-save-path flag valid for the whole server lifetime.
 		await this._ensureKvCacheDir();
-		const tuning = await this._augmentTuningWithHardware(modelPath, backend, baseTuning, extraResidentBytes);
 		// Remember the context this launch runs with, so an OOM crash can halve it on the retry.
 		const launchContext = tuning.contextSize ?? DEFAULT_LLAMA_CONTEXT_SIZE;
 		this._lastLaunchContext.set(modelId, launchContext);
@@ -4241,7 +4264,7 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 			message,
 			detail,
 			buttons: [{ label: 'Run anyway', run: () => 'run' as const }],
-			cancelButton: { label: 'Keep current model', run: () => 'keep' as const },
+			cancelButton: { label: 'Cancel', run: () => 'keep' as const },
 		});
 		if (result === 'run') {
 			this._forcedLaunch.add(modelId);
@@ -4305,8 +4328,8 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 	 * a model that fits AFTER the switch is never blocked. This is the transient companion to the capability
 	 * gate (models too big for total RAM).
 	 */
-	private async _memoryAllowsLaunch(modelId: string, interactive: boolean, backend?: LlamaBackend): Promise<boolean> {
-		const fit = await this._computeLaunchFit(modelId, interactive, backend);
+	private async _memoryAllowsLaunch(modelId: string, interactive: boolean, backend?: LlamaBackend, tuning?: LlamaServerTuning, extraResidentBytes: number = 0): Promise<boolean> {
+		const fit = await this._computeLaunchFit(modelId, interactive, backend, tuning, extraResidentBytes);
 		if (!fit || fit.fits) {
 			return true; // can't measure (never block on the unmeasurable), or it fits.
 		}
@@ -4333,7 +4356,7 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 	 * every case the real gate treats as "don't block". Otherwise reports whether the model fits and the
 	 * numbers used, so callers can log / prompt without recomputing.
 	 */
-	private async _computeLaunchFit(modelId: string, interactive: boolean, resolvedBackend?: LlamaBackend): Promise<{ fits: boolean; needGb: number; haveGb: number; name: string; pressure: MemoryPressureLevel; evictableGb: number } | undefined> {
+	private async _computeLaunchFit(modelId: string, interactive: boolean, resolvedBackend?: LlamaBackend, tuning?: LlamaServerTuning, llamaExtraResidentBytes: number = 0): Promise<{ fits: boolean; needGb: number; haveGb: number; name: string; pressure: MemoryPressureLevel; evictableGb: number } | undefined> {
 		const model = this.customLanguageModelsService.getCustomModels().find(m => m.id === modelId);
 		if (!model || !model.localPath) {
 			return undefined;
@@ -4353,13 +4376,15 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 		} catch {
 			return undefined;
 		}
-		// MLX commits a ~15%-of-RAM prompt cache alongside the weights; reserve it here so a model that leaves no
-		// headroom for its cache trips this SOFT "not enough free right now" gate (Run-anyway available) instead
-		// of thrashing after launch. llama.cpp's growable KV is bounded by the context clamp instead, so 0 there.
-		const extraResidentBytes = kind === 'mlx' ? this._mlxRuntimeReserveBytes(mem.totalBytes) : 0;
+		// Charge the footprint of the plan that will actually launch. MLX contributes only its guaranteed
+		// minimum prompt cache (the larger configured value is a growable cap); llama.cpp contributes the
+		// finalized draft/projector extras selected before this gate.
+		const extraResidentBytes = kind === 'mlx'
+			? this._mlxRuntimeReserveBytes(mem.totalBytes)
+			: llamaExtraResidentBytes;
 		const hw = await this._getHardwareInfo();
 		const discreteVramBytes = this._discreteVramBytes(backend, hw);
-		const fit = await this._computeFit(modelPath, backend, discreteVramBytes, extraResidentBytes);
+		const fit = await this._computeFit(modelPath, backend, discreteVramBytes, extraResidentBytes, tuning);
 		if (!fit) {
 			return undefined; // unknown footprint -> don't block
 		}
@@ -4397,9 +4422,16 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 			residentWeightBytes = Math.max(0, fit.weightBytes - vramWeightAllowance);
 		}
 		const requiredFreeNow = nonWeightBytes + residentWeightBytes;
+		const estimateTolerance = Math.max(
+			LAUNCH_FIT_TOLERANCE_MIN_BYTES,
+			requiredFreeNow * LAUNCH_FIT_TOLERANCE_FRACTION
+		);
 		const GB = 1024 * 1024 * 1024;
 		return {
-			fits: mem.pressure !== 'critical' && requiredFreeNow <= availableNow,
+			// A critical kernel-pressure signal always blocks. Otherwise only prompt for a material shortfall:
+			// exact byte comparison made harmless mmap/cache/driver estimation noise look like an unsafe launch
+			// (for example ~8.7 GiB estimated vs ~8.6 GiB kernel-available, displayed misleadingly as 9 vs 8).
+			fits: mem.pressure !== 'critical' && requiredFreeNow <= availableNow + estimateTolerance,
 			needGb: Math.ceil(requiredFreeNow / GB),
 			haveGb: Math.max(0, Math.floor(availableNow / GB)),
 			name: model.displayName || model.modelName,

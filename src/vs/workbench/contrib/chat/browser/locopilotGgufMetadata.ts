@@ -4,6 +4,7 @@
  *--------------------------------------------------------------------------------------------*/
 
 import { URI } from '../../../../base/common/uri.js';
+import { streamToBuffer } from '../../../../base/common/buffer.js';
 import { IFileService } from '../../../../platform/files/common/files.js';
 
 /**
@@ -116,8 +117,12 @@ class GgufCursor {
 		}
 		while (this.off + need > this.buf.length) {
 			const readAt = this.bufStart + this.buf.length;
-			const content = await this.fileService.readFile(this.uri, { position: readAt, length: CHUNK_BYTES });
-			const chunk = content.value.buffer;
+			// `IFileService.readFile` deliberately prefers the provider's unbuffered primitive. For the local
+			// disk provider that primitive reads the WHOLE file and only then applies position/length, so Node
+			// rejects every GGUF larger than its ~2 GiB Buffer limit before our 256 KiB range is sliced out.
+			// The streaming path uses the provider's open/read implementation and honors the range at the source.
+			const content = await this.fileService.readFileStream(this.uri, { position: readAt, length: CHUNK_BYTES });
+			const chunk = (await streamToBuffer(content.value)).buffer;
 			if (chunk.length === 0) {
 				throw new Error('gguf: unexpected end of file');
 			}

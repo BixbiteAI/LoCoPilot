@@ -36,6 +36,39 @@ function tryExecOk(command: string, args: string[]): Promise<boolean> {
 	});
 }
 
+/**
+ * Resolves the memory macOS can make available without pressure. `vm_stat` exposes only individual page
+ * queues and undercounts compressed/reclaimable memory on a busy machine; `memory_pressure -Q` reports the
+ * kernel's aggregate free percentage and therefore wins when present.
+ */
+export function parseDarwinAvailableBytes(totalBytes: number, fallbackBytes: number, vmStatOut: string, memoryPressureOut: string): number {
+	let availableBytes = fallbackBytes;
+	if (vmStatOut) {
+		const pageSizeMatch = vmStatOut.match(/page size of (\d+) bytes/);
+		const pageSize = pageSizeMatch ? parseInt(pageSizeMatch[1], 10) : 16384;
+		const count = (label: string): number => {
+			const m = vmStatOut.match(new RegExp(`${label}:\\s+(\\d+)`, 'i'));
+			return m ? parseInt(m[1], 10) : 0;
+		};
+		const reclaimablePages = count('Pages free')
+			+ count('Pages inactive')
+			+ count('Pages speculative')
+			+ count('Pages purgeable');
+		if (reclaimablePages > 0) {
+			availableBytes = reclaimablePages * pageSize;
+		}
+	}
+
+	const availablePercentMatch = memoryPressureOut.match(/System-wide memory free percentage:\s*([\d.]+)%/i);
+	if (availablePercentMatch) {
+		const availablePercent = parseFloat(availablePercentMatch[1]);
+		if (Number.isFinite(availablePercent) && availablePercent >= 0 && availablePercent <= 100) {
+			availableBytes = Math.max(availableBytes, Math.floor(totalBytes * availablePercent / 100));
+		}
+	}
+	return Math.max(0, Math.min(totalBytes, availableBytes));
+}
+
 export class LoCoPilotSystemInfoService implements ILoCoPilotSystemInfoService {
 	declare readonly _serviceBrand: undefined;
 
@@ -98,38 +131,23 @@ export class LoCoPilotSystemInfoService implements ILoCoPilotSystemInfoService {
 	}
 
 	/**
-	 * macOS: `os.freemem()` counts only truly-free pages and is wildly pessimistic (most RAM sits in
-	 * reclaimable file cache), so available memory is computed from `vm_stat` page counts instead:
-	 * free + inactive + speculative + purgeable - a close analogue of what Activity Monitor and Ollama's
-	 * host_statistics64 path treat as reclaimable. Pressure comes from the kernel's own memorystatus level
-	 * (the signal macOS itself uses to fire low-memory warnings), swap from `vm.swapusage`.
+	 * macOS: `os.freemem()` counts only truly-free pages and is wildly pessimistic. `memory_pressure -Q`
+	 * exposes the kernel's own system-wide free percentage, including memory it can reclaim without entering
+	 * pressure; use that as the primary availability figure. Keep the `vm_stat` free+inactive+speculative+
+	 * purgeable sum as a fallback because `memory_pressure` is absent in some restricted environments.
+	 * Pressure comes from the kernel's memorystatus level, swap from `vm.swapusage`.
 	 */
 	private async _darwinMemoryStatus(): Promise<IMemoryStatus> {
-		const [vmStatOut, pressureOut, swapOut, thermalOut] = await Promise.all([
+		const [vmStatOut, availableOut, pressureOut, swapOut, thermalOut] = await Promise.all([
 			tryExec('vm_stat', []),
+			tryExec('memory_pressure', ['-Q']),
 			tryExec('sysctl', ['-n', 'kern.memorystatus_vm_pressure_level']),
 			tryExec('sysctl', ['-n', 'vm.swapusage']),
 			tryExec('sysctl', ['-n', 'kern.thermalpressurelevel']),
 		]);
 
 		const totalBytes = totalmem();
-		let availableBytes = freemem(); // worst-case fallback when vm_stat is unavailable
-
-		if (vmStatOut) {
-			const pageSizeMatch = vmStatOut.match(/page size of (\d+) bytes/);
-			const pageSize = pageSizeMatch ? parseInt(pageSizeMatch[1], 10) : 16384;
-			const count = (label: string): number => {
-				const m = vmStatOut.match(new RegExp(`${label}:\\s+(\\d+)`, 'i'));
-				return m ? parseInt(m[1], 10) : 0;
-			};
-			const reclaimablePages = count('Pages free')
-				+ count('Pages inactive')
-				+ count('Pages speculative')
-				+ count('Pages purgeable');
-			if (reclaimablePages > 0) {
-				availableBytes = reclaimablePages * pageSize;
-			}
-		}
+		const availableBytes = parseDarwinAvailableBytes(totalBytes, freemem(), vmStatOut, availableOut);
 
 		// kern.memorystatus_vm_pressure_level: 1 = normal, 2 = warn, 4 = critical.
 		let pressure: MemoryPressureLevel = 'unknown';
