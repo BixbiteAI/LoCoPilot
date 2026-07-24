@@ -177,11 +177,13 @@ export interface ILoCoPilotLocalModelRunner {
 	getServerLogs(modelId: string): string[];
 	/**
 	 * Launches the server for `modelId`. `interactive` = true for explicit user actions (send message, Start
-	 * button, Retry, picker): a model that won't fit shows the "Run anyway / Keep current" dialog. false for
+	 * button, Retry, picker): a model that won't fit shows the "Run anyway / Cancel" dialog. false for
 	 * background pre-warm / crash-relaunch: a non-fitting model is skipped silently, and a prior "Run anyway"
 	 * choice (the `_forcedLaunch` flag) still carries the relaunch through.
+	 * Returns true when the launch proceeded (already running, attached, or spawned past the fit gates);
+	 * false when it was abandoned (Cancel at the fit dialog, silent pre-warm skip, missing path, etc.).
 	 */
-	startServerInTerminal(modelId: string, interactive?: boolean): Promise<void>;
+	startServerInTerminal(modelId: string, interactive?: boolean): Promise<boolean>;
 	/**
 	 * Ensures a local server for the model is running and ready to answer chat requests.
 	 * If not running, starts it (evicting the least-recently-used server first when the resident-model
@@ -269,7 +271,7 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 	 * callers (e.g. startup pre-warm racing the model-picker's select pre-warm) share one launch instead of
 	 * each spawning a server on the same port - the classic "exit code 1" double-start at startup.
 	 */
-	private readonly _startInFlight = new Map<string, Promise<void>>();
+	private readonly _startInFlight = new Map<string, Promise<boolean>>();
 	/** Ports picked by an in-flight launch but not yet bound; reserved so concurrent launches don't reuse them. */
 	private readonly _reservedPorts = new Set<number>();
 	/**
@@ -493,11 +495,12 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 			}
 			async run(accessor: ServicesAccessor, modelId?: string): Promise<void> {
 				if (modelId) {
-					// Kick off the interactive launch first so any picker pre-warm from the chat-panel
-					// selection sync joins this in-flight promise (and keeps the "Run anyway?" path).
-					const launch = self.startServerInTerminal(modelId, true); // explicit user action (Start/Retry) -> may prompt "Run anyway?"
-					self._selectStartedModelInChatPanel(modelId);
-					await launch;
+					// Gate/start FIRST, then commit the picker selection. Selecting before the fit dialog meant
+					// Cancel left the picker on the declined model whenever revert couldn't find a prior server.
+					const launched = await self.startServerInTerminal(modelId, true); // explicit user action (Start/Retry) -> may prompt "Run anyway?"
+					if (launched) {
+						self._selectStartedModelInChatPanel(modelId);
+					}
 				}
 			}
 		});
@@ -3613,32 +3616,37 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 	 *
 	 * Concurrent callers for the same model share a single launch (see {@link _startInFlight}) so two
 	 * pre-warm triggers cannot spawn duplicate servers on the same port.
+	 * Returns true when the model is (or was successfully promoted to) running/starting; false when the
+	 * launch was abandoned before a server record existed (fit Cancel, silent pre-warm skip, etc.).
 	 */
-	startServerInTerminal(modelId: string, interactive: boolean = false): Promise<void> {
+	startServerInTerminal(modelId: string, interactive: boolean = false): Promise<boolean> {
 		if (this.runningServers.has(modelId)) {
 			this._log(`[LoCoPilot Runner] Server for model ${modelId} is already running.`);
-			return Promise.resolve();
+			return Promise.resolve(true);
 		}
 		const inFlight = this._startInFlight.get(modelId);
 		if (inFlight) {
 			this._log(`[LoCoPilot Runner] Launch already in progress for model ${modelId}; reusing it.`);
 			return inFlight;
 		}
-		const launch = this._doStartServerInTerminal(modelId, interactive).finally(() => {
-			this._startInFlight.delete(modelId);
-			// Safety net: the cross-window handoff optimistically shows a spinner (_beginStarting) before it
-			// knows the launch will succeed. If the launch then bails early (failed fit check, missing engine,
-			// etc.) without promoting to a running server, clear that leftover "starting" state so the picker
-			// doesn't hang on a spinner forever.
-			if (this.startingServers.has(modelId) && !this.runningServers.has(modelId)) {
-				this._endStarting(modelId);
-			}
-			// If we won the launch claim but never promoted to a running server (bailed early or attached to
-			// another window's server), release the mutex so other windows aren't blocked from launching.
-			if (this._myClaimToken !== undefined) {
-				void this._releaseClaimIfHeld();
-			}
-		});
+		const launch = this._doStartServerInTerminal(modelId, interactive)
+			.then(() => this.runningServers.has(modelId) || this.startingServers.has(modelId))
+			.catch(() => false)
+			.finally(() => {
+				this._startInFlight.delete(modelId);
+				// Safety net: the cross-window handoff optimistically shows a spinner (_beginStarting) before it
+				// knows the launch will succeed. If the launch then bails early (failed fit check, missing engine,
+				// etc.) without promoting to a running server, clear that leftover "starting" state so the picker
+				// doesn't hang on a spinner forever.
+				if (this.startingServers.has(modelId) && !this.runningServers.has(modelId)) {
+					this._endStarting(modelId);
+				}
+				// If we won the launch claim but never promoted to a running server (bailed early or attached to
+				// another window's server), release the mutex so other windows aren't blocked from launching.
+				if (this._myClaimToken !== undefined) {
+					void this._releaseClaimIfHeld();
+				}
+			});
 		this._startInFlight.set(modelId, launch);
 		return launch;
 	}
@@ -4931,9 +4939,11 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 	}
 
 	runModel(modelId: string): void {
-		const launch = this.startServerInTerminal(modelId, true); // explicit user "Run" action -> may prompt "Run anyway?"
-		this._selectStartedModelInChatPanel(modelId);
-		void launch;
+		void this.startServerInTerminal(modelId, true).then(launched => { // explicit user "Run" action -> may prompt "Run anyway?"
+			if (launched) {
+				this._selectStartedModelInChatPanel(modelId);
+			}
+		});
 	}
 
 	private _log(msg: string, ...args: unknown[]): void {

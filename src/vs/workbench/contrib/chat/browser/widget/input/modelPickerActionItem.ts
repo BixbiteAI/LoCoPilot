@@ -102,15 +102,33 @@ function selectCustomModelInChat(delegate: IModelPickerDelegate, customLanguageM
 /**
  * Confirm-then-select a custom model. The confirmation MUST run before `setSelectedCustomModelId` (which
  * drives the picker label/checkmark) so that declining while a request is running leaves the previous
- * selection - and therefore the picker label - completely untouched. No-ops on decline.
+ * selection - and therefore the picker label - completely untouched.
+ *
+ * For startable local HF models, the memory fit gate / server start also runs BEFORE selection is committed:
+ * Cancel at "Run anyway?" leaves the previous model selected; only a successful launch (or an already-running
+ * server) commits the new pick. No-ops on decline / Cancel.
  */
-async function applyCustomModelSelection(delegate: IModelPickerDelegate, customLanguageModelsService: ICustomLanguageModelsService, customModelId: string, skipConfirm = false): Promise<void> {
+async function applyCustomModelSelection(
+	delegate: IModelPickerDelegate,
+	customLanguageModelsService: ICustomLanguageModelsService,
+	localModelRunner: ILoCoPilotLocalModelRunner,
+	customModelId: string,
+	skipConfirm = false
+): Promise<void> {
 	const customModel = customLanguageModelsService.getCustomModels().find(m => m.id === customModelId);
 	const modelName = customModel ? getCustomModelListLabel(customModel) : customModelId;
 	// `skipConfirm` is set when the picked model is the one already running the in-flight request (e.g. the
 	// model Auto currently resolves to): the switch interrupts nothing, so don't prompt "change anyway?".
 	if (!skipConfirm && !await delegate.confirmModelChange(modelName)) {
 		return;
+	}
+	// Gate-first for local llama.cpp / MLX models: start (may show Run anyway / Cancel) before touching
+	// selection. Cloud / Ollama / not-downloaded models have no managed server to gate.
+	if (customModel && isStartableLocalModel(customModel)) {
+		const launched = await localModelRunner.startServerInTerminal(customModelId, true);
+		if (!launched) {
+			return; // Cancel / fit block / start failure - keep the previous selection
+		}
 	}
 	customLanguageModelsService.setSelectedCustomModelId(customModelId);
 	selectCustomModelInChat(delegate, customLanguageModelsService, customModelId);
@@ -403,7 +421,7 @@ function modelDelegateToWidgetActionsProvider(delegate: IModelPickerDelegate, te
 							// Skip the running-request prompt when this model is already the one in use (e.g. the
 							// model Auto currently resolves to) - re-selecting it concretely interrupts nothing.
 							const modelUnchanged = customModel.id === currentEffectiveModelId;
-							applyCustomModelSelection(delegate, customLanguageModelsService, customModel.id, modelUnchanged);
+							applyCustomModelSelection(delegate, customLanguageModelsService, localModelRunner, customModel.id, modelUnchanged);
 						}
 				};
 			});
@@ -439,8 +457,7 @@ function modelDelegateToWidgetActionsProvider(delegate: IModelPickerDelegate, te
 									return;
 								}
 								await customLanguageModelsService.hideCustomModel(hiddenModel.id, false);
-								customLanguageModelsService.setSelectedCustomModelId(hiddenModel.id);
-								selectCustomModelInChat(delegate, customLanguageModelsService, hiddenModel.id);
+								await applyCustomModelSelection(delegate, customLanguageModelsService, localModelRunner, hiddenModel.id, true /* already confirmed */);
 								actionWidgetService.hide();
 							}
 						})
@@ -450,8 +467,7 @@ function modelDelegateToWidgetActionsProvider(delegate: IModelPickerDelegate, te
 							return;
 						}
 						await customLanguageModelsService.hideCustomModel(hiddenModel.id, false);
-						customLanguageModelsService.setSelectedCustomModelId(hiddenModel.id);
-						selectCustomModelInChat(delegate, customLanguageModelsService, hiddenModel.id);
+						await applyCustomModelSelection(delegate, customLanguageModelsService, localModelRunner, hiddenModel.id, true /* already confirmed */);
 						actionWidgetService.hide();
 					}
 				};
