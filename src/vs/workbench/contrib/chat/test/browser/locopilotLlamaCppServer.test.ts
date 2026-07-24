@@ -33,6 +33,7 @@ import {
 	DEFAULT_CLAMP_LAYER_COUNT,
 	DEFAULT_LLAMA_CONTEXT_SIZE,
 	DEFAULT_KV_BYTES_PER_TOKEN_PER_LAYER_F16,
+	MTP_DRAFT_KV_LAYER_EQUIV,
 	type GpuLike,
 } from '../../browser/locopilotLlamaCppServer.js';
 import { getMlxLmServerCommand, MLX_MEMORY_LIMIT_BOOTSTRAP } from '../../browser/locopilotMlxServer.js';
@@ -254,6 +255,18 @@ suite('LoCoPilot llama.cpp server', () => {
 			assert.strictEqual(q8, 21504); // ~2x the f16 window
 		});
 
+		test('MTP surcharge (extra draft-context layers) shrinks the granted context to leave room for the second KV cache', () => {
+			// With MTP on, the runner inflates the clamp's layer count by MTP_DRAFT_KV_LAYER_EQUIV so the same
+			// budget must also hold the draft context's KV. More layers -> fewer tokens fit -> smaller context,
+			// scaled dynamically to the machine's budget (no hard cap). A tiny model with lots of headroom keeps
+			// a large context; the surcharge only bites when the KV budget is the binding constraint.
+			const budget = 2 * 1024 * 1024 * 1024;
+			const noMtp = clampContextSize({ requestedContext: 262144, kvBudgetBytes: budget, layerCount: 24, kvBytesPerTokenPerLayer: DEFAULT_KV_BYTES_PER_TOKEN_PER_LAYER_F16 });
+			const withMtp = clampContextSize({ requestedContext: 262144, kvBudgetBytes: budget, layerCount: 24 + MTP_DRAFT_KV_LAYER_EQUIV, kvBytesPerTokenPerLayer: DEFAULT_KV_BYTES_PER_TOKEN_PER_LAYER_F16 });
+			assert.ok(withMtp < noMtp, `MTP context (${withMtp}) must be smaller than non-MTP (${noMtp})`);
+			assert.strictEqual(MTP_DRAFT_KV_LAYER_EQUIV, 2);
+		});
+
 		test('clamps a long-context model even when the GGUF has no layer count', () => {
 			// Regression: a non-standard GGUF (e.g. some gemma-4 conversions) can parse without a layer count.
 			// The clamp used to be skipped entirely for these, letting a 256K window through and OOM-ing the
@@ -444,10 +457,16 @@ suite('LoCoPilot llama.cpp server', () => {
 			assert.strictEqual(withMtp.args.filter(a => a === '--spec-type').length, 1, 'MTP wins over promptLookup');
 		});
 
-		test('MTP takes precedence over a separate draft model', () => {
+		test('MTP loads the embedded head via --spec-type only (no --model-draft second copy)', () => {
+			const { args } = getLlamaCppServerCommand('/m.gguf', 'metal', undefined, 1234, { multiTokenPrediction: true });
+			assert.strictEqual(args.indexOf('--model-draft'), -1, 'MTP must NOT pass --model-draft (that loads a full second weight copy)');
+			assert.strictEqual(argValue(args, '--spec-type'), 'draft-mtp');
+		});
+
+		test('MTP takes precedence over a separate draft model (no --model-draft emitted)', () => {
 			const { args } = getLlamaCppServerCommand('/m.gguf', 'metal', undefined, 1234, { multiTokenPrediction: true, draftModelPath: '/draft.gguf' });
-			assert.strictEqual(argValue(args, '--model-draft'), '/m.gguf', 'MTP points --model-draft at the main model');
-			assert.ok(args.includes('--spec-type'));
+			assert.strictEqual(args.indexOf('--model-draft'), -1, 'MTP wins and uses the embedded head, not the separate draft');
+			assert.strictEqual(argValue(args, '--spec-type'), 'draft-mtp');
 		});
 
 		test('swaFull emits --swa-full; unset omits it', () => {

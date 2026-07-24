@@ -47,6 +47,7 @@ import {
 	kvCacheBytesPerElem,
 	DEFAULT_KV_BYTES_PER_TOKEN_PER_LAYER_F16,
 	DEFAULT_CLAMP_LAYER_COUNT,
+	MTP_DRAFT_KV_LAYER_EQUIV,
 	swaFullKvHeadroomBytes,
 	type LlamaServerTuning,
 	type FlashAttentionMode,
@@ -1587,10 +1588,12 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 			const tuning = this._getLlamaTuning(model);
 			const sepDraft = tuning.draftModelPath?.trim();
 			if (tuning.multiTokenPrediction) {
-				// Current llama.cpp creates a separate draft context and reports approximately another full
-				// weights-worth of committed memory. Keep this identical to the launch extras gate; divergent
-				// accounting previously admitted MTP at launch but under-evicted by almost one whole model later.
-				runtime += weightBytes;
+				// MTP now loads only the embedded single-layer draft head (`--spec-type draft-mtp` alone, no
+				// `--model-draft` second weight copy), so it commits a small bounded extra, not another full
+				// model. Keep this formula IDENTICAL to the launch extras gate (see the MTP branch in the launch
+				// flow) so eviction accounting matches admission - divergence previously admitted MTP at launch
+				// but then under-/over-evicted by almost a whole model.
+				runtime += Math.min(Math.max(weightBytes * 0.08, 512 * 1e6), 2 * 1e9);
 			} else if (sepDraft) {
 				// A separate draft costs its own (much smaller) file; full weights only when it can't be statted.
 				runtime += (await this._fileBytes(sepDraft)) || weightBytes;
@@ -2127,6 +2130,13 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 			// a fixed 32K threshold, while preserving f16 for small windows and near-lossless q8 when it already fits.
 			const f16PerTokenPerLayer = kvBytesPerTokenPerLayer(info, kvCacheBytesPerElem('f16'))
 				?? DEFAULT_KV_BYTES_PER_TOKEN_PER_LAYER_F16;
+			// MTP surcharge: with MTP on, llama.cpp allocates a SECOND (draft) context whose KV also scales with
+			// n_ctx (~one extra layer's worth per token). Model it by inflating the layer count the clamp budgets
+			// for, so the SAME weight-aware budget now sizes the largest context that holds BOTH caches - dynamic
+			// per machine, no hard cap. Only the clamp's budgeting uses this; the real layer count is kept below
+			// (layersForKv) for the --swa-full estimate, which measures the main KV alone.
+			const baseLayerCount = info.layerCount && info.layerCount > 0 ? info.layerCount : DEFAULT_CLAMP_LAYER_COUNT;
+			const clampLayerCount = tuning.multiTokenPrediction ? baseLayerCount + MTP_DRAFT_KV_LAYER_EQUIV : baseLayerCount;
 			let resolvedKvType: Exclude<KvCacheType, 'auto'>;
 			let clamped: number;
 			if ((tuning.kvCacheType ?? 'auto') === 'auto') {
@@ -2134,12 +2144,12 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 					requestedContext: tuning.contextSize,
 					modelContextLength: info.contextLength,
 					kvBudgetBytes,
-					layerCount: info.layerCount,
+					layerCount: clampLayerCount,
 					kvBytesPerTokenPerLayerF16: f16PerTokenPerLayer,
 				});
 				resolvedKvType = selection.kvCacheType;
 				clamped = selection.contextSize;
-				this._log(`[LoCoPilot Runner] Dynamic KV selected ${resolvedKvType} for ${clamped}/${tuning.contextSize} requested tokens from the model-specific memory budget.`);
+				this._log(`[LoCoPilot Runner] Dynamic KV selected ${resolvedKvType} for ${clamped}/${tuning.contextSize} requested tokens from the model-specific memory budget${tuning.multiTokenPrediction ? ' (incl. MTP draft-context KV reserve)' : ''}.`);
 			} else {
 				resolvedKvType = tuning.kvCacheType as Exclude<KvCacheType, 'auto'>;
 				const fixedPerTokenPerLayer = f16PerTokenPerLayer * kvCacheBytesPerElem(resolvedKvType) / kvCacheBytesPerElem('f16');
@@ -2147,7 +2157,7 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 					requestedContext: tuning.contextSize,
 					modelContextLength: info.contextLength,
 					kvBudgetBytes,
-					layerCount: info.layerCount,
+					layerCount: clampLayerCount,
 					kvBytesPerTokenPerLayer: fixedPerTokenPerLayer,
 				});
 			}
@@ -3788,23 +3798,26 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 			}
 		}
 		// Resident extras beyond weights+KV: the vision projector plus whatever draft model speculation loads.
-		// MTP self-drafts from the same GGUF (~doubles weights); a user-configured separate draft costs its own
-		// file size (fall back to a full weights-worth when it can't be statted - the safe direction).
+		// MTP loads a lightweight embedded head from the same GGUF (see below); a user-configured separate draft
+		// costs its own file size (fall back to a full weights-worth when it can't be statted - the safe direction).
 		const weightBytesForBudget = await this._weightBytesOnDisk(modelPath);
 		let extraResidentBytes = mmprojBytes;
 		const userDraftPath = baseTuning.draftModelPath?.trim();
 		if (baseTuning.multiTokenPrediction) {
-			// MTP self-drafts from the same GGUF, but the current llama.cpp build loads a SECOND full copy of the
-			// weights for the draft context (the log shows `[spec] estimated memory usage of draft model is ~16 GiB`).
-			// On GPU backends that copy lands in the constrained Metal/VRAM working set, and on a memory-tight
-			// machine the doubling busts the ceiling at decode (kIOGPUCommandBufferCallbackErrorOutOfMemory). So keep
-			// MTP only when the machine still fits with the doubled weights loaded; otherwise drop it here and let the
-			// zero-memory n-gram drafting below take over - same speedup intent, no second weight copy, no OOM. This
-			// runs BEFORE the paired-draft / n-gram blocks, so clearing the flag lets one of them pick up the slack.
-			if (await this._extrasFitBudget(modelPath, backend, discreteVramBytes, mmprojBytes + weightBytesForBudget)) {
-				extraResidentBytes += weightBytesForBudget;
+			// MTP self-drafts from the SAME GGUF using `--spec-type draft-mtp` alone (no `--model-draft`), which
+			// loads only the embedded single-layer MTP head + its small draft context - the server logs
+			// `[spec] estimated memory usage of MTP context is <N> MiB` (~100-300 MB, not a second weight copy).
+			// We therefore reserve a bounded head cost rather than a full weights-worth: ~8% of the model weights
+			// with a 512 MB floor and 2 GB ceiling comfortably covers the head tensors plus the draft KV cache,
+			// while keeping big MTP models (e.g. 27B) fitting on machines that hold a single weight copy. Keep MTP
+			// only when even this small extra fits; otherwise drop it here and let the zero-memory n-gram drafting
+			// below take over. Runs BEFORE the paired-draft / n-gram blocks, so clearing the flag lets one of them
+			// pick up the slack.
+			const mtpHeadBytes = Math.min(Math.max(weightBytesForBudget * 0.08, 512 * 1e6), 2 * 1e9);
+			if (await this._extrasFitBudget(modelPath, backend, discreteVramBytes, mmprojBytes + mtpHeadBytes)) {
+				extraResidentBytes += mtpHeadBytes;
 			} else {
-				this._log(`[LoCoPilot Runner] MTP disabled for ${modelId}: its embedded draft would load a second ~${Math.round(weightBytesForBudget / 1e6)}MB weight copy that exceeds this machine's memory budget; falling back to n-gram drafting.`);
+				this._log(`[LoCoPilot Runner] MTP disabled for ${modelId}: even the lightweight embedded draft head (~${Math.round(mtpHeadBytes / 1e6)}MB) exceeds this machine's memory budget; falling back to n-gram drafting.`);
 				baseTuning.multiTokenPrediction = false;
 			}
 		} else if (userDraftPath) {

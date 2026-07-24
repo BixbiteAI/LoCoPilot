@@ -442,6 +442,17 @@ export const DEFAULT_CLAMP_LAYER_COUNT = 48;
 export const DEFAULT_KV_BYTES_PER_TOKEN_PER_LAYER_F16 = 4096;
 
 /**
+ * When MTP (Multi-Token Prediction) is on, llama.cpp spins up a SEPARATE draft context with its own KV cache
+ * that scales with `n_ctx` (the server logs `estimated memory usage of MTP context is <N> MiB`). Empirically
+ * that draft context costs roughly one extra transformer layer's worth of KV per token plus a small fixed base,
+ * so the context clamp models it by adding this many layers to the model's real layer count. This keeps the
+ * clamp's dynamic sizing intact - a big machine still gets a big context, a tight one shrinks just enough to
+ * hold BOTH caches - instead of hard-capping MTP context to a constant. Conservative (2) to also absorb the
+ * fixed base overhead at the long contexts where it starts to matter.
+ */
+export const MTP_DRAFT_KV_LAYER_EQUIV = 2;
+
+/**
  * Clamps the requested context window to (a) the model's trained maximum and (b) what the KV-cache memory
  * budget can hold, rounded down to a multiple of 1024 and floored at {@link MIN_CLAMPED_CONTEXT}. Returns
  * the requested size unchanged when no constraint applies or inputs are missing. This stops a long-context
@@ -536,11 +547,12 @@ export interface LlamaServerTuning {
 	kvCacheType?: KvCacheType;
 	/**
 	 * Multi-Token Prediction / NextN speculative decoding. Only valid for MTP-trained models on a
-	 * recent llama.cpp build (~b9180+). When on, points `--model-draft` at the same GGUF (the MTP
-	 * head is embedded) and appends `mtpArgs`. Off by default; the exact flags are build-specific.
+	 * recent llama.cpp build (~b9180+). When on, emits `mtpArgs` ALONE (default `--spec-type draft-mtp`) so
+	 * llama.cpp loads the embedded MTP head from the main GGUF as a lightweight draft context - it does NOT
+	 * pass `--model-draft` (that would load a second full weight copy). Off by default; flags are build-specific.
 	 */
 	multiTokenPrediction?: boolean;
-	/** Flags appended after `--model-draft` when MTP is on. Build-specific; defaults to `--spec-type nextn`. */
+	/** Speculative flags emitted when MTP is on (no `--model-draft`). Build-specific; defaults to `--spec-type draft-mtp`. */
 	mtpArgs?: string;
 	/** Lock weights in RAM (`--mlock`). Can fail without privileges/RAM, so opt-in. */
 	mlock?: boolean;
@@ -902,10 +914,13 @@ export function getLlamaCppServerCommand(modelPath: string, backend: LlamaBacken
 
 	// Multi-Token Prediction / NextN speculative decoding. OPT-IN and default off: only models trained
 	// with MTP/NextN heads (e.g. Qwen3.5/3.6, DeepSeek V3/R1, Gemma 4) on a recent llama.cpp build
-	// (~b9180+) support this. The draft head is embedded in the same GGUF, so --model-draft points at
-	// the same file. The spec-type flag name is build-specific, so it is configurable via mtpArgs.
+	// (~b9180+) support this. The MTP head is embedded in the main GGUF, so `--spec-type draft-mtp` ALONE
+	// loads it as a lightweight single-layer draft context (~100-300 MB) straight from the main model - the
+	// server logs `[spec] estimated memory usage of MTP context is <N> MiB`. We deliberately do NOT pass
+	// `--model-draft <same.gguf>` here: that routes MTP through the generic separate-draft path, which
+	// mmaps and loads a SECOND full copy of the weights (a 27B doubles to ~32 GB and busts the Metal/VRAM
+	// budget). The spec-type flag name is build-specific, so it is configurable via mtpArgs.
 	if (tuning.multiTokenPrediction) {
-		args.push('--model-draft', modelPath);
 		const mtpArgs = (tuning.mtpArgs && tuning.mtpArgs.trim()) ? tuning.mtpArgs.trim() : '--spec-type draft-mtp';
 		args.push(...mtpArgs.split(/\s+/));
 	} else if (tuning.draftModelPath && tuning.draftModelPath.trim()) {
