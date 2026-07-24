@@ -4329,9 +4329,60 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 	 * gate (models too big for total RAM).
 	 */
 	private async _memoryAllowsLaunch(modelId: string, interactive: boolean, backend?: LlamaBackend, tuning?: LlamaServerTuning, extraResidentBytes: number = 0): Promise<boolean> {
-		const fit = await this._computeLaunchFit(modelId, interactive, backend, tuning, extraResidentBytes);
+		// Keep one live snapshot for the complete decision. Re-probing while searching context sizes introduces
+		// jitter (and repeatedly spawns the platform probes) even though every candidate belongs to one launch.
+		const memoryStatus = await this._getMemoryStatus();
+		let fit = await this._computeLaunchFit(modelId, interactive, backend, tuning, extraResidentBytes, memoryStatus);
 		if (!fit || fit.fits) {
 			return true; // can't measure (never block on the unmeasurable), or it fits.
+		}
+
+		// A requested long context is not a reason to block a model that can safely serve normal turns at a
+		// smaller window. The hardware tuner has already resolved KV quantization/offload/extras; now search for
+		// the largest 1024-token context that fits CURRENT available memory and mutate the same tuning object that
+		// is passed to getLlamaCppServerCommand. Thus the gate and actual allocation cannot disagree. The 4K floor
+		// remains the minimum useful agent context; only a model that still misses there reaches the dialog.
+		const requestedContext = tuning?.contextSize ?? 0;
+		if (tuning && requestedContext > MIN_CLAMPED_CONTEXT && fit.pressure !== 'critical') {
+			const fitAt = (contextSize: number) => this._computeLaunchFit(
+				modelId,
+				interactive,
+				backend,
+				{ ...tuning, contextSize },
+				extraResidentBytes,
+				memoryStatus
+			);
+			const minimumFit = await fitAt(MIN_CLAMPED_CONTEXT);
+			if (minimumFit?.fits) {
+				const step = 1024;
+				let bestContext = MIN_CLAMPED_CONTEXT;
+				let bestFit = minimumFit;
+				let low = Math.floor(MIN_CLAMPED_CONTEXT / step) + 1;
+				let high = Math.max(low - 1, Math.floor(requestedContext / step));
+				while (low <= high) {
+					const mid = Math.floor((low + high) / 2);
+					const candidateContext = mid * step;
+					const candidateFit = await fitAt(candidateContext);
+					if (!candidateFit) {
+						return true; // measurement became unavailable; preserve the established fail-open policy
+					}
+					if (candidateFit.fits) {
+						bestContext = candidateContext;
+						bestFit = candidateFit;
+						low = mid + 1;
+					} else {
+						high = mid - 1;
+					}
+				}
+				tuning.contextSize = Math.min(requestedContext, bestContext);
+				this._log(`[LoCoPilot Runner] Auto-reduced launch context for ${modelId}: ${requestedContext} -> ${tuning.contextSize} tokens; optimized footprint ~${bestFit.needGb}GB fits ~${bestFit.haveGb}GB currently available.`);
+				return true;
+			}
+			// If even 4K misses, show/record numbers for that minimum viable plan rather than alarming the user
+			// with the much larger requested-context footprint.
+			if (minimumFit) {
+				fit = minimumFit;
+			}
 		}
 		this._log(`[LoCoPilot Runner] ${modelId} would not fit free RAM: needs ~${fit.needGb}GB but only ~${fit.haveGb}GB is free right now (pressure=${fit.pressure}, evictable ~${fit.evictableGb}GB, interactive=${interactive}).`);
 		if (!interactive) {
@@ -4356,7 +4407,7 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 	 * every case the real gate treats as "don't block". Otherwise reports whether the model fits and the
 	 * numbers used, so callers can log / prompt without recomputing.
 	 */
-	private async _computeLaunchFit(modelId: string, interactive: boolean, resolvedBackend?: LlamaBackend, tuning?: LlamaServerTuning, llamaExtraResidentBytes: number = 0): Promise<{ fits: boolean; needGb: number; haveGb: number; name: string; pressure: MemoryPressureLevel; evictableGb: number } | undefined> {
+	private async _computeLaunchFit(modelId: string, interactive: boolean, resolvedBackend?: LlamaBackend, tuning?: LlamaServerTuning, llamaExtraResidentBytes: number = 0, memoryStatus?: IMemoryStatus): Promise<{ fits: boolean; needGb: number; haveGb: number; name: string; pressure: MemoryPressureLevel; evictableGb: number } | undefined> {
 		const model = this.customLanguageModelsService.getCustomModels().find(m => m.id === modelId);
 		if (!model || !model.localPath) {
 			return undefined;
@@ -4364,7 +4415,7 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 		if (this._forcedLaunch.has(modelId)) {
 			return undefined; // user already chose "Run anyway" for this model
 		}
-		const mem = await this._getMemoryStatus();
+		const mem = memoryStatus ?? await this._getMemoryStatus();
 		if (!mem) {
 			return undefined; // no live probe -> never block on what we can't measure
 		}
