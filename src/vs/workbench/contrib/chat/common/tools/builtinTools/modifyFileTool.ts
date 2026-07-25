@@ -607,7 +607,10 @@ export class ModifyFileTool implements IToolImpl {
 		// nested path if the model put one there, otherwise return a clear, actionable error.
 		if (typeof params.path !== 'string' || params.path.trim().length === 0) {
 			const nestedPath = Array.isArray(params.edits)
-				? params.edits.map(e => (e && typeof (e as Record<string, unknown>).path === 'string') ? (e as Record<string, unknown>).path as string : undefined).find(p => typeof p === 'string' && p.trim().length > 0)
+				? params.edits.map(e => {
+					const p = (e as unknown as Record<string, unknown>)?.path;
+					return typeof p === 'string' ? p : undefined;
+				}).find(p => typeof p === 'string' && p.trim().length > 0)
 				: undefined;
 			if (typeof nestedPath === 'string' && nestedPath.trim().length > 0) {
 				params.path = nestedPath;
