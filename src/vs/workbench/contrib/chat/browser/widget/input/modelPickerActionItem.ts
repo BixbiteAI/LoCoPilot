@@ -163,17 +163,23 @@ function buildStartStopControl(
 	commandService: ICommandService,
 	modelId: string
 ): { icon: ThemeIcon; tooltip: string; run: () => void } {
-	const isRunning = runner.isServerRunning(modelId);
-	const isStarting = runner.isServerStarting(modelId);
+	// Gate the icon on the real load phase, not just "a process exists". The server record is created with
+	// ready:false the moment the process spawns, so isServerRunning() is true while weights are still loading
+	// ('loading' phase). The chat send path only fires at phase 'ready', so showing the Stop icon during loading
+	// made a still-loading model look started, then a send re-entered its own wait - the "started, now starting
+	// again" flicker. Show the spinner for both 'starting' and 'loading', and only show Stop once truly ready.
+	const phase = runner.getServerPhase(modelId);
+	const isReady = phase === 'ready';
+	const isLaunching = phase === 'starting' || phase === 'loading';
 
-	if (isStarting) {
+	if (isLaunching) {
 		return {
 			icon: ThemeIcon.modify(Codicon.loading, 'spin'),
 			tooltip: localize('chat.modelPicker.serverStarting', 'Starting...'),
 			run: () => { }
 		};
 	}
-	if (isRunning) {
+	if (isReady) {
 		return {
 			icon: Codicon.stopCircle,
 			tooltip: localize('chat.modelPicker.stopServer', 'Stop server'),

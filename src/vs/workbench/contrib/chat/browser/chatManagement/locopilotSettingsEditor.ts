@@ -1552,11 +1552,18 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 		actionsContainer: HTMLElement,
 		startCommand: () => void
 	): void {
-		const isRunning = this.localModelRunner.isServerRunning(modelId);
-		const isStarting = this.localModelRunner.isServerStarting(modelId);
+		// Gate the controls on the real load phase, not merely on "a process exists". A server record is created
+		// with ready:false the instant the process spawns, so isServerRunning() flips true while weights are still
+		// loading ('loading' phase) - which used to show the Stop button before the model could actually answer.
+		// The chat send path only fires at phase 'ready' (getServerPhase === 'ready'), so a message sent during the
+		// loading window re-enters its own wait, making a "Stop"-showing model look like it is starting again. Show
+		// the spinner for both 'starting' and 'loading', and only offer Stop once the endpoint is truly ready.
+		const phase = this.localModelRunner.getServerPhase(modelId);
+		const isReady = phase === 'ready';
+		const isLaunching = phase === 'starting' || phase === 'loading';
 
-		if (isStarting) {
-			// Spinner + disabled label while the server is launching
+		if (isLaunching) {
+			// Spinner + disabled label while the server is launching (process spawning OR weights still loading)
 			const spinnerWrap = DOM.append(runSlot, $('.model-server-starting'));
 			const activity = DOM.append(spinnerWrap, $('.model-ollama-activity'));
 			activity.setAttribute('aria-hidden', 'true');
@@ -1565,7 +1572,7 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 			startingLabel.textContent = localize('customLanguageModels.serverStarting', 'Starting...');
 			spinnerWrap.setAttribute('aria-busy', 'true');
 			spinnerWrap.setAttribute('aria-label', localize('customLanguageModels.serverStartingAria', 'Server is starting, please wait'));
-		} else if (isRunning) {
+		} else if (isReady) {
 			// Running: Stop + Logs. Local models also auto-start on first use (see ensureServerForModel),
 			// so the button below is a convenience to spin up (or shut down) the server ahead of a request.
 			const btn = this._register(new Button(runSlot, { ...defaultButtonStyles, secondary: true, supportIcons: true, title: localize('customLanguageModels.stopServerTooltip', 'Unload this model and stop its server') }));
