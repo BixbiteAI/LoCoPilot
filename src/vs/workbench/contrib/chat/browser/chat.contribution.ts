@@ -635,7 +635,7 @@ configurationRegistry.registerConfiguration({
 		},
 		[ChatConfiguration.LocopilotMlxPythonPath]: {
 			type: 'string',
-			description: nls.localize('locopilot.mlx.pythonPath.description', "Advanced override for the Python interpreter used to run `python -m mlx_lm.server` (local Hugging Face MLX models, Apple Silicon). LoCoPilot ships a bundled self-contained Python with mlx-lm pre-installed, so this is normally left empty. Set it only to use your own interpreter (e.g. /path/to/.venv/bin/python3)."),
+			description: nls.localize('locopilot.mlx.pythonPath.description', "Advanced fallback for the Python interpreter used to run `python -m mlx_lm.server` (local Hugging Face MLX models, Apple Silicon). LoCoPilot ships a bundled self-contained Python with mlx-lm pre-installed and always prefers it when present, so this is normally left empty. It is used only on builds where the bundled runtime is absent, and is ignored if the path does not exist."),
 			default: '',
 		},
 		[ChatConfiguration.LocopilotLlamaCppContextSize]: {

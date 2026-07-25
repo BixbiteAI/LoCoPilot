@@ -2905,16 +2905,16 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 
 	/**
 	 * Resolves the Python interpreter for mlx_lm.server. Priority:
-	 *   1. User override (locopilot.mlx.pythonPath) - advanced; unset by default.
-	 *   2. Bundled self-contained Python with mlx-lm pre-installed, shipped in the macOS arm64 package
-	 *      (resources/mlx/darwin-arm64/python/bin/python3) - the zero-setup default.
+	 *   1. Bundled self-contained Python with mlx-lm pre-installed, shipped in the macOS arm64 package
+	 *      (resources/mlx/darwin-arm64/python/bin/python3) - the zero-setup default. Always preferred when
+	 *      present, so a stale personal `locopilot.mlx.pythonPath` (e.g. a venv that only exists on the
+	 *      machine it was set on) can never mask the runtime we ship.
+	 *   2. User override (locopilot.mlx.pythonPath) - advanced; only used when the bundle is absent from
+	 *      this build (non-arm64, or the fetch step didn't run). Existence-checked so a dangling path
+	 *      doesn't get handed to the shell.
 	 *   3. `python3` on PATH (legacy fallback; requires the user to have installed mlx-lm themselves).
 	 */
 	private async resolveMlxPython(): Promise<string> {
-		const configured = (this.configurationService.getValue<string>(ChatConfiguration.LocopilotMlxPythonPath) ?? '').trim();
-		if (configured) {
-			return configured;
-		}
 		const bundled = getBundledMlxPython(this._appRoot);
 		if (bundled) {
 			try {
@@ -2923,7 +2923,19 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 					return bundled;
 				}
 			} catch {
-				// Not bundled in this build - fall through to PATH.
+				// Not bundled in this build - fall through to the override / PATH.
+			}
+		}
+		const configured = (this.configurationService.getValue<string>(ChatConfiguration.LocopilotMlxPythonPath) ?? '').trim();
+		if (configured) {
+			try {
+				const stat = await this.fileService.stat(URI.file(configured));
+				if (stat.isFile) {
+					return configured;
+				}
+				this._log(`[LoCoPilot Runner] Ignoring locopilot.mlx.pythonPath "${configured}" - not a file; falling back to python3 on PATH.`);
+			} catch {
+				this._log(`[LoCoPilot Runner] Ignoring locopilot.mlx.pythonPath "${configured}" - path does not exist; falling back to python3 on PATH.`);
 			}
 		}
 		return 'python3';
