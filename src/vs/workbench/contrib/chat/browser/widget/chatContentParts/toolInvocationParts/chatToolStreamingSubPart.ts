@@ -23,22 +23,51 @@ const CONTENT_FIELD_CANDIDATES = ['newString', 'content', 'text', 'code'];
 const PREVIEW_TAIL_LINES = 3;
 const PREVIEW_MAX_LINE_LENGTH = 200;
 
+/** Short tail (last few lines) of a streamed string, clipped per line. */
+function tailPreview(value: string): string {
+	const lines = value.replace(/\s+$/, '').split('\n');
+	return lines
+		.slice(-PREVIEW_TAIL_LINES)
+		.map(l => l.length > PREVIEW_MAX_LINE_LENGTH ? `${l.slice(0, PREVIEW_MAX_LINE_LENGTH)}…` : l)
+		.join('\n');
+}
+
 /**
  * Extract a short live tail of the content an in-flight tool call is generating (e.g. modifyFile's
  * `newString`) from its best-effort-parsed partial input, so the user sees the file being written.
+ * Handles both a top-level content field (single-edit / create) and the `edits[]` multi-edit array,
+ * where the currently-streaming patch's newString lives inside the LAST array element.
  */
 function extractStreamingContentPreview(partialInput: unknown): string | undefined {
 	if (!partialInput || typeof partialInput !== 'object') {
 		return undefined;
 	}
+	const obj = partialInput as Record<string, unknown>;
+
+	// Multi-edit: preview the newString (or oldString before it arrives) of the last, currently-
+	// streaming patch, so the code tail shows just like it does for a single-edit newString.
+	const edits = obj['edits'];
+	if (Array.isArray(edits)) {
+		for (let i = edits.length - 1; i >= 0; i--) {
+			const e = edits[i];
+			if (e && typeof e === 'object') {
+				const patch = e as Record<string, unknown>;
+				const ns = patch['newString'];
+				if (typeof ns === 'string' && ns.trim().length > 0) {
+					return tailPreview(ns);
+				}
+				const os = patch['oldString'];
+				if (typeof os === 'string' && os.trim().length > 0) {
+					return tailPreview(os);
+				}
+			}
+		}
+	}
+
 	for (const field of CONTENT_FIELD_CANDIDATES) {
-		const value = (partialInput as Record<string, unknown>)[field];
+		const value = obj[field];
 		if (typeof value === 'string' && value.trim().length > 0) {
-			const lines = value.replace(/\s+$/, '').split('\n');
-			return lines
-				.slice(-PREVIEW_TAIL_LINES)
-				.map(l => l.length > PREVIEW_MAX_LINE_LENGTH ? `${l.slice(0, PREVIEW_MAX_LINE_LENGTH)}…` : l)
-				.join('\n');
+			return tailPreview(value);
 		}
 	}
 	return undefined;

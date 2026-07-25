@@ -269,6 +269,26 @@ export class UnifiedAgent {
 							if (typeof value === 'string' && value.length > STORED_TOOL_ARG_MAX_CHARS) {
 								newParams[key] = `${value.slice(0, STORED_TOOL_ARG_MAX_CHARS)}…[truncated]`;
 								paramsChanged = true;
+							} else if (Array.isArray(value)) {
+								// Arrays of objects (e.g. modifyFile's edits[]) carry oldString/newString file
+								// bodies inside each element - truncate those nested strings too, not just top-level.
+								const newArr = value.map(item => {
+									if (item && typeof item === 'object' && !Array.isArray(item)) {
+										const obj = item as Record<string, unknown>;
+										let itemChanged = false;
+										const newObj: Record<string, unknown> = { ...obj };
+										for (const k of Object.keys(newObj)) {
+											const v = newObj[k];
+											if (typeof v === 'string' && v.length > STORED_TOOL_ARG_MAX_CHARS) {
+												newObj[k] = `${v.slice(0, STORED_TOOL_ARG_MAX_CHARS)}…[truncated]`;
+												itemChanged = true;
+											}
+										}
+										if (itemChanged) { paramsChanged = true; return newObj; }
+									}
+									return item;
+								});
+								if (paramsChanged) { newParams[key] = newArr; }
 							}
 						}
 						if (paramsChanged) {

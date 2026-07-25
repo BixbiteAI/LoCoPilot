@@ -89,9 +89,11 @@ export const AGENT_SYSTEM_PROMPT_TOOLS_AND_INTERNAL = `
 - Edit with \`modifyFile\`. Check results with \`readLints\` after edits.
 
 # EDITING (modifyFile)
-- Create or overwrite a whole file: \`modifyFile(path, "", fullContents)\`.
+- DEFAULT to targeted edits: change ONLY the lines that differ, never rewrite a whole file for a small change. \`readFile\` first, then pass the EXACT text you copied as \`oldString\` and its replacement as \`newString\`. Set \`replaceAll: true\` to replace every occurrence.
+- To ADD code (a new method/function/import between existing code): use \`insertAfter\` (or \`insertBefore\`) with a short UNIQUE anchor line copied from readFile, and put ONLY the new code in \`newString\`. Do NOT copy the surrounding block into \`oldString\` and repeat it - that causes match errors.
+- Changing several separate places in one file? Pass \`edits: [{oldString, newString} | {insertAfter, newString}, ...]\` in a single \`modifyFile\` call (applied in order, all-or-nothing) instead of one big rewrite.
+- Create a new file OR fully overwrite an existing one: \`modifyFile(path, "", fullContents)\` (empty \`oldString\`). Only overwrite when MOST of the file changes - never paste the old file into \`oldString\` to "rewrite" it; an empty \`oldString\` already means full write.
 - Do NOT create directories as a separate step. Writing \`modifyFile("dir/sub/file.ext", "", contents)\` creates the parent folders automatically - there is no mkdir step. Never create an empty file whose name looks like a folder.
-- Partial edit: \`readFile\` the file first, then pass the EXACT text you copied as \`oldString\` (character-for-character, same whitespace). Set \`replaceAll: true\` to replace every occurrence.
 - If a partial edit returns "String not found", use the exact hint from the error as \`oldString\` next turn - do not retry the same string.
 
 # READING TOOL RESULTS
@@ -158,7 +160,7 @@ For greetings, thanks, or general questions not about this project: reply direct
 For project work, follow this loop:
 1. Find code: \`semanticSearch\` by meaning, \`grep\` for exact strings, \`findFiles\` for filenames, \`listDirectory\` for structure. Then \`readFile\` (use offset/limit on big files). Never guess file contents.
 2. Multi-step task? Write the steps with \`manage_todo_list\` first; keep exactly one in-progress and mark items completed as you go.
-3. Edit with \`modifyFile\`: empty oldString ("") creates or fully replaces the file (parent folders are automatic - no mkdir); otherwise oldString must match the file EXACTLY (copy it from readFile). On "String not found", use the hint from the error - never retry the same string.
+3. Edit with \`modifyFile\`: PREFER targeted edits - set oldString to the exact text from readFile and newString to its replacement, changing only what differs (change several spots in one call with \`edits: [{oldString, newString}, ...]\`). Use empty oldString ("") ONLY to create a new file or fully rewrite one (parent folders automatic - no mkdir). On "String not found", use the hint from the error - never retry the same string.
 4. Run commands/builds/tests with \`run_in_terminal\`. Check edits with \`readLints\` and fix what it finds.
 
 Rules:
