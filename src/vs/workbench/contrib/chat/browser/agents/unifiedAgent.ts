@@ -7,6 +7,7 @@
 
 import { timeout } from '../../../../../base/common/async.js';
 import { CancellationToken } from '../../../../../base/common/cancellation.js';
+import { hash } from '../../../../../base/common/hash.js';
 import { MarkdownString } from '../../../../../base/common/htmlContent.js';
 import { URI } from '../../../../../base/common/uri.js';
 import { ILogService } from '../../../../../platform/log/common/log.js';
@@ -113,6 +114,16 @@ interface IStoredTranscript {
 	readonly messages: IChatMessage[];
 	/** History length the NEXT request must have for this transcript to still be valid. */
 	readonly expectedHistoryLength: number;
+}
+
+/** A ready-to-send warm-up request plus a content signature that keys its persisted KV slot cache. */
+export interface IWarmPrefix {
+	/** The system + trivial-user messages a real first turn's prefix would begin with. */
+	readonly messages: IChatMessage[];
+	/** Request options (carries the tool set when non-empty). */
+	readonly options: any;
+	/** Stable hex hash of the prefix content (system prompt + tool JSON); identifies a matching disk cache. */
+	readonly signature: string;
 }
 
 export class UnifiedAgent {
@@ -743,27 +754,55 @@ export class UnifiedAgent {
 	 */
 	async warmUp(modelId: string, systemPrompt: string, token: CancellationToken): Promise<void> {
 		try {
-			const modelMetadata = this.languageModelsService.lookupLanguageModel(modelId);
-			// Same tool set a real turn sends with the default (no explicit) tool selection.
-			const allTools = await this.getAvailableTools(modelMetadata, {});
-			const { llmNameById } = this.buildToolNameMap(allTools);
-			const tools = this.formatToolsForLLM(allTools, llmNameById);
+			const prefix = await this.buildWarmPrefix(modelId, systemPrompt);
+			await this.warmUpWithPrefix(modelId, prefix, token);
+		} catch (e) {
+			this._log(`[LoCoPilot] Prefix warm-up failed (ignored): ${e}`);
+		}
+	}
 
-			const messages: IChatMessage[] = [
-				{ role: ChatMessageRole.System, content: [{ type: 'text', value: systemPrompt }] },
-				{ role: ChatMessageRole.User, content: [{ type: 'text', value: 'hi' }] },
-			];
-			const options: any = { locopilotForegroundTurn: false };
-			if (tools.length > 0) {
-				options.tools = tools;
-			}
+	/**
+	 * Build the exact system+tools warm-up request a real first turn would send, plus a stable
+	 * {@link IWarmPrefix.signature} derived from its content. The signature is what the persisted KV
+	 * slot cache is keyed by: it changes whenever the system prompt (prompt version, project memory,
+	 * workspace facts) OR the tool set changes, so a blob saved by an earlier session with a different
+	 * prefix can never be restored into a mismatched context (the stale root cause of a full turn-1
+	 * re-prefill). Kept separate from {@link warmUpWithPrefix} so the caller can compute the signature,
+	 * look for a matching cache, and only pay the tool build once.
+	 */
+	async buildWarmPrefix(modelId: string, systemPrompt: string): Promise<IWarmPrefix> {
+		const modelMetadata = this.languageModelsService.lookupLanguageModel(modelId);
+		// Same tool set a real turn sends with the default (no explicit) tool selection.
+		const allTools = await this.getAvailableTools(modelMetadata, {});
+		const { llmNameById } = this.buildToolNameMap(allTools);
+		const tools = this.formatToolsForLLM(allTools, llmNameById);
 
-			this._log(`[LoCoPilot] Warming prefix for ${modelId} (${tools.length} tools)...`);
+		const messages: IChatMessage[] = [
+			{ role: ChatMessageRole.System, content: [{ type: 'text', value: systemPrompt }] },
+			{ role: ChatMessageRole.User, content: [{ type: 'text', value: 'hi' }] },
+		];
+		const options: any = { locopilotForegroundTurn: false };
+		if (tools.length > 0) {
+			options.tools = tools;
+		}
+
+		// Hash the FULL prefix content (system prompt + the exact tool JSON sent), not just names -
+		// a changed tool description shifts the rendered prompt tokens too. Unsigned hex keeps it
+		// filesystem-safe. NUL separator so prompt/tool boundaries can't collide.
+		const signature = (hash(systemPrompt + '\u0000' + JSON.stringify(tools)) >>> 0).toString(16);
+		return { messages, options, signature };
+	}
+
+	/** Send a prefix built by {@link buildWarmPrefix}; drains and discards the output (only the cached KV matters). */
+	async warmUpWithPrefix(modelId: string, prefix: IWarmPrefix, token: CancellationToken): Promise<void> {
+		try {
+			const toolCount = Array.isArray(prefix.options?.tools) ? prefix.options.tools.length : 0;
+			this._log(`[LoCoPilot] Warming prefix for ${modelId} (${toolCount} tools, sig=${prefix.signature})...`);
 			const response = await this.languageModelsService.sendChatRequest(
 				modelId,
 				nullExtensionDescription.identifier,
-				messages,
-				options,
+				prefix.messages,
+				prefix.options,
 				token
 			);
 			// Drain the stream; we discard the output - only the cached prefix matters.

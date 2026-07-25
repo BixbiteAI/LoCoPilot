@@ -384,6 +384,16 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 	/** Model ids whose LAST llama-server launch included speculative flags; consulted by the crash fallback. */
 	private readonly _launchedWithSpecFlags = new Set<string>();
 	/**
+	 * Model ids whose LAST launch created a real SECOND (draft) KV context - `--model-draft` or an MTP/next-n
+	 * `--spec-type draft-*`. llama.cpp's /slots save+restore only captures the MAIN context, so a restored blob
+	 * leaves the draft context uninitialized and the server re-processes the whole prompt anyway ("lack of cache
+	 * data"). Worse, the restore returns 200, which makes the warm trigger think the prefix is ready and skip the
+	 * in-session warm that DOES work for these models. So slot save/restore is disabled for them (see
+	 * saveSlotCache/restoreSlotCache) and they always warm in-session. n-gram speculation (ngram-mod/-cache) has
+	 * no separate KV context, so it is NOT included here - its slot caches restore fine.
+	 */
+	private readonly _launchedWithDraftContext = new Set<string>();
+	/**
 	 * True once a llama-server launch crashed because the binary rejected `--cache-ram` (older builds predate
 	 * it). The cap is then skipped for the session and the failed launch retried once without it - same
 	 * self-healing shape as the speculative flags.
@@ -983,6 +993,14 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 			this._log(`[LoCoPilot Runner] KV slot restore skipped for ${modelId}: server not ready (present=${!!running}, kind=${running?.kind ?? 'none'}, ready=${running?.ready ?? false}).`);
 			return false;
 		}
+		// Draft-context models (MTP / separate draft): /slots restore only reloads the MAIN KV, so the restored
+		// prefix is NOT reusable (the server re-prefills the whole prompt with "lack of cache data") - yet the
+		// restore returns 200. Returning false here makes the warm trigger fall through to the in-session warm,
+		// which builds a genuinely reusable prefix for these models. See _launchedWithDraftContext.
+		if (this._launchedWithDraftContext.has(modelId)) {
+			this._log(`[LoCoPilot Runner] KV slot restore skipped for ${modelId}: draft/MTP context - restored slots aren't reusable, warming in-session instead.`);
+			return false;
+		}
 		const filename = this._slotCacheFileName(modelId, key);
 		// The file must exist under the slot-save dir, or llama.cpp rejects the restore. Check first so a
 		// cold first-ever run (no cache yet) quietly falls back to warming instead of logging a failure.
@@ -1020,6 +1038,12 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 	async saveSlotCache(modelId: string, key: string, token: CancellationToken = CancellationToken.None): Promise<void> {
 		const running = this.runningServers.get(modelId);
 		if (!running || running.kind !== 'llama' || !running.ready) {
+			return;
+		}
+		// Don't persist slot caches for draft-context models: their restored blobs aren't reusable (see
+		// restoreSlotCache / _launchedWithDraftContext), so writing them only burns disk (these are the
+		// hundreds-of-MB files) for a cache that would never be restored usefully.
+		if (this._launchedWithDraftContext.has(modelId)) {
 			return;
 		}
 		if (!await this._ensureKvCacheDir()) {
@@ -2193,16 +2217,23 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 				tuning.swaFull = true;
 				this._log(`[LoCoPilot Runner] Forcing --swa-full (mode=on, detectedSwa=${isSwaModelInfo(info)}, window=${info.slidingWindow ?? 'n/a'}).`);
 			} else if (mode === 'auto' && isSwaModelInfo(info) && budget !== undefined && budget > 0) {
-				// Headroom gate: verify the full-size SWA KV cache fits alongside the resident weights, the host
-				// prompt cache, base runtime overhead AND a margin for the warm-up compute graph (the peak neither
-				// our clamp nor llama's -fit fully models). If it doesn't, keep the far smaller WINDOWED SWA cache -
-				// the model still runs at the same big context, it just re-processes the prompt each turn (a speed
-				// hit, not a correctness one). On discrete GPUs the host prompt cache lives in system RAM, separate
-				// from the VRAM the KV occupies, so it doesn't count against this budget.
+				// Headroom gate: verify the full-size SWA KV cache fits alongside the resident weights, base
+				// runtime overhead AND a margin for the warm-up compute graph (the peak neither our clamp nor
+				// llama's -fit fully models). If it doesn't, keep the far smaller WINDOWED SWA cache - the model
+				// still runs at the same big context, it just re-processes the prompt each turn (a speed hit, not
+				// a correctness one).
+				//
+				// The host prompt cache (--cache-ram) is NOT part of the weights+KV pool this budget measures, so
+				// it must not be charged here: on discrete GPUs it lives in separate system RAM (not the VRAM the
+				// KV occupies), and on Metal the wired-limit fraction (0.66/0.75 of RAM) ALREADY carves out the
+				// ~25-34% of unified memory the host side - prompt cache included - runs in. Subtracting it again
+				// double-counted it, which is what wrongly failed the gate on models that in fact fit (e.g. Gemma
+				// on a 16GB Mac). Only pure CPU, whose budget (usableSystemMemoryBytes) is the single shared pool
+				// the prompt cache also draws from, still reserves for it.
 				const GB = 1024 * 1024 * 1024;
 				const isDiscreteGpu = backend === 'cuda' || backend === 'vulkan';
 				const residentWeights = isDiscreteGpu ? Math.min(modelBytes, offloadBudget) : modelBytes;
-				const promptCacheReserve = isDiscreteGpu ? 0 : 2 * GB;
+				const promptCacheReserve = backend === 'cpu' ? 2 * GB : 0;
 				const canEstimate = fullSwaKvBytesEstimate !== undefined && modelBytes > 0;
 				const headroom = canEstimate
 					? swaFullKvHeadroomBytes({
@@ -3907,6 +3938,16 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 			this._launchedWithSpecFlags.add(modelId);
 		} else {
 			this._launchedWithSpecFlags.delete(modelId);
+		}
+		// Track whether this launch stood up a real DRAFT KV context (separate draft model, or an MTP/next-n
+		// speculative head). Those make /slots save+restore ineffective (see _launchedWithDraftContext), so the
+		// prewarm must warm in-session rather than trust a restored blob. n-gram speculation has no such context.
+		const specTypeIdx = args.indexOf('--spec-type');
+		const specTypeVal = specTypeIdx >= 0 ? args[specTypeIdx + 1] : undefined;
+		if (args.includes('--model-draft') || specTypeVal?.startsWith('draft')) {
+			this._launchedWithDraftContext.add(modelId);
+		} else {
+			this._launchedWithDraftContext.delete(modelId);
 		}
 		// Same bookkeeping for --cache-ram, so an old build's rejection of it can be told apart and self-healed.
 		if (args.includes('--cache-ram')) {

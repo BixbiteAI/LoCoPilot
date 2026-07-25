@@ -1329,18 +1329,11 @@ export class LoCoPilotBuiltInAgent extends Disposable implements IChatAgentImple
 		// Claim SYNCHRONOUSLY (before the async work) so concurrent callers - the other five agent instances,
 		// or the selection trigger racing the server-ready hook - see it taken and skip.
 		LoCoPilotBuiltInAgent._warmedPrefixKeys.add(warmKey);
-		// Build the SAME stable system prompt a real turn uses for this mode. Volatile editor state is
-		// excluded (it lives in the user turn), so this prefix matches the real turn's prefix and hits cache.
 		(async () => {
 			try {
-				// Server is already ready (gated above). Try the persisted slot cache first: on a hit the
-				// prefix KV is already resident, so we skip the (multi-thousand-token) prefill entirely.
-				// The restore is keyed by (model, mode) so a different mode never restores the wrong prefix.
-				const restored = await this.localModelRunner.restoreSlotCache(modelId, warmKey, CancellationToken.None);
-				if (restored) {
-					return;
-				}
-
+				// Build the EXACT stable prefix a real turn uses for this mode FIRST, so the disk cache can be
+				// keyed by its content (diskKey below). Volatile editor state is excluded (it lives in the user
+				// turn), so this prefix matches the real turn's prefix and hits cache.
 				let systemPrompt = this.getDefaultSystemPrompt(modeKind, undefined);
 				// Mirror buildMessages' small-window swap so the warmed prefix matches the real turn.
 				const metadata = this.languageModelsService.lookupLanguageModel(modelId);
@@ -1356,9 +1349,26 @@ export class LoCoPilotBuiltInAgent extends Disposable implements IChatAgentImple
 						systemPrompt = systemPrompt + '\n\n' + workspaceContext;
 					}
 				}
-				await this.unifiedAgent.warmUp(modelId, systemPrompt, CancellationToken.None);
+
+				// Content-tied disk key: the slot cache is keyed by (model, mode, prefix-signature). The
+				// signature changes whenever the system prompt (prompt version, project memory, workspace
+				// facts) OR the tool set changes, so a blob persisted by an earlier session with a DIFFERENT
+				// prefix is simply not found and we re-warm below - instead of restoring a stale blob that
+				// llama.cpp accepts (HTTP 200) but whose tokens don't match the real turn, forcing a full
+				// turn-1 re-prefill. This is what makes the fast turn-1 path self-heal with no manual wipe.
+				const prefix = await this.unifiedAgent.buildWarmPrefix(modelId, systemPrompt);
+				const diskKey = `${warmKey}::${prefix.signature}`;
+
+				// Server is already ready (gated above). Try the matching persisted slot cache first: on a hit
+				// the prefix KV is already resident, so we skip the multi-thousand-token prefill entirely.
+				const restored = await this.localModelRunner.restoreSlotCache(modelId, diskKey, CancellationToken.None);
+				if (restored) {
+					return;
+				}
+
+				await this.unifiedAgent.warmUpWithPrefix(modelId, prefix, CancellationToken.None);
 				// Persist the freshly-warmed prefix KV so a future session can restore it without re-prefilling.
-				await this.localModelRunner.saveSlotCache(modelId, warmKey, CancellationToken.None);
+				await this.localModelRunner.saveSlotCache(modelId, diskKey, CancellationToken.None);
 			} catch (e) {
 				// Warm failed (server crash, etc.) - drop the claim so a later ready can retry. If the crash
 				// tears the server down, _onServerStateChange also clears it; this covers a plain throw.
