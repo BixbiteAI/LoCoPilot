@@ -50,7 +50,7 @@ export function createEditFileToolData(): IToolData {
 			},
 			newString: {
 				type: 'string',
-				description: 'The replacement text for oldString. Change only what differs.'
+				description: 'The replacement text for oldString. Change only what differs. Use an empty string ("") to DELETE the matched text.'
 			},
 			replaceAll: {
 				type: 'boolean',
@@ -153,6 +153,9 @@ export class EditFileTool implements IToolImpl {
 
 	async invoke(invocation: IToolInvocation, _countTokens: CountTokensCallback, progress: ToolProgress, _token: CancellationToken): Promise<IToolResult> {
 		const params = invocation.parameters as IEditFileParams;
+		// Forgiving on a MISSING newString: treat it as "" so a lone oldString means "delete that text"
+		// (a legitimate edit) instead of erroring. oldString stays strict - an empty oldString is rejected.
+		if (typeof params.newString !== 'string') { params.newString = ''; }
 
 		if (invocation.context) {
 			const model = this.chatService.getSession(invocation.context.sessionResource) as ChatModel | undefined;
@@ -175,9 +178,13 @@ export class EditFileTool implements IToolImpl {
 
 			progress.report({ message: buildFileLinkInvocationMessage(localize('editFile.editing', "Editing {0}", '{0}'), fileName, fileUri) });
 
-			// --- Multi-edit batch ---
+			// --- Multi-edit batch --- keep any patch that has a TARGET (oldString or an insert anchor);
+			// a missing newString is coerced to "" (delete for a replace patch; an insert with "" is then
+			// rejected by resolvePatch, which is correct - there is nothing to insert).
 			const editsArray: IEditPatch[] = Array.isArray(params.edits)
-				? params.edits.filter((e): e is IEditPatch => !!e && typeof e.newString === 'string' && (typeof e.oldString === 'string' || typeof e.insertAfter === 'string' || typeof e.insertBefore === 'string'))
+				? params.edits
+					.filter((e): e is IEditPatch => !!e && (typeof e.oldString === 'string' || typeof e.insertAfter === 'string' || typeof e.insertBefore === 'string'))
+					.map(e => ({ ...e, newString: typeof e.newString === 'string' ? e.newString : '' }))
 				: [];
 			if (Array.isArray(params.edits) && editsArray.length === 0) {
 				return { content: [{ kind: 'text', value: `Error: You provided edits[] but no patch was valid. Each patch needs "newString" AND either "oldString" (replace) or "insertAfter"/"insertBefore" (add). Next: resend a well-formed edits[].` }], toolResultError: 'No valid edits' };
@@ -199,7 +206,7 @@ export class EditFileTool implements IToolImpl {
 			}
 
 			// --- Single replace ---
-			const single = resolvePatch(currentContent, { oldString: params.oldString, newString: typeof params.newString === 'string' ? params.newString : '', replaceAll: params.replaceAll }, '');
+			const single = resolvePatch(currentContent, { oldString: params.oldString, newString: params.newString, replaceAll: params.replaceAll }, '');
 			if (hasKey(single, { error: true })) {
 				const firstLine = currentContent.split('\n')[0] ?? '';
 				const hint = firstLine.length > 0 ? `\n\nExact first line of the file (copy for oldString if unsure):\n${JSON.stringify(firstLine)}` : '';

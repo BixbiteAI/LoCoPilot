@@ -191,12 +191,15 @@ export function resolvePatch(content: string, patch: IEditPatch, label: string):
 		return { ranges: anchorRanges, replacementFor: replacementForInsert, lenient: anchorLenient };
 	}
 
+	// Strict on oldString: an empty/missing oldString has nothing to target, so this is always an error
+	// (checked before the identical-strings check so a lone newString gets the clear "provide oldString"
+	// hint). A missing newString, by contrast, is coerced to "" by the caller = delete the matched text.
 	const oldString = patch.oldString ?? '';
+	if (oldString.length === 0) {
+		return { error: `${label}oldString is empty (nothing to replace). Provide the exact text to replace, or use insertCode/createFile.` };
+	}
 	if (oldString === patch.newString) {
 		return { error: `${label}oldString and newString are identical - no change.` };
-	}
-	if (oldString.length === 0) {
-		return { error: `${label}oldString is empty. Provide the text to replace, or use insertAfter/insertBefore to ADD code.` };
 	}
 	let ranges = findExactRanges(content, oldString, patch.replaceAll ?? false);
 	let lenient = false;
