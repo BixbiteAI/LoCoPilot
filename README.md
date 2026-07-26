@@ -14,6 +14,25 @@ LoCoPilot by **Bixbite AI** brings AI pair programming to your desktop. Use loca
 
 ---
 
+## See it in action
+
+Real games built by LoCoPilot in **Agent mode** — prompt to playable, fully offline.
+
+<table>
+  <tr>
+    <td align="center" width="50%">
+      <img src="media/Mario.gif" alt="LoCoPilot generating a platformer game" width="100%"/>
+      <br/><sub><b>Platformer game</b> — generated from a single prompt</sub>
+    </td>
+    <td align="center" width="50%">
+      <img src="media/RouletteGame.gif" alt="LoCoPilot building and enhancing a roulette game" width="100%"/>
+      <br/><sub><b>Roulette game</b> — built and visually enhanced by the agent</sub>
+    </td>
+  </tr>
+</table>
+
+---
+
 ## Why LoCoPilot?
 
 
