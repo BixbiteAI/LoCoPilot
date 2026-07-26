@@ -27,6 +27,7 @@ import { IStorageService } from '../../../../platform/storage/common/storage.js'
 import { getReasoningEffort, reasoningBudgetTokens, ReasoningEffort } from '../common/locopilotReasoningEffort.js';
 import { ICustomLanguageModelsService, ICustomLanguageModel, getCustomModelListLabel, deriveTokenLimits, defaultContextWindow, TOOL_FAILURE_DISABLE_THRESHOLD, customModelSupportsVision, LOCOPILOT_AUTO_MODEL_ID } from '../common/customLanguageModelsService.js';
 import { AGENT_LOOP_EXCLUDED_TOOL_IDS, LOCAL_MODEL_EXCLUDED_TOOL_IDS, isToolExcluded } from '../common/tools/builtinTools/agentToolPolicy.js';
+import { parseToolCallArguments } from '../common/tools/partialJsonInput.js';
 import { IChatMessage, ILanguageModelChatInfoOptions, ILanguageModelChatMetadataAndIdentifier, ILanguageModelChatProvider, ILanguageModelChatResponse, ILanguageModelsService, IChatResponsePart, ChatMessageRole } from '../common/languageModels.js';
 import { IWorkbenchContribution } from '../../../common/contributions.js';
 import { LOCOPILOT_SETTINGS_SECTION_LIST_MODELS } from './chatManagement/locopilotSettingsEditorInput.js';
@@ -674,12 +675,9 @@ export class LoCoPilotLanguageModelProvider extends Disposable implements ILangu
 			if (!name || typeof name !== 'string') { return; }
 			const trimmedName = name.trim();
 			if (!trimmedName) { return; }
-			let parameters: Record<string, unknown> = {};
-			if (rawArgs && typeof rawArgs === 'object') {
-				parameters = rawArgs as Record<string, unknown>;
-			} else if (typeof rawArgs === 'string' && rawArgs.trim()) {
-				try { parameters = JSON.parse(rawArgs); } catch { parameters = {}; }
-			}
+			// Tolerant parse: recovers a big file/code argument whose escaping is slightly off (raw newlines,
+			// truncation) instead of collapsing to {} - see parseToolCallArguments.
+			const parameters: Record<string, unknown> = parseToolCallArguments(rawArgs);
 			out.push({ name: trimmedName, parameters });
 		};
 
@@ -967,7 +965,7 @@ export class LoCoPilotLanguageModelProvider extends Disposable implements ILangu
 						const acc = accumulatedToolCalls.get(idx)!;
 						if (acc.id && acc.name) {
 							try {
-								const parameters = acc.args ? JSON.parse(acc.args) : {};
+								const parameters = parseToolCallArguments(acc.args);
 								stream.emitOne({
 									type: 'tool_use',
 									name: acc.name,
@@ -1081,14 +1079,7 @@ export class LoCoPilotLanguageModelProvider extends Disposable implements ILangu
 									pendingToolUse = { id: toolUse.id, name: toolUse.name };
 									inputJsonAccum = '';
 								} else if (json.type === 'content_block_stop' && pendingToolUse) {
-									let parameters: object = {};
-									if (inputJsonAccum.trim()) {
-										try {
-											parameters = JSON.parse(inputJsonAccum) as object;
-										} catch {
-											// partial JSON may be incomplete; use empty object
-										}
-									}
+									const parameters: object = parseToolCallArguments(inputJsonAccum);
 									stream.emitOne({
 										type: 'tool_use',
 										name: pendingToolUse.name,
@@ -1566,7 +1557,7 @@ export class LoCoPilotLanguageModelProvider extends Disposable implements ILangu
 				const acc = accumulatedToolCalls.get(idx)!;
 				if (acc.id && acc.name) {
 					try {
-						stream.emitOne({ type: 'tool_use', name: acc.name, toolCallId: acc.id, parameters: acc.args ? JSON.parse(acc.args) : {} });
+						stream.emitOne({ type: 'tool_use', name: acc.name, toolCallId: acc.id, parameters: parseToolCallArguments(acc.args) });
 					} catch {
 						stream.emitOne({ type: 'tool_use', name: acc.name, toolCallId: acc.id, parameters: {} });
 					}
@@ -1755,7 +1746,7 @@ export class LoCoPilotLanguageModelProvider extends Disposable implements ILangu
 				const acc = accumulatedToolCalls.get(idx)!;
 				if (acc.id && acc.name) {
 					try {
-						stream.emitOne({ type: 'tool_use', name: acc.name, toolCallId: acc.id, parameters: acc.args ? JSON.parse(acc.args) : {} });
+						stream.emitOne({ type: 'tool_use', name: acc.name, toolCallId: acc.id, parameters: parseToolCallArguments(acc.args) });
 					} catch (_e) {
 						stream.emitOne({ type: 'tool_use', name: acc.name, toolCallId: acc.id, parameters: {} });
 					}
@@ -1996,7 +1987,7 @@ export class LoCoPilotLanguageModelProvider extends Disposable implements ILangu
 				const acc = accumulatedToolCalls.get(idx)!;
 				if (acc.id && acc.name) {
 					try {
-						stream.emitOne({ type: 'tool_use', name: acc.name, toolCallId: acc.id, parameters: acc.args ? JSON.parse(acc.args) : {} });
+						stream.emitOne({ type: 'tool_use', name: acc.name, toolCallId: acc.id, parameters: parseToolCallArguments(acc.args) });
 					} catch {
 						stream.emitOne({ type: 'tool_use', name: acc.name, toolCallId: acc.id, parameters: {} });
 					}

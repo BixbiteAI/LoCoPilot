@@ -93,3 +93,61 @@ function tryParseObject(text: string): Record<string, unknown> | undefined {
 		return undefined;
 	}
 }
+
+/**
+ * Escape RAW control characters that appear INSIDE JSON string values. Small models emitting code as a
+ * tool argument routinely write literal newlines/tabs (and other control chars) directly into the string
+ * instead of `\n`/`\t`, which strict JSON.parse rejects ("Bad control character in string literal"). This
+ * walks the text tracking string vs structure (respecting backslash escapes) and rewrites those raw chars
+ * to their valid JSON escapes, leaving everything outside strings untouched.
+ */
+function escapeRawControlCharsInStrings(s: string): string {
+	let out = '';
+	let inString = false;
+	let escaped = false;
+	for (let i = 0; i < s.length; i++) {
+		const ch = s[i];
+		const code = s.charCodeAt(i);
+		if (inString) {
+			if (escaped) { out += ch; escaped = false; continue; }
+			if (ch === '\\') { out += ch; escaped = true; continue; }
+			if (ch === '"') { out += ch; inString = false; continue; }
+			if (code === 0x0a) { out += '\\n'; continue; }
+			if (code === 0x0d) { out += '\\r'; continue; }
+			if (code === 0x09) { out += '\\t'; continue; }
+			if (code < 0x20) { out += '\\u' + code.toString(16).padStart(4, '0'); continue; }
+			out += ch;
+		} else {
+			if (ch === '"') { inString = true; }
+			out += ch;
+		}
+	}
+	return out;
+}
+
+/**
+ * Tolerant parse of a COMPLETE tool-call `arguments` string. Strict JSON first; then repair raw control
+ * chars inside strings (the dominant failure when a model emits a whole file/code blob as one argument);
+ * then fall back to the streaming partial-JSON repair (handles truncation - a file cut off by the output
+ * token limit). Never throws - returns `{}` only when nothing at all could be recovered. This lets a big
+ * `createFile`/`editFile` payload with slightly malformed escaping still yield its `path` + content instead
+ * of collapsing to an empty object (which surfaced to the model as a misleading "path is required" error).
+ */
+export function parseToolCallArguments(raw: unknown): Record<string, unknown> {
+	if (raw && typeof raw === 'object' && !Array.isArray(raw)) {
+		return raw as Record<string, unknown>;
+	}
+	if (typeof raw !== 'string' || !raw.trim()) {
+		return {};
+	}
+	const strict = tryParseObject(raw);
+	if (strict) { return strict; }
+
+	const repaired = escapeRawControlCharsInStrings(raw);
+	if (repaired !== raw) {
+		const fixed = tryParseObject(repaired);
+		if (fixed) { return fixed; }
+	}
+
+	return parsePartialJsonObject(raw) ?? parsePartialJsonObject(repaired) ?? {};
+}
