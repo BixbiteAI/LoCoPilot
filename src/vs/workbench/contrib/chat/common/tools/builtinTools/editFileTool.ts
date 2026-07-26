@@ -90,7 +90,7 @@ export class EditTool implements IToolImpl {
 		const editSession = model.editingSession;
 		if (!editSession) {
 			return {
-				content: [{ kind: 'text', value: 'Error: This tool must be called from within an editing session. Next: Start a chat in agent/edit mode with editing enabled, or use modifyFile for file edits.' }],
+				content: [{ kind: 'text', value: 'Error: This tool must be called from within an editing session. Next: Start a chat in agent/edit mode with editing enabled, or use editFile for file edits.' }],
 				toolResultError: 'No editing session'
 			};
 		}
@@ -119,7 +119,7 @@ export class EditTool implements IToolImpl {
 
 		if (result?.errorMessage) {
 			return {
-				content: [{ kind: 'text', value: `Error: ${result.errorMessage}. Next: Fix the code mapping (ensure code blocks reference valid locations), or use modifyFile with readFile for direct string edits.` }],
+				content: [{ kind: 'text', value: `Error: ${result.errorMessage}. Next: Fix the code mapping (ensure code blocks reference valid locations), or use editFile with readFile for direct string edits.` }],
 				toolResultError: result.errorMessage
 			};
 		}

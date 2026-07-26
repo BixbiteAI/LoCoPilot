@@ -133,7 +133,7 @@ export class RunSubagentTool extends Disposable implements IToolImpl {
 			// Get the default agent
 			const defaultAgent = this.chatAgentService.getDefaultAgent(ChatAgentLocation.Chat, ChatModeKind.Agent);
 			if (!defaultAgent) {
-				return createToolSimpleTextResult('Error: No default agent available. Next: Perform the task yourself using readFile, grep, findFiles, modifyFile, and other tools.');
+				return createToolSimpleTextResult('Error: No default agent available. Next: Perform the task yourself using readFile, grep, findFiles, editFile, and other tools.');
 			}
 
 			// Resolve mode-specific configuration if subagentId is provided
@@ -260,7 +260,7 @@ export class RunSubagentTool extends Disposable implements IToolImpl {
 
 			// Check for errors
 			if (result.errorDetails) {
-				return createToolSimpleTextResult(`Agent error: ${result.errorDetails.message}. Next: Summarize the error for the user, retry with a clearer prompt, or perform the task yourself using other tools (readFile, grep, modifyFile, etc.).`);
+				return createToolSimpleTextResult(`Agent error: ${result.errorDetails.message}. Next: Summarize the error for the user, retry with a clearer prompt, or perform the task yourself using other tools (readFile, grep, editFile, etc.).`);
 			}
 
 			const resultText = markdownParts.join('') || 'Agent completed with no output';
@@ -273,7 +273,7 @@ export class RunSubagentTool extends Disposable implements IToolImpl {
 			return createToolSimpleTextResult(resultText + '\n\nProceed to the next step or goal.');
 
 		} catch (error) {
-			const errorMessage = `Error invoking subagent: ${error instanceof Error ? error.message : 'Unknown error'}. Next: Retry with a simpler or more specific prompt, or perform the task yourself using readFile, grep, findFiles, modifyFile, etc.`;
+			const errorMessage = `Error invoking subagent: ${error instanceof Error ? error.message : 'Unknown error'}. Next: Retry with a simpler or more specific prompt, or perform the task yourself using readFile, grep, findFiles, editFile, etc.`;
 			this.logService.error(errorMessage, error);
 			return createToolSimpleTextResult(errorMessage);
 		}

@@ -64,7 +64,7 @@ export function createReadFileToolData(): IToolData {
 		icon: ThemeIcon.fromId(Codicon.file.id),
 		displayName: localize('tool.readFile.displayName', 'Read file contents'),
 		userDescription: localize('tool.readFile.userDescription', 'Read the contents of a file (raw text for use with edits)'),
-		modelDescription: 'Read file contents from the workspace. Returns RAW file text (no line number prefixes) so you can copy it exactly for modifyFile oldString.\n\n**Ways to call:**\n1. **Complete file**: readFile(path) - returns the full file. Use when you need the entire contents (e.g. small config, full module). Files with more than 1000 lines cannot be read in full; the tool returns an error - use (2) for those.\n2. **Specific lines**: readFile(path, offset, limit) - returns only the requested line range. offset = 1-based start line, limit = max lines to return (capped at 1000 per read). Examples: readFile(path, 1, 200) for first 200 lines; readFile(path, 50, 100) for lines 50-149. Use when you need only a section or when the file is large; grep/readLints can give you line numbers.\n\nUse this tool to: examine file contents before edits; copy exact text for modifyFile oldString; read a specific block when you know the line range. Path can be absolute or relative to workspace root.\n\nHandles: text files (raw content); image files (png, jpg, gif, etc. - returns the image for vision so you can describe or analyze it; max 5MB); binary files (returns "[Binary file]"); missing files (clear error); files >1000 lines without offset/limit (error asking you to use offset and limit).',
+		modelDescription: 'Read file contents from the workspace. Returns RAW file text (no line number prefixes) so you can copy it exactly for editFile oldString.\n\n**Ways to call:**\n1. **Complete file**: readFile(path) - returns the full file. Use when you need the entire contents (e.g. small config, full module). Files with more than 1000 lines cannot be read in full; the tool returns an error - use (2) for those.\n2. **Specific lines**: readFile(path, offset, limit) - returns only the requested line range. offset = 1-based start line, limit = max lines to return (capped at 1000 per read). Examples: readFile(path, 1, 200) for first 200 lines; readFile(path, 50, 100) for lines 50-149. Use when you need only a section or when the file is large; grep/readLints can give you line numbers.\n\nUse this tool to: examine file contents before edits; copy exact text for editFile oldString; read a specific block when you know the line range. Path can be absolute or relative to workspace root.\n\nHandles: text files (raw content); image files (png, jpg, gif, etc. - returns the image for vision so you can describe or analyze it; max 5MB); binary files (returns "[Binary file]"); missing files (clear error); files >1000 lines without offset/limit (error asking you to use offset and limit).',
 		source: ToolDataSource.Internal,
 		inputSchema: inputSchema,
 		alwaysDisplayInputOutput: true
@@ -145,11 +145,11 @@ export class ReadFileTool implements IToolImpl {
 			const isBinary = content.includes('\0');
 			if (isBinary) {
 				return {
-					content: [{ kind: 'text', value: `File "${params.path}" is a binary file (${stat.size} bytes). Next: You cannot edit binary files with modifyFile; skip this file or inform the user.` }]
+					content: [{ kind: 'text', value: `File "${params.path}" is a binary file (${stat.size} bytes). Next: You cannot edit binary files with editFile; skip this file or inform the user.` }]
 				};
 			}
 
-			// Return raw content (no line numbers) so LLM can copy exactly for modifyFile oldString
+			// Return raw content (no line numbers) so LLM can copy exactly for editFile oldString
 			const lines = content.split('\n');
 			const totalLines = lines.length;
 

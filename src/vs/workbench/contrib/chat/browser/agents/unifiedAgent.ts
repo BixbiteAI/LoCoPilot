@@ -56,7 +56,7 @@ const SEMANTIC_ERROR_CORRECTION_THRESHOLD = 2;
 const NO_PROGRESS_REORIENT_THRESHOLD = 3;
 
 /** Tool ids that mutate the workspace - a successful call to one of these counts as real progress. */
-const MUTATING_TOOL_IDS = new Set<string>(['modifyFile', 'editFile_internal']);
+const MUTATING_TOOL_IDS = new Set<string>(['createFile', 'editFile', 'insertCode', 'modifyFile', 'editFile_internal']);
 
 /**
  * Tool ids that are safe to run concurrently within a single agent turn: read-only inspection
@@ -1041,9 +1041,9 @@ export class UnifiedAgent {
 		const lower = (errorText || '').toLowerCase();
 		let specific = '';
 		if (lower.includes('not a directory') || lower.includes('already exists but is not a directory')) {
-			specific = ' ROOT CAUSE: a path you are treating as a folder already exists as a FILE. Do NOT keep retrying writes. Either delete that file first (run_in_terminal with `rm <path>`) and retry, or just write your target file directly (modifyFile with path like `dir/file.ext` creates parent folders automatically - there is no separate mkdir step).';
-		} else if (toolId === 'modifyFile' && lower.includes('string not found')) {
-			specific = ' ROOT CAUSE: your oldString does not match the file. Call readFile to get the exact current text and copy it character-for-character, or use the exact hint from the error - do not guess again.';
+			specific = ' ROOT CAUSE: a path you are treating as a folder already exists as a FILE. Do NOT keep retrying writes. Either delete that file first (run_in_terminal with `rm <path>`) and retry, or just write your target file directly (createFile with path like `dir/file.ext` creates parent folders automatically - there is no separate mkdir step).';
+		} else if ((toolId === 'editFile' || toolId === 'modifyFile' || toolId === 'insertCode') && (lower.includes('string not found') || lower.includes('anchor for insertion not found'))) {
+			specific = ' ROOT CAUSE: your oldString/anchor does not match the file. Call readFile to get the exact current text and copy it character-for-character - do not guess again.';
 		} else if (lower.includes('no workspace folder')) {
 			specific = ' ROOT CAUSE: no folder is open. Stop retrying; tell the user to open a folder.';
 		}

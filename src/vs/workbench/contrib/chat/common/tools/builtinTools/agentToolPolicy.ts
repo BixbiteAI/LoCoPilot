@@ -50,7 +50,10 @@ export const AGENT_LOOP_EXCLUDED_TOOL_IDS: ReadonlySet<string> = new Set([
  * mode legitimately allows read-only commands); its own confirmation UI gates side effects.
  */
 export const EDIT_TOOL_IDS: ReadonlySet<string> = new Set([
-	'modifyFile',
+	'createFile',
+	'editFile',
+	'insertCode',
+	'modifyFile', // legacy single tool (dormant, kept for easy re-enable)
 	'editFile_internal',
 	'create_and_run_task',
 ].map(bareName));

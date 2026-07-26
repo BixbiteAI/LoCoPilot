@@ -20,10 +20,16 @@ import { createFindFilesToolData, FindFilesTool } from './findFilesTool.js';
 // grep (e.g. pattern "function|class|def|export"). Re-enable the import + registration below if
 // a dedicated outline tool is wanted again.
 // import { createOutlineToolData, OutlineTool } from './outlineTool.js';
-// Enable createFile for more tools if desired (LLM does not see it when commented out)
-// import { createCreateFileToolData, CreateFileTool } from './createFileTool.js';
+// stringReplace: superseded by the split editFile tool below (kept for reference, not registered).
 // import { createStringReplaceToolData, StringReplaceTool } from './stringReplaceTool.js';
-import { createModifyFileToolData, ModifyFileTool } from './modifyFileTool.js';
+// modifyFile: the old single mega-tool (create + overwrite + replace + insert + multi-edit in one). It
+// was split into the three focused tools below (createFile / editFile / insertCode) so small local models
+// get one fixed signature per action instead of an 8-param, 4-mode schema. Kept + importable so it can be
+// re-enabled by uncommenting the import + registration if the single-tool approach is wanted again.
+// import { createModifyFileToolData, ModifyFileTool } from './modifyFileTool.js';
+import { createCreateFileToolData, CreateFileTool } from './createFileTool.js';
+import { createEditFileToolData, EditFileTool } from './fileEditTool.js';
+import { createInsertCodeToolData, InsertCodeTool } from './insertCodeTool.js';
 import { createWebSearchToolData, WebSearchTool } from './webSearchTool.js';
 
 export class BuiltinToolsContribution extends Disposable implements IWorkbenchContribution {
@@ -62,15 +68,19 @@ export class BuiltinToolsContribution extends Disposable implements IWorkbenchCo
 		const webSearchTool = instantiationService.createInstance(WebSearchTool);
 		this._register(toolsService.registerTool(createWebSearchToolData(), webSearchTool));
 
-		// Register write/edit tools - modifyFile handles create + full replace + partial replace
-		// createFile: commented out so LLM uses modifyFile(path, "", contents) to create files
-		// const createFileTool = instantiationService.createInstance(CreateFileTool);
-		// this._register(toolsService.registerTool(createCreateFileToolData(), createFileTool));
-		// stringReplace: commented out so LLM uses modifyFile for all edits
-		// const stringReplaceTool = instantiationService.createInstance(StringReplaceTool);
-		// this._register(toolsService.registerTool(createStringReplaceToolData(), stringReplaceTool));
-		const modifyFileTool = instantiationService.createInstance(ModifyFileTool);
-		this._register(toolsService.registerTool(createModifyFileToolData(), modifyFileTool));
+		// Register write/edit tools - split into three focused, fixed-signature tools:
+		//   createFile  -> write a whole file (create / overwrite)
+		//   editFile    -> change text in an existing file (single replace OR atomic multi-edit batch)
+		//   insertCode  -> add code next to an anchor line (no replacement)
+		// To go back to the single mega-tool, comment these three out and uncomment modifyFile (import above).
+		const createFileTool = instantiationService.createInstance(CreateFileTool);
+		this._register(toolsService.registerTool(createCreateFileToolData(), createFileTool));
+		const editFileTool = instantiationService.createInstance(EditFileTool);
+		this._register(toolsService.registerTool(createEditFileToolData(), editFileTool));
+		const insertCodeTool = instantiationService.createInstance(InsertCodeTool);
+		this._register(toolsService.registerTool(createInsertCodeToolData(), insertCodeTool));
+		// const modifyFileTool = instantiationService.createInstance(ModifyFileTool);
+		// this._register(toolsService.registerTool(createModifyFileToolData(), modifyFileTool));
 
 		const editTool = instantiationService.createInstance(EditTool);
 		this._register(toolsService.registerTool(EditToolData, editTool));

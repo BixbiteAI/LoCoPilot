@@ -1766,7 +1766,8 @@ Preserve: key facts, decisions, code changes, file names and paths, user prefere
 		context += `- **Search code:** Use \`grep\` to search for patterns\n`;
 		context += `- **Find files:** Use \`findFiles\` to locate files by name\n`;
 		context += `- **List directories:** Use \`listDirectory\` to explore structure\n`;
-		context += `- **Modify code:** Use \`modifyFile\` to create or edit files (path, oldString, newString; use oldString "" to create or overwrite entire file)\n`;
+		context += `- **Write files:** Use \`createFile\` (path, content) to create or overwrite a whole file\n`;
+		context += `- **Edit files:** Use \`editFile\` (path, oldString, newString) to change existing text; \`insertCode\` (path, insertAfter, newString) to add code\n`;
 		context += `- **Run commands:** Use \`run_in_terminal\` to execute shell commands\n\n`;
 		context += `**Start by exploring the codebase to understand its structure before making changes.**\n`;
 
