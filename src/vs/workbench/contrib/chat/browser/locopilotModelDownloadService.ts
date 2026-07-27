@@ -568,7 +568,22 @@ export class LoCoPilotModelDownloadService extends Disposable implements IWorkbe
 	}
 
 	cancelModelDownload(modelId: string): void {
-		this._downloadTokens.get(modelId)?.cancel();
+		const token = this._downloadTokens.get(modelId);
+		if (token) {
+			token.cancel();
+			return;
+		}
+		// No live download token, yet the row is showing "Stop download": the flag is stale (the download
+		// wedged and its token was lost - e.g. the network dropped mid-stream, or the app was reloaded while
+		// this window kept a persisted `isDownloading`). Cancel here would be a no-op, leaving the button
+		// stuck forever, so self-heal the state directly and clean up any partial files. This lets the row
+		// fall back to "Download" so the user can retry without restarting.
+		const model = this.customLanguageModelsService.getCustomModels().find(m => m.id === modelId);
+		if (!model || !model.isDownloading) {
+			return;
+		}
+		this._log(`[LoCoPilot Download] Stop download for ${model.modelName}: no active download token; clearing stale in-progress state.`);
+		void this.removeModelDownload(modelId);
 	}
 
 	/**

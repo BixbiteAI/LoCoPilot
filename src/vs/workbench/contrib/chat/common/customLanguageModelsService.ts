@@ -309,6 +309,13 @@ export class CustomLanguageModelsService extends Disposable implements ICustomLa
 			// Ensure hidden and token limits exist for backward compatibility
 			this.models = this.models.map(m => ({
 				...m,
+				// A download only ever runs in-memory (its cancellation token does not survive a process
+				// restart), so any model still flagged `isDownloading` in persisted storage is stale - the
+				// download died when the app last closed / crashed / lost the network. Clear it on load so the
+				// row reverts to a "Download" button the user can click to start again, instead of getting stuck
+				// on a "Stop download" button whose cancel is a no-op (no live token to cancel).
+				isDownloading: false,
+				downloadProgress: m.isDownloading ? undefined : m.downloadProgress,
 				hidden: m.hidden ?? false,
 				useNativeTools: m.useNativeTools ?? true,
 				mtp: m.mtp ?? false,
