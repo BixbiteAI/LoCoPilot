@@ -411,16 +411,9 @@
 	animation: model-item-pulse 0.7s ease-in-out 3;
 }
 
-/* "Hide" button: accented - model is visible, clicking will hide it; draw attention so user knows it's an action */
+/* "Hide" button: plain secondary style, matching the other action buttons */
 .model-action-hide .monaco-button.model-btn-hide {
-	border-color: var(--vscode-focusBorder);
-	color: var(--vscode-button-foreground);
-	background-color: var(--vscode-button-background);
 	opacity: 1;
-}
-
-.model-action-hide .monaco-button.model-btn-hide:hover {
-	background-color: var(--vscode-button-hoverBackground);
 }
 
 /* "Show" button: muted/ghost - model is already hidden, low-key until hovered */

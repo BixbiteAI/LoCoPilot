@@ -31,6 +31,7 @@ import {
 	buildExpertOffloadOverride,
 	computeKvBudgetBytes,
 	clampContextSize,
+	kvCacheBytesForContext,
 	selectAutomaticKvCache,
 	shouldUseBundledVulkan,
 	metalOffloadBudgetBytes,
@@ -41,6 +42,8 @@ import {
 	runtimeOverheadBytesForTuning,
 	DEFAULT_LLAMA_CONTEXT_SIZE,
 	MIN_CLAMPED_CONTEXT,
+	MAX_CLAMPED_CONTEXT,
+	TARGET_MIN_CONTEXT,
 	LOCOPILOT_LLAMA_SERVER_PORT,
 	LlamaBackend,
 	resolveKvCacheType,
@@ -438,6 +441,11 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 	private readonly _oomContextCap = new Map<string, number>();
 	/** Models whose OOM ladder also strips the memory-heavy extras (MTP self-draft / separate draft model). */
 	private readonly _oomStripExtras = new Set<string>();
+	/**
+	 * Models we've already shown the plain-language "tight fit - context below the comfort floor" notice for,
+	 * so a relaunch (OOM ladder, prewarm) or a later turn doesn't nag the user again this session.
+	 */
+	private readonly _tightContextNoticed = new Set<string>();
 	/**
 	 * Models whose GPU backend wedged at compute while the process stayed alive (Metal command-buffer OOM ->
 	 * "backend is in error state"). Latched so {@link _handleWedgedBackend} tears down + relaunches ONCE per
@@ -1546,7 +1554,16 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 				const perTokenPerLayer = kvBytesPerTokenPerLayer(info, 2); // f16 k+v; conservative for a budget
 				const layers = info.layerCount && info.layerCount > 0 ? info.layerCount : 32;
 				if (perTokenPerLayer && perTokenPerLayer > 0) {
-					return ctxTokens * perTokenPerLayer * layers;
+					// Windowed-aware, matching the clamp / fit gate: a sliding-window model's SWA layers hold only
+					// `window` tokens, so the old all-layers-full estimate over-counted KV (now amplified because the
+					// windowing fix lets these models launch at a much larger context) and over-evicted peers. Assume
+					// windowed (swa-full off) - the common case on the memory-tight machines where eviction matters.
+					return kvCacheBytesForContext({
+						contextTokens: ctxTokens,
+						layerCount: layers,
+						kvBytesPerTokenPerLayer: perTokenPerLayer,
+						slidingWindow: info.slidingWindow,
+					});
 				}
 			} catch {
 				// fall through to the flat fallback below
@@ -2170,6 +2187,10 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 					kvBudgetBytes,
 					layerCount: clampLayerCount,
 					kvBytesPerTokenPerLayerF16: f16PerTokenPerLayer,
+					// Sliding-window models size KV windowed unless --swa-full is force-ON at clamp time (it's
+					// decided AFTER this, so 'undefined' means windowed - the swa-full gate below re-checks fit).
+					slidingWindow: info.slidingWindow,
+					swaFullOnAllLayers: tuning.swaFull === true,
 				});
 				resolvedKvType = selection.kvCacheType;
 				clamped = selection.contextSize;
@@ -2183,6 +2204,8 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 					kvBudgetBytes,
 					layerCount: clampLayerCount,
 					kvBytesPerTokenPerLayer: fixedPerTokenPerLayer,
+					slidingWindow: info.slidingWindow,
+					swaFullOnAllLayers: tuning.swaFull === true,
 				});
 			}
 			const perTokenPerLayer = f16PerTokenPerLayer * kvCacheBytesPerElem(resolvedKvType) / kvCacheBytesPerElem('f16');
@@ -2213,23 +2236,18 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 			// gemma-4 whose sliding_window key we don't capture). llama.cpp harmlessly ignores it on non-SWA models,
 			// and if a build rejects the flag by name the launch-crash fallback strips it. 'auto' still needs a
 			// positively-detected SWA model + a memory budget AND enough room for the full-size KV cache.
-			if (mode === 'on') {
-				tuning.swaFull = true;
-				this._log(`[LoCoPilot Runner] Forcing --swa-full (mode=on, detectedSwa=${isSwaModelInfo(info)}, window=${info.slidingWindow ?? 'n/a'}).`);
-			} else if (mode === 'auto' && isSwaModelInfo(info) && budget !== undefined && budget > 0) {
-				// Headroom gate: verify the full-size SWA KV cache fits alongside the resident weights, base
-				// runtime overhead AND a margin for the warm-up compute graph (the peak neither our clamp nor
-				// llama's -fit fully models). If it doesn't, keep the far smaller WINDOWED SWA cache - the model
-				// still runs at the same big context, it just re-processes the prompt each turn (a speed hit, not
-				// a correctness one).
-				//
-				// The host prompt cache (--cache-ram) is NOT part of the weights+KV pool this budget measures, so
-				// it must not be charged here: on discrete GPUs it lives in separate system RAM (not the VRAM the
-				// KV occupies), and on Metal the wired-limit fraction (0.66/0.75 of RAM) ALREADY carves out the
-				// ~25-34% of unified memory the host side - prompt cache included - runs in. Subtracting it again
-				// double-counted it, which is what wrongly failed the gate on models that in fact fit (e.g. Gemma
-				// on a 16GB Mac). Only pure CPU, whose budget (usableSystemMemoryBytes) is the single shared pool
-				// the prompt cache also draws from, still reserves for it.
+			// Headroom gate applies to BOTH 'auto' and 'on'. 'on' overrides our SWA *detection* (so a newer arch we
+			// don't sniff still gets it) but NOT the memory budget: forcing a full-size KV that doesn't fit is exactly
+			// what inflates the launch fit estimate into a scary "doesn't fit" popup for a model that runs fine
+			// windowed. So we only enable --swa-full when the full cache genuinely fits; the model still runs at the
+			// same big context windowed, just re-processing the prompt each turn (a speed hit, not a correctness one).
+			// Only when we truly CAN'T size the cache does an explicit 'on' win unconditionally.
+			//
+			// The host prompt cache (--cache-ram) is NOT part of the weights+KV pool this budget measures: on discrete
+			// GPUs it lives in separate system RAM, and on Metal the wired-limit fraction already carves out the host
+			// share. Only pure CPU, whose budget is the single shared pool the prompt cache also draws from, reserves it.
+			const wantSwaFull = mode === 'on' || (mode === 'auto' && isSwaModelInfo(info));
+			if (wantSwaFull && budget !== undefined && budget > 0) {
 				const GB = 1024 * 1024 * 1024;
 				const isDiscreteGpu = backend === 'cuda' || backend === 'vulkan';
 				const residentWeights = isDiscreteGpu ? Math.min(modelBytes, offloadBudget) : modelBytes;
@@ -2246,10 +2264,18 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 					: -1;
 				if (canEstimate && headroom >= 0) {
 					tuning.swaFull = true;
-					this._log(`[LoCoPilot Runner] SWA model (window ${info.slidingWindow}); enabling --swa-full - full-size SWA KV ~${(fullSwaKvBytesEstimate! / GB).toFixed(1)}GB fits with ~${(headroom / GB).toFixed(1)}GB headroom (mode=auto).`);
+					this._log(`[LoCoPilot Runner] SWA model (window ${info.slidingWindow}); enabling --swa-full (mode=${mode}) - full-size SWA KV ~${(fullSwaKvBytesEstimate! / GB).toFixed(1)}GB fits with ~${(headroom / GB).toFixed(1)}GB headroom.`);
+				} else if (!canEstimate && mode === 'on') {
+					// Can't size the cache (unknown geometry) and the user explicitly forced it: honor the force.
+					tuning.swaFull = true;
+					this._log(`[LoCoPilot Runner] Forcing --swa-full (mode=on) - cache size unknown, honoring the explicit setting.`);
 				} else {
-					this._log(`[LoCoPilot Runner] SWA model (window ${info.slidingWindow}); keeping WINDOWED SWA cache - forcing --swa-full would need full-size KV ~${canEstimate ? (fullSwaKvBytesEstimate! / GB).toFixed(1) + 'GB' : 'unknown'} that doesn't fit the budget with margin (headroom ~${(headroom / GB).toFixed(1)}GB). Cross-turn prompt-cache reuse is off, but the model fits (mode=auto).`);
+					this._log(`[LoCoPilot Runner] SWA model (window ${info.slidingWindow}); keeping WINDOWED SWA cache (mode=${mode}) - the full-size KV ~${canEstimate ? (fullSwaKvBytesEstimate! / GB).toFixed(1) + 'GB' : 'unknown'} doesn't fit the budget with margin (headroom ~${(headroom / GB).toFixed(1)}GB). Cross-turn reuse is off, but the model fits and won't over-warn at launch.`);
 				}
+			} else if (wantSwaFull && mode === 'on') {
+				// No memory budget known at all (e.g. web) but explicitly forced: honor it.
+				tuning.swaFull = true;
+				this._log(`[LoCoPilot Runner] Forcing --swa-full (mode=on) - no memory budget to check against.`);
 			}
 		}
 
@@ -2332,7 +2358,16 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 		const perTokenPerLayer = (info && kvBytesPerTokenPerLayer(info, kvBytesPerElement))
 			|| DEFAULT_KV_BYTES_PER_TOKEN_PER_LAYER_F16 * kvBytesPerElement / kvCacheBytesPerElem('f16');
 		const layerCount = info?.layerCount && info.layerCount > 0 ? info.layerCount : 32;
-		const kvBytes = contextTokens * perTokenPerLayer * layerCount;
+		// Windowed-aware KV: a sliding-window model with --swa-full off holds only `window` tokens on its SWA
+		// layers, so its real footprint is far below `contextTokens * perTok * allLayers`. Mirror the clamp so
+		// the gate doesn't reject the large windowed context the clamp granted. swaFull true => full on all layers.
+		const kvBytes = kvCacheBytesForContext({
+			contextTokens,
+			layerCount,
+			kvBytesPerTokenPerLayer: perTokenPerLayer,
+			slidingWindow: info?.slidingWindow,
+			swaFullOnAllLayers: tuning?.swaFull === true,
+		});
 		const runtimeOverhead = tuning
 			? runtimeOverheadBytesForTuning(tuning, backend)
 			: RUNTIME_OVERHEAD_BYTES;
@@ -2437,6 +2472,23 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 			const haveGb = Math.max(1, Math.round(fit.usableBytes / GB));
 			this._log(`[LoCoPilot Runner] ${modelId} exceeds usable RAM: needs ~${needGb}GB but only ~${haveGb}GB is usable on this machine (interactive=${interactive}).`);
 			const name = model.displayName || model.modelName;
+			// B: the Metal budget above is a CONSERVATIVE wired fraction that sits below the device's true working-set
+			// ceiling, and the runtime watchdog is the real backstop - so a SMALL overage of that budget is not a
+			// genuine "won't fit". Only raise the strong Run-anyway dialog on a CLEAR overflow past a tolerance band
+			// that approximates the real ceiling; within the band, launch and surface the plain-language tight-fit
+			// notice instead. (Metal's fraction understates the ceiling more than the already-realistic CPU/VRAM ones.)
+			const fitTolerance = backend === 'metal' ? 0.18 : 0.05;
+			if (interactive && fit.requiredBytes <= fit.usableBytes * (1 + fitTolerance)) {
+				this._log(`[LoCoPilot Runner] ${modelId} marginally over the conservative budget (~${needGb}GB vs ~${haveGb}GB, within ${Math.round(fitTolerance * 100)}%); launching with a soft notice - the watchdog is the backstop.`);
+				if (!this._tightContextNoticed.has(modelId)) {
+					this._tightContextNoticed.add(modelId);
+					this.notificationService.notify({
+						severity: Severity.Warning,
+						message: `"${name}" is a tight fit for your system's memory. You can still use it, but it may slow down or stop on its own during longer chats. For smoother performance, close some apps to free up memory, or pick a smaller model.`,
+					});
+				}
+				return true;
+			}
 			if (!interactive) {
 				// Background pre-warm of a too-big model: skip silently (no dialog, no toast).
 				this._recordLaunchBlocked(modelId, this._buildFitBlockedMessage(name, needGb, haveGb, true));
@@ -3811,6 +3863,24 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 		// model (MTP) + the mmproj projector. Loading these extras without reserving for them is what OOM-ed
 		// the Metal command buffer (kIOGPUCommandBufferCallbackErrorOutOfMemory) on a 16GB Mac.
 		const baseTuning = this._getLlamaTuning(model);
+		// Requested context CEILING: aim for the model's full window and let the memory clamp be the real limiter,
+		// instead of the legacy 16384 default silently capping every model. An EXPLICIT per-model context (set by
+		// the user in their model list) wins - whether higher OR intentionally lower; otherwise we request the
+		// model's trained window from the GGUF. The clamp then grants the largest slice that fits (down to the
+		// TARGET_MIN comfort floor, using q4 KV if needed), so a big-window model on a roomy machine gets a big
+		// context and a tight one is trimmed to fit - never OOM-ed by requesting more than the device holds.
+		try {
+			const ceilingInfo = await this._getModelInfo(modelPath);
+			const explicitPerModel = model.contextWindow && model.contextWindow > 0 ? model.contextWindow : undefined;
+			const trainedWindow = ceilingInfo.contextLength && ceilingInfo.contextLength > 0 ? ceilingInfo.contextLength : undefined;
+			const requestedCeiling = explicitPerModel ?? trainedWindow ?? baseTuning.contextSize ?? DEFAULT_LLAMA_CONTEXT_SIZE;
+			// Never request beyond the trained window (rope stays un-scaled) or the absolute backstop.
+			baseTuning.contextSize = Math.max(
+				MIN_CLAMPED_CONTEXT,
+				Math.min(requestedCeiling, trainedWindow ?? requestedCeiling, MAX_CLAMPED_CONTEXT));
+		} catch {
+			// GGUF unreadable (e.g. Ollama-managed): leave the settings-derived context as-is.
+		}
 		// OOM degradation ladder: a previous launch of this model died from memory exhaustion, so this one
 		// runs with the reduced footprint the ladder chose (smaller context, no speculative extras).
 		const oomCap = this._oomContextCap.get(modelId);
@@ -3907,6 +3977,26 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 		// configuration we will really launch (clamped context, q8/q4 KV, offload plan, stripped extras), not an
 		// earlier worst-case approximation that can warn even though auto-tuning has already made the model fit.
 		const tuning = await this._augmentTuningWithHardware(modelPath, backend, baseTuning, extraResidentBytes);
+		// Tight-fit notice: the clamp granted the largest context that fits, but it landed below the comfort floor
+		// (TARGET_MIN) on a model whose own window is larger - i.e. the DEVICE, not the model, is the limit. The
+		// model still runs (at best fit; the watchdog auto-stops it if memory later runs out), so this is a plain-
+		// language heads-up, NOT a blocking gate. Skipped when the model's own trained window is below the floor
+		// (then the small window is just its size, not a shortfall) and when we've already told the user once.
+		const finalCtx = tuning.contextSize ?? 0;
+		const modelWindowCeiling = baseTuning.contextSize ?? 0; // resolved above to per-model override / trained window
+		if (interactive
+			&& finalCtx > 0
+			&& finalCtx < TARGET_MIN_CONTEXT
+			&& modelWindowCeiling >= TARGET_MIN_CONTEXT
+			&& !this._oomContextCap.has(modelId) // an OOM-ladder cap is a separate, already-surfaced situation
+			&& !this._tightContextNoticed.has(modelId)) {
+			this._tightContextNoticed.add(modelId);
+			const displayName = model.modelName ?? model.id;
+			this.notificationService.notify({
+				severity: Severity.Warning,
+				message: `"${displayName}" is a tight fit for your system's memory. You can still use it, but it may slow down or stop on its own during longer chats. For smoother performance, close some apps to free up memory, or pick a smaller model.`,
+			});
+		}
 		if (!await this._memoryAllowsLaunch(modelId, interactive, backend, tuning, extraResidentBytes)) {
 			return;
 		}

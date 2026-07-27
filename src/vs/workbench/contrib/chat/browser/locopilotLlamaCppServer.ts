@@ -216,13 +216,19 @@ export function kvCacheBytesPerElem(kvCacheType: Exclude<KvCacheType, 'auto'>): 
  * Fractions of Apple-Silicon unified memory the GPU may WIRE for inference. macOS caps a Metal app's
  * working set at `recommendedMaxWorkingSetSize`; trying to wire more forces the OS to page weights to SSD,
  * which thrashes the machine (freeze, sustained 100% GPU, heat, thermal shutdown). Apple's actual default
- * ceiling is TIERED: ~66-68% of total RAM on <=36GB machines and ~75% on larger ones - a flat 0.70 (the
- * old constant) over-budgeted exactly the memory-tight 8-16GB Macs that hang. So the offload/KV budget on
- * Metal must be sized off these fractions of TOTAL RAM - never raw total, which ignores both this ceiling
- * and the RAM the OS + editor already hold.
+ * ceiling is TIERED and rises with RAM. It is calibrated in THREE bands rather than two: the tight 0.66 is
+ * needed only on the memory-starved 8-16 GB Macs that actually hang (the OS+editor hold a large ABSOLUTE
+ * share of so little RAM); a 24-32 GB Mac has plenty of absolute headroom and its measured working-set
+ * ceiling runs ~75-78% (an M1 Max 32 GB reports ~25 GB / 78%), so the old flat 0.66 there left ~2-3 GB of
+ * usable KV budget on the table and needlessly crushed context. The MID band (0.70) recovers most of that
+ * while staying safely under the measured ceiling on machines whose ceiling sits lower. Sized off fractions
+ * of TOTAL RAM - never raw total, which ignores both this ceiling and the RAM the OS + editor already hold.
  */
 export const METAL_WIRED_MEMORY_FRACTION_SMALL = 0.66;
+export const METAL_WIRED_MEMORY_FRACTION_MID = 0.70;
 export const METAL_WIRED_MEMORY_FRACTION_LARGE = 0.75;
+/** RAM below which the tight small-machine fraction applies (protects the 8-16 GB Macs that page/hang). */
+export const METAL_SMALL_RAM_THRESHOLD_BYTES = 18 * 1024 * 1024 * 1024;
 /** RAM size at/above which macOS applies the larger default wired-memory fraction. */
 export const METAL_LARGE_RAM_THRESHOLD_BYTES = 36 * 1024 * 1024 * 1024;
 
@@ -286,7 +292,9 @@ export function metalOffloadBudgetBytes(totalmemBytes: number, wiredLimitBytes?:
 	}
 	const fraction = totalmemBytes >= METAL_LARGE_RAM_THRESHOLD_BYTES
 		? METAL_WIRED_MEMORY_FRACTION_LARGE
-		: METAL_WIRED_MEMORY_FRACTION_SMALL;
+		: (totalmemBytes < METAL_SMALL_RAM_THRESHOLD_BYTES
+			? METAL_WIRED_MEMORY_FRACTION_SMALL
+			: METAL_WIRED_MEMORY_FRACTION_MID);
 	return Math.floor(totalmemBytes * fraction);
 }
 
@@ -419,10 +427,56 @@ export interface ContextClampInputs {
 	 * still gets clamped rather than over-allocating - erring toward a smaller, safe window.
 	 */
 	kvBytesPerTokenPerLayer?: number;
+	/**
+	 * SWA (sliding-window attention) window size in tokens (`<arch>.attention.sliding_window`), 0/undefined for
+	 * a full-attention model. On a sliding-window model whose `--swa-full` is OFF (the default when the full
+	 * cache doesn't fit - see {@link swaFullOnAllLayers}), the SWA layers hold only `slidingWindow` tokens, NOT
+	 * the whole context - so charging every layer the full context (the old behavior) over-counted KV several-
+	 * fold and collapsed the window (e.g. Gemma clamped to ~8K when ~128K fits). When set, the clamp charges the
+	 * SWA layers a fixed `window`-sized cost and lets only the GLOBAL (full-attention) layers scale with context.
+	 */
+	slidingWindow?: number;
+	/**
+	 * True when `--swa-full` will be forced on, so EVERY layer holds the full context and the SWA windowing
+	 * above must NOT apply. Defaults to false (windowed): the runner's swa-full headroom gate runs AFTER the
+	 * clamp and only turns swa-full on when the full cache genuinely fits, so sizing the clamp as windowed is
+	 * safe - a larger windowed context simply keeps swa-full off, never past the budget.
+	 */
+	swaFullOnAllLayers?: boolean;
 }
 
 /** Smallest context we will ever clamp down to, so a tiny budget can't make the model unusable. */
 export const MIN_CLAMPED_CONTEXT = 4096;
+
+/**
+ * Absolute backstop on the context window. The real ceiling is the model's own trained window (or a per-model
+ * override) - this only stops a pathological 1M-token advertisement from sizing a context nothing benefits
+ * from. Set high (256K) so it almost never binds: a model trained to 128K/256K gets its full window when the
+ * device can hold it, and only a >256K advertisement is capped here.
+ */
+export const MAX_CLAMPED_CONTEXT = 262144;
+
+/**
+ * Comfort floor for a coding agent: the context we TRY to reach on every model, because a smaller window is
+ * unusable for multi-iteration work (a system prompt alone can be ~7K). It is a TARGET, not a guarantee - when
+ * even a q4 KV cache can't fit it on this device, the launch still runs at the largest context that DOES fit
+ * (never a hard OOM) and surfaces a plain-language "tight fit" notice. Used to (a) decide when to trade KV
+ * precision down to q4 and (b) trigger that notice. Models whose trained window is below this are capped by
+ * their own window instead - the floor never inflates a model past what it was trained for.
+ */
+export const TARGET_MIN_CONTEXT = 32768;
+
+/**
+ * Fraction of a sliding-window model's transformer layers assumed to be GLOBAL (full-attention) layers when
+ * sizing the windowed KV cache. Only the global layers' KV scales with the context window; the local (SWA)
+ * layers are pinned to {@link ContextClampInputs.slidingWindow} tokens. We detect the window size from GGUF
+ * but NOT the exact global:local split, so this is deliberately CONSERVATIVE: Gemma 3/4 are 1 global : 5
+ * local (~0.17 global) and Gemma 2 alternates 1:1 (0.5 global). Assuming 0.5 over-counts KV for the 5:1
+ * models (grants a smaller, safe window) while sizing the 1:1 models correctly, and any model with fewer
+ * global layers than assumed only ends up with MORE headroom - never less. Erring high on global layers is
+ * the memory-safe direction.
+ */
+export const SWA_GLOBAL_LAYER_FRACTION = 0.5;
 
 /**
  * Transformer-layer count assumed by the memory clamp when the GGUF metadata doesn't expose `block_count`
@@ -470,14 +524,56 @@ export function clampContextSize(inputs: ContextClampInputs): number {
 		// Fall back to a conservative layer count when the GGUF didn't expose one, so a long-context model
 		// with unparseable metadata still gets clamped instead of escaping with its full trained window.
 		const layerCount = inputs.layerCount && inputs.layerCount > 0 ? inputs.layerCount : DEFAULT_CLAMP_LAYER_COUNT;
-		const maxTokens = Math.floor(inputs.kvBudgetBytes / (perTokenPerLayer * layerCount));
+		const window = inputs.slidingWindow && inputs.slidingWindow > 0 ? Math.floor(inputs.slidingWindow) : 0;
+		let maxTokens: number;
+		if (window > 0 && !inputs.swaFullOnAllLayers) {
+			// Sliding-window model with windowed (non-swa-full) KV: the SWA layers never hold more than `window`
+			// tokens, so their KV is a FIXED cost independent of context; only the global (full-attention) layers
+			// grow with the window. Solving `budget = perTok*(global*ctx + local*window)` for ctx is what restores
+			// the large windowed context these models actually support (vs. charging all layers the full context).
+			const globalLayers = Math.max(1, Math.ceil(layerCount * SWA_GLOBAL_LAYER_FRACTION));
+			const localLayers = Math.max(0, layerCount - globalLayers);
+			const localFixedBytes = perTokenPerLayer * localLayers * window;
+			const budgetForGlobal = inputs.kvBudgetBytes - localFixedBytes;
+			maxTokens = budgetForGlobal > 0 ? Math.floor(budgetForGlobal / (perTokenPerLayer * globalLayers)) : 0;
+		} else {
+			maxTokens = Math.floor(inputs.kvBudgetBytes / (perTokenPerLayer * layerCount));
+		}
 		// Clamp even when the budget holds ~0 tokens: the MIN_CLAMPED_CONTEXT floor below keeps the model
 		// usable, and skipping the clamp here (the old behavior) let a near-full budget escape unclamped.
 		ctx = Math.min(ctx, Math.max(0, maxTokens));
 	}
+	// Never exceed the practical maximum, even when trained length and memory both allow more.
+	ctx = Math.min(ctx, MAX_CLAMPED_CONTEXT);
 	// Round down to a 1024 multiple and never go below the floor.
 	ctx = Math.floor(ctx / 1024) * 1024;
 	return Math.max(MIN_CLAMPED_CONTEXT, ctx);
+}
+
+/**
+ * Forward estimate of the KV-cache bytes a given context will occupy - the inverse of {@link clampContextSize},
+ * used by the pre-flight fit gate so both agree on a model's footprint. Sliding-window models (with `--swa-full`
+ * off) charge the SWA layers only `min(ctx, window)` tokens and let the global layers scale with context,
+ * matching what the windowed clamp granted; without this the fit gate would size a windowed model's KV as if
+ * every layer held the full context and wrongly reject the large context the clamp just approved.
+ */
+export function kvCacheBytesForContext(inputs: {
+	contextTokens: number;
+	layerCount: number;
+	kvBytesPerTokenPerLayer: number;
+	slidingWindow?: number;
+	swaFullOnAllLayers?: boolean;
+}): number {
+	const layers = Math.max(1, Math.floor(inputs.layerCount));
+	const perTok = Math.max(0, inputs.kvBytesPerTokenPerLayer);
+	const ctx = Math.max(0, Math.floor(inputs.contextTokens));
+	const window = inputs.slidingWindow && inputs.slidingWindow > 0 ? Math.floor(inputs.slidingWindow) : 0;
+	if (window > 0 && !inputs.swaFullOnAllLayers) {
+		const globalLayers = Math.max(1, Math.ceil(layers * SWA_GLOBAL_LAYER_FRACTION));
+		const localLayers = Math.max(0, layers - globalLayers);
+		return perTok * (globalLayers * ctx + localLayers * Math.min(ctx, window));
+	}
+	return perTok * layers * ctx;
 }
 
 export interface AutomaticKvCacheSelectionInputs extends ContextClampInputs {
@@ -495,15 +591,20 @@ export interface AutomaticKvCacheSelection {
 
 /**
  * Selects automatic KV precision from the model's real geometry and memory budget. Small contexts retain
- * f16 when it fits; normal/large contexts prefer near-lossless q8_0; q4_0 is selected only when it grants
- * more of the requested context than q8_0. Selection happens before launch and remains stable for the
- * server lifetime, so an active conversation never loses its cache to a precision change.
+ * f16 when it fits; normal/large contexts prefer near-lossless q8_0; q4_0 is used only when a higher precision
+ * can't reach the {@link TARGET_MIN_CONTEXT} comfort floor - i.e. q4 is a floor-REACHING tool, not a maximize-
+ * context tool, so a model that already clears the floor at q8 keeps q8's quality rather than trading it for a
+ * longer-but-lossier window. Selection happens before launch and remains stable for the server lifetime, so an
+ * active conversation never loses its cache to a precision change.
  */
 export function selectAutomaticKvCache(inputs: AutomaticKvCacheSelectionInputs): AutomaticKvCacheSelection {
 	const targetContext = clampContextSize({
 		requestedContext: inputs.requestedContext,
 		modelContextLength: inputs.modelContextLength,
 	});
+	// The bar a precision must clear to be "good enough": the comfort floor, but never above what the model's
+	// own window allows (a 16K-trained model is satisfied by 16K, we don't drop to q4 chasing an impossible 32K).
+	const satisfiedAt = Math.min(targetContext, TARGET_MIN_CONTEXT);
 	const preferred: Exclude<KvCacheType, 'auto'>[] = targetContext < KV_AUTO_QUANT_CONTEXT_THRESHOLD
 		? ['f16', 'q8_0', 'q4_0']
 		: ['q8_0', 'q4_0'];
@@ -521,9 +622,13 @@ export function selectAutomaticKvCache(inputs: AutomaticKvCacheSelectionInputs):
 			kvBudgetBytes: inputs.kvBudgetBytes,
 			layerCount: inputs.layerCount,
 			kvBytesPerTokenPerLayer: perTokenPerLayer,
+			slidingWindow: inputs.slidingWindow,
+			swaFullOnAllLayers: inputs.swaFullOnAllLayers,
 		});
 		const candidate = { kvCacheType, contextSize };
-		if (contextSize >= targetContext) {
+		// Accept the FIRST (highest-quality) precision that clears the comfort floor at its full fitting context -
+		// don't drop to a lossier cache just because it would grant even more length past the floor.
+		if (contextSize >= satisfiedAt) {
 			return candidate;
 		}
 		if (!best || contextSize > best.contextSize) {

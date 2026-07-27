@@ -12,6 +12,7 @@ import {
 	swaFullKvHeadroomBytes,
 	SWA_FULL_GRAPH_MARGIN_FRACTION,
 	clampContextSize,
+	kvCacheBytesForContext,
 	getBundledLlamaServerPath,
 	getLlamaCppServerCommand,
 	resolveKvCacheType,
@@ -21,8 +22,13 @@ import {
 	metalOffloadBudgetBytes,
 	usableSystemMemoryBytes,
 	METAL_WIRED_MEMORY_FRACTION_SMALL,
+	METAL_WIRED_MEMORY_FRACTION_MID,
 	METAL_WIRED_MEMORY_FRACTION_LARGE,
+	METAL_SMALL_RAM_THRESHOLD_BYTES,
 	METAL_LARGE_RAM_THRESHOLD_BYTES,
+	MAX_CLAMPED_CONTEXT,
+	TARGET_MIN_CONTEXT,
+	SWA_GLOBAL_LAYER_FRACTION,
 	USABLE_SYSTEM_MEMORY_FRACTION,
 	KV_AUTO_QUANT_CONTEXT_THRESHOLD,
 	KV_CLAMP_BUDGET_FRACTION,
@@ -113,6 +119,20 @@ suite('LoCoPilot llama.cpp server', () => {
 				...geometry,
 			}), { kvCacheType: 'f16', contextSize: 8192 });
 		});
+
+		test('keeps q8_0 once it clears the comfort floor, even though q4_0 would grant more length', () => {
+			// q4 is a floor-REACHING tool, not a maximize-length tool: once q8 is above TARGET_MIN we keep its
+			// quality instead of trading down to a lossier cache for extra tokens the user didn't need.
+			const sel = selectAutomaticKvCache({ requestedContext: 131072, kvBudgetBytes: 3 * GB, ...geometry });
+			assert.strictEqual(sel.kvCacheType, 'q8_0');
+			assert.ok(sel.contextSize >= TARGET_MIN_CONTEXT, `q8 context ${sel.contextSize} should clear the ${TARGET_MIN_CONTEXT} floor`);
+		});
+
+		test('drops to q4_0 only when q8_0 cannot reach the comfort floor', () => {
+			// Tight budget: q8 lands below TARGET_MIN, so q4 is used to claw back up toward the floor.
+			const sel = selectAutomaticKvCache({ requestedContext: 131072, kvBudgetBytes: 2 * GB, ...geometry });
+			assert.strictEqual(sel.kvCacheType, 'q4_0');
+		});
 	});
 
 	suite('runtimeOverheadBytesForTuning', () => {
@@ -185,16 +205,23 @@ suite('LoCoPilot llama.cpp server', () => {
 		const GB = 1024 * 1024 * 1024;
 
 		test('metalOffloadBudgetBytes is the wired fraction of total, not raw total', () => {
-			assert.strictEqual(metalOffloadBudgetBytes(32 * GB), Math.floor(32 * GB * METAL_WIRED_MEMORY_FRACTION_SMALL));
+			// 32GB sits in the MID band now (24-36GB), not the tight small-machine fraction.
+			assert.strictEqual(metalOffloadBudgetBytes(32 * GB), Math.floor(32 * GB * METAL_WIRED_MEMORY_FRACTION_MID));
 			// The whole point of the fix: the budget must be strictly less than total RAM.
 			assert.ok(metalOffloadBudgetBytes(32 * GB) < 32 * GB);
 		});
 
-		test('metalOffloadBudgetBytes is tiered like Apple\'s default wired ceiling', () => {
-			// <=36GB machines get the conservative small-machine fraction; larger ones the 75% tier.
+		test('metalOffloadBudgetBytes is tiered in three bands like Apple\'s default wired ceiling', () => {
+			// <18GB (the 8-16GB Macs that page/hang) stay on the tight fraction...
 			assert.strictEqual(metalOffloadBudgetBytes(16 * GB), Math.floor(16 * GB * METAL_WIRED_MEMORY_FRACTION_SMALL));
+			// ...24-32GB get the MID fraction (recovers the KV budget the flat 0.66 wasted on roomier Macs)...
+			assert.strictEqual(metalOffloadBudgetBytes(24 * GB), Math.floor(24 * GB * METAL_WIRED_MEMORY_FRACTION_MID));
+			assert.strictEqual(metalOffloadBudgetBytes(METAL_SMALL_RAM_THRESHOLD_BYTES), Math.floor(METAL_SMALL_RAM_THRESHOLD_BYTES * METAL_WIRED_MEMORY_FRACTION_MID));
+			// ...and >=36GB get the 75% tier.
 			assert.strictEqual(metalOffloadBudgetBytes(64 * GB), Math.floor(64 * GB * METAL_WIRED_MEMORY_FRACTION_LARGE));
 			assert.strictEqual(metalOffloadBudgetBytes(METAL_LARGE_RAM_THRESHOLD_BYTES), Math.floor(METAL_LARGE_RAM_THRESHOLD_BYTES * METAL_WIRED_MEMORY_FRACTION_LARGE));
+			// The bands are monotonic: a 32GB Mac never gets a smaller budget than under the old flat 0.66.
+			assert.ok(metalOffloadBudgetBytes(32 * GB) > Math.floor(32 * GB * METAL_WIRED_MEMORY_FRACTION_SMALL));
 		});
 
 		test('metalOffloadBudgetBytes honors an explicit iogpu wired limit, capped below total', () => {
@@ -291,6 +318,37 @@ suite('LoCoPilot llama.cpp server', () => {
 			assert.strictEqual(ctx, MIN_CLAMPED_CONTEXT);
 		});
 
+		test('sliding-window model gets a MUCH larger context than full-layer sizing for the same budget', () => {
+			// Regression: a SWA model (Gemma) was sized as if every layer held the full context, collapsing the
+			// window (~8K when far more fits). Windowed sizing charges the SWA layers only `window` tokens, so
+			// only the global layers scale with context. Same 2GB budget, 48 layers, f16, window 1024:
+			const budget = 2 * 1024 * 1024 * 1024;
+			const full = clampContextSize({ requestedContext: 262144, kvBudgetBytes: budget, layerCount: 48, kvBytesPerTokenPerLayer: DEFAULT_KV_BYTES_PER_TOKEN_PER_LAYER_F16 });
+			const windowed = clampContextSize({ requestedContext: 262144, kvBudgetBytes: budget, layerCount: 48, kvBytesPerTokenPerLayer: DEFAULT_KV_BYTES_PER_TOKEN_PER_LAYER_F16, slidingWindow: 1024 });
+			assert.strictEqual(full, 10240);
+			assert.strictEqual(windowed, 20480); // ~2x with the conservative 0.5 global fraction (far more on 5:1 Gemma)
+			assert.ok(windowed > full);
+		});
+
+		test('forcing --swa-full on all layers disables windowing (falls back to full-layer sizing)', () => {
+			// When swa-full is force-ON, every layer holds the full context, so the windowing must NOT apply -
+			// else the clamp would grant a context whose full cache busts the budget.
+			const budget = 2 * 1024 * 1024 * 1024;
+			const full = clampContextSize({ requestedContext: 262144, kvBudgetBytes: budget, layerCount: 48, kvBytesPerTokenPerLayer: DEFAULT_KV_BYTES_PER_TOKEN_PER_LAYER_F16 });
+			const swaFull = clampContextSize({ requestedContext: 262144, kvBudgetBytes: budget, layerCount: 48, kvBytesPerTokenPerLayer: DEFAULT_KV_BYTES_PER_TOKEN_PER_LAYER_F16, slidingWindow: 1024, swaFullOnAllLayers: true });
+			assert.strictEqual(swaFull, full);
+		});
+
+		test('never exceeds the absolute backstop, even with a pathological trained window and spare memory', () => {
+			assert.strictEqual(MAX_CLAMPED_CONTEXT, 262144);
+			// A model trained to its backstop still gets it (the real ceiling is the model window, this only
+			// stops a >256K advertisement).
+			assert.strictEqual(clampContextSize({ requestedContext: 262144 }), MAX_CLAMPED_CONTEXT);
+			// A 1M-token request with a roomy budget is still bounded by the backstop.
+			const ctx = clampContextSize({ requestedContext: 1_000_000, kvBudgetBytes: 400 * 1024 * 1024 * 1024, layerCount: 4, kvBytesPerTokenPerLayer: 128, slidingWindow: 1024 });
+			assert.strictEqual(ctx, MAX_CLAMPED_CONTEXT);
+		});
+
 		test('emits --n-cpu-moe and --slot-save-path when tuned', () => {
 			const { args } = getLlamaCppServerCommand('/m.gguf', 'metal', undefined, 38452, { cpuMoeLayers: 12, slotSavePath: '/tmp/kv', promptLookup: true });
 			assert.strictEqual(argValue(args, '--n-cpu-moe'), '12');
@@ -298,6 +356,31 @@ suite('LoCoPilot llama.cpp server', () => {
 			// The slots endpoint must be enabled too, or the save/restore route 404s.
 			assert.ok(args.includes('--slots'));
 			assert.ok(args.includes('--spec-type') && args.includes('ngram-cache'));
+		});
+	});
+
+	suite('kvCacheBytesForContext', () => {
+		test('full-attention model charges every layer the full context', () => {
+			assert.strictEqual(
+				kvCacheBytesForContext({ contextTokens: 8192, layerCount: 48, kvBytesPerTokenPerLayer: 4096 }),
+				4096 * 48 * 8192);
+		});
+
+		test('sliding-window model charges SWA layers only the window (inverse of the windowed clamp)', () => {
+			// window 1024, 48 layers, 0.5 global => 24 global (scale with ctx) + 24 local (pinned to 1024 tokens).
+			const globalLayers = Math.ceil(48 * SWA_GLOBAL_LAYER_FRACTION);
+			const localLayers = 48 - globalLayers;
+			const expected = 4096 * (globalLayers * 8192 + localLayers * 1024);
+			const windowed = kvCacheBytesForContext({ contextTokens: 8192, layerCount: 48, kvBytesPerTokenPerLayer: 4096, slidingWindow: 1024 });
+			assert.strictEqual(windowed, expected);
+			// ...and it's strictly cheaper than sizing every layer full.
+			assert.ok(windowed < kvCacheBytesForContext({ contextTokens: 8192, layerCount: 48, kvBytesPerTokenPerLayer: 4096 }));
+		});
+
+		test('swa-full on all layers ignores the window (full footprint)', () => {
+			assert.strictEqual(
+				kvCacheBytesForContext({ contextTokens: 8192, layerCount: 48, kvBytesPerTokenPerLayer: 4096, slidingWindow: 1024, swaFullOnAllLayers: true }),
+				kvCacheBytesForContext({ contextTokens: 8192, layerCount: 48, kvBytesPerTokenPerLayer: 4096 }));
 		});
 	});
 
