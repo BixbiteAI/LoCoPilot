@@ -60,6 +60,10 @@ export function createCreateFileToolData(): IToolData {
 			overwrite: {
 				type: 'boolean',
 				description: 'Optional: set true to replace an existing file with the whole new content. If the file exists and this is not set, the call is rejected (use editFile for targeted changes instead).'
+			},
+			force: {
+				type: 'boolean',
+				description: 'Optional: set true ONLY when intentionally overwriting a large file with much shorter (but complete) content. Without it such a shrink is rejected as likely accidental truncation.'
 			}
 		},
 		required: ['path', 'content']
@@ -74,7 +78,7 @@ export function createCreateFileToolData(): IToolData {
 		userDescription: localize('tool.createFile.userDescription', 'Create a new file (or overwrite one) with the given contents'),
 		modelDescription: 'Write a WHOLE file. Params: path, content, overwrite?.\n\n' +
 			'- Create a new file: pass path + content (parent folders are created automatically - no mkdir step).\n' +
-			'- To fully replace an EXISTING file: also pass overwrite: true. Without it, writing over an existing file is rejected.\n' +
+			'- To fully replace an EXISTING file: also pass overwrite: true. Without it, writing over an existing file is rejected. Replacing a large file with much shorter (but COMPLETE) content also needs force: true.\n' +
 			'- For SMALL/targeted changes to an existing file, do NOT use this - use editFile (change text) or insertCode (add code). Rewriting a whole file for a small change is wasteful and error-prone.',
 		source: ToolDataSource.Internal,
 		inputSchema,
@@ -87,6 +91,7 @@ interface ICreateFileParams {
 	path: string;
 	content: string;
 	overwrite?: boolean;
+	force?: boolean;
 }
 
 export class CreateFileTool implements IToolImpl {
@@ -167,8 +172,8 @@ export class CreateFileTool implements IToolImpl {
 				return { content: [{ kind: 'text', value: `Error: "${params.path}" already exists. Next: to change part of it use editFile (or insertCode to add code); to replace the WHOLE file, resend createFile with overwrite: true.` }], toolResultError: 'File exists' };
 			}
 			const currentLines = currentContent.split('\n').length;
-			if (currentLines >= SHRINK_GUARD_MIN_LINES && params.content.length < currentContent.length * SHRINK_GUARD_RATIO) {
-				return { content: [{ kind: 'text', value: `Error: Refusing to overwrite "${params.path}" (${currentLines} lines) with much shorter content (${params.content.split('\n').length} lines) - likely incomplete. Next: use editFile for a partial change, or resend createFile with the COMPLETE content.` }], toolResultError: 'Shrink overwrite refused' };
+			if (!params.force && currentLines >= SHRINK_GUARD_MIN_LINES && params.content.length < currentContent.length * SHRINK_GUARD_RATIO) {
+				return { content: [{ kind: 'text', value: `Error: Refusing to overwrite "${params.path}" (${currentLines} lines) with much shorter content (${params.content.split('\n').length} lines) - likely incomplete. Next: use editFile for a partial change, or - if the shorter content really is COMPLETE - resend createFile with overwrite: true and force: true.` }], toolResultError: 'Shrink overwrite refused' };
 			}
 			progress.report({ message: buildFileLinkInvocationMessage(localize('createFile.overwriting', "Replacing entire file {0}", '{0}'), fileName, fileUri) });
 			const lines = currentContent.split('\n');
