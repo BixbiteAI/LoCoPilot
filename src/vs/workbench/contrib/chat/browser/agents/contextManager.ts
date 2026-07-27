@@ -159,8 +159,14 @@ export class ContextManager {
 			const summaryBudget = Math.floor(usable * this.config.summaryFraction);
 			const summaryText = await this.summarizeMessages(modelId, middle, summaryBudget, token);
 			if (summaryText && !token.isCancellationRequested) {
+				// Inserted as a USER message, not Assistant. The recent window that follows is almost
+				// always assistant-led (assistant tool_use -> user tool_result), so an Assistant summary
+				// produced two consecutive assistant turns at the seam. Local llama.cpp jinja templates
+				// assume user/assistant alternation and mishandle a doubled assistant turn - the model then
+				// emits its next tool call as prose ("tool call was not formatted correctly"). A user-role
+				// summary keeps the seam a valid user -> assistant alternation.
 				const summaryMsg: IChatMessage = {
-					role: ChatMessageRole.Assistant,
+					role: ChatMessageRole.User,
 					content: [{
 						type: 'text',
 						value: `[Earlier context summary - older turns were compacted to save space]\n\n${summaryText}`,
@@ -273,7 +279,7 @@ export class ContextManager {
 
 	/** True for the Tier 2 summary block, which must survive Tier 3 (it replaced the whole middle). */
 	private isSummaryMessage(msg: IChatMessage): boolean {
-		return msg.role === ChatMessageRole.Assistant
+		return msg.role === ChatMessageRole.User
 			&& msg.content.some(p => p.type === 'text' && (p as IChatMessageTextPart).value.startsWith('[Earlier context summary'));
 	}
 

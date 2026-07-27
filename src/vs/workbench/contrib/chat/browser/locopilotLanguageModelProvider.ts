@@ -853,7 +853,7 @@ export class LoCoPilotLanguageModelProvider extends Disposable implements ILangu
 			'Accept': 'text/event-stream'
 		};
 
-		const mappedMessages = messages.flatMap(m => this._mapMessageToOpenAI(m));
+		const mappedMessages = this._coalesceSameRoleMessages(messages).flatMap(m => this._mapMessageToOpenAI(m));
 		this._log(`[LoCoPilot Provider] OpenAI request: ${mappedMessages.length} messages`);
 		for (let i = 0; i < mappedMessages.length; i++) {
 			const msg = mappedMessages[i];
@@ -1315,7 +1315,7 @@ export class LoCoPilotLanguageModelProvider extends Disposable implements ILangu
 			throw new Error(this._getLocalServerUnavailableMessage(model));
 		}
 		const url = `${baseUrl}/chat/completions`;
-		const mappedMessages = messages.flatMap(m => this._mapMessageToOpenAI(m));
+		const mappedMessages = this._coalesceSameRoleMessages(messages).flatMap(m => this._mapMessageToOpenAI(m));
 		const isLocalModel = model.provider === 'huggingface' || model.provider === 'localhost' || model.provider === 'ollama';
 		const effectiveContext = this.localModelRunner.getLaunchedContextWindow(model.id)
 			?? model.contextWindow
@@ -1614,7 +1614,7 @@ export class LoCoPilotLanguageModelProvider extends Disposable implements ILangu
 		// cross-engine handoff, so it applies regardless of the (llama/mlx-only) resident-model budget.
 		this.localModelRunner.stopManagedServers();
 		const baseUrl = (model.localPath || 'http://localhost:11434').replace(/\/$/, '');
-		const mappedMessages = messages.flatMap(m => this._mapMessageToOpenAI(m));
+		const mappedMessages = this._coalesceSameRoleMessages(messages).flatMap(m => this._mapMessageToOpenAI(m));
 		const isLocalModel = model.provider === 'huggingface' || model.provider === 'localhost' || model.provider === 'ollama';
 		const { maxOutputTokens } = deriveTokenLimits(model.contextWindow ?? defaultContextWindow(isLocalModel), isLocalModel);
 
@@ -1800,7 +1800,7 @@ export class LoCoPilotLanguageModelProvider extends Disposable implements ILangu
 			throw new Error('Localhost URL is not set. Edit this model in LoCoPilot Settings and enter the complete endpoint URL.');
 		}
 		this._log(`[LoCoPilot Provider] Calling localhost model at: ${url}`);
-		const mappedMessages = messages.flatMap(m => this._mapMessageToOpenAI(m));
+		const mappedMessages = this._coalesceSameRoleMessages(messages).flatMap(m => this._mapMessageToOpenAI(m));
 		const isLocalModel = model.provider === 'huggingface' || model.provider === 'localhost' || model.provider === 'ollama';
 		const { maxOutputTokens } = deriveTokenLimits(model.contextWindow ?? defaultContextWindow(isLocalModel), isLocalModel);
 		let openAiModel = (model.localhostOpenAiModel ?? '').trim();
@@ -2082,6 +2082,29 @@ export class LoCoPilotLanguageModelProvider extends Disposable implements ILangu
 	 * Assistant messages with tool_use become { role, content, tool_calls }.
 	 * User messages with tool_result parts become a user message (if text) + one "tool" message per result.
 	 */
+	/**
+	 * Merge adjacent messages that share the same role into one, concatenating their content parts.
+	 * OpenAI-style local servers (llama.cpp / mlx via jinja templates) assume strict user/assistant
+	 * alternation; a doubled same-role turn - e.g. the Tier 2 context summary sitting right before an
+	 * assistant tool_use turn - corrupts the template's tool-call grammar so the model emits its next
+	 * call as prose ("tool call was not formatted correctly"). Coalescing before mapping guarantees the
+	 * wire sequence alternates, so no seam (summariser or otherwise) can trigger that failure. Tool
+	 * results are role User and tool_use turns are role Assistant, so this never merges a tool_use turn
+	 * with its matching tool_result (different roles) - pairing stays intact.
+	 */
+	private _coalesceSameRoleMessages(messages: IChatMessage[]): IChatMessage[] {
+		const out: IChatMessage[] = [];
+		for (const msg of messages) {
+			const prev = out.length > 0 ? out[out.length - 1] : undefined;
+			if (prev && prev.role === msg.role) {
+				out[out.length - 1] = { role: prev.role, content: [...prev.content, ...msg.content] };
+			} else {
+				out.push(msg);
+			}
+		}
+		return out;
+	}
+
 	private _mapMessageToOpenAI(message: IChatMessage): any[] {
 		const role = this._mapRole(message.role);
 
