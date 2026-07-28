@@ -31,7 +31,7 @@ import { toErrorMessage } from '../../../../base/common/errorMessage.js';
 import { CancellationError, isCancellationError } from '../../../../base/common/errors.js';
 import { ICommandService } from '../../../../platform/commands/common/commands.js';
 import { LOCOPILOT_SETTINGS_SECTION_LIST_MODELS } from './chatManagement/locopilotSettingsEditorInput.js';
-import { usableSystemMemoryBytes } from './locopilotLlamaCppServer.js';
+import { usableSystemMemoryBytes, metalOffloadBudgetBytes, kvCacheBytesPerElem, DEFAULT_KV_BYTES_PER_TOKEN_PER_LAYER_F16, RUNTIME_OVERHEAD_BYTES, TARGET_MIN_CONTEXT } from './locopilotLlamaCppServer.js';
 import { IConfigurationService } from '../../../../platform/configuration/common/configuration.js';
 import { ChatConfiguration } from '../common/constants.js';
 import { findDraftPairing } from './locopilotModelCatalog.js';
@@ -124,9 +124,21 @@ interface HFTreeItem {
  * a bigger/fatter quant always outranks a smaller one. Anything unrecognised scores lowest.
  */
 const GGUF_QUANT_QUALITY = [
-	'F16', 'BF16', 'Q8_0', 'Q6_K', 'Q5_K_M', 'Q5_K_S', 'Q5_0', 'Q4_K_M', 'Q4_K_S', 'Q4_1', 'Q4_0',
-	'IQ4_XS', 'IQ4_NL', 'Q3_K_L', 'Q3_K_M', 'Q3_K_S', 'IQ3_M', 'IQ3_S', 'IQ3_XXS', 'Q2_K', 'IQ2_M', 'IQ2_XS', 'IQ2_XXS'
+	// Longer/"XL"/"L" variants must precede their shorter siblings so quantQualityScore's substring match
+	// resolves to the exact quant (e.g. a "Q4_K_XL" file must not first match "Q4_K"). "UD-"/"-i1-" repo
+	// prefixes are ignored by the .includes() match, so dynamic (Unsloth) quants score off their core name.
+	'F32', 'F16', 'BF16', 'Q8_0', 'Q6_K_L', 'Q6_K', 'Q5_K_XL', 'Q5_K_L', 'Q5_K_M', 'Q5_K_S', 'Q5_0',
+	'Q4_K_XL', 'Q4_K_L', 'Q4_K_M', 'Q4_K_S', 'Q4_1', 'Q4_0',
+	'IQ4_XS', 'IQ4_NL', 'Q3_K_XL', 'Q3_K_L', 'Q3_K_M', 'Q3_K_S', 'IQ3_M', 'IQ3_S', 'IQ3_XXS', 'Q2_K', 'IQ2_M', 'IQ2_XS', 'IQ2_XXS'
 ];
+
+/**
+ * Highest weight quant the hardware-aware picker will auto-select. Above this (F16/BF16/F32) the quality gain
+ * over Q8_0 is negligible for inference while the file ~doubles in size and download time - so we never
+ * auto-pick it. This is a PREFERENCE, not a hard exclusion: a repo that ships ONLY such files still gets one
+ * downloaded (see {@link pickBestGgufForBudget}). An explicit user quant choice is honoured separately.
+ */
+export const MAX_AUTO_GGUF_QUANT = 'Q8_0';
 
 /** Quality score for a GGUF filename: higher = better quality. Unknown quants score 0 (lowest). */
 export function quantQualityScore(filename: string): number {
@@ -156,16 +168,113 @@ function isWeightGgufPath(path: string): boolean {
 }
 
 /**
- * Picks the GGUF file to download given the machine's memory budget: the **highest-quality quant whose file
- * fits** `budgetBytes` (after a safety fraction), and when none fit, the **smallest** file so the model can
- * at least run. Returns undefined when there are no GGUF files or no sizes are known (caller falls back to
- * the static priority pick). `files` are {path,size}; entries without a size are treated as unknown and only
- * used as a last-resort smallest pick.
+ * Coarse transformer-layer count for the KV-cache reserve, bucketed from the GGUF weight-file size. The real
+ * geometry (layers, kv heads) isn't known until the file is on disk, so this errs HIGH - more layers means a
+ * larger KV reserve and therefore a safer, more conservative quant pick - matching the runner's "erring high
+ * on KV is memory-safe" philosophy. Buckets are sized off typical Q4-Q8 file sizes for each parameter class.
+ */
+function estimateLayerCountFromWeightBytes(weightBytes: number): number {
+	const GB = 1024 * 1024 * 1024;
+	if (weightBytes <= 2 * GB) { return 28; }   // ~1-3B
+	if (weightBytes <= 6 * GB) { return 36; }   // ~7-9B
+	if (weightBytes <= 14 * GB) { return 52; }  // ~13-15B
+	if (weightBytes <= 30 * GB) { return 68; }  // ~30-34B
+	return 84;                                  // ~70B+
+}
+
+/** Transformer-layer count bucketed from a model's TOTAL parameter count (billions). Layers track a model's
+ * DEPTH, which tracks total params for dense models and is the memory-safe over-estimate for MoE (whose depth
+ * is lower than a dense model of the same total). Quant-INDEPENDENT, unlike the file-size fallback. */
+function estimateLayerCountFromParamsB(paramsB: number): number {
+	if (paramsB <= 1.5) { return 24; }
+	if (paramsB <= 4) { return 30; }
+	if (paramsB <= 9) { return 36; }
+	if (paramsB <= 16) { return 48; }
+	if (paramsB <= 40) { return 64; }
+	return 80;
+}
+
+/**
+ * Approximate TOTAL parameter count (billions) parsed from a model name / repo id. Handles dense names
+ * ("Qwen3-4B" -> 4), MoE names ("Qwen3.6-35B-A3B" -> 35 total, NOT the 3B active - KV scales with the model's
+ * full transformer depth and the total is the memory-safe over-estimate), and Gemma effective sizes
+ * ("gemma-4-E4B" -> 4). The active "A<n>B" token is deliberately ignored. Returns undefined when no size token
+ * is present (e.g. "Phi-4-mini"), so callers fall back to the quant-dependent file-size bucket.
+ */
+export function modelParamsBillionsFromName(name: string): number | undefined {
+	if (!name) {
+		return undefined;
+	}
+	// A standalone <N>B or E<N>B token at a word boundary; the leading 'A' of an active-param "A3B" tag is not
+	// in the boundary class, so active tokens never match - only total/dense sizes do.
+	const matches = [...name.matchAll(/(?:^|[-_/ ])E?(\d+(?:\.\d+)?)\s*B(?![a-z])/gi)];
+	if (matches.length === 0) {
+		return undefined;
+	}
+	// The total is the largest size token (an MoE's active "A<n>B" is always smaller and never matches anyway).
+	return Math.max(...matches.map(m => parseFloat(m[1])));
+}
+
+/** Layer count for a model from its NAME (params-based, quant-independent, MoE-aware), or undefined when the
+ * name carries no size token. Preferred over {@link estimateLayerCountFromWeightBytes} because the same model's
+ * higher-quant (larger) file must not be charged more KV layers than its lower-quant file. */
+export function estimateLayerCountFromModelName(name: string): number | undefined {
+	const paramsB = modelParamsBillionsFromName(name);
+	return paramsB !== undefined ? estimateLayerCountFromParamsB(paramsB) : undefined;
+}
+
+/**
+ * Estimated FULL runtime footprint (bytes) of running a GGUF weights file: the weights themselves, PLUS a
+ * minimum-viable KV cache (the {@link TARGET_MIN_CONTEXT} comfort floor at q4_0 - the lowest precision the
+ * runner drops to under memory pressure), PLUS the engine's fixed {@link RUNTIME_OVERHEAD_BYTES}. The download
+ * picker sizes quants against THIS rather than the bare weight-file size, so it never selects a quant whose
+ * weights merely fit on their own and then leave no room to actually run at a usable context. Pass an explicit
+ * `layerCount` (from the model name, via {@link estimateLayerCountFromModelName}) so every quant of a model is
+ * charged the SAME KV - otherwise the layer count is bucketed from the (quant-dependent) file size, which would
+ * unfairly charge a higher quant more KV. The KV term is an estimate; the launch-time context clamp remains the
+ * precise authority and will still grow the cache to q8/f16 when the machine has spare room.
+ */
+export function estimateGgufRuntimeFootprintBytes(weightBytes: number, layerCount?: number): number {
+	const layers = layerCount && layerCount > 0 ? layerCount : estimateLayerCountFromWeightBytes(weightBytes);
+	const kvPerTokenPerLayer = DEFAULT_KV_BYTES_PER_TOKEN_PER_LAYER_F16 * kvCacheBytesPerElem('q4_0') / kvCacheBytesPerElem('f16');
+	const kvBytes = kvPerTokenPerLayer * layers * TARGET_MIN_CONTEXT;
+	return weightBytes + kvBytes + RUNTIME_OVERHEAD_BYTES;
+}
+
+export interface GgufBudgetPickOptions {
+	/**
+	 * Never auto-select a quant of HIGHER quality than this one. Defaults to {@link MAX_AUTO_GGUF_QUANT}
+	 * (Q8_0). The cap is a preference: if NO quant at/below it exists in the repo, the picker still returns
+	 * one of the remaining (higher) files so there is always something to download.
+	 */
+	maxQuant?: string;
+	/**
+	 * When the user pinned an exact quant, pass its filename here: the picker then never UPGRADES past that
+	 * quant's quality - it keeps that quant if it fits and only ever downgrades to make the model runnable.
+	 */
+	noUpgradeAbove?: string;
+	/**
+	 * Transformer-layer count for the KV term, from the model name via {@link estimateLayerCountFromModelName}.
+	 * Passing it makes every quant of the model charge the SAME KV (quant-independent) and handles MoE (whose
+	 * depth is lower than its total-param size implies). Omitted -> each file's layers are bucketed from its own
+	 * (quant-dependent) size, which biases the pick toward lower quants.
+	 */
+	layerCount?: number;
+}
+
+/**
+ * Picks the GGUF file to download for this machine: the **highest-quality quant (capped at Q8_0) whose full
+ * runtime footprint fits** `budgetBytes` - weights + a comfort-floor KV cache + engine overhead, via
+ * {@link estimateGgufRuntimeFootprintBytes}, NOT the weight file alone - and when none fit, the **smallest**
+ * file so the model can at least run. This is two-way: on a capable machine it upgrades a small catalog quant
+ * (e.g. Q4_K_M) to Q8_0, and on a tight one it downgrades. Returns undefined when there are no GGUF files or
+ * no sizes are known (caller falls back to the static priority pick). Entries without a size are treated as
+ * unknown and only used as a last-resort smallest pick.
  *
  * Multimodal projectors (`mmproj-*.gguf`) are ignored - they are tiny and would otherwise win the
  * "smallest fallback" path on memory-tight machines, which then fails at launch as architecture `clip`.
  */
-export function pickBestGgufForBudget(files: readonly { path: string; size?: number }[], budgetBytes: number): string | undefined {
+export function pickBestGgufForBudget(files: readonly { path: string; size?: number }[], budgetBytes: number, options: GgufBudgetPickOptions = {}): string | undefined {
 	const gguf = files.filter(f => isWeightGgufPath(f.path));
 	if (gguf.length === 0) {
 		return undefined;
@@ -174,16 +283,35 @@ export function pickBestGgufForBudget(files: readonly { path: string; size?: num
 	if (sized.length === 0 || budgetBytes <= 0) {
 		return undefined; // no sizes -> let the static picker decide
 	}
-	const usable = budgetBytes * 0.7; // leave headroom for the KV cache, runtime, and the OS
-	const fitting = sized.filter(f => f.size <= usable);
+	// Quality ceiling: the lower of the auto-cap (Q8_0) and any user-pinned quant. A user-pinned quant is only
+	// ever kept or downgraded, never upgraded past.
+	const capScore = quantQualityScore(options.maxQuant ?? MAX_AUTO_GGUF_QUANT);
+	const pinScore = options.noUpgradeAbove ? quantQualityScore(options.noUpgradeAbove) : Number.POSITIVE_INFINITY;
+	const ceilingScore = Math.min(capScore, pinScore);
+	// Prefer candidates at/below the quality ceiling; only if NONE exist (e.g. a repo shipping only F16) do we
+	// fall back to the rest, so there is always something to download.
+	const capped = sized.filter(f => quantQualityScore(f.path) <= ceilingScore);
+	const pool = capped.length > 0 ? capped : sized;
+
+	const fitting = pool.filter(f => estimateGgufRuntimeFootprintBytes(f.size, options.layerCount) <= budgetBytes);
 	if (fitting.length > 0) {
 		// Highest quality among those that fit; on a tie, the larger file (more bits) wins.
 		fitting.sort((a, b) => (quantQualityScore(b.path) - quantQualityScore(a.path)) || (b.size - a.size));
 		return fitting[0].path;
 	}
-	// Nothing fits -> smallest weight file so the model is at least runnable (with paging / partial offload).
-	sized.sort((a, b) => a.size - b.size);
-	return sized[0].path;
+	// Nothing fits even at minimum-viable KV -> smallest weight file so the model is at least runnable
+	// (with a reduced context / paging / partial offload).
+	pool.sort((a, b) => a.size - b.size);
+	return pool[0].path;
+}
+
+/** True when a model's `format` selects GGUF weights - either the generic 'gguf' or a specific quant name. */
+export function isGgufFormatRequest(format: string): boolean {
+	const f = (format || '').trim();
+	if (!f) {
+		return false;
+	}
+	return f.toLowerCase().includes('gguf') || GGUF_QUANT_PRIORITY.some(q => f.toUpperCase().includes(q));
 }
 
 /** Model format priority list. */
@@ -545,25 +673,35 @@ export class LoCoPilotModelDownloadService extends Disposable implements IWorkbe
 	}
 
 	/**
-	 * The memory budget (bytes) used to size-select a GGUF quant at download time: the larger of the machine's
-	 * total system RAM and its biggest detected GPU VRAM pool. RAM is included because GGUF weights can live in
-	 * system RAM (CPU/Metal backends, or partial/MoE offload), so a model that fits RAM is still runnable even
-	 * without enough VRAM. Returns 0 when neither figure is available (caller then skips the downgrade).
+	 * The memory budget (bytes) used to size-select a GGUF quant at download time: the machine's binding
+	 * runtime budget for weights + KV cache, plus any discrete VRAM that can hold offloaded weights on top.
+	 * On Apple Silicon the binding limit is the Metal WIRED-memory ceiling (lower than usable system RAM) - the
+	 * amount the model must fit to run on the GPU without paging - so the download picker sizes against the same
+	 * ceiling the runtime enforces. Elsewhere it is usable system RAM (raw total minus an OS/editor reserve),
+	 * since GGUF weights live in system RAM on CPU / partial-offload backends. Apple's unified memory reports 0
+	 * discrete VRAM, so it is covered by the RAM term rather than double-counted. Returns 0 when unavailable
+	 * (caller then keeps the format-filtered pick).
 	 */
 	private async _memoryBudgetForDownload(): Promise<number> {
-		let ram = 0;
-		let vram = 0;
+		let total = 0;
 		try {
 			const stats = await this.nativeHostService.getOSStatistics();
-			// Usable RAM, not raw total: the OS + editor always hold a slice, so sizing the quant off raw total
-			// over-states capacity and skips the downgrade on machines that can't actually run the bigger quant.
-			ram = usableSystemMemoryBytes(stats.totalmem ?? 0);
+			total = stats.totalmem ?? 0;
 		} catch { /* ignore */ }
+		let appleSilicon = false;
+		let metalWiredLimit = 0;
+		let discreteVram = 0;
 		try {
 			const hw = await this.systemInfoService.getHardwareInfo();
-			vram = hw.gpus.reduce((max, g) => Math.max(max, g.totalVramBytes), 0);
+			appleSilicon = hw.gpus.some(g => g.vendor === 'apple');
+			metalWiredLimit = hw.metalWiredLimitBytes ?? 0;
+			// Only DISCRETE VRAM adds capacity beyond system RAM; Apple's unified memory reports 0 here.
+			discreteVram = hw.gpus.reduce((max, g) => g.vendor === 'apple' ? max : Math.max(max, g.totalVramBytes), 0);
 		} catch { /* ignore */ }
-		return Math.max(ram, vram);
+		const ramBudget = appleSilicon
+			? metalOffloadBudgetBytes(total, metalWiredLimit || undefined)
+			: usableSystemMemoryBytes(total);
+		return Math.max(ramBudget, discreteVram);
 	}
 
 	/**
@@ -818,19 +956,27 @@ export class LoCoPilotModelDownloadService extends Disposable implements IWorkbe
 			const allPaths = await this.listRepoFiles(repoId, token, cancel, sizes);
 			let toDownload = filterPathsByFormat(allPaths, format);
 
-			// #4 Hardware-aware quant selection: when the chosen GGUF quant is too big for this machine's memory
-			// budget, fall back to the highest-quality quant that *does* fit (or the smallest if none do). Only
-			// ever downgrades - a quant that already fits is left untouched - so explicit choices are respected.
-			if (toDownload.length === 1 && toDownload[0].toLowerCase().endsWith('.gguf')) {
+			// #4 Hardware-aware quant selection: pick the highest-quality quant (capped at Q8_0) whose FULL runtime
+			// footprint - weights + a comfort-floor KV cache + engine overhead, not the weight file alone - fits
+			// this machine's memory budget, considering EVERY quant the repo ships (not just the catalog default).
+			// Two-way: upgrades a small catalog quant (e.g. Q4_K_M -> Q8_0) on a capable machine and downgrades on a
+			// tight one. When the user pinned an exact quant we keep it and only ever downgrade it to fit.
+			if (toDownload.some(isWeightGgufPath)) {
 				const budget = await this._memoryBudgetForDownload();
-				const chosen = toDownload[0];
-				const chosenSize = sizes.get(chosen) ?? 0;
-				if (budget > 0 && chosenSize > budget * 0.7) {
+				if (budget > 0) {
 					const files = allPaths.map(p => ({ path: p, size: sizes.get(p) }));
-					const better = pickBestGgufForBudget(files, budget);
-					if (better && better !== chosen) {
-						this._log(`[LoCoPilot Download] ${chosen} (${Math.round(chosenSize / 1e9)}GB) exceeds the ~${Math.round(budget / 1e9)}GB memory budget; downloading ${better} instead (hardware-aware quant).`);
-						toDownload = [better];
+					const userPinnedQuant = !!model.userOverrides?.format && !!format && !format.toLowerCase().includes('gguf');
+					const currentPick = toDownload.length === 1 && isWeightGgufPath(toDownload[0]) ? toDownload[0] : undefined;
+					// MoE/quant-independent KV sizing: charge every quant the SAME layer count, derived from the model
+					// name's param size (a 35B-A3B MoE is charged its depth, not its 18 GB file size).
+					const layerCount = estimateLayerCountFromModelName(model.displayName || repoId);
+					const chosen = pickBestGgufForBudget(files, budget, { ...(userPinnedQuant && currentPick ? { noUpgradeAbove: currentPick } : {}), layerCount });
+					if (chosen && chosen !== currentPick) {
+						const chosenSize = sizes.get(chosen) ?? 0;
+						const prevSize = currentPick ? (sizes.get(currentPick) ?? 0) : 0;
+						const direction = chosenSize >= prevSize ? 'higher-quality' : 'smaller';
+						this._log(`[LoCoPilot Download] Hardware-aware quant: ${direction} ${chosen} (~${Math.round(chosenSize / 1e9)}GB, est. footprint ~${Math.round(estimateGgufRuntimeFootprintBytes(chosenSize) / 1e9)}GB) for the ~${Math.round(budget / 1e9)}GB budget${currentPick ? ` instead of ${currentPick}` : ''}.`);
+						toDownload = [chosen];
 					}
 				}
 			}
