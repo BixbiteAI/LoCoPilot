@@ -21,7 +21,6 @@ import { IContextKey, IContextKeyService } from '../../../../platform/contextkey
 import { Severity, NotificationsFilter, NotificationPriority, withSeverityPrefix } from '../../../../platform/notification/common/notification.js';
 import { ScrollbarVisibility } from '../../../../base/common/scrollable.js';
 import { ILifecycleService, LifecyclePhase } from '../../../services/lifecycle/common/lifecycle.js';
-import { IHostService } from '../../../services/host/browser/host.js';
 import { IntervalCounter } from '../../../../base/common/async.js';
 import { assertReturnsDefined } from '../../../../base/common/types.js';
 import { NotificationsToastsVisibleContext } from '../../../common/contextkeys.js';
@@ -83,8 +82,7 @@ export class NotificationsToasts extends Themable implements INotificationsToast
 		@IThemeService themeService: IThemeService,
 		@IEditorGroupsService private readonly editorGroupService: IEditorGroupsService,
 		@IContextKeyService contextKeyService: IContextKeyService,
-		@ILifecycleService private readonly lifecycleService: ILifecycleService,
-		@IHostService private readonly hostService: IHostService
+		@ILifecycleService private readonly lifecycleService: ILifecycleService
 	) {
 		super(themeService);
 
@@ -296,14 +294,22 @@ export class NotificationsToasts extends Themable implements INotificationsToast
 
 			purgeTimeoutHandle = setTimeout(() => {
 
-				// If the window does not have focus, we wait for the window to gain focus
-				// again before triggering the timeout again. This prevents an issue where
-				// focussing the window could immediately hide the notification because the
-				// timeout was triggered again.
-				if (!this.hostService.hasFocus) {
+				// If the window is not visible (e.g. minimized or occluded), we wait for it
+				// to become visible again before triggering the timeout again, so a toast that
+				// appeared while the user was away is still shown when they return.
+				//
+				// NOTE: we intentionally gate on *visibility* rather than window focus here.
+				// `hostService.hasFocus` is `document.hasFocus()`, which reports `false`
+				// whenever focus lives inside a child webview/iframe (e.g. the LoCoPilot chat
+				// panel or model settings editor) even though the window is fully visible and
+				// in active use. Gating on focus therefore parked toasts indefinitely - they
+				// never auto-dismissed while the user worked in a webview. Visibility does not
+				// have this problem.
+				const toastWindow = getWindow(notificationToastContainer);
+				if (toastWindow.document.visibilityState === 'hidden') {
 					if (!listener) {
-						listener = this.hostService.onDidChangeFocus(focus => {
-							if (focus) {
+						listener = addDisposableListener(toastWindow.document, 'visibilitychange', () => {
+							if (toastWindow.document.visibilityState !== 'hidden') {
 								hideAfterTimeout();
 							}
 						});

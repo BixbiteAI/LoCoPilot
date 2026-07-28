@@ -7,7 +7,7 @@
 
 import { CancellationToken, CancellationTokenSource } from '../../../../base/common/cancellation.js';
 import { listenStream } from '../../../../base/common/stream.js';
-import { Disposable } from '../../../../base/common/lifecycle.js';
+import { Disposable, DisposableStore } from '../../../../base/common/lifecycle.js';
 import { dirname, isEqual, isEqualOrParent, joinPath } from '../../../../base/common/resources.js';
 import { URI } from '../../../../base/common/uri.js';
 import { generateUuid } from '../../../../base/common/uuid.js';
@@ -16,7 +16,7 @@ import { IRequestService } from '../../../../platform/request/common/request.js'
 import type { IRequestToFileProgressEvent } from '../../../../platform/request/common/requestIpc.js';
 import { ILogService } from '../../../../platform/log/common/log.js';
 import { IFileService } from '../../../../platform/files/common/files.js';
-import { IEnvironmentService } from '../../../../platform/environment/common/environment.js';
+import { IEnvironmentService, INativeEnvironmentService } from '../../../../platform/environment/common/environment.js';
 import { ICustomLanguageModelsService, ICustomLanguageModel, MIN_CONTEXT_WINDOW, MAX_CONTEXT_WINDOW, getCustomModelListLabel } from '../common/customLanguageModelsService.js';
 import { ILoCoPilotFileLog } from './locopilotFileLog.js';
 import { ILoCoPilotOllamaService } from './locopilotOllamaService.js';
@@ -35,9 +35,76 @@ import { usableSystemMemoryBytes } from './locopilotLlamaCppServer.js';
 import { IConfigurationService } from '../../../../platform/configuration/common/configuration.js';
 import { ChatConfiguration } from '../common/constants.js';
 import { findDraftPairing } from './locopilotModelCatalog.js';
+import { ITerminalService, ITerminalInstance } from '../../terminal/browser/terminal.js';
+import { getBundledMlxPython } from './locopilotMlxServer.js';
+import { showTransientNotification } from './locopilotNotify.js';
 
 const HF_API_BASE = 'https://huggingface.co';
 const HF_RESOLVE = `${HF_API_BASE}`;
+
+/**
+ * Inline Python (run as `python -c`) that downloads a repo's files with huggingface_hub/hf_xet and prints its
+ * REAL network progress as `LCP_PROGRESS <bytes_done> <bytes_total>` lines (newline-terminated, ~200ms cadence).
+ *
+ * Why not just parse `hf download`'s own progress? Two reasons: (1) hf_xet's default bar reports bytes *written
+ * to disk* during reconstruction, which stays frozen while chunks stream into the cache, and (2) that bar uses
+ * carriage returns, which VS Code's terminal onLineData (newline-based) never delivers. So we read hf_xet's
+ * `total_transfer_bytes_completed` counter directly - the only value that tracks the actual download - by
+ * wrapping the xet session's `new_file_download_group` to observe its progress report. The wrap is guarded: if
+ * the internal API ever changes, the download still runs (just without live progress) rather than failing.
+ *
+ * Contract with the caller: repo id = argv[1], target dir = argv[2], JSON file list = env `LCP_FILES`. Files
+ * land at `<dir>/<relPath>` (matching the direct path). A failed file raises -> non-zero exit -> caller falls
+ * back to the direct download.
+ */
+// Assembled as tab-indented source lines joined by newlines (NOT a template literal): the repo's hygiene
+// checker rejects the space indentation Python requires, but Python only sees the spaces inside each string.
+const HF_XET_DOWNLOAD_PY = [
+	'import sys, os, json, time',
+	'from huggingface_hub import hf_hub_download',
+	'_groups = {}',
+	'_gid = [0]',
+	'_last = [0.0]',
+	'def _emit(force=False):',
+	'    now = time.time()',
+	'    if not force and now - _last[0] < 0.2:',
+	'        return',
+	'    _last[0] = now',
+	'    c = sum(v[0] for v in _groups.values())',
+	'    t = sum(v[1] for v in _groups.values())',
+	'    if t > 0:',
+	'        print("LCP_PROGRESS", c, t)',
+	'        sys.stdout.flush()',
+	'try:',
+	'    import huggingface_hub.utils._xet as _xu',
+	'    _real = _xu.get_xet_session',
+	'    class _Wrap:',
+	'        def __init__(self, s):',
+	'            self._s = s',
+	'        def __getattr__(self, k):',
+	'            return getattr(self._s, k)',
+	'        def new_file_download_group(self, *a, **k):',
+	'            _gid[0] += 1',
+	'            gid = _gid[0]',
+	'            cb = k.get("progress_callback")',
+	'            def nc(rep, x):',
+	'                _groups[gid] = (getattr(rep, "total_transfer_bytes_completed", 0), getattr(rep, "total_transfer_bytes", 0))',
+	'                _emit()',
+	'                return cb(rep, x) if cb else None',
+	'            k["progress_callback"] = nc',
+	'            return self._s.new_file_download_group(*a, **k)',
+	'    _xu.get_xet_session = lambda: _Wrap(_real())',
+	'except Exception:',
+	'    pass',
+	'repo = sys.argv[1]',
+	'local_dir = sys.argv[2]',
+	'files = json.loads(os.environ.get("LCP_FILES") or "[]")',
+	'for f in files:',
+	'    hf_hub_download(repo_id=repo, filename=f, local_dir=local_dir)',
+	'_emit(force=True)',
+	'print("LCP_DONE")',
+	'sys.stdout.flush()',
+].join('\n');
 
 /** GGUF quantization preference (best quality/size tradeoff first). */
 const GGUF_QUANT_PRIORITY = [
@@ -294,9 +361,15 @@ export class LoCoPilotModelDownloadService extends Disposable implements IWorkbe
 		@ILoCoPilotSystemInfoService private readonly systemInfoService: ILoCoPilotSystemInfoService,
 		@INativeHostService private readonly nativeHostService: INativeHostService,
 		@IConfigurationService private readonly configurationService: IConfigurationService,
+		@ITerminalService private readonly terminalService: ITerminalService,
 	) {
 		super();
 		this._registerCommands();
+	}
+
+	/** App install root (INativeEnvironmentService.appRoot); undefined on web. Used to locate bundled tools. */
+	private get _appRoot(): string | undefined {
+		return (this.environmentService as Partial<INativeEnvironmentService>).appRoot;
 	}
 
 	private _registerCommands(): void {
@@ -315,7 +388,7 @@ export class LoCoPilotModelDownloadService extends Disposable implements IWorkbe
 				// and any time it takes for the progress bar to appear.
 				const startModel = self.customLanguageModelsService.getCustomModels().find(m => m.id === modelId);
 				if (startModel) {
-					self.notificationService.info(`Download started for "${getCustomModelListLabel(startModel)}". You can keep working - I'll let you know when it's ready.`);
+					showTransientNotification(self.notificationService, Severity.Info, `Download started for "${getCustomModelListLabel(startModel)}". You can keep working - I'll let you know when it's ready.`);
 				}
 				// Open the model list focused on this model so the user can track download progress.
 				const commandService = accessor.get(ICommandService);
@@ -593,9 +666,9 @@ export class LoCoPilotModelDownloadService extends Disposable implements IWorkbe
 	 */
 	private _notifyDownloadReady(model: ICustomLanguageModel): void {
 		const label = getCustomModelListLabel(model);
-		this.notificationService.notify({
-			severity: Severity.Info,
-			message: `"${label}" is ready. Send your message to start chatting.`,
+		// A bit longer than the default transient lifetime since this toast carries a click action.
+		showTransientNotification(this.notificationService, Severity.Info, `"${label}" is ready. Send your message to start chatting.`, {
+			timeoutMs: 12000,
 			actions: {
 				primary: [{
 					id: 'locopilot.startChattingAfterDownload',
@@ -628,7 +701,7 @@ export class LoCoPilotModelDownloadService extends Disposable implements IWorkbe
 		const readiness = await this.ollamaService.ensureReady(baseUrl);
 		if (readiness !== 'ready') {
 			if (readiness === 'starting') {
-				this.notificationService.info(`Ollama is starting up. Once it is running, click "Download" again to pull "${repoId}".`);
+				showTransientNotification(this.notificationService, Severity.Info, `Ollama is starting up. Once it is running, click "Download" again to pull "${repoId}".`);
 			}
 			this._log(`[LoCoPilot Ollama] Not ready to pull ${repoId} (state: ${readiness}).`);
 			return;
@@ -788,68 +861,93 @@ export class LoCoPilotModelDownloadService extends Disposable implements IWorkbe
 			partialInstallDir = baseDir;
 
 			const total = toDownload.length;
+
+			// Per-file on-disk targets, shared by both download paths. Also picks the main weights GGUF llama.cpp
+			// loads as `-m`: the mmproj projector is a .gguf too but must never be the main file, so skip it; a
+			// single-file gguf wins outright, otherwise the first weight gguf. Pure path logic - no I/O - so it is
+			// identical whether the bundled-hf fast path or the direct fallback actually fetched the bytes.
 			let mainModelFileUri: URI | undefined;
-			for (let i = 0; i < toDownload.length; i++) {
-				const relPath = toDownload[i];
-				// Use path segment encoding so "org/repo" stays as org/repo in URL path (HF CDN expects it)
-				const repoPathEnc = repoId.split('/').map(encodeURIComponent).join('/');
-				const filePathEnc = relPath.split('/').map(encodeURIComponent).join('/');
-				const fileUrl = `${HF_RESOLVE}/${repoPathEnc}/resolve/main/${filePathEnc}`;
-				const headers: Record<string, string> = {};
-				if (token) headers['Authorization'] = `Bearer ${token}`;
+			const targets = toDownload.map(relPath => {
 				const segments = relPath.split('/').filter(Boolean);
 				const fileUri = segments.length > 1 ? joinPath(baseDir, ...segments) : joinPath(baseDir, relPath);
-				const parentPath = segments.slice(0, -1);
-				if (parentPath.length > 0) {
-					await this.fileService.createFolder(joinPath(baseDir, ...parentPath));
-				}
-				// Use requestToFile when available to stream directly to disk and avoid OOM for large model files
-				if (this.requestService.requestToFile) {
-					const progressRequestId = generateUuid();
-					let lastPct = -1;
-					const progressEvent = this.requestService.getRequestToFileProgressEvent?.(progressRequestId);
-					const progressDisposable = progressEvent
-						? progressEvent((evt: IRequestToFileProgressEvent) => {
-							const contentLength = evt.contentLength;
-							const filePct = contentLength && contentLength > 0
-								? Math.min(100, Math.round((evt.bytesReceived / contentLength) * 100))
-								: 0;
-							// Overall progress: completed files + current file progress
-							const pct = total <= 1
-								? filePct
-								: Math.min(99, Math.round((i / total) * 100 + (filePct / 100) * (1 / total) * 100));
-							if (pct !== lastPct && pct >= 0) {
-								lastPct = pct;
-								this.customLanguageModelsService.updateCustomModel(modelId, { downloadProgress: pct });
-							}
-						})
-						: undefined;
-					try {
-						const res = await this.requestService.requestToFile({ type: 'GET', url: fileUrl, headers }, fileUri.fsPath, cancel, progressRequestId);
-						if (res.res.statusCode !== 200) {
-							throw new Error(`Download failed for ${relPath}: ${res.res.statusCode}`);
-						}
-					} finally {
-						progressDisposable?.dispose();
-					}
-				} else {
-					const res = await this.requestService.request({ type: 'GET', url: fileUrl, headers }, cancel);
-					if (res.res.statusCode !== 200) {
-						throw new Error(`Download failed for ${relPath}: ${res.res.statusCode}`);
-					}
-					await this.fileService.writeFile(fileUri, res.stream);
-				}
-				// For single GGUF download, use this file as the main model path for llama.cpp. The mmproj
-				// projector is also a .gguf but must NOT be treated as the main weights, so skip it here.
+				return { relPath, segments, fileUri };
+			});
+			for (const { relPath, fileUri } of targets) {
 				const isMmproj = isMmprojGgufPath(relPath) || relPath === mmprojRelPath;
 				if (!isMmproj && total === 1 && relPath.toLowerCase().endsWith('.gguf')) {
 					mainModelFileUri = fileUri;
 				} else if (!isMmproj && relPath.toLowerCase().endsWith('.gguf')) {
 					mainModelFileUri = mainModelFileUri ?? fileUri;
 				}
-				const pct = Math.round(((i + 1) / total) * 100);
-				await this.customLanguageModelsService.updateCustomModel(modelId, { downloadProgress: pct });
-				this._log(`[LoCoPilot Download] ${repoId} progress: ${pct}% (${i + 1}/${total})`);
+			}
+
+			// Fast path (Apple Silicon only): download the whole file set in one shot through the bundled `hf`
+			// CLI, which uses hf_xet - parallel, chunk-deduplicated, resumable transfers that saturate the link
+			// far better than our single-stream-per-file HTTP path. Any failure (not present, non-zero exit)
+			// falls through to the original direct download below, so nothing breaks on machines without it.
+			let downloadedViaHf = false;
+			try {
+				downloadedViaHf = await this._tryDownloadViaBundledHf(repoId, token, toDownload, baseDir, modelId, cancel);
+			} catch (e) {
+				if (cancel.isCancellationRequested || isCancellationError(e)) {
+					throw e;
+				}
+				this._log(`[LoCoPilot Download] Bundled hf fast path failed for ${repoId}; falling back to direct download: ${toErrorMessage(e)}`);
+			}
+
+			if (!downloadedViaHf) {
+				for (let i = 0; i < targets.length; i++) {
+					const { relPath, segments, fileUri } = targets[i];
+					// Use path segment encoding so "org/repo" stays as org/repo in URL path (HF CDN expects it)
+					const repoPathEnc = repoId.split('/').map(encodeURIComponent).join('/');
+					const filePathEnc = relPath.split('/').map(encodeURIComponent).join('/');
+					const fileUrl = `${HF_RESOLVE}/${repoPathEnc}/resolve/main/${filePathEnc}`;
+					const headers: Record<string, string> = {};
+					if (token) headers['Authorization'] = `Bearer ${token}`;
+					const parentPath = segments.slice(0, -1);
+					if (parentPath.length > 0) {
+						await this.fileService.createFolder(joinPath(baseDir, ...parentPath));
+					}
+					// Use requestToFile when available to stream directly to disk and avoid OOM for large model files
+					if (this.requestService.requestToFile) {
+						const progressRequestId = generateUuid();
+						let lastPct = -1;
+						const progressEvent = this.requestService.getRequestToFileProgressEvent?.(progressRequestId);
+						const progressDisposable = progressEvent
+							? progressEvent((evt: IRequestToFileProgressEvent) => {
+								const contentLength = evt.contentLength;
+								const filePct = contentLength && contentLength > 0
+									? Math.min(100, Math.round((evt.bytesReceived / contentLength) * 100))
+									: 0;
+								// Overall progress: completed files + current file progress
+								const pct = total <= 1
+									? filePct
+									: Math.min(99, Math.round((i / total) * 100 + (filePct / 100) * (1 / total) * 100));
+								if (pct !== lastPct && pct >= 0) {
+									lastPct = pct;
+									this.customLanguageModelsService.updateCustomModel(modelId, { downloadProgress: pct });
+								}
+							})
+							: undefined;
+						try {
+							const res = await this.requestService.requestToFile({ type: 'GET', url: fileUrl, headers }, fileUri.fsPath, cancel, progressRequestId);
+							if (res.res.statusCode !== 200) {
+								throw new Error(`Download failed for ${relPath}: ${res.res.statusCode}`);
+							}
+						} finally {
+							progressDisposable?.dispose();
+						}
+					} else {
+						const res = await this.requestService.request({ type: 'GET', url: fileUrl, headers }, cancel);
+						if (res.res.statusCode !== 200) {
+							throw new Error(`Download failed for ${relPath}: ${res.res.statusCode}`);
+						}
+						await this.fileService.writeFile(fileUri, res.stream);
+					}
+					const pct = Math.round(((i + 1) / total) * 100);
+					await this.customLanguageModelsService.updateCustomModel(modelId, { downloadProgress: pct });
+					this._log(`[LoCoPilot Download] ${repoId} progress: ${pct}% (${i + 1}/${total})`);
+				}
 			}
 
 			// Prefer full path to a single weight GGUF so llama.cpp can load it as `-m`. Never persist an
@@ -900,6 +998,152 @@ export class LoCoPilotModelDownloadService extends Disposable implements IWorkbe
 				`Failed to download model "${repoId}": ${message}. Check the model name (use format org/model-name), token for gated repos, and network.`
 			);
 			throw e;
+		}
+	}
+
+	/**
+	 * Fast download path for Apple Silicon: fetch the `toDownload` file set through the bundled Python's
+	 * **hf_xet** engine - parallel, chunk-deduplicated, resumable transfers that saturate the link far better
+	 * than our single-connection-per-file HTTP path (the direct fallback). Files land at the same
+	 * `<baseDir>/<relPath>` layout the caller expects.
+	 *
+	 * Progress comes from hf_xet's own *network* transfer counter (`total_transfer_bytes_completed`), surfaced
+	 * by {@link HF_XET_DOWNLOAD_PY} as newline-delimited `LCP_PROGRESS <done> <total>` lines. That is the only
+	 * signal that reflects real download speed: the file itself is reconstructed from cached chunks and only
+	 * written to disk near the end, so both an on-disk size poll and hf_xet's *reconstruction* counter (what the
+	 * default progress bar shows) sit frozen for most of the download - which is exactly why the previous
+	 * folder-size meter looked stuck.
+	 *
+	 * Returns true only when every requested file is on disk after a clean (exit 0) run. Returns false - so the
+	 * caller runs the original direct download - whenever the fast path is unavailable or unsuccessful (not an
+	 * Apple Silicon build, Python missing, terminal couldn't start, non-zero exit, or a file didn't materialise).
+	 * Throws only on cancellation, which the caller turns into the normal partial-install cleanup.
+	 */
+	private async _tryDownloadViaBundledHf(
+		repoId: string,
+		token: string | undefined,
+		toDownload: string[],
+		baseDir: URI,
+		modelId: string,
+		cancel: CancellationToken,
+	): Promise<boolean> {
+		if (cancel.isCancellationRequested) {
+			return false;
+		}
+		// The self-contained Python (huggingface_hub + hf_xet) ships only in the macOS arm64 package; this
+		// returns undefined on every other platform/arch and on web (no appRoot).
+		const pythonCmd = getBundledMlxPython(this._appRoot);
+		if (!pythonCmd) {
+			return false;
+		}
+		try {
+			if (!(await this.fileService.exists(URI.file(pythonCmd)))) {
+				this._log(`[LoCoPilot Download] Bundled Python not found at ${pythonCmd}; using direct download.`);
+				return false;
+			}
+		} catch {
+			return false;
+		}
+
+		// Drive the download from a small inline script (`python -c`) rather than the `hf` console script: the
+		// script's shebang is hard-coded to the BUILD machine's Python path and breaks once the app is installed
+		// elsewhere, and running it inline lets us emit machine-readable progress. repo id + target dir go as
+		// argv; the file list rides in an env var to avoid any quoting concerns.
+		const args = ['-c', HF_XET_DOWNLOAD_PY, repoId, baseDir.fsPath];
+		// Additive env only (VS Code merges this over the inherited environment). A token also lifts rate limits.
+		const env: { [key: string]: string } = {
+			HF_HUB_DISABLE_TELEMETRY: '1',
+			HF_HUB_DISABLE_PROGRESS_BARS: '1', // suppress hf_xet's own \r progress bars; we print our own lines
+			LCP_FILES: JSON.stringify(toDownload),
+		};
+		if (token) {
+			env.HF_TOKEN = token;
+		}
+		// hf_xet raises its concurrency/buffer ceilings under this flag, but the bigger buffers are only safe
+		// with plenty of RAM, so gate it on a 64GB+ machine.
+		try {
+			const stats = await this.nativeHostService.getOSStatistics();
+			if ((stats.totalmem ?? 0) >= 64 * 1024 * 1024 * 1024) {
+				env.HF_XET_HIGH_PERFORMANCE = '1';
+			}
+		} catch { /* ignore */ }
+
+		this._log(`[LoCoPilot Download] Fast path (hf_xet): downloading ${repoId} (${toDownload.length} file(s)) via bundled Python.`);
+
+		let terminal: ITerminalInstance;
+		try {
+			terminal = await this.terminalService.createTerminal({
+				config: {
+					name: `Download - ${repoId}`,
+					executable: pythonCmd,
+					args,
+					env,
+					// Transient so the pty host tears it (and the process) down on window reload instead of
+					// orphaning it; hidden so it never clutters the terminal panel. Logs still flow via onLineData.
+					isTransient: true,
+					hideFromUser: true,
+				}
+			});
+		} catch (e) {
+			this._log(`[LoCoPilot Download] Could not start bundled hf terminal (${toErrorMessage(e)}); using direct download.`);
+			return false;
+		}
+
+		const logTail: string[] = [];
+		const store = new DisposableStore();
+		// Progress + log capture: parse the script's `LCP_PROGRESS <done> <total>` lines (real network bytes from
+		// hf_xet) and map them to the model's download percent, updating only when the integer percent changes.
+		let lastPct = -1;
+		store.add(terminal.onLineData(line => {
+			logTail.push(line);
+			if (logTail.length > 40) {
+				logTail.splice(0, logTail.length - 40);
+			}
+			const m = /LCP_PROGRESS (\d+) (\d+)/.exec(line);
+			if (m) {
+				const done = Number(m[1]);
+				const total = Number(m[2]);
+				if (total > 0) {
+					const pct = Math.max(0, Math.min(99, Math.round((done / total) * 100)));
+					if (pct !== lastPct) {
+						lastPct = pct;
+						this.customLanguageModelsService.updateCustomModel(modelId, { downloadProgress: pct });
+					}
+				}
+			}
+		}));
+
+		try {
+			const exitCode = await new Promise<number | undefined>((resolve, reject) => {
+				store.add(terminal.onExit(code => resolve(typeof code === 'number' ? code : undefined)));
+				store.add(cancel.onCancellationRequested(() => reject(new CancellationError())));
+			});
+			if (exitCode !== 0) {
+				this._log(`[LoCoPilot Download] Bundled hf exited ${exitCode ?? 'n/a'} for ${repoId}; using direct download. Last output:\n${logTail.slice(-15).join('\n')}`);
+				return false;
+			}
+			// A clean exit should mean every file is present; verify so a partial/skipped run falls back cleanly.
+			for (const relPath of toDownload) {
+				const segments = relPath.split('/').filter(Boolean);
+				const fileUri = segments.length > 1 ? joinPath(baseDir, ...segments) : joinPath(baseDir, relPath);
+				let ok = false;
+				try {
+					const st = await this.fileService.stat(fileUri);
+					ok = !st.isDirectory;
+				} catch {
+					ok = false;
+				}
+				if (!ok) {
+					this._log(`[LoCoPilot Download] Bundled hf finished but ${relPath} is missing; using direct download.`);
+					return false;
+				}
+			}
+			await this.customLanguageModelsService.updateCustomModel(modelId, { downloadProgress: 99 });
+			this._log(`[LoCoPilot Download] Fast path (hf_xet) completed for ${repoId}.`);
+			return true;
+		} finally {
+			store.dispose();
+			terminal.dispose();
 		}
 	}
 

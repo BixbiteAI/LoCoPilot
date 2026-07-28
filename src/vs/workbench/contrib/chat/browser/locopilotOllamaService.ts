@@ -13,6 +13,7 @@ import { ILogService } from '../../../../platform/log/common/log.js';
 import { IFileService } from '../../../../platform/files/common/files.js';
 import { IRequestService } from '../../../../platform/request/common/request.js';
 import { INotificationService, Severity } from '../../../../platform/notification/common/notification.js';
+import { showTransientNotification } from './locopilotNotify.js';
 import { IOpenerService } from '../../../../platform/opener/common/opener.js';
 import { IPathService } from '../../../services/path/common/pathService.js';
 import { ITerminalService, ITerminalGroupService } from '../../terminal/browser/terminal.js';
@@ -230,10 +231,7 @@ export class LoCoPilotOllamaService extends Disposable implements ILoCoPilotOlla
 			await this.terminalGroupService.showPanel(true);
 			await timeout(400);
 			await terminal.sendText(cmd, true);
-			this.notificationService.notify({
-				severity: Severity.Info,
-				message: 'Installing Ollama in the terminal. When it finishes, click "Download" / "Run model" again to pull your model.',
-			});
+			showTransientNotification(this.notificationService, Severity.Info, 'Installing Ollama in the terminal. When it finishes, click "Download" / "Run model" again to pull your model.');
 		} catch (e) {
 			this._log(`[LoCoPilot Ollama] Failed to launch installer: ${e}`);
 			this.openerService.open(URI.parse(OLLAMA_DOWNLOAD_PAGE));

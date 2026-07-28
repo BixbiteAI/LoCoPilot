@@ -72,6 +72,7 @@ import {
 	MLX_TIGHT_FIT_HEADROOM_BYTES,
 	type MlxServerTuning,
 } from './locopilotMlxServer.js';
+import { showTransientNotification } from './locopilotNotify.js';
 import { findDraftPairing } from './locopilotModelCatalog.js';
 import { LoCoPilotModelDownloadService, modelDownloadDirName, isMmprojGgufPath } from './locopilotModelDownloadService.js';
 import { joinPath } from '../../../../base/common/resources.js';
@@ -923,7 +924,7 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 		this._cudaDownloadInFlight = true;
 		try {
 			if (interactive) {
-				this.notificationService.info('Downloading the CUDA engine (~650 MB) in the background. You can keep working - it will be used the next time a local model starts.');
+				showTransientNotification(this.notificationService, Severity.Info, 'Downloading the CUDA engine (~650 MB) in the background. You can keep working - it will be used the next time a local model starts.');
 			}
 			const release = await this._findCudaRelease();
 			if (!release) {
@@ -965,7 +966,7 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 				throw new Error('llama-server.exe was not found after extraction.');
 			}
 			this._log(`[LoCoPilot Runner] CUDA engine ${release.tag} installed at ${bin}.`);
-			this.notificationService.info('The CUDA engine is ready. It will be used the next time a local model starts.');
+			showTransientNotification(this.notificationService, Severity.Info, 'The CUDA engine is ready. It will be used the next time a local model starts.');
 		} catch (e) {
 			this._log(`[LoCoPilot Runner] CUDA engine download failed: ${e}`);
 			// Remove a partial install so the next attempt starts clean and _installedCudaServerPath can't

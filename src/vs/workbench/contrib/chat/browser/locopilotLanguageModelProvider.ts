@@ -22,7 +22,8 @@ import { ChatConfiguration, ChatAgentLocation } from '../common/constants.js';
 import { findCatalogEntryByRepoId, getDefaultPickerRepoId, isAutoCandidate, resolveAutoModel } from './locopilotModelCatalog.js';
 import { ITimerService } from '../../../services/timer/browser/timerService.js';
 import { ILoCoPilotFileLog } from './locopilotFileLog.js';
-import { INotificationService } from '../../../../platform/notification/common/notification.js';
+import { INotificationService, Severity } from '../../../../platform/notification/common/notification.js';
+import { showTransientNotification } from './locopilotNotify.js';
 import { IStorageService } from '../../../../platform/storage/common/storage.js';
 import { getReasoningEffort, reasoningBudgetTokens, ReasoningEffort } from '../common/locopilotReasoningEffort.js';
 import { ICustomLanguageModelsService, ICustomLanguageModel, getCustomModelListLabel, deriveTokenLimits, defaultContextWindow, TOOL_FAILURE_DISABLE_THRESHOLD, customModelSupportsVision, LOCOPILOT_AUTO_MODEL_ID } from '../common/customLanguageModelsService.js';
@@ -587,7 +588,7 @@ export class LoCoPilotLanguageModelProvider extends Disposable implements ILangu
 					const wasVision = await this.customLanguageModelsService.autoDisableVision(model.id);
 					this._log(`[LoCoPilot Provider] Image input rejected by "${getCustomModelListLabel(model)}"; retrying as text-only. ${errMsg}`);
 					if (wasVision) {
-						this.notificationService.info(`Image skipped - "${getCustomModelListLabel(model)}" can't read images, so your attachment was sent as a text note. Switch to a vision-capable model to send images.`);
+						showTransientNotification(this.notificationService, Severity.Info, `Image skipped - "${getCustomModelListLabel(model)}" can't read images, so your attachment was sent as a text note. Switch to a vision-capable model to send images.`);
 					}
 					return await this._dispatchProvider({ ...model, supportsVision: false }, this._stripImageParts(messages), options, stream, token);
 				} catch (retryErr) {
@@ -609,7 +610,7 @@ export class LoCoPilotLanguageModelProvider extends Disposable implements ILangu
 					this._log(`[LoCoPilot Provider] Tool-call failure #${streak} for ${getCustomModelListLabel(model)}: ${errMsg}`);
 					if (streak >= TOOL_FAILURE_DISABLE_THRESHOLD && !model.toolsAutoDisabled) {
 						await this.customLanguageModelsService.autoDisableTools(model.id);
-						this.notificationService.info(`Disabled native tool calling for "${getCustomModelListLabel(model)}" after repeated failures. You can re-enable it in the model's settings.`);
+						showTransientNotification(this.notificationService, Severity.Info, `Disabled native tool calling for "${getCustomModelListLabel(model)}" after repeated failures. You can re-enable it in the model's settings.`);
 					}
 					const retryOptions = { ...options, tools: undefined };
 					return await this._dispatchProvider({ ...model, useNativeTools: false }, messages, retryOptions, stream, token);

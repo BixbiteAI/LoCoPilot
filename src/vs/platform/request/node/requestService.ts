@@ -8,7 +8,7 @@ import type * as https from 'https';
 import * as fs from 'fs';
 import { parse as parseUrl } from 'url';
 import { Promises } from '../../../base/common/async.js';
-import { streamToBufferReadableStream } from '../../../base/common/buffer.js';
+import { streamToBuffer, streamToBufferReadableStream } from '../../../base/common/buffer.js';
 import { CancellationToken } from '../../../base/common/cancellation.js';
 import { CancellationError, getErrorMessage } from '../../../base/common/errors.js';
 import * as streams from '../../../base/common/stream.js';
@@ -123,6 +123,25 @@ export class RequestService extends AbstractRequestService implements IRequestSe
 				...(options.headers || {}),
 				'Proxy-Authorization': this.authorization
 			};
+		}
+
+		// Try a multi-connection ranged download first (much faster for large model files on links where a
+		// single stream is throughput-limited). It only engages for large GETs on servers that advertise byte
+		// ranges; anything else - and ANY failure - falls through to the original single-stream download, so
+		// behaviour never regresses and the file still downloads. macOS Apple Silicon uses the bundled hf_xet
+		// path instead (in the model download service), so in practice this benefits Windows / Intel Mac / Linux.
+		if ((options.type ?? 'GET') === 'GET') {
+			try {
+				const parallel = await nodeParallelRequestToFile(options, destinationFilePath, token, onProgress);
+				if (parallel) {
+					return parallel;
+				}
+			} catch (err) {
+				if (token.isCancellationRequested) {
+					throw err;
+				}
+				this.logService.warn(`[requestToFile] parallel download failed (${getErrorMessage(err)}); falling back to single stream.`);
+			}
 		}
 
 		return nodeRequestToFile(options, destinationFilePath, token, onProgress);
@@ -394,4 +413,96 @@ export async function nodeRequestToFile(
 			reject(new CancellationError());
 		});
 	});
+}
+
+/** Only parallelize downloads at least this large; below it, one stream is already fast enough and the extra probe isn't worth it. */
+const PARALLEL_MIN_TOTAL_BYTES = 64 * 1024 * 1024;
+/** Number of concurrent range connections. 8 saturates most links without tripping HF's per-client rate limits. */
+const PARALLEL_CONNECTIONS = 8;
+/** Fixed range size per request. Small enough that peak memory (CONNECTIONS x CHUNK) stays bounded (~128MB), and each completion advances progress in visible steps. */
+const PARALLEL_CHUNK_BYTES = 16 * 1024 * 1024;
+
+/**
+ * Downloads a file using multiple concurrent HTTP range requests, writing each range to its correct offset in a
+ * `.part` file that is atomically renamed into place on success. This is typically several times faster than a
+ * single stream on links where one connection is throughput-limited.
+ *
+ * Returns `undefined` (NOT an error) when the ranged path does not apply - the server doesn't honour byte ranges
+ * (no `206`/`Content-Range`), the size is unknown, or the file is small - so the caller falls back to the normal
+ * single-stream download. Throws only on a real failure mid-download (which the caller also turns into a
+ * fallback) or on cancellation. On any throw the partial `.part` file is removed, so nothing corrupt is left.
+ *
+ * Memory is bounded to about `PARALLEL_CONNECTIONS * PARALLEL_CHUNK_BYTES`: a fixed pool of workers each buffers
+ * at most one chunk before writing it positionally.
+ */
+export async function nodeParallelRequestToFile(
+	options: NodeRequestOptions,
+	destinationFilePath: string,
+	token: CancellationToken,
+	onProgress?: RequestToFileProgressCallback
+): Promise<IRequestToFileResult | undefined> {
+	// Probe with a 1-byte range to learn the total size and confirm the server (after any redirects) serves
+	// ranges. nodeRequest follows redirects and preserves our headers (auth + Range) across them.
+	const probe = await nodeRequest({ ...options, type: 'GET', headers: { ...(options.headers || {}), Range: 'bytes=0-0' } }, token);
+	const probeStatus = probe.res.statusCode ?? 0;
+	const contentRange = probe.res.headers['content-range'];
+	try { await streamToBuffer(probe.stream); } catch { /* drain the tiny probe body; ignore */ }
+	if (probeStatus !== 206 || typeof contentRange !== 'string') {
+		return undefined; // ranges not supported -> caller falls back to single stream
+	}
+	const totalMatch = /\/(\d+)\s*$/.exec(contentRange); // "bytes 0-0/<total>"
+	const total = totalMatch ? parseInt(totalMatch[1], 10) : NaN;
+	if (!Number.isFinite(total) || total < PARALLEL_MIN_TOTAL_BYTES) {
+		return undefined; // unknown or small -> not worth parallelizing
+	}
+
+	const partPath = destinationFilePath + '.part';
+	const handle = await fs.promises.open(partPath, 'w');
+	let received = 0;
+	try {
+		await handle.truncate(total); // preallocate so concurrent positional writes land correctly
+		const totalChunks = Math.ceil(total / PARALLEL_CHUNK_BYTES);
+		let nextChunk = 0;
+
+		const worker = async (): Promise<void> => {
+			for (; ;) {
+				if (token.isCancellationRequested) {
+					throw new CancellationError();
+				}
+				const idx = nextChunk++;
+				if (idx >= totalChunks) {
+					return;
+				}
+				const start = idx * PARALLEL_CHUNK_BYTES;
+				const end = Math.min(start + PARALLEL_CHUNK_BYTES - 1, total - 1);
+				const ctx = await nodeRequest({ ...options, type: 'GET', headers: { ...(options.headers || {}), Range: `bytes=${start}-${end}` } }, token);
+				// A 200 (range ignored) would hand us the WHOLE file for this chunk - writing that at an offset
+				// would corrupt the output, so require an exact 206 partial and bail (to fallback) otherwise.
+				if (ctx.res.statusCode !== 206) {
+					throw new Error(`range request returned ${ctx.res.statusCode ?? 'no status'}`);
+				}
+				const buffer = await streamToBuffer(ctx.stream);
+				const expected = end - start + 1;
+				if (buffer.byteLength !== expected) {
+					throw new Error(`range size mismatch: got ${buffer.byteLength}, expected ${expected}`);
+				}
+				await handle.write(buffer.buffer, 0, buffer.byteLength, start);
+				received += buffer.byteLength;
+				onProgress?.(received, total);
+			}
+		};
+
+		const workers: Promise<void>[] = [];
+		for (let i = 0; i < Math.min(PARALLEL_CONNECTIONS, totalChunks); i++) {
+			workers.push(worker());
+		}
+		await Promise.all(workers);
+		await handle.close();
+		await fs.promises.rename(partPath, destinationFilePath);
+		return { res: { statusCode: 200, headers: probe.res.headers as IRequestContext['res']['headers'] } };
+	} catch (err) {
+		try { await handle.close(); } catch { /* ignore */ }
+		try { await fs.promises.unlink(partPath); } catch { /* ignore */ }
+		throw err;
+	}
 }
