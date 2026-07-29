@@ -1168,9 +1168,16 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 		const runSlot = DOM.append(actionsContainer, $('.model-actions-run-slot'));
 		const downloadingHFOrOllama = model.isDownloading && (model.provider === 'huggingface' || isOllama);
 		if (needsDownloadOrPullRetry(model)) {
-			const resumeTooltip = localize('customLanguageModels.resumeDownloadTitle', 'Start or resume downloading this model');
+			// A paused/interrupted HF download kept its partial on disk, so surface it as "Resume download"
+			// (with the retained % in the tooltip) - clicking continues from where it stopped, not from 0.
+			const isResumable = model.provider === 'huggingface' && !!model.downloadPaused;
+			const resumeTooltip = isResumable
+				? localize('customLanguageModels.resumeDownloadTitle.paused', 'Resume this download from {0}%', model.downloadProgress ?? 0)
+				: localize('customLanguageModels.resumeDownloadTitle', 'Start or resume downloading this model');
 			const resumeButton = this._register(new Button(runSlot, { ...defaultButtonStyles, secondary: true, title: resumeTooltip, supportIcons: true }));
-			resumeButton.label = '$(cloud-download) ' + localize('customLanguageModels.resumeDownload', 'Download');
+			resumeButton.label = '$(cloud-download) ' + (isResumable
+				? localize('customLanguageModels.resumeDownload.paused', 'Resume download')
+				: localize('customLanguageModels.resumeDownload', 'Download'));
 			this._register(resumeButton.onDidClick(() => {
 				this.commandService.executeCommand('locopilot.downloadModel', model.id);
 			}));

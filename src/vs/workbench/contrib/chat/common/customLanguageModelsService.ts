@@ -67,7 +67,10 @@ export function hasRemovableLocalDownload(model: ICustomLanguageModel): boolean 
 		return false;
 	}
 	if (model.provider === 'huggingface' || model.provider === 'ollama') {
-		return !needsDownloadOrPullRetry(model);
+		// A completed download, OR a paused HF download whose partial can be deleted, is removable. The paused
+		// case lets the user discard a half-downloaded model (deleting its `.part`/`.incomplete`) while keeping
+		// the list entry so they can start over.
+		return !needsDownloadOrPullRetry(model) || !!model.downloadPaused;
 	}
 	return false;
 }
@@ -158,6 +161,13 @@ export interface ICustomLanguageModel {
 	isDownloading?: boolean;
 	/** Download progress (0-100) */
 	downloadProgress?: number;
+	/**
+	 * True when a download was stopped or interrupted (user stop, crash, network loss, app restart) with a
+	 * resumable partial left on disk. The row shows "Resume download" (keeping {@link downloadProgress}) instead
+	 * of a fresh "Download", and re-invoking the download continues from where it stopped. Cleared on successful
+	 * completion or when the partial is explicitly removed.
+	 */
+	downloadPaused?: boolean;
 	/** Local path where the model is stored */
 	localPath?: string;
 	modelName: string;
@@ -307,25 +317,29 @@ export class CustomLanguageModelsService extends Disposable implements ICustomLa
 			const parsed = JSON.parse(stored);
 			this.models = Array.isArray(parsed) ? parsed : [];
 			// Ensure hidden and token limits exist for backward compatibility
-			this.models = this.models.map(m => ({
-				...m,
-				// A download only ever runs in-memory (its cancellation token does not survive a process
-				// restart), so any model still flagged `isDownloading` in persisted storage is stale - the
-				// download died when the app last closed / crashed / lost the network. Clear it on load so the
-				// row reverts to a "Download" button the user can click to start again, instead of getting stuck
-				// on a "Stop download" button whose cancel is a no-op (no live token to cancel).
-				isDownloading: false,
-				downloadProgress: m.isDownloading ? undefined : m.downloadProgress,
-				hidden: m.hidden ?? false,
-				useNativeTools: m.useNativeTools ?? true,
-				mtp: m.mtp ?? false,
-				contextWindow: m.contextWindow ?? m.maxInputTokens ?? defaultContextWindow(m.type === 'local'),
-				ollamaPullComplete: m.provider === 'ollama' ? (m.ollamaPullComplete ?? true) : m.ollamaPullComplete,
-				userOverrides: m.userOverrides ?? {},
-				metadataEnriched: m.metadataEnriched ?? false,
-				toolsAutoDisabled: m.toolsAutoDisabled ?? false,
-				toolFailureStreak: m.toolFailureStreak ?? 0
-			}));
+			this.models = this.models.map(m => {
+				// A download only ever runs in-memory (its cancellation token does not survive a process restart),
+				// so any model still flagged `isDownloading` in persisted storage is stale - the download died when
+				// the app last closed / crashed / lost the network. But it left a resumable partial on disk, so
+				// instead of resetting to a blank "Download", clear the (no-op) live flag, KEEP the progress, and
+				// mark it paused: the row shows "Resume download" and continues from where it stopped.
+				const interrupted = !!m.isDownloading && !(m.localPath && m.localPath.trim());
+				return {
+					...m,
+					isDownloading: false,
+					downloadProgress: interrupted ? m.downloadProgress : (m.isDownloading ? undefined : m.downloadProgress),
+					downloadPaused: interrupted ? true : (m.downloadPaused ?? false),
+					hidden: m.hidden ?? false,
+					useNativeTools: m.useNativeTools ?? true,
+					mtp: m.mtp ?? false,
+					contextWindow: m.contextWindow ?? m.maxInputTokens ?? defaultContextWindow(m.type === 'local'),
+					ollamaPullComplete: m.provider === 'ollama' ? (m.ollamaPullComplete ?? true) : m.ollamaPullComplete,
+					userOverrides: m.userOverrides ?? {},
+					metadataEnriched: m.metadataEnriched ?? false,
+					toolsAutoDisabled: m.toolsAutoDisabled ?? false,
+					toolFailureStreak: m.toolFailureStreak ?? 0
+				};
+			});
 			// Load secrets for each model
 			for (const model of this.models) {
 				if (model.apiKey) {

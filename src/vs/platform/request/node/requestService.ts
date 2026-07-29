@@ -125,23 +125,19 @@ export class RequestService extends AbstractRequestService implements IRequestSe
 			};
 		}
 
-		// Try a multi-connection ranged download first (much faster for large model files on links where a
-		// single stream is throughput-limited). It only engages for large GETs on servers that advertise byte
-		// ranges; anything else - and ANY failure - falls through to the original single-stream download, so
-		// behaviour never regresses and the file still downloads. macOS Apple Silicon uses the bundled hf_xet
-		// path instead (in the model download service), so in practice this benefits Windows / Intel Mac / Linux.
+		// Try a multi-connection, resumable ranged download first (much faster for large model files on links
+		// where a single stream is throughput-limited, and able to continue a stopped/crashed download instead
+		// of restarting). It only engages for large GETs on servers that advertise byte ranges: when ranges are
+		// NOT supported it returns undefined and we fall through to the original single-stream download, so
+		// behaviour never regresses. A real mid-download FAILURE is propagated (not silently restarted from 0):
+		// the partial is preserved on disk so the caller can resume it. macOS Apple Silicon uses the bundled
+		// hf_xet path instead (in the model download service), so this mainly benefits Windows / Intel Mac / Linux.
 		if ((options.type ?? 'GET') === 'GET') {
-			try {
-				const parallel = await nodeParallelRequestToFile(options, destinationFilePath, token, onProgress);
-				if (parallel) {
-					return parallel;
-				}
-			} catch (err) {
-				if (token.isCancellationRequested) {
-					throw err;
-				}
-				this.logService.warn(`[requestToFile] parallel download failed (${getErrorMessage(err)}); falling back to single stream.`);
+			const parallel = await nodeParallelRequestToFile(options, destinationFilePath, token, onProgress);
+			if (parallel) {
+				return parallel;
 			}
+			this.logService.info(`[requestToFile] ranged/resumable download unavailable for ${options.url} (server did not honour byte ranges); using single stream.`);
 		}
 
 		return nodeRequestToFile(options, destinationFilePath, token, onProgress);
@@ -417,20 +413,59 @@ export async function nodeRequestToFile(
 
 /** Only parallelize downloads at least this large; below it, one stream is already fast enough and the extra probe isn't worth it. */
 const PARALLEL_MIN_TOTAL_BYTES = 64 * 1024 * 1024;
-/** Number of concurrent range connections. 8 saturates most links without tripping HF's per-client rate limits. */
-const PARALLEL_CONNECTIONS = 8;
-/** Fixed range size per request. Small enough that peak memory (CONNECTIONS x CHUNK) stays bounded (~128MB), and each completion advances progress in visible steps. */
+/** Number of concurrent range connections. 32 pushes throughput close to hf_xet on higher-bandwidth links while staying under HF's per-client rate limits. */
+const PARALLEL_CONNECTIONS = 32;
+/** Fixed range size per request. Kept at 16MB (peak memory ~512MB at 32 conns) so existing resume manifests - which record this chunk size - stay valid across the connection-count bump. */
 const PARALLEL_CHUNK_BYTES = 16 * 1024 * 1024;
+/** Per-range-request retry attempts before the chunk (and the whole download) gives up, so transient drops self-heal. */
+const PARALLEL_CHUNK_MAX_ATTEMPTS = 5;
+/** Base backoff between chunk retries; grows exponentially with jitter. */
+const PARALLEL_CHUNK_RETRY_BASE_MS = 1000;
+/** Per-range-request timeout. A range that makes no progress within this window is treated as stuck and retried. */
+const PARALLEL_RANGE_TIMEOUT_MS = 120_000;
+
+/** On-disk resume manifest written next to the `.part` file, recording which fixed-size chunks are already fetched. */
+interface IParallelDownloadManifest {
+	v: 1;
+	/** Server ETag at the time the partial was written; a mismatch on resume means the remote changed -> restart. */
+	etag: string | undefined;
+	/** Full file size in bytes; guards against resuming against a different file. */
+	total: number;
+	/** Chunk size the `done` indices are measured in; a change (e.g. new app version) invalidates resume. */
+	chunk: number;
+	/** Indices of fully-downloaded chunks. */
+	done: number[];
+}
+
+async function readDownloadManifest(manifestPath: string): Promise<IParallelDownloadManifest | undefined> {
+	try {
+		const raw = await fs.promises.readFile(manifestPath, 'utf8');
+		const parsed = JSON.parse(raw) as IParallelDownloadManifest;
+		if (parsed && parsed.v === 1 && Array.isArray(parsed.done) && typeof parsed.total === 'number' && typeof parsed.chunk === 'number') {
+			return parsed;
+		}
+	} catch { /* missing or corrupt manifest -> start fresh */ }
+	return undefined;
+}
 
 /**
  * Downloads a file using multiple concurrent HTTP range requests, writing each range to its correct offset in a
- * `.part` file that is atomically renamed into place on success. This is typically several times faster than a
- * single stream on links where one connection is throughput-limited.
+ * `.part` file that is atomically renamed into place on success. Typically several times faster than a single
+ * stream on links where one connection is throughput-limited.
+ *
+ * RESUMABLE + SELF-HEALING:
+ * - Progress is tracked in a `<dest>.part.json` manifest of completed chunks. A later call (retry, or a fresh app
+ *   session) reuses the existing `.part` and skips the chunks already recorded, so a stopped/crashed download
+ *   continues where it left off instead of restarting from 0. Resume is only accepted when the server ETag and
+ *   total size still match; otherwise the stale partial is discarded and it starts clean.
+ * - Each range request is retried with exponential backoff, and a range that stalls past
+ *   {@link PARALLEL_RANGE_TIMEOUT_MS} is aborted and retried, so transient drops / stuck connections recover.
+ * - On failure or cancellation the `.part` and its manifest are DELIBERATELY KEPT (not deleted) so the next
+ *   attempt resumes. Only an explicit delete by the caller removes them.
  *
  * Returns `undefined` (NOT an error) when the ranged path does not apply - the server doesn't honour byte ranges
  * (no `206`/`Content-Range`), the size is unknown, or the file is small - so the caller falls back to the normal
- * single-stream download. Throws only on a real failure mid-download (which the caller also turns into a
- * fallback) or on cancellation. On any throw the partial `.part` file is removed, so nothing corrupt is left.
+ * single-stream download.
  *
  * Memory is bounded to about `PARALLEL_CONNECTIONS * PARALLEL_CHUNK_BYTES`: a fixed pool of workers each buffers
  * at most one chunk before writing it positionally.
@@ -441,11 +476,29 @@ export async function nodeParallelRequestToFile(
 	token: CancellationToken,
 	onProgress?: RequestToFileProgressCallback
 ): Promise<IRequestToFileResult | undefined> {
-	// Probe with a 1-byte range to learn the total size and confirm the server (after any redirects) serves
-	// ranges. nodeRequest follows redirects and preserves our headers (auth + Range) across them.
-	const probe = await nodeRequest({ ...options, type: 'GET', headers: { ...(options.headers || {}), Range: 'bytes=0-0' } }, token);
+	// Force Node's own https (manual redirect handling) instead of Electron's `net` for the ranged requests:
+	// Chromium's stack drops the `Range` header across HuggingFace's cross-origin redirect (huggingface.co ->
+	// CDN), so range requests come back as a full `200` and this whole path would (correctly) bail to the slow
+	// single-stream download. Node re-issues the redirect ourselves with the header intact and returns `206`.
+	// The proxy `agent` set by the caller is preserved, so proxy users still work.
+	const rangeOptions: NodeRequestOptions = { ...options, getRawRequest: undefined, isChromiumNetwork: false };
+
+	// Probe with a 1-byte range to learn the total size + ETag and confirm the server (after any redirects) serves
+	// ranges. nodeRequest follows redirects and preserves our headers (auth + Range) across them. If the probe
+	// itself fails (e.g. a corporate proxy / custom CA that Node's https can't negotiate but Electron's net can),
+	// return undefined so the caller falls back to the normal single-stream download instead of hard-failing.
+	let probe: IRequestContext;
+	try {
+		probe = await nodeRequest({ ...rangeOptions, type: 'GET', headers: { ...(options.headers || {}), Range: 'bytes=0-0' } }, token);
+	} catch (err) {
+		if (token.isCancellationRequested || err instanceof CancellationError) {
+			throw err;
+		}
+		return undefined;
+	}
 	const probeStatus = probe.res.statusCode ?? 0;
 	const contentRange = probe.res.headers['content-range'];
+	const etag = typeof probe.res.headers['etag'] === 'string' ? probe.res.headers['etag'] : undefined;
 	try { await streamToBuffer(probe.stream); } catch { /* drain the tiny probe body; ignore */ }
 	if (probeStatus !== 206 || typeof contentRange !== 'string') {
 		return undefined; // ranges not supported -> caller falls back to single stream
@@ -457,12 +510,52 @@ export async function nodeParallelRequestToFile(
 	}
 
 	const partPath = destinationFilePath + '.part';
-	const handle = await fs.promises.open(partPath, 'w');
-	let received = 0;
+	const manifestPath = destinationFilePath + '.part.json';
+	const totalChunks = Math.ceil(total / PARALLEL_CHUNK_BYTES);
+
+	// Resume: adopt an existing partial only when it clearly belongs to the same remote file (same ETag when
+	// known, same size, same chunking). Otherwise wipe it and start clean so we never stitch mismatched bytes.
+	const done = new Set<number>();
+	const existing = await readDownloadManifest(manifestPath);
+	let partExists = false;
+	try { partExists = (await fs.promises.stat(partPath)).size === total; } catch { partExists = false; }
+	const canResume = !!existing && partExists && existing.total === total && existing.chunk === PARALLEL_CHUNK_BYTES
+		&& (existing.etag === undefined || etag === undefined || existing.etag === etag);
+	if (canResume) {
+		for (const idx of existing!.done) {
+			if (idx >= 0 && idx < totalChunks) { done.add(idx); }
+		}
+	} else {
+		try { await fs.promises.unlink(partPath); } catch { /* ignore */ }
+		try { await fs.promises.unlink(manifestPath); } catch { /* ignore */ }
+	}
+
+	const handle = await fs.promises.open(partPath, canResume ? 'r+' : 'w');
+	let received = done.size * PARALLEL_CHUNK_BYTES; // approximate resumed byte count for the progress meter
+	let nextChunk = 0;
+
+	// Debounced manifest flush: workers just mark dirty; a single timer serializes writes so concurrent workers
+	// never race on the file, and disk churn stays low even with many small chunks.
+	let manifestDirty = false;
+	let flushing = false;
+	const flushManifest = async (): Promise<void> => {
+		if (flushing) { manifestDirty = true; return; }
+		flushing = true;
+		try {
+			while (manifestDirty) {
+				manifestDirty = false;
+				const data: IParallelDownloadManifest = { v: 1, etag, total, chunk: PARALLEL_CHUNK_BYTES, done: [...done] };
+				await fs.promises.writeFile(manifestPath, JSON.stringify(data));
+			}
+		} catch { /* best-effort; a missed manifest write just re-downloads a chunk on resume */ } finally {
+			flushing = false;
+		}
+	};
+
 	try {
-		await handle.truncate(total); // preallocate so concurrent positional writes land correctly
-		const totalChunks = Math.ceil(total / PARALLEL_CHUNK_BYTES);
-		let nextChunk = 0;
+		if (!canResume) {
+			await handle.truncate(total); // preallocate so concurrent positional writes land correctly
+		}
 
 		const worker = async (): Promise<void> => {
 			for (; ;) {
@@ -473,22 +566,48 @@ export async function nodeParallelRequestToFile(
 				if (idx >= totalChunks) {
 					return;
 				}
+				if (done.has(idx)) {
+					continue; // already fetched in a previous run
+				}
 				const start = idx * PARALLEL_CHUNK_BYTES;
 				const end = Math.min(start + PARALLEL_CHUNK_BYTES - 1, total - 1);
-				const ctx = await nodeRequest({ ...options, type: 'GET', headers: { ...(options.headers || {}), Range: `bytes=${start}-${end}` } }, token);
-				// A 200 (range ignored) would hand us the WHOLE file for this chunk - writing that at an offset
-				// would corrupt the output, so require an exact 206 partial and bail (to fallback) otherwise.
-				if (ctx.res.statusCode !== 206) {
-					throw new Error(`range request returned ${ctx.res.statusCode ?? 'no status'}`);
-				}
-				const buffer = await streamToBuffer(ctx.stream);
 				const expected = end - start + 1;
-				if (buffer.byteLength !== expected) {
-					throw new Error(`range size mismatch: got ${buffer.byteLength}, expected ${expected}`);
+
+				let attempt = 0;
+				for (; ;) {
+					if (token.isCancellationRequested) {
+						throw new CancellationError();
+					}
+					try {
+						const ctx = await nodeRequest({ ...rangeOptions, type: 'GET', timeout: PARALLEL_RANGE_TIMEOUT_MS, headers: { ...(options.headers || {}), Range: `bytes=${start}-${end}` } }, token);
+						// A 200 (range ignored) would hand us the WHOLE file for this chunk - writing that at an
+						// offset would corrupt the output, so require an exact 206 partial.
+						if (ctx.res.statusCode !== 206) {
+							throw new Error(`range request returned ${ctx.res.statusCode ?? 'no status'}`);
+						}
+						const buffer = await streamToBuffer(ctx.stream);
+						if (buffer.byteLength !== expected) {
+							throw new Error(`range size mismatch: got ${buffer.byteLength}, expected ${expected}`);
+						}
+						await handle.write(buffer.buffer, 0, buffer.byteLength, start);
+						break;
+					} catch (err) {
+						if (token.isCancellationRequested || err instanceof CancellationError) {
+							throw err;
+						}
+						if (++attempt >= PARALLEL_CHUNK_MAX_ATTEMPTS) {
+							throw err; // exhausted retries -> partial is kept for a later resume
+						}
+						const backoff = PARALLEL_CHUNK_RETRY_BASE_MS * Math.pow(2, attempt - 1) + Math.floor(Math.random() * 500);
+						await new Promise<void>(resolve => setTimeout(resolve, backoff));
+					}
 				}
-				await handle.write(buffer.buffer, 0, buffer.byteLength, start);
-				received += buffer.byteLength;
-				onProgress?.(received, total);
+
+				done.add(idx);
+				received += expected;
+				manifestDirty = true;
+				void flushManifest();
+				onProgress?.(Math.min(received, total), total);
 			}
 		};
 
@@ -497,12 +616,18 @@ export async function nodeParallelRequestToFile(
 			workers.push(worker());
 		}
 		await Promise.all(workers);
+
+		manifestDirty = true;
+		await flushManifest();
 		await handle.close();
 		await fs.promises.rename(partPath, destinationFilePath);
+		try { await fs.promises.unlink(manifestPath); } catch { /* ignore */ }
 		return { res: { statusCode: 200, headers: probe.res.headers as IRequestContext['res']['headers'] } };
 	} catch (err) {
+		// Persist progress and KEEP the partial + manifest so the next attempt resumes from here.
+		manifestDirty = true;
+		try { await flushManifest(); } catch { /* ignore */ }
 		try { await handle.close(); } catch { /* ignore */ }
-		try { await fs.promises.unlink(partPath); } catch { /* ignore */ }
 		throw err;
 	}
 }

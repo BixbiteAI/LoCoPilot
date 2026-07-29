@@ -43,6 +43,15 @@ const HF_API_BASE = 'https://huggingface.co';
 const HF_RESOLVE = `${HF_API_BASE}`;
 
 /**
+ * When true, macOS Apple Silicon downloads go through the bundled hf_xet engine ({@link HF_XET_DOWNLOAD_PY}):
+ * faster on very high-bandwidth links (up to 64 streams) with chunk dedup, but it CANNOT resume a partial - each
+ * run restarts from a fresh temp file. Disabled by default so every platform uses the resumable ranged
+ * downloader instead, which continues an interrupted download from where it stopped (the priority for the
+ * multi-GB models this handles). Kept behind this flag so the hf_xet path can be re-enabled if desired.
+ */
+const HF_XET_FAST_PATH_ENABLED = false;
+
+/**
  * Inline Python (run as `python -c`) that downloads a repo's files with huggingface_hub/hf_xet and prints its
  * REAL network progress as `LCP_PROGRESS <bytes_done> <bytes_total>` lines (newline-terminated, ~200ms cadence).
  *
@@ -493,6 +502,10 @@ export class LoCoPilotModelDownloadService extends Disposable implements IWorkbe
 	) {
 		super();
 		this._registerCommands();
+		// NOTE: interrupted downloads are NOT auto-resumed on startup/reload. That would surprise users with
+		// unexpected multi-GB traffic (especially on shared machines) and risks two windows grabbing the same
+		// download. Instead an interrupted download stays paused and the row shows a "Resume download" button;
+		// the user decides when to continue. See loadModels() reconciliation + the settings-editor resume button.
 	}
 
 	/** App install root (INativeEnvironmentService.appRoot); undefined on web. Used to locate bundled tools. */
@@ -608,6 +621,21 @@ export class LoCoPilotModelDownloadService extends Disposable implements IWorkbe
 		}
 
 		if (!model.localPath) {
+			// A paused/incomplete HF download has no localPath yet, but its partial (`.part` / hf_xet
+			// `.incomplete`) lives at the deterministic install dir - delete that so "Remove" clears
+			// half-downloaded files too, not just completed ones.
+			if (model.provider === 'huggingface') {
+				const repoId = model.modelName.trim();
+				if (repoId) {
+					const derivedDir = joinPath(this.environmentService.cacheHome, LoCoPilotModelDownloadService.MODELS_DIR, modelDownloadDirName(repoId));
+					try {
+						await this.fileService.del(derivedDir, { recursive: true });
+						this._log(`[LoCoPilot Download] Deleted incomplete download for ${repoId}: ${derivedDir.fsPath}`);
+					} catch (e) {
+						this._log(`[LoCoPilot Download] No incomplete files to delete for ${repoId} (or delete failed): ${e}`);
+					}
+				}
+			}
 			return;
 		}
 		const uri = URI.file(model.localPath);
@@ -648,12 +676,14 @@ export class LoCoPilotModelDownloadService extends Disposable implements IWorkbe
 		if (model.provider === 'ollama') {
 			await this.customLanguageModelsService.updateCustomModel(modelId, {
 				isDownloading: false,
+				downloadPaused: false,
 				downloadProgress: undefined,
 				ollamaPullComplete: false,
 			});
 		} else if (model.provider === 'huggingface') {
 			await this.customLanguageModelsService.updateCustomModel(modelId, {
 				isDownloading: false,
+				downloadPaused: false,
 				downloadProgress: undefined,
 				localPath: undefined,
 			});
@@ -786,15 +816,14 @@ export class LoCoPilotModelDownloadService extends Disposable implements IWorkbe
 		}
 		// No live download token, yet the row is showing "Stop download": the flag is stale (the download
 		// wedged and its token was lost - e.g. the network dropped mid-stream, or the app was reloaded while
-		// this window kept a persisted `isDownloading`). Cancel here would be a no-op, leaving the button
-		// stuck forever, so self-heal the state directly and clean up any partial files. This lets the row
-		// fall back to "Download" so the user can retry without restarting.
+		// this window kept a persisted `isDownloading`). Cancel here would be a no-op, so self-heal the state to
+		// PAUSED (partial kept) rather than deleting it - the row shows "Resume download" and continues from here.
 		const model = this.customLanguageModelsService.getCustomModels().find(m => m.id === modelId);
 		if (!model || !model.isDownloading) {
 			return;
 		}
-		this._log(`[LoCoPilot Download] Stop download for ${model.modelName}: no active download token; clearing stale in-progress state.`);
-		void this.removeModelDownload(modelId);
+		this._log(`[LoCoPilot Download] Stop download for ${model.modelName}: no active token; pausing (partial kept for resume).`);
+		void this.customLanguageModelsService.updateCustomModel(modelId, { isDownloading: false, downloadPaused: true });
 	}
 
 	/**
@@ -818,15 +847,6 @@ export class LoCoPilotModelDownloadService extends Disposable implements IWorkbe
 				}],
 			},
 		});
-	}
-
-	private async _deleteIncompleteHfFolder(uri: URI): Promise<void> {
-		try {
-			await this.fileService.del(uri, { recursive: true });
-			this._log(`[LoCoPilot Download] Removed partial install under ${uri.fsPath}`);
-		} catch (e) {
-			this._log(`[LoCoPilot Download] Could not remove partial install under ${uri.fsPath}: ${e}`);
-		}
 	}
 
 	private async _pullOllamaModel(model: ICustomLanguageModel, cancel: CancellationToken): Promise<void> {
@@ -947,10 +967,11 @@ export class LoCoPilotModelDownloadService extends Disposable implements IWorkbe
 		const format = (model.format || '').trim();
 
 		this._log(`[LoCoPilot Download] Starting download for ${repoId} (Format: ${format || 'Auto-select'})`);
-		let partialInstallDir: URI | undefined;
 
 		try {
-			await this.customLanguageModelsService.updateCustomModel(modelId, { isDownloading: true, downloadProgress: 0 });
+			// Keep the existing progress when resuming a paused/interrupted download (the underlying transfer picks
+			// up from the on-disk partial); only a fresh start resets the bar to 0.
+			await this.customLanguageModelsService.updateCustomModel(modelId, { isDownloading: true, downloadPaused: false, downloadProgress: model.downloadPaused ? (model.downloadProgress ?? 0) : 0 });
 
 			const sizes = new Map<string, number>();
 			const allPaths = await this.listRepoFiles(repoId, token, cancel, sizes);
@@ -1004,7 +1025,6 @@ export class LoCoPilotModelDownloadService extends Disposable implements IWorkbe
 				repoId.replace(/\//g, '_')
 			);
 			await this.fileService.createFolder(baseDir);
-			partialInstallDir = baseDir;
 
 			const total = toDownload.length;
 
@@ -1027,18 +1047,22 @@ export class LoCoPilotModelDownloadService extends Disposable implements IWorkbe
 				}
 			}
 
-			// Fast path (Apple Silicon only): download the whole file set in one shot through the bundled `hf`
-			// CLI, which uses hf_xet - parallel, chunk-deduplicated, resumable transfers that saturate the link
-			// far better than our single-stream-per-file HTTP path. Any failure (not present, non-zero exit)
-			// falls through to the original direct download below, so nothing breaks on machines without it.
+			// Downloading: we use the multi-connection, RESUMABLE ranged downloader (in requestToFile) on every
+			// platform, so a stopped/crashed download continues from where it left off and the progress bar
+			// reflects true cumulative bytes. The Apple-Silicon hf_xet fast path is faster on very high-bandwidth
+			// links and can chunk-dedup, but it CANNOT resume a partial (each run restarts from a fresh temp
+			// file), which matters far more for the multi-GB models this handles - so it is disabled by default.
+			// Flip HF_XET_FAST_PATH_ENABLED to re-enable it (and give up cross-run resume on macOS).
 			let downloadedViaHf = false;
-			try {
-				downloadedViaHf = await this._tryDownloadViaBundledHf(repoId, token, toDownload, baseDir, modelId, cancel);
-			} catch (e) {
-				if (cancel.isCancellationRequested || isCancellationError(e)) {
-					throw e;
+			if (HF_XET_FAST_PATH_ENABLED) {
+				try {
+					downloadedViaHf = await this._tryDownloadViaBundledHf(repoId, token, toDownload, baseDir, modelId, cancel);
+				} catch (e) {
+					if (cancel.isCancellationRequested || isCancellationError(e)) {
+						throw e;
+					}
+					this._log(`[LoCoPilot Download] Bundled hf fast path failed for ${repoId}; falling back to direct download: ${toErrorMessage(e)}`);
 				}
-				this._log(`[LoCoPilot Download] Bundled hf fast path failed for ${repoId}; falling back to direct download: ${toErrorMessage(e)}`);
 			}
 
 			if (!downloadedViaHf) {
@@ -1111,12 +1135,12 @@ export class LoCoPilotModelDownloadService extends Disposable implements IWorkbe
 			const localPath = mainModelFileUri ? mainModelFileUri.fsPath : baseDir.fsPath;
 			await this.customLanguageModelsService.updateCustomModel(modelId, {
 				isDownloading: false,
+				downloadPaused: false,
 				downloadProgress: 100,
 				localPath,
 				// A projector on disk is ground truth that this model can read images, so enable vision.
 				...(mmprojRelPath ? { supportsVision: true } : {})
 			});
-			partialInstallDir = undefined;
 			this._log(`[LoCoPilot Download] ${repoId} downloaded to ${localPath}.`);
 
 			// Enrich format/context window from HF now that the files are on disk (best-effort, never blocks completion).
@@ -1128,20 +1152,20 @@ export class LoCoPilotModelDownloadService extends Disposable implements IWorkbe
 			this._ensureDraftForRepo(repoId, token).catch(e => this._log(`[LoCoPilot Download] Draft fetch for ${repoId} failed (ignored): ${e}`));
 		} catch (e) {
 			this._log(`[LoCoPilot Download] Error downloading ${repoId}: ${e}`);
-			await this.customLanguageModelsService.updateCustomModel(modelId, { isDownloading: false });
+			// Stop/interrupt/error: KEEP the partial on disk and mark the row paused (progress preserved) so it
+			// shows "Resume download" and continues from here next time - never wipe progress on a stop. Only an
+			// explicit Remove/Delete (deleteModelFiles) clears the partial.
+			await this.customLanguageModelsService.updateCustomModel(modelId, { isDownloading: false, downloadPaused: true });
 
 			const userCancelled = cancel.isCancellationRequested || isCancellationError(e);
 			if (userCancelled) {
-				this._log(`[LoCoPilot Download] Download cancelled for ${repoId}.`);
-				if (partialInstallDir) {
-					await this._deleteIncompleteHfFolder(partialInstallDir);
-				}
+				this._log(`[LoCoPilot Download] Download stopped for ${repoId}; partial kept for resume.`);
 				return;
 			}
 
 			const message = toErrorMessage(e);
 			this.notificationService.error(
-				`Failed to download model "${repoId}": ${message}. Check the model name (use format org/model-name), token for gated repos, and network.`
+				`Download of "${repoId}" was interrupted: ${message}. It will resume from where it stopped when you click Resume.`
 			);
 			throw e;
 		}
