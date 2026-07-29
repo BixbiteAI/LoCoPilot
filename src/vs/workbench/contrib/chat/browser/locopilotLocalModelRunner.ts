@@ -2483,10 +2483,7 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 				this._log(`[LoCoPilot Runner] ${modelId} marginally over the conservative budget (~${needGb}GB vs ~${haveGb}GB, within ${Math.round(fitTolerance * 100)}%); launching with a soft notice - the watchdog is the backstop.`);
 				if (!this._tightContextNoticed.has(modelId)) {
 					this._tightContextNoticed.add(modelId);
-					this.notificationService.notify({
-						severity: Severity.Warning,
-						message: `"${name}" is a tight fit for your system's memory. You can still use it, but it may slow down or stop on its own during longer chats. For smoother performance, close some apps to free up memory, or pick a smaller model.`,
-					});
+					showTransientNotification(this.notificationService, Severity.Warning, `"${name}" is a tight fit for your system's memory. You can still use it, but it may slow down or stop on its own during longer chats. For smoother performance, close some apps to free up memory, or pick a smaller model.`, { timeoutMs: 15000 });
 				}
 				return true;
 			}
@@ -2608,10 +2605,7 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 			return;
 		}
 		this._watchdogWarnedThisEpisode = true;
-		this.notificationService.notify({
-			severity: Severity.Warning,
-			message: 'Your system is running low on memory. The local model will keep running - LoCoPilot will only stop it if the system starts paging to disk. Close other apps to free memory, or switch to a smaller model.',
-		});
+		showTransientNotification(this.notificationService, Severity.Warning, 'Your system is running low on memory. The local model will keep running - LoCoPilot will only stop it if the system starts paging to disk. Close other apps to free memory, or switch to a smaller model.', { timeoutMs: 15000 });
 	}
 
 	/** Number of live server processes THIS window owns (foreign attachments excluded). */
@@ -2833,12 +2827,9 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 		const thermalCause = mem.thermalPressure === 'critical' || mem.thermalPressure === 'serious';
 		this._log(`[LoCoPilot Runner] Memory watchdog TRIPPED: stopped ${stoppedNames.join(', ') || 'local server'} to keep the system responsive (thermal=${mem.thermalPressure}, pressure=${mem.pressure}).`);
 		const names = stoppedNames.join('", "');
-		this.notificationService.notify({
-			severity: Severity.Warning,
-			message: thermalCause
-				? `LoCoPilot stopped "${names}" because your system was overheating. Let it cool down and try again, or switch to a smaller model.`
-				: `LoCoPilot stopped "${names}" because your system was running out of memory. Close some applications and try again, or switch to a smaller model.`,
-		});
+		showTransientNotification(this.notificationService, Severity.Warning, thermalCause
+			? `LoCoPilot stopped "${names}" because your system was overheating. Let it cool down and try again, or switch to a smaller model.`
+			: `LoCoPilot stopped "${names}" because your system was running out of memory. Close some applications and try again, or switch to a smaller model.`, { timeoutMs: 15000 });
 	}
 
 	/**
@@ -3993,10 +3984,7 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 			&& !this._tightContextNoticed.has(modelId)) {
 			this._tightContextNoticed.add(modelId);
 			const displayName = model.modelName ?? model.id;
-			this.notificationService.notify({
-				severity: Severity.Warning,
-				message: `"${displayName}" is a tight fit for your system's memory. You can still use it, but it may slow down or stop on its own during longer chats. For smoother performance, close some apps to free up memory, or pick a smaller model.`,
-			});
+			showTransientNotification(this.notificationService, Severity.Warning, `"${displayName}" is a tight fit for your system's memory. You can still use it, but it may slow down or stop on its own during longer chats. For smoother performance, close some apps to free up memory, or pick a smaller model.`, { timeoutMs: 15000 });
 		}
 		if (!await this._memoryAllowsLaunch(modelId, interactive, backend, tuning, extraResidentBytes)) {
 			return;
