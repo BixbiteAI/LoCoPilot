@@ -171,3 +171,112 @@
 		}
 	}
 }
+.chat-viewpane {
+
+	.chat-view-tabs-container {
+		display: none;
+		align-items: center;
+		flex: 0 0 auto;
+		height: 30px;
+		padding-right: 4px;
+		border-bottom: 1px solid var(--vscode-editorGroupHeader-tabsBorder, transparent);
+		background-color: var(--vscode-editorGroupHeader-tabsBackground, transparent);
+	}
+
+	.chat-view-tabs-container.visible {
+		display: flex;
+	}
+
+	.chat-view-tabs {
+		display: flex;
+		flex: 1 1 auto;
+		min-width: 0;
+		height: 100%;
+		overflow-x: auto;
+		overflow-y: hidden;
+		scrollbar-width: none;
+	}
+
+	.chat-view-tabs::-webkit-scrollbar {
+		display: none;
+	}
+
+	.chat-view-tab {
+		display: flex;
+		align-items: center;
+		gap: 4px;
+		flex: 0 1 160px;
+		min-width: 60px;
+		max-width: 160px;
+		padding: 0 8px;
+		height: 100%;
+		cursor: pointer;
+		user-select: none;
+		white-space: nowrap;
+		border-right: 1px solid var(--vscode-tab-border, transparent);
+		background-color: var(--vscode-tab-inactiveBackground, transparent);
+		color: var(--vscode-tab-inactiveForeground, inherit);
+	}
+
+	.chat-view-tab.active {
+		background-color: var(--vscode-tab-activeBackground, transparent);
+		color: var(--vscode-tab-activeForeground, inherit);
+		box-shadow: inset 0 -1px 0 0 var(--vscode-tab-activeBorder, transparent);
+	}
+
+	.chat-view-tab:hover:not(.active) {
+		background-color: var(--vscode-tab-hoverBackground, transparent);
+	}
+
+	.chat-view-tab .chat-view-tab-icon {
+		flex: 0 0 auto;
+		font-size: 14px;
+		opacity: 0.8;
+	}
+
+	.chat-view-tab .chat-view-tab-label {
+		flex: 1 1 auto;
+		min-width: 0;
+		overflow: hidden;
+		text-overflow: ellipsis;
+		font-size: 12px;
+		line-height: 30px;
+	}
+
+	.chat-view-tab .chat-view-tab-close {
+		flex: 0 0 auto;
+		font-size: 14px;
+		border-radius: 4px;
+		visibility: hidden;
+	}
+
+	.chat-view-tab:hover .chat-view-tab-close,
+	.chat-view-tab.active .chat-view-tab-close {
+		visibility: visible;
+	}
+
+	.chat-view-tab .chat-view-tab-close:hover {
+		background-color: var(--vscode-toolbar-hoverBackground, transparent);
+	}
+
+	.chat-view-tabs-new-tab {
+		flex: 0 0 auto;
+		display: flex;
+		align-items: center;
+		justify-content: center;
+		width: 28px;
+		height: 100%;
+		cursor: pointer;
+		font-size: 16px;
+		color: var(--vscode-icon-foreground, inherit);
+	}
+
+	.chat-view-tabs-new-tab:hover {
+		background-color: var(--vscode-toolbar-hoverBackground, transparent);
+	}
+
+	.chat-view-tabs-actions-toolbar {
+		flex: 0 0 auto;
+		padding-left: 2px;
+	}
+}

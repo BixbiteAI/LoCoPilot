@@ -5,11 +5,13 @@
 
 import './media/chatViewPane.css';
 import { $, addDisposableListener, append, EventHelper, EventType, getWindow, setVisibility } from '../../../../../../base/browser/dom.js';
+import { renderAsPlaintext } from '../../../../../../base/browser/markdownRenderer.js';
 import { StandardMouseEvent } from '../../../../../../base/browser/mouseEvent.js';
 import { Button } from '../../../../../../base/browser/ui/button/button.js';
 import { Orientation, Sash } from '../../../../../../base/browser/ui/sash/sash.js';
 import { CancellationToken } from '../../../../../../base/common/cancellation.js';
 import { Event } from '../../../../../../base/common/event.js';
+import { MarkdownString } from '../../../../../../base/common/htmlContent.js';
 import { MutableDisposable, toDisposable, DisposableStore } from '../../../../../../base/common/lifecycle.js';
 import { MarshalledId } from '../../../../../../base/common/marshallingIds.js';
 import { autorun, IReader } from '../../../../../../base/common/observable.js';
@@ -32,6 +34,7 @@ import { ITelemetryService } from '../../../../../../platform/telemetry/common/t
 import { defaultButtonStyles } from '../../../../../../platform/theme/browser/defaultStyles.js';
 import { editorBackground } from '../../../../../../platform/theme/common/colorRegistry.js';
 import { ChatViewTitleControl } from './chatViewTitleControl.js';
+import { ChatViewTabsControl, IChatViewTab } from './chatViewTabsControl.js';
 import { IThemeService } from '../../../../../../platform/theme/common/themeService.js';
 import { IViewPaneOptions, ViewPane } from '../../../../../browser/parts/views/viewPane.js';
 import { Memento } from '../../../../../common/memento.js';
@@ -67,6 +70,8 @@ interface IChatViewPaneState extends Partial<IChatModelInputState> {
 	sessionId?: string;
 
 	sessionsSidebarWidth?: number;
+
+	openTabs?: string[];
 }
 
 type ChatViewPaneOpenedClassification = {
@@ -128,7 +133,9 @@ export class ChatViewPane extends ViewPane implements IViewWelcomeDelegate {
 			this.configurationService.getValue<boolean>(ChatConfiguration.RestoreLastPanelSession) === false
 		) {
 			this.viewState.sessionId = undefined; // clear persisted session on fresh start
+			this.viewState.openTabs = undefined; // and with it the open tabs
 		}
+		this.openTabs = (this.viewState.openTabs ?? []).map(tab => URI.parse(tab));
 		this.sessionsViewerShowActiveOnly = this.configurationService.getValue<boolean>(ChatConfiguration.ChatViewSessionsShowActiveOnly) ?? true;
 		this.sessionsViewerVisible = false; // will be updated from layout code
 		this.sessionsViewerSidebarWidth = Math.max(ChatViewPane.SESSIONS_SIDEBAR_MIN_WIDTH, this.viewState.sessionsSidebarWidth ?? ChatViewPane.SESSIONS_SIDEBAR_DEFAULT_WIDTH);
@@ -510,8 +517,12 @@ export class ChatViewPane extends ViewPane implements IViewWelcomeDelegate {
 		const editorOverflowWidgetsDomNode = this.layoutService.getContainer(getWindow(chatControlsContainer)).appendChild($('.chat-editor-overflow.monaco-editor'));
 		this._register(toDisposable(() => editorOverflowWidgetsDomNode.remove()));
 
-		// Chat Title
-		this.createChatTitleControl(chatControlsContainer);
+		// Chat Tabs
+		this.createChatTabsControl(chatControlsContainer);
+
+		// Chat Title: replaced by the tabs control above, which shows the
+		// session name in the active tab and hosts the title actions
+		// this.createChatTitleControl(chatControlsContainer);
 
 		// Chat Widget
 		const scopedInstantiationService = this._register(this.instantiationService.createChild(new ServiceCollection([IContextKeyService, this.scopedContextKeyService])));
@@ -553,18 +564,111 @@ export class ChatViewPane extends ViewPane implements IViewWelcomeDelegate {
 		return this._widget;
 	}
 
-	private createChatTitleControl(parent: HTMLElement): void {
-		this.titleControl = this._register(this.instantiationService.createInstance(ChatViewTitleControl,
-			parent,
-			{
-				focusChat: () => this._widget.focusInput()
-			}
-		));
+	//#region Tabs Control
 
-		this._register(this.titleControl.onDidChangeHeight(() => {
-			this.relayout();
+	private tabsControl: ChatViewTabsControl | undefined;
+	private openTabs: URI[];
+	private readonly activeModelTabListener = this._register(new MutableDisposable());
+
+	private createChatTabsControl(parent: HTMLElement): void {
+		this.tabsControl = this._register(this.instantiationService.createInstance(ChatViewTabsControl, parent, {
+			openTab: resource => this.loadSession(resource),
+			closeTab: resource => this.closeTab(resource),
+			newTab: () => this.commandService.executeCommand(ACTION_ID_NEW_CHAT)
 		}));
+
+		this._register(this.tabsControl.onDidChangeHeight(() => this.relayout()));
+
+		// Session labels may arrive/change after the tab was created
+		this._register(this.agentSessionsService.model.onDidChangeSessions(() => this.updateTabs()));
+
+		this.updateTabs();
 	}
+
+	private updateTabs(): void {
+		const activeResource = this.modelRef.value?.object.sessionResource;
+
+		// Drop tabs of sessions that no longer exist (e.g. deleted from history
+		// or persisted from a previous window), but never the active one.
+		if (this.agentSessionsService.model.resolved) {
+			this.openTabs = this.openTabs.filter(resource =>
+				resource.toString() === activeResource?.toString() ||
+				!!this.agentSessionsService.model.getSession(resource));
+		}
+
+		const tabs: IChatViewTab[] = this.openTabs.map(resource => ({
+			resource,
+			label: this.getTabLabel(resource, activeResource)
+		}));
+
+		this.tabsControl?.setTabs(tabs, activeResource, activeResource ? {
+			$mid: MarshalledId.ChatViewContext,
+			sessionResource: activeResource
+		} satisfies IChatViewTitleActionContext : undefined);
+
+		this.viewState.openTabs = this.openTabs.map(resource => resource.toString());
+	}
+
+	private getTabLabel(resource: URI, activeResource: URI | undefined): string {
+		if (activeResource && resource.toString() === activeResource.toString()) {
+			const title = this.modelRef.value?.object.title;
+			if (title) {
+				return renderAsPlaintext(new MarkdownString(title));
+			}
+		}
+
+		const session = this.agentSessionsService.model.getSession(resource);
+		if (session?.label) {
+			return session.label;
+		}
+
+		return localize('newChatTab', "New Chat");
+	}
+
+	private trackTab(resource: URI): void {
+		if (!this.openTabs.some(tab => tab.toString() === resource.toString())) {
+			this.openTabs.push(resource);
+		}
+	}
+
+	private async closeTab(resource: URI): Promise<void> {
+		const index = this.openTabs.findIndex(tab => tab.toString() === resource.toString());
+		if (index === -1) {
+			return;
+		}
+
+		const wasActive = this.modelRef.value?.object.sessionResource.toString() === resource.toString();
+		this.openTabs.splice(index, 1);
+
+		if (!wasActive) {
+			this.updateTabs();
+			return;
+		}
+
+		const next = this.openTabs[index] ?? this.openTabs[index - 1];
+		if (next) {
+			await this.loadSession(next);
+		} else {
+			await this.clear(); // no tabs left: start a fresh session
+		}
+	}
+
+	//#endregion
+
+	// Replaced by the tabs control: the session name now shows in the active
+	// tab and the title actions moved into the tabs row.
+	// private createChatTitleControl(parent: HTMLElement): void {
+	// 	this.titleControl = this._register(this.instantiationService.createInstance(ChatViewTitleControl,
+	// 		parent,
+	// 		{
+	// 			focusChat: () => this._widget.focusInput()
+	// 		}
+	// 	));
+	//
+	// 	this._register(this.titleControl.onDidChangeHeight(() => {
+	// 		this.relayout();
+	// 	}));
+	// }
 
 	//#endregion
 
@@ -702,6 +806,17 @@ export class ChatViewPane extends ViewPane implements IViewWelcomeDelegate {
 		// Update title control
 		this.titleControl?.update(model);
 
+		// Update tabs control: the shown session becomes the active tab
+		this.activeModelTabListener.value = model?.onDidChange(e => {
+			if (e.kind === 'setCustomTitle' || e.kind === 'addRequest') {
+				this.updateTabs();
+			}
+		});
+		if (model) {
+			this.trackTab(model.sessionResource);
+		}
+		this.updateTabs();
+
 		// Update the toolbar context with new sessionId
 		this.updateActions();
 
@@ -830,6 +945,9 @@ export class ChatViewPane extends ViewPane implements IViewWelcomeDelegate {
 		const { heightReduction, widthReduction } = this.layoutSessionsControl(remainingHeight, remainingWidth);
 		remainingHeight -= heightReduction;
 		remainingWidth -= widthReduction;
+
+		// Tabs Control
+		remainingHeight -= this.tabsControl?.getHeight() ?? 0;
 
 		// Title Control
 		remainingHeight -= this.titleControl?.getHeight() ?? 0;
