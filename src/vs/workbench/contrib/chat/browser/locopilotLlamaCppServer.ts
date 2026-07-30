@@ -520,6 +520,26 @@ export function swaFullKvHeadroomBytes(inputs: {
 export const MIN_FULL_SWA_CONTEXT = 16384;
 
 /**
+ * Context the `--swa-full` KV re-plan aims for before it stops spending precision. Deliberately HIGHER than
+ * the general {@link TARGET_MIN_CONTEXT} comfort floor, because swa-full is the one regime where the normal
+ * "stop at the floor" rule gives the wrong answer: it pins a FULL-size cache on every sliding-window layer, so
+ * KV becomes several times more expensive than the windowed sizing the clamp used, and the window collapses to
+ * barely above the floor. In that regime context is the scarce resource and the next rung down is nearly free,
+ * so it is worth buying more of it. (Measured on gemma-4-E4B on a 16 GB M3: the floor-based rule stopped at f16
+ * / ~34K; aiming here reaches ~56K at q8_0 for the same footprint.)
+ */
+export const SWA_FULL_REPLAN_TARGET_CONTEXT = 65536;
+
+/**
+ * The lowest KV rung the `--swa-full` re-plan may descend to. Capped at near-lossless q8_0 ON PURPOSE: the
+ * entire justification for spending precision to buy context here is that q8_0's quality delta is too small to
+ * measure, and that argument does NOT extend to the 4-bit rungs. If q8_0 still can't reach the target we keep
+ * the shorter window rather than quietly trading real quality for length nobody asked for - the general ladder
+ * in {@link selectAutomaticKvCache} remains the only place 4-bit is reached, and only to rescue the floor.
+ */
+export const SWA_FULL_REPLAN_MAX_TIER: KvCachePlan = { k: 'q8_0', v: 'q8_0' };
+
+/**
  * Largest context whose FULL-size SWA KV cache still fits the memory budget - the inverse of
  * {@link swaFullKvHeadroomBytes}. The old gate asked "does --swa-full fit at the context we already picked?"
  * and gave up when it didn't, which silently left cross-turn prompt-cache reuse off on every sliding-window

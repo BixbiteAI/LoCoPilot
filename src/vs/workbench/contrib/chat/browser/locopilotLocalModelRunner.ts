@@ -61,6 +61,8 @@ import {
 	swaFullKvHeadroomBytes,
 	maxContextForFullSwa,
 	MIN_FULL_SWA_CONTEXT,
+	SWA_FULL_REPLAN_TARGET_CONTEXT,
+	SWA_FULL_REPLAN_MAX_TIER,
 	type LlamaServerTuning,
 	type FlashAttentionMode,
 	type KvCacheType,
@@ -2385,7 +2387,15 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 				if (canEstimate && headroom < 0 && layersForSwaKv > 0) {
 					const autoKv = (tuning.kvCacheType ?? 'auto') === 'auto';
 					const startIndex = autoKv ? KV_CACHE_TIERS.findIndex(t => t.k === tradedPlan.k && t.v === tradedPlan.v) : -1;
-					const candidates = startIndex >= 0 ? KV_CACHE_TIERS.slice(startIndex) : [tradedPlan];
+					// Descend no further than the near-lossless rung (see SWA_FULL_REPLAN_MAX_TIER) - buying context
+					// with 4-bit K/V is a different trade, and not one to make silently.
+					const floorIndex = KV_CACHE_TIERS.findIndex(t => t.k === SWA_FULL_REPLAN_MAX_TIER.k && t.v === SWA_FULL_REPLAN_MAX_TIER.v);
+					const candidates = startIndex >= 0 ? KV_CACHE_TIERS.slice(startIndex, Math.max(startIndex + 1, floorIndex + 1)) : [tradedPlan];
+					// Aim past the general comfort floor: under swa-full the clamp's windowed sizing collapses the
+					// window, and stopping at the floor (the old bar) meant f16 satisfied it on the FIRST iteration
+					// and q8 was never priced - which is why this whole re-plan was a no-op on the machine it was
+					// written for. Never aim beyond what the caller actually asked for.
+					const replanTarget = Math.min(tuning.contextSize ?? 0, SWA_FULL_REPLAN_TARGET_CONTEXT);
 					for (const candidatePlan of candidates) {
 						const perToken = f16PerTokenPerLayerForSwa * kvPlanBytesPerElem(candidatePlan) / kvCacheBytesPerElem('f16') * layersForSwaKv;
 						const candidateContext = maxContextForFullSwa({
@@ -2400,8 +2410,8 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 							tradedContext = candidateContext;
 							tradedPlan = candidatePlan;
 						}
-						// Good enough: this rung already reaches the comfort window, so stop spending quality.
-						if (candidateContext >= Math.min(tuning.contextSize ?? 0, TARGET_MIN_CONTEXT)) {
+						// Good enough: this rung already reaches the target window, so stop spending quality.
+						if (candidateContext >= replanTarget) {
 							break;
 						}
 					}
