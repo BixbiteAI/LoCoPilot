@@ -31,7 +31,7 @@ import { toErrorMessage } from '../../../../base/common/errorMessage.js';
 import { CancellationError, isCancellationError } from '../../../../base/common/errors.js';
 import { ICommandService } from '../../../../platform/commands/common/commands.js';
 import { LOCOPILOT_SETTINGS_SECTION_LIST_MODELS } from './chatManagement/locopilotSettingsEditorInput.js';
-import { usableSystemMemoryBytes, metalOffloadBudgetBytes, kvCacheBytesPerElem, DEFAULT_KV_BYTES_PER_TOKEN_PER_LAYER_F16, RUNTIME_OVERHEAD_BYTES, TARGET_MIN_CONTEXT } from './locopilotLlamaCppServer.js';
+import { usableSystemMemoryBytes, metalOffloadBudgetBytes, kvCacheBytesPerElem, kvPlanBytesPerElem, DEFAULT_KV_BYTES_PER_TOKEN_PER_LAYER_F16, RUNTIME_OVERHEAD_BYTES, TARGET_MIN_CONTEXT, MIN_CLAMPED_CONTEXT } from './locopilotLlamaCppServer.js';
 import { IConfigurationService } from '../../../../platform/configuration/common/configuration.js';
 import { ChatConfiguration } from '../common/constants.js';
 import { findDraftPairing } from './locopilotModelCatalog.js';
@@ -233,20 +233,37 @@ export function estimateLayerCountFromModelName(name: string): number | undefine
 }
 
 /**
- * Estimated FULL runtime footprint (bytes) of running a GGUF weights file: the weights themselves, PLUS a
- * minimum-viable KV cache (the {@link TARGET_MIN_CONTEXT} comfort floor at q4_0 - the lowest precision the
- * runner drops to under memory pressure), PLUS the engine's fixed {@link RUNTIME_OVERHEAD_BYTES}. The download
- * picker sizes quants against THIS rather than the bare weight-file size, so it never selects a quant whose
- * weights merely fit on their own and then leave no room to actually run at a usable context. Pass an explicit
- * `layerCount` (from the model name, via {@link estimateLayerCountFromModelName}) so every quant of a model is
- * charged the SAME KV - otherwise the layer count is bucketed from the (quant-dependent) file size, which would
- * unfairly charge a higher quant more KV. The KV term is an estimate; the launch-time context clamp remains the
- * precise authority and will still grow the cache to q8/f16 when the machine has spare room.
+ * The two service levels the download picker sizes a quant against. Weights are a PERMANENT choice while the KV
+ * cache is elastic, so "it fits" is not the right bar - the question is what quality of run the quant leaves
+ * room for once it's on disk:
+ *
+ *  - 'comfort' - the target: weights + the {@link TARGET_MIN_CONTEXT} comfort window at a near-lossless q8_0
+ *    cache. A quant that clears this will actually run well, not merely load.
+ *  - 'floor'   - the fallback: weights + the {@link MIN_CLAMPED_CONTEXT} usability window at the asymmetric
+ *    q4_0-K / q8_0-V rung the planner falls back to. A quant that clears only this still runs every agent task,
+ *    just with less room to spare.
  */
-export function estimateGgufRuntimeFootprintBytes(weightBytes: number, layerCount?: number): number {
+export type GgufFootprintTier = 'comfort' | 'floor';
+
+/**
+ * Estimated FULL runtime footprint (bytes) of running a GGUF weights file at the given service tier: the
+ * weights themselves, PLUS the tier's KV cache, PLUS the engine's fixed {@link RUNTIME_OVERHEAD_BYTES}. The
+ * download picker sizes quants against THIS rather than the bare weight-file size, so it never selects a quant
+ * whose weights merely fit on their own and then leave no room to actually run at a usable context.
+ *
+ * Pass an explicit `layerCount` (from the model name, via {@link estimateLayerCountFromModelName}) so every
+ * quant of a model is charged the SAME KV - otherwise the layer count is bucketed from the (quant-dependent)
+ * file size, which would unfairly charge a higher quant more KV. The KV term is an estimate; the launch-time
+ * context clamp remains the precise authority and will still grow the window when the machine has spare room.
+ */
+export function estimateGgufRuntimeFootprintBytes(weightBytes: number, layerCount?: number, tier: GgufFootprintTier = 'comfort'): number {
 	const layers = layerCount && layerCount > 0 ? layerCount : estimateLayerCountFromWeightBytes(weightBytes);
-	const kvPerTokenPerLayer = DEFAULT_KV_BYTES_PER_TOKEN_PER_LAYER_F16 * kvCacheBytesPerElem('q4_0') / kvCacheBytesPerElem('f16');
-	const kvBytes = kvPerTokenPerLayer * layers * TARGET_MIN_CONTEXT;
+	const bytesPerElem = tier === 'comfort'
+		? kvPlanBytesPerElem({ k: 'q8_0', v: 'q8_0' })
+		: kvPlanBytesPerElem({ k: 'q4_0', v: 'q8_0' });
+	const contextTokens = tier === 'comfort' ? TARGET_MIN_CONTEXT : MIN_CLAMPED_CONTEXT;
+	const kvPerTokenPerLayer = DEFAULT_KV_BYTES_PER_TOKEN_PER_LAYER_F16 * bytesPerElem / kvCacheBytesPerElem('f16');
+	const kvBytes = kvPerTokenPerLayer * layers * contextTokens;
 	return weightBytes + kvBytes + RUNTIME_OVERHEAD_BYTES;
 }
 
@@ -272,13 +289,22 @@ export interface GgufBudgetPickOptions {
 }
 
 /**
- * Picks the GGUF file to download for this machine: the **highest-quality quant (capped at Q8_0) whose full
- * runtime footprint fits** `budgetBytes` - weights + a comfort-floor KV cache + engine overhead, via
- * {@link estimateGgufRuntimeFootprintBytes}, NOT the weight file alone - and when none fit, the **smallest**
- * file so the model can at least run. This is two-way: on a capable machine it upgrades a small catalog quant
- * (e.g. Q4_K_M) to Q8_0, and on a tight one it downgrades. Returns undefined when there are no GGUF files or
- * no sizes are known (caller falls back to the static priority pick). Entries without a size are treated as
- * unknown and only used as a last-resort smallest pick.
+ * Picks the GGUF file to download for this machine, by service tier rather than by weight size alone.
+ *
+ * Weight quant and KV cache compete for the SAME memory, and the weight choice is permanent while the context
+ * is re-negotiated at every launch - so maximizing weight quality alone is the wrong objective. A Q8_0 that
+ * leaves room for only a cramped window is a worse coding model than a Q5_K_M that leaves room for a comfort
+ * window: the quantization gap between them is a fraction of a percent of perplexity, while the context gap
+ * decides whether the file you are editing fits in the conversation at all.
+ *
+ * So the pick is made in tiers:
+ *  1. the highest-quality quant (capped at Q8_0) that still leaves room for a **comfort** run - the target;
+ *  2. failing that, the highest-quality quant that still leaves room for a **floor** run - still fully usable;
+ *  3. failing that, the **smallest** weight file, so the model can at least load.
+ *
+ * This is two-way: on a capable machine it upgrades a small catalog quant (e.g. Q4_K_M) to Q8_0, and on a tight
+ * one it downgrades. Returns undefined when there are no GGUF files or no sizes are known (caller falls back to
+ * the static priority pick). Entries without a size are treated as unknown and only used as a last-resort pick.
  *
  * Multimodal projectors (`mmproj-*.gguf`) are ignored - they are tiny and would otherwise win the
  * "smallest fallback" path on memory-tight machines, which then fails at launch as architecture `clip`.
@@ -302,13 +328,18 @@ export function pickBestGgufForBudget(files: readonly { path: string; size?: num
 	const capped = sized.filter(f => quantQualityScore(f.path) <= ceilingScore);
 	const pool = capped.length > 0 ? capped : sized;
 
-	const fitting = pool.filter(f => estimateGgufRuntimeFootprintBytes(f.size, options.layerCount) <= budgetBytes);
-	if (fitting.length > 0) {
-		// Highest quality among those that fit; on a tie, the larger file (more bits) wins.
-		fitting.sort((a, b) => (quantQualityScore(b.path) - quantQualityScore(a.path)) || (b.size - a.size));
-		return fitting[0].path;
+	// Tier 1 then tier 2: take the best quant that leaves room for a comfort run; if none does, settle for the
+	// best that leaves room for a floor run. Both are quality-ordered, so this never trades quality for a tier
+	// the machine could already afford.
+	for (const tier of ['comfort', 'floor'] as const) {
+		const fitting = pool.filter(f => estimateGgufRuntimeFootprintBytes(f.size, options.layerCount, tier) <= budgetBytes);
+		if (fitting.length > 0) {
+			// Highest quality among those that fit; on a tie, the larger file (more bits) wins.
+			fitting.sort((a, b) => (quantQualityScore(b.path) - quantQualityScore(a.path)) || (b.size - a.size));
+			return fitting[0].path;
+		}
 	}
-	// Nothing fits even at minimum-viable KV -> smallest weight file so the model is at least runnable
+	// Nothing fits even at the usability floor -> smallest weight file so the model is at least runnable
 	// (with a reduced context / paging / partial offload).
 	pool.sort((a, b) => a.size - b.size);
 	return pool[0].path;

@@ -79,13 +79,38 @@ suite('LoCoPilot model download - hardware-aware quant selection', () => {
 
 		test('picks a mid quant that fits the FULL footprint, not the biggest that fits weights-only', () => {
 			// ~10.56GB metal budget (16GB Mac, 0.66 wired fraction). Q8 weights (8.1GB) fit alone, but the full
-			// footprint (~11.4GB) overflows, so the highest quant whose footprint DOES fit is chosen instead.
+			// comfort footprint overflows, so the highest quant whose footprint DOES fit is chosen instead.
+			// layerCount is passed the way the real caller does (from the model name), so every quant of this 7B
+			// is charged the same KV instead of the larger files being penalised by their own size bucket.
 			const budget = 10.56 * GB;
-			const pick = pickBestGgufForBudget(repo7b, budget)!;
+			const layerCount = 36; // ~7B
+			const pick = pickBestGgufForBudget(repo7b, budget, { layerCount })!;
 			const size = repo7b.find(f => f.path === pick)!.size;
-			assert.ok(estimateGgufRuntimeFootprintBytes(size) <= budget, `${pick} footprint must fit`);
+			assert.ok(estimateGgufRuntimeFootprintBytes(size, layerCount) <= budget, `${pick} footprint must fit`);
 			assert.strictEqual(pick, 'model-Q6_K.gguf');
-			assert.ok(estimateGgufRuntimeFootprintBytes(8.1 * GB) > budget, 'Q8 footprint must NOT fit this budget');
+			assert.ok(estimateGgufRuntimeFootprintBytes(8.1 * GB, layerCount) > budget, 'Q8 footprint must NOT fit this budget');
+		});
+
+		test('sizes against a COMFORT run (32K @ q8 KV), not merely a loadable one', () => {
+			// The weight quant is permanent while the context is re-negotiated every launch, so a quant that only
+			// leaves room for a cramped window is the wrong trade: the quantization gap between Q6 and Q8 is a
+			// fraction of a percent, the context gap decides whether the file being edited fits at all.
+			const layerCount = 36;
+			const comfort = estimateGgufRuntimeFootprintBytes(6.3 * GB, layerCount, 'comfort');
+			const floor = estimateGgufRuntimeFootprintBytes(6.3 * GB, layerCount, 'floor');
+			assert.ok(comfort > floor, 'the comfort tier must reserve more than the floor tier');
+			// A budget that fits Q6_K only at the floor tier must NOT be spent on Q8_0.
+			const budget = floor + 0.1 * GB;
+			assert.strictEqual(pickBestGgufForBudget(repo7b, budget, { layerCount }), 'model-Q6_K.gguf');
+		});
+
+		test('falls back to the floor tier before falling back to the smallest file', () => {
+			// Nothing clears comfort here, but Q4_K_M clears the floor - so we keep that quality rather than
+			// dropping to the smallest file in the repo.
+			const layerCount = 36;
+			const budget = estimateGgufRuntimeFootprintBytes(4.7 * GB, layerCount, 'floor') + 0.05 * GB;
+			assert.ok(estimateGgufRuntimeFootprintBytes(4.7 * GB, layerCount, 'comfort') > budget, 'comfort must NOT fit');
+			assert.strictEqual(pickBestGgufForBudget(repo7b, budget, { layerCount }), 'model-Q4_K_M.gguf');
 		});
 
 		test('downgrades on a tight machine', () => {

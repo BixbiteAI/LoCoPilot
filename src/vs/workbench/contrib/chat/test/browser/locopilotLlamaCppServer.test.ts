@@ -18,8 +18,14 @@ import {
 	getBundledLlamaServerPath,
 	getLlamaCppServerCommand,
 	resolveKvCacheType,
+	resolveKvCachePlan,
 	selectAutomaticKvCache,
 	kvCacheBytesPerElem,
+	kvPlanBytesPerElem,
+	kvPlanId,
+	symmetricKvPlan,
+	KV_CACHE_TIERS,
+	ABSOLUTE_MIN_CONTEXT,
 	shouldUseBundledVulkan,
 	metalOffloadBudgetBytes,
 	usableSystemMemoryBytes,
@@ -85,6 +91,36 @@ suite('LoCoPilot llama.cpp server', () => {
 		});
 	});
 
+	suite('kvPlanBytesPerElem / kvPlanId', () => {
+		test('the tier ladder is strictly cheaper per element, best quality first', () => {
+			const costs = KV_CACHE_TIERS.map(kvPlanBytesPerElem);
+			assert.deepStrictEqual(costs, [2, 1.0625, 0.8125, 0.5625]);
+			for (let i = 1; i < costs.length; i++) {
+				assert.ok(costs[i] < costs[i - 1], `tier ${i} must be cheaper than tier ${i - 1}`);
+			}
+		});
+
+		test('the asymmetric rung sits between the two symmetric quantized ones', () => {
+			const q8 = kvPlanBytesPerElem({ k: 'q8_0', v: 'q8_0' });
+			const mixed = kvPlanBytesPerElem({ k: 'q4_0', v: 'q8_0' });
+			const q4 = kvPlanBytesPerElem({ k: 'q4_0', v: 'q4_0' });
+			assert.ok(mixed < q8 && mixed > q4);
+			// It buys ~31% more context than q8 while keeping the V half (where 4-bit hurts) at 8 bits.
+			assert.ok(q8 / mixed > 1.3);
+		});
+
+		test('ids are stable and distinguish the asymmetric rung', () => {
+			assert.strictEqual(kvPlanId({ k: 'q8_0', v: 'q8_0' }), 'q8_0');
+			assert.strictEqual(kvPlanId({ k: 'q4_0', v: 'q8_0' }), 'q4_0-q8_0');
+			assert.strictEqual(kvPlanId({ k: 'f16', v: 'f16' }), 'f16');
+		});
+
+		test('a user-pinned type stays symmetric - the asymmetric rung is automatic-only', () => {
+			assert.deepStrictEqual(resolveKvCachePlan('q4_0', 65536), { k: 'q4_0', v: 'q4_0' });
+			assert.deepStrictEqual(symmetricKvPlan('q8_0'), { k: 'q8_0', v: 'q8_0' });
+		});
+	});
+
 	suite('selectAutomaticKvCache', () => {
 		const GB = 1024 * 1024 * 1024;
 		const geometry = { layerCount: 32, kvBytesPerTokenPerLayerF16: 4096 };
@@ -92,9 +128,10 @@ suite('LoCoPilot llama.cpp server', () => {
 		test('keeps f16 for a small context when it fits', () => {
 			assert.deepStrictEqual(selectAutomaticKvCache({
 				requestedContext: 8192,
+				modelContextLength: 8192,
 				kvBudgetBytes: 2 * GB,
 				...geometry,
-			}), { kvCacheType: 'f16', contextSize: 8192 });
+			}), { kvCachePlan: { k: 'f16', v: 'f16' }, contextSize: 8192 });
 		});
 
 		test('prefers near-lossless q8_0 for a normal context when it fits', () => {
@@ -102,15 +139,7 @@ suite('LoCoPilot llama.cpp server', () => {
 				requestedContext: 32768,
 				kvBudgetBytes: 2.25 * GB,
 				...geometry,
-			}), { kvCacheType: 'q8_0', contextSize: 32768 });
-		});
-
-		test('selects q4_0 when it materially extends a long context beyond q8_0', () => {
-			assert.deepStrictEqual(selectAutomaticKvCache({
-				requestedContext: 65536,
-				kvBudgetBytes: 2 * GB,
-				...geometry,
-			}), { kvCacheType: 'q4_0', contextSize: 57344 });
+			}), { kvCachePlan: { k: 'q8_0', v: 'q8_0' }, contextSize: 32768 });
 		});
 
 		test('uses the trained model window when deciding that f16 is sufficient', () => {
@@ -119,21 +148,36 @@ suite('LoCoPilot llama.cpp server', () => {
 				modelContextLength: 8192,
 				kvBudgetBytes: 2 * GB,
 				...geometry,
-			}), { kvCacheType: 'f16', contextSize: 8192 });
+			}), { kvCachePlan: { k: 'f16', v: 'f16' }, contextSize: 8192 });
 		});
 
-		test('keeps q8_0 once it clears the comfort floor, even though q4_0 would grant more length', () => {
-			// q4 is a floor-REACHING tool, not a maximize-length tool: once q8 is above TARGET_MIN we keep its
-			// quality instead of trading down to a lossier cache for extra tokens the user didn't need.
+		test('keeps q8_0 once it clears the comfort floor, even though a cheaper rung would grant more length', () => {
+			// A quantized rung is a floor-REACHING tool, not a maximize-length tool: once q8 is above TARGET_MIN we
+			// keep its quality instead of trading down for extra tokens the user didn't ask for.
 			const sel = selectAutomaticKvCache({ requestedContext: 131072, kvBudgetBytes: 3 * GB, ...geometry });
-			assert.strictEqual(sel.kvCacheType, 'q8_0');
+			assert.deepStrictEqual(sel.kvCachePlan, { k: 'q8_0', v: 'q8_0' });
 			assert.ok(sel.contextSize >= TARGET_MIN_CONTEXT, `q8 context ${sel.contextSize} should clear the ${TARGET_MIN_CONTEXT} floor`);
 		});
 
-		test('drops to q4_0 only when q8_0 cannot reach the comfort floor', () => {
-			// Tight budget: q8 lands below TARGET_MIN, so q4 is used to claw back up toward the floor.
+		test('drops to the asymmetric q4/q8 rung - not straight to 4-bit - when q8_0 misses the comfort floor', () => {
+			// Tight budget: q8 lands below TARGET_MIN. The mixed rung reaches the floor, so we stop there and keep
+			// the V half at 8 bits instead of quantizing both halves to 4.
 			const sel = selectAutomaticKvCache({ requestedContext: 131072, kvBudgetBytes: 2 * GB, ...geometry });
-			assert.strictEqual(sel.kvCacheType, 'q4_0');
+			assert.deepStrictEqual(sel.kvCachePlan, { k: 'q4_0', v: 'q8_0' });
+			assert.ok(sel.contextSize >= TARGET_MIN_CONTEXT);
+		});
+
+		test('reaches full 4-bit only when the mixed rung still cannot reach the comfort floor', () => {
+			const sel = selectAutomaticKvCache({ requestedContext: 131072, kvBudgetBytes: 1.2 * GB, ...geometry });
+			assert.deepStrictEqual(sel.kvCachePlan, { k: 'q4_0', v: 'q4_0' });
+		});
+
+		test('does not walk down the ladder when a cheaper rung buys no extra context', () => {
+			// Budget so small that every rung floors at MIN_CLAMPED_CONTEXT. Downgrading precision would then be a
+			// pure quality loss for zero extra tokens, so the highest-quality rung must be kept.
+			const sel = selectAutomaticKvCache({ requestedContext: 131072, kvBudgetBytes: 1, ...geometry });
+			assert.strictEqual(sel.contextSize, MIN_CLAMPED_CONTEXT);
+			assert.deepStrictEqual(sel.kvCachePlan, { k: 'q8_0', v: 'q8_0' });
 		});
 	});
 
@@ -313,11 +357,50 @@ suite('LoCoPilot llama.cpp server', () => {
 			assert.strictEqual(ctx, MIN_CLAMPED_CONTEXT);
 		});
 
+		test('the usability floor is 16K, not a token-starved single-digit window', () => {
+			// Regression: a tight budget used to hand back a ~5K window, which "starts" but cannot hold this
+			// agent's system prompt + tools + a file, so every multi-turn task failed. The floor is now the
+			// smallest window that actually works; the runtime watchdog is the backstop if memory runs out.
+			assert.strictEqual(MIN_CLAMPED_CONTEXT, 16384);
+			assert.strictEqual(ABSOLUTE_MIN_CONTEXT, 4096);
+			const ctx = clampContextSize({ requestedContext: 131072, kvBudgetBytes: 5000 * 4096 * 32, layerCount: 32, kvBytesPerTokenPerLayer: 4096 });
+			assert.strictEqual(ctx, MIN_CLAMPED_CONTEXT);
+		});
+
 		test('a budget too small for even one token still clamps to the floor (not unclamped)', () => {
 			// Old behavior skipped the clamp when maxTokens computed to 0, letting a near-full budget
 			// escape with the full requested window. Now it clamps and the floor keeps the model usable.
 			const ctx = clampContextSize({ requestedContext: 131072, kvBudgetBytes: 1, layerCount: 32, kvBytesPerTokenPerLayer: 4096 });
 			assert.strictEqual(ctx, MIN_CLAMPED_CONTEXT);
+		});
+
+		test('a ZERO kv budget means exhausted, not unknown', () => {
+			// computeKvBudgetBytes returns 0 when the weights + overhead already fill the budget. Reading that as
+			// "no budget known" skipped the clamp entirely and let the model escape with its full trained window -
+			// the exact opposite of what an exhausted budget means. Only `undefined` may skip the clamp.
+			assert.strictEqual(clampContextSize({ requestedContext: 131072, kvBudgetBytes: 0, layerCount: 32, kvBytesPerTokenPerLayer: 4096 }), MIN_CLAMPED_CONTEXT);
+			assert.strictEqual(clampContextSize({ requestedContext: 131072, layerCount: 32, kvBytesPerTokenPerLayer: 4096 }), 131072);
+		});
+
+		test('the floor never inflates an explicitly smaller request or a smaller trained window', () => {
+			// The floor lifts a BUDGET-driven collapse, it is not a minimum imposed on a deliberate choice.
+			const explicit = clampContextSize({ requestedContext: 8192, kvBudgetBytes: 1, layerCount: 32, kvBytesPerTokenPerLayer: 4096 });
+			assert.strictEqual(explicit, 8192);
+			const trained = clampContextSize({ requestedContext: 131072, modelContextLength: 8192, kvBudgetBytes: 1, layerCount: 32, kvBytesPerTokenPerLayer: 4096 });
+			assert.strictEqual(trained, 8192);
+		});
+
+		test('the OOM ladder may go below the floor via minContext', () => {
+			// After a real OOM the machine has proven it cannot hold the planned window, so the ladder's cap must
+			// survive the clamp - otherwise the degraded relaunch requests the same window that just died.
+			const ctx = clampContextSize({
+				requestedContext: ABSOLUTE_MIN_CONTEXT,
+				kvBudgetBytes: 1,
+				layerCount: 32,
+				kvBytesPerTokenPerLayer: 4096,
+				minContext: ABSOLUTE_MIN_CONTEXT,
+			});
+			assert.strictEqual(ctx, ABSOLUTE_MIN_CONTEXT);
 		});
 
 		test('sliding-window model gets a MUCH larger context than full-layer sizing for the same budget', () => {
@@ -545,15 +628,50 @@ suite('LoCoPilot llama.cpp server', () => {
 	});
 
 	suite('getLlamaCppServerCommand', () => {
-		test('default KV cache is auto: f16 at small context', () => {
-			const { args } = getLlamaCppServerCommand('/m.gguf', 'metal', undefined, 1234, { contextSize: 16384 });
+		test('default KV cache is auto: f16 below the auto-quant threshold', () => {
+			const { args } = getLlamaCppServerCommand('/m.gguf', 'metal', undefined, 1234, { contextSize: 8192 });
+			assert.ok(8192 < KV_AUTO_QUANT_CONTEXT_THRESHOLD);
 			assert.strictEqual(args.indexOf('--cache-type-k'), -1, 'f16 should emit no cache-type flags');
+			assert.strictEqual(args.indexOf('--cache-type-v'), -1, 'f16 should emit no cache-type flags');
 		});
 
 		test('default KV cache is auto: q8_0 at large context', () => {
 			const { args } = getLlamaCppServerCommand('/m.gguf', 'metal', undefined, 1234, { contextSize: 65536 });
 			assert.strictEqual(argValue(args, '--cache-type-k'), 'q8_0');
 			assert.strictEqual(argValue(args, '--cache-type-v'), 'q8_0');
+		});
+
+		test('a pinned asymmetric plan emits different K and V precisions', () => {
+			const { args } = getLlamaCppServerCommand('/m.gguf', 'metal', undefined, 1234, {
+				contextSize: 65536,
+				kvCachePlan: { k: 'q4_0', v: 'q8_0' },
+			});
+			assert.strictEqual(argValue(args, '--cache-type-k'), 'q4_0');
+			assert.strictEqual(argValue(args, '--cache-type-v'), 'q8_0');
+		});
+
+		test('a pinned plan wins over the settings-derived type', () => {
+			// The planner sized the context for this exact plan; re-resolving `kvCacheType` here would flip the
+			// precision out from under the clamp that just budgeted for it.
+			const { args } = getLlamaCppServerCommand('/m.gguf', 'metal', undefined, 1234, {
+				contextSize: 65536,
+				kvCacheType: 'f16',
+				kvCachePlan: { k: 'q4_0', v: 'q8_0' },
+			});
+			assert.strictEqual(argValue(args, '--cache-type-k'), 'q4_0');
+			assert.strictEqual(argValue(args, '--cache-type-v'), 'q8_0');
+		});
+
+		test('a half-quantized plan still promotes flash attention off -> auto', () => {
+			// KV quantization requires FA; only the K half is quantized here, which must still count.
+			const { args } = getLlamaCppServerCommand('/m.gguf', 'metal', undefined, 1234, {
+				contextSize: 65536,
+				flashAttention: 'off',
+				kvCachePlan: { k: 'q4_0', v: 'f16' },
+			});
+			assert.strictEqual(argValue(args, '-fa'), 'auto');
+			assert.strictEqual(argValue(args, '--cache-type-k'), 'q4_0');
+			assert.strictEqual(args.indexOf('--cache-type-v'), -1, 'an f16 V half needs no flag');
 		});
 
 		test('cpu backend forces 0 gpu layers', () => {

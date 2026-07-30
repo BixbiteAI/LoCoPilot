@@ -659,12 +659,12 @@ configurationRegistry.registerConfiguration({
 			type: 'string',
 			enum: ['auto', 'f16', 'q8_0', 'q4_0'],
 			enumDescriptions: [
-				nls.localize('locopilot.llamaCpp.kv.auto', "Automatic (default): evaluates the model's GGUF attention geometry, weights, requested context and hardware memory budget at launch. It keeps f16 for small windows, prefers near-lossless q8_0 for larger windows, and uses q4_0 when that materially extends a context that q8_0 cannot fit."),
+				nls.localize('locopilot.llamaCpp.kv.auto', "Automatic (default): evaluates the model's GGUF attention geometry, weights, requested context and hardware memory budget at launch. It keeps f16 for small windows, prefers near-lossless q8_0 for larger windows, and when q8_0 cannot reach a comfortable context it first quantizes only the K half to 4-bit (keeping V at 8-bit, which preserves most of the quality) before falling back to a full 4-bit cache."),
 				nls.localize('locopilot.llamaCpp.kv.f16', "Full-precision KV cache (always safe)."),
 				nls.localize('locopilot.llamaCpp.kv.q8_0', "8-bit KV cache: ~half the memory, slightly faster. Requires Flash Attention (auto-enabled)."),
 				nls.localize('locopilot.llamaCpp.kv.q4_0', "4-bit KV cache: smallest memory, fastest. May slightly reduce quality. Requires Flash Attention (auto-enabled)."),
 			],
-			markdownDescription: nls.localize('locopilot.llamaCpp.kvCacheType.description', "KV cache quantization (`--cache-type-k/v`) for the local llama.cpp server. Quantizing shrinks the cache so more context fits on the GPU. `auto` dynamically compares f16, q8_0 and q4_0 using the selected model's real attention geometry and the launch memory budget: f16 for small windows, near-lossless q8_0 for normal/large windows, or q4_0 when it grants a larger safe context. When quantized, Flash Attention is auto-enabled (required), so this never fails to start."),
+			markdownDescription: nls.localize('locopilot.llamaCpp.kvCacheType.description', "KV cache quantization (`--cache-type-k/v`) for the local llama.cpp server. Quantizing shrinks the cache so more context fits on the GPU. `auto` walks a quality-ordered ladder - f16, q8_0, 4-bit K with 8-bit V, then full 4-bit - using the selected model's real attention geometry and the launch memory budget, and stops at the highest quality that still reaches a comfortable context. Choosing a fixed type here applies it to both halves. When quantized, Flash Attention is auto-enabled (required), so this never fails to start."),
 			default: 'auto',
 		},
 		[ChatConfiguration.LocopilotLlamaCppMtp]: {

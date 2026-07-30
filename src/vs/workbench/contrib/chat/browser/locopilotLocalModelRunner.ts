@@ -36,18 +36,25 @@ import {
 	shouldUseBundledVulkan,
 	metalOffloadBudgetBytes,
 	usableSystemMemoryBytes,
+	discreteVramBudgetBytes,
+	splitDiscreteGpuFootprint,
 	KV_BUDGET_FRACTION,
 	KV_CLAMP_BUDGET_FRACTION,
 	RUNTIME_OVERHEAD_BYTES,
 	runtimeOverheadBytesForTuning,
 	DEFAULT_LLAMA_CONTEXT_SIZE,
 	MIN_CLAMPED_CONTEXT,
+	ABSOLUTE_MIN_CONTEXT,
 	MAX_CLAMPED_CONTEXT,
 	TARGET_MIN_CONTEXT,
 	LOCOPILOT_LLAMA_SERVER_PORT,
 	LlamaBackend,
-	resolveKvCacheType,
+	resolveKvCachePlan,
 	kvCacheBytesPerElem,
+	kvPlanBytesPerElem,
+	kvPlanId,
+	KV_CACHE_TIERS,
+	symmetricKvPlan,
 	DEFAULT_KV_BYTES_PER_TOKEN_PER_LAYER_F16,
 	DEFAULT_CLAMP_LAYER_COUNT,
 	MTP_DRAFT_KV_LAYER_EQUIV,
@@ -56,10 +63,12 @@ import {
 	MIN_FULL_SWA_CONTEXT,
 	type LlamaServerTuning,
 	type FlashAttentionMode,
-	type KvCacheType
+	type KvCacheType,
+	type KvCachePlan
 } from './locopilotLlamaCppServer.js';
 import { readGgufModelInfo, isMoeModelInfo, isSwaModelInfo, kvBytesPerTokenPerLayer, type IGgufModelInfo } from './locopilotGgufMetadata.js';
-import { ILoCoPilotSystemInfoService, type IMemoryStatus, type ISystemHardwareInfo, type MemoryPressureLevel } from '../../../../platform/locopilotSystemInfo/common/locopilotSystemInfo.js';
+import { readMlxModelInfo } from './locopilotMlxMetadata.js';
+import { ILoCoPilotSystemInfoService, type IGpuInfo, type IMemoryStatus, type ISystemHardwareInfo, type MemoryPressureLevel } from '../../../../platform/locopilotSystemInfo/common/locopilotSystemInfo.js';
 import { dirname } from '../../../../base/common/path.js';
 import { isWindows, isMacintosh } from '../../../../base/common/platform.js';
 import {
@@ -132,6 +141,38 @@ export type LocalServerPhase = 'starting' | 'loading' | 'ready';
  * 'running' entry carrying the real pid/port once the server is up. Other windows read this to attach to or
  * replace the single active server.
  */
+/**
+ * A launch's measured footprint against the memory pool that constrains it. On single-pool backends (Metal /
+ * CPU) `requiredBytes` vs `usableBytes` is the whole story. On a discrete GPU the footprint is split across two
+ * pools that fail differently - VRAM hard-OOMs, host RAM pages - so the pair reports whichever pool is TIGHTER,
+ * and the host half is carried separately because the live-availability gate can only measure host RAM.
+ */
+interface IModelFit {
+	/** Footprint in the constraining pool. */
+	readonly requiredBytes: number;
+	/** Capacity of that same pool. */
+	readonly usableBytes: number;
+	/** Weight-file bytes, for callers that discount mmap-able / VRAM-resident weights. */
+	readonly weightBytes: number;
+	/** Discrete GPU only: the host-RAM half of the footprint. */
+	readonly hostRequiredBytes?: number;
+	/** Discrete GPU only: the weight bytes that will reside in VRAM after the offload plan. */
+	readonly gpuWeightBytes?: number;
+}
+
+/**
+ * A planned MLX launch: the effective context window plus every mlx_lm.server knob it implies. Produced before
+ * the memory gates run (so they measure the real configuration) and consumed by the launch itself, mirroring
+ * how the llama.cpp path finalizes its tuning ahead of the same gates.
+ */
+interface IMlxLaunchPlan {
+	readonly tuning: MlxServerTuning;
+	/** Effective window. Mutable: the availability gate may shrink it to fit memory free right now. */
+	contextSize: number;
+	/** False when auto-tuning is off (or a build rejected the flags), so the launch skips the add-ons too. */
+	readonly autoTuned: boolean;
+}
+
 interface IActiveServerLock {
 	phase: 'claiming' | 'running';
 	modelId: string;
@@ -1550,12 +1591,16 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 	 */
 	private async _kvBytesForContext(localPath: string, kind: 'llama' | 'mlx', ctxTokens: number): Promise<number> {
 		const FALLBACK_BYTES_PER_TOKEN = 128 * 1024;
-		if (kind === 'llama') {
+		{
 			try {
-				const filePath = await this.resolveModelFilePath(localPath);
+				// llama.cpp resolves to a .gguf file (header geometry); MLX resolves to a weights directory
+				// (config.json geometry). Both return the same shape, so the estimate is identical either way -
+				// MLX no longer falls back to the flat per-token guess, which was off by several-fold on a
+				// modern GQA model and made eviction/Auto decisions from a number unrelated to the real cache.
+				const filePath = kind === 'llama' ? await this.resolveModelFilePath(localPath) : await this.getMlxModelRootPath(localPath);
 				const info = await this._getModelInfo(filePath);
-				const perTokenPerLayer = kvBytesPerTokenPerLayer(info, 2); // f16 k+v; conservative for a budget
-				const layers = info.layerCount && info.layerCount > 0 ? info.layerCount : 32;
+				const perTokenPerLayer = kvBytesPerTokenPerLayer(info, 2); // f16 k+v; MLX has no KV quantization
+				const layers = info.layerCount && info.layerCount > 0 ? info.layerCount : DEFAULT_CLAMP_LAYER_COUNT;
 				if (perTokenPerLayer && perTokenPerLayer > 0) {
 					// Windowed-aware, matching the clamp / fit gate: a sliding-window model's SWA layers hold only
 					// `window` tokens, so the old all-layers-full estimate over-counted KV (now amplified because the
@@ -1884,9 +1929,12 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 		}
 		this._oomRetryCount.set(modelId, attempts + 1);
 		const lastCtx = this._lastLaunchContext.get(modelId) ?? DEFAULT_LLAMA_CONTEXT_SIZE;
+		// The OOM ladder is the ONE place allowed below the usability floor: the machine has already proven at
+		// runtime that it can't hold the planned window, so a cramped model beats no model. First rung halves
+		// (not below the usable floor), the last rung drops to the absolute minimum.
 		const newCap = attempts === 0
 			? Math.max(MIN_CLAMPED_CONTEXT, Math.floor(lastCtx / 2 / 1024) * 1024)
-			: MIN_CLAMPED_CONTEXT;
+			: ABSOLUTE_MIN_CONTEXT;
 		this._oomContextCap.set(modelId, newCap);
 		this._oomStripExtras.add(modelId);
 		this._log(`[LoCoPilot Runner] "${modelName}" ran out of memory (attempt ${attempts + 1}/2); relaunching with context capped at ${newCap} and the memory-heavy extras (speculative draft / --swa-full) stripped.`);
@@ -2016,24 +2064,51 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 		return this._hardwareInfo;
 	}
 
-	/** Largest VRAM pool that the selected backend can actually target (never an unrelated adapter). */
-	private _discreteVramBytes(backend: LlamaBackend, hw: ISystemHardwareInfo | undefined): number | undefined {
+	/** The adapter the selected backend will actually target (never an unrelated GPU): the one with most VRAM. */
+	private _targetGpu(backend: LlamaBackend, hw: ISystemHardwareInfo | undefined): IGpuInfo | undefined {
 		const candidates = (hw?.gpus ?? []).filter(g => {
 			if (backend === 'cuda') {
 				return g.vendor === 'nvidia';
 			}
 			return backend === 'vulkan' && g.vendor !== 'apple';
-		}).map(g => g.totalVramBytes).filter(v => v > 0);
-		return candidates.length ? Math.max(...candidates) : undefined;
+		}).filter(g => g.totalVramBytes > 0);
+		return candidates.length ? candidates.reduce((a, b) => b.totalVramBytes > a.totalVramBytes ? b : a) : undefined;
 	}
 
-	/** Reads (and caches) GGUF model info (layer/expert count, context length) for a resolved file path. */
+	/** Largest VRAM pool that the selected backend can actually target (never an unrelated adapter). */
+	private _discreteVramBytes(backend: LlamaBackend, hw: ISystemHardwareInfo | undefined): number | undefined {
+		return this._targetGpu(backend, hw)?.totalVramBytes;
+	}
+
+	/**
+	 * VRAM actually available for inference on the target adapter: free VRAM less the driver/display reserve.
+	 * Unlike system RAM there is no swap behind VRAM - overflowing it is a hard OOM, not a slowdown - so the
+	 * budget is sized off what is FREE right now (other GPU consumers included) rather than the card's total.
+	 */
+	private _discreteVramBudgetBytes(backend: LlamaBackend, hw: ISystemHardwareInfo | undefined): number | undefined {
+		const gpu = this._targetGpu(backend, hw);
+		if (!gpu) {
+			return undefined;
+		}
+		const budget = discreteVramBudgetBytes(gpu.totalVramBytes, gpu.freeVramBytes);
+		return budget > 0 ? budget : undefined;
+	}
+
+	/**
+	 * Reads (and caches) model geometry (layer/expert count, context length, attention shape) for a resolved
+	 * path. A `.gguf` file is read from its header; an MLX weights DIRECTORY is read from its `config.json`,
+	 * which yields the same shape - so the context clamp, the fit gate and the resident-cost estimator all
+	 * work on MLX models instead of falling back to generic constants.
+	 */
 	private async _getModelInfo(modelPath: string): Promise<IGgufModelInfo> {
 		const cached = this._modelInfoCache.get(modelPath);
 		if (cached) {
 			return cached;
 		}
-		const info = await readGgufModelInfo(this.fileService, modelPath, e => this._log(`[LoCoPilot Runner] GGUF metadata parse aborted for "${modelPath}": ${e}`));
+		const isGguf = modelPath.toLowerCase().endsWith('.gguf');
+		const info = isGguf
+			? await readGgufModelInfo(this.fileService, modelPath, e => this._log(`[LoCoPilot Runner] GGUF metadata parse aborted for "${modelPath}": ${e}`))
+			: await readMlxModelInfo(this.fileService, modelPath, e => this._log(`[LoCoPilot Runner] MLX config.json parse aborted for "${modelPath}": ${e}`));
 		this._log(`[LoCoPilot Runner] GGUF metadata for "${modelPath}": layers=${info.layerCount ?? '?'}, ctx=${info.contextLength ?? '?'}, experts=${info.expertCount ?? '?'}, slidingWindow=${info.slidingWindow ?? 'none'}.`);
 		this._modelInfoCache.set(modelPath, info);
 		return info;
@@ -2053,7 +2128,9 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 	 */
 	private async _memoryBudgetBytes(backend: LlamaBackend, hw: ISystemHardwareInfo): Promise<number | undefined> {
 		if (backend === 'cuda' || backend === 'vulkan') {
-			return this._discreteVramBytes(backend, hw);
+			// Free VRAM less the driver reserve, NOT the card's total: the offload plan and the context clamp both
+			// size against this, so a card already half-committed to other apps no longer gets planned as if empty.
+			return this._discreteVramBudgetBytes(backend, hw);
 		}
 		const mem = await this._getSystemMemory();
 		if (!mem?.totalmem) {
@@ -2076,7 +2153,7 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 	 *
 	 * All steps are best-effort: any missing data leaves the base tuning untouched.
 	 */
-	private async _augmentTuningWithHardware(modelPath: string, backend: LlamaBackend, base: LlamaServerTuning, extraResidentBytes: number = 0): Promise<LlamaServerTuning> {
+	private async _augmentTuningWithHardware(modelPath: string, backend: LlamaBackend, base: LlamaServerTuning, extraResidentBytes: number = 0, minContext?: number): Promise<LlamaServerTuning> {
 		const hw = await this._getHardwareInfo();
 		if (!hw) {
 			return base;
@@ -2156,6 +2233,11 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 		// Same estimate expressed per token, so the gate below can SOLVE for the largest context whose full-size
 		// SWA cache fits instead of only answering yes/no at the context the clamp happened to pick.
 		let fullSwaBytesPerTokenEstimate: number | undefined;
+		// Inputs the swa-full gate needs to RE-PRICE the cache at a different KV precision: the model's f16
+		// bytes/token/layer, its layer count, and the precision the (windowed) clamp settled on.
+		let f16PerTokenPerLayerForSwa = 0;
+		let layersForSwaKv = 0;
+		let resolvedKvPlanForSwa: KvCachePlan = symmetricKvPlan('f16');
 
 		// #5 Context clamp: never request more than the model supports, nor more than the KV budget can hold.
 		// The KV allowance is weight-aware (computeKvBudgetBytes): at most KV_BUDGET_FRACTION of the budget,
@@ -2175,11 +2257,11 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 				// Discrete GPUs: partial offload caps the weights that land in VRAM at the offload budget;
 				// Metal/CPU: the full weights share the one unified/system pool with the KV cache.
 				const residentWeights = (backend === 'cuda' || backend === 'vulkan') ? Math.min(modelBytes, offloadBudget) : modelBytes;
-				// Unknown weight size (0) degrades to the plain fraction allowance. Floor at 1 byte so a
-				// zero-remainder budget still CLAMPS to the minimum context instead of skipping the clamp
-				// (clampContextSize treats 0/undefined as "no budget known").
+				// Unknown weight size (0) degrades to the plain fraction allowance. A zero remainder is passed
+				// through as-is: clampContextSize reads 0 as "the budget is exhausted" and clamps to the floor,
+				// which is what an exhausted budget means (only `undefined` skips the clamp).
 				kvBudgetBytes = modelBytes > 0
-					? Math.max(1, computeKvBudgetBytes(budget, residentWeights, runtimeOverhead))
+					? computeKvBudgetBytes(budget, residentWeights, runtimeOverhead)
 					: budget * KV_CLAMP_BUDGET_FRACTION;
 			}
 			// Compare every automatic precision against the same exact model geometry and weight-aware budget.
@@ -2194,7 +2276,7 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 			// (layersForKv) for the --swa-full estimate, which measures the main KV alone.
 			const baseLayerCount = info.layerCount && info.layerCount > 0 ? info.layerCount : DEFAULT_CLAMP_LAYER_COUNT;
 			const clampLayerCount = tuning.multiTokenPrediction ? baseLayerCount + MTP_DRAFT_KV_LAYER_EQUIV : baseLayerCount;
-			let resolvedKvType: Exclude<KvCacheType, 'auto'>;
+			let resolvedKvPlan: KvCachePlan;
 			let clamped: number;
 			if ((tuning.kvCacheType ?? 'auto') === 'auto') {
 				const selection = selectAutomaticKvCache({
@@ -2207,13 +2289,15 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 					// decided AFTER this, so 'undefined' means windowed - the swa-full gate below re-checks fit).
 					slidingWindow: info.slidingWindow,
 					swaFullOnAllLayers: tuning.swaFull === true,
+					minContext,
 				});
-				resolvedKvType = selection.kvCacheType;
+				resolvedKvPlan = selection.kvCachePlan;
 				clamped = selection.contextSize;
-				this._log(`[LoCoPilot Runner] Dynamic KV selected ${resolvedKvType} for ${clamped}/${tuning.contextSize} requested tokens from the model-specific memory budget${tuning.multiTokenPrediction ? ' (incl. MTP draft-context KV reserve)' : ''}.`);
+				this._log(`[LoCoPilot Runner] Dynamic KV selected ${kvPlanId(resolvedKvPlan)} (K ${resolvedKvPlan.k} / V ${resolvedKvPlan.v}) for ${clamped}/${tuning.contextSize} requested tokens from the model-specific memory budget${tuning.multiTokenPrediction ? ' (incl. MTP draft-context KV reserve)' : ''}.`);
 			} else {
-				resolvedKvType = tuning.kvCacheType as Exclude<KvCacheType, 'auto'>;
-				const fixedPerTokenPerLayer = f16PerTokenPerLayer * kvCacheBytesPerElem(resolvedKvType) / kvCacheBytesPerElem('f16');
+				// A user-pinned type applies to both halves - the asymmetric rung is an automatic choice only.
+				resolvedKvPlan = symmetricKvPlan(tuning.kvCacheType as Exclude<KvCacheType, 'auto'>);
+				const fixedPerTokenPerLayer = f16PerTokenPerLayer * kvPlanBytesPerElem(resolvedKvPlan) / kvCacheBytesPerElem('f16');
 				clamped = clampContextSize({
 					requestedContext: tuning.contextSize,
 					modelContextLength: info.contextLength,
@@ -2222,21 +2306,26 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 					kvBytesPerTokenPerLayer: fixedPerTokenPerLayer,
 					slidingWindow: info.slidingWindow,
 					swaFullOnAllLayers: tuning.swaFull === true,
+					minContext,
 				});
 			}
-			const perTokenPerLayer = f16PerTokenPerLayer * kvCacheBytesPerElem(resolvedKvType) / kvCacheBytesPerElem('f16');
+			const perTokenPerLayer = f16PerTokenPerLayer * kvPlanBytesPerElem(resolvedKvPlan) / kvCacheBytesPerElem('f16');
 			if (clamped < tuning.contextSize) {
-				this._log(`[LoCoPilot Runner] Clamped context ${tuning.contextSize} -> ${clamped} to fit the model/memory budget (KV ${resolvedKvType}, ~${perTokenPerLayer} B/tok/layer).`);
+				this._log(`[LoCoPilot Runner] Clamped context ${tuning.contextSize} -> ${clamped} to fit the model/memory budget (KV ${kvPlanId(resolvedKvPlan)}, ~${perTokenPerLayer} B/tok/layer).`);
 				tuning.contextSize = clamped;
 			}
 			// Pin the precision the clamp sized for so getLlamaCppServerCommand doesn't re-resolve 'auto' from the
 			// (possibly now sub-threshold) clamped window and flip to f16. No-op when the user pinned a fixed type.
-			tuning.kvCacheType = resolvedKvType;
+			tuning.kvCachePlan = resolvedKvPlan;
 			// Full-size KV the SWA layers would take with --swa-full, at the final context + precision. Mirrors
 			// clampContextSize's own layer-count fallback so the estimate matches what the clamp budgeted.
 			const layersForKv = info.layerCount && info.layerCount > 0 ? info.layerCount : DEFAULT_CLAMP_LAYER_COUNT;
 			fullSwaBytesPerTokenEstimate = perTokenPerLayer * layersForKv;
 			fullSwaKvBytesEstimate = fullSwaBytesPerTokenEstimate * (tuning.contextSize ?? 0);
+			// Carried out of this block so the swa-full gate can re-price the cache at another precision.
+			f16PerTokenPerLayerForSwa = f16PerTokenPerLayer;
+			layersForSwaKv = layersForKv;
+			resolvedKvPlanForSwa = resolvedKvPlan;
 		}
 
 		// SWA full cache: sliding-window models (Gemma 2/3/4) default to a window-sized KV for their SWA layers,
@@ -2284,16 +2373,44 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 				// re-prefill the whole conversation every turn (measured on gemma-4-E4B: 33s for a 7.4K-token turn
 				// vs 62ms with --swa-full on). So rather than give up, solve for the largest context whose full
 				// cache DOES fit and clamp to it - as long as that stays at or above MIN_FULL_SWA_CONTEXT.
-				const tradedContext = (canEstimate && headroom < 0)
-					? maxContextForFullSwa({
-						budgetBytes: budget,
-						residentWeightBytes: residentWeights,
-						fullSwaBytesPerToken: fullSwaBytesPerTokenEstimate ?? 0,
-						requestedContext: tuning.contextSize ?? 0,
-						promptCacheReserveBytes: promptCacheReserve,
-						overheadBytes: runtimeOverheadBytesForTuning(tuning, backend),
-					})
-					: 0;
+				// Re-plan KV PRECISION against the swa-full cost, not just the context. The clamp above sized the
+				// cache as WINDOWED (swa-full isn't decided until here), so it happily kept f16 - but with
+				// --swa-full EVERY layer holds the full context, which multiplies the cache several-fold and is
+				// what forces the trade. Spending a rung of precision here is far cheaper than the context it buys
+				// back: q8_0 is ~half the bytes at a quality delta too small to measure, so a Gemma that lands at
+				// ~33K on f16 reaches ~64K on q8 for the SAME footprint. Walk down only as far as the comfort
+				// target needs, and only when the precision is ours to choose (never over a user-pinned type).
+				let tradedContext = 0;
+				let tradedPlan = resolvedKvPlanForSwa;
+				if (canEstimate && headroom < 0 && layersForSwaKv > 0) {
+					const autoKv = (tuning.kvCacheType ?? 'auto') === 'auto';
+					const startIndex = autoKv ? KV_CACHE_TIERS.findIndex(t => t.k === tradedPlan.k && t.v === tradedPlan.v) : -1;
+					const candidates = startIndex >= 0 ? KV_CACHE_TIERS.slice(startIndex) : [tradedPlan];
+					for (const candidatePlan of candidates) {
+						const perToken = f16PerTokenPerLayerForSwa * kvPlanBytesPerElem(candidatePlan) / kvCacheBytesPerElem('f16') * layersForSwaKv;
+						const candidateContext = maxContextForFullSwa({
+							budgetBytes: budget,
+							residentWeightBytes: residentWeights,
+							fullSwaBytesPerToken: perToken,
+							requestedContext: tuning.contextSize ?? 0,
+							promptCacheReserveBytes: promptCacheReserve,
+							overheadBytes: runtimeOverheadBytesForTuning(tuning, backend),
+						});
+						if (candidateContext > tradedContext) {
+							tradedContext = candidateContext;
+							tradedPlan = candidatePlan;
+						}
+						// Good enough: this rung already reaches the comfort window, so stop spending quality.
+						if (candidateContext >= Math.min(tuning.contextSize ?? 0, TARGET_MIN_CONTEXT)) {
+							break;
+						}
+					}
+					if (tradedContext >= MIN_FULL_SWA_CONTEXT && (tradedPlan.k !== resolvedKvPlanForSwa.k || tradedPlan.v !== resolvedKvPlanForSwa.v)) {
+						this._log(`[LoCoPilot Runner] SWA full-cache re-plan: KV ${kvPlanId(resolvedKvPlanForSwa)} -> ${kvPlanId(tradedPlan)} keeps ${tradedContext} tokens instead of collapsing the window to fit a full-precision cache.`);
+						tuning.kvCachePlan = tradedPlan;
+						fullSwaBytesPerTokenEstimate = f16PerTokenPerLayerForSwa * kvPlanBytesPerElem(tradedPlan) / kvCacheBytesPerElem('f16') * layersForSwaKv;
+					}
+				}
 				if (canEstimate && headroom >= 0) {
 					tuning.swaFull = true;
 					this._log(`[LoCoPilot Runner] SWA model (window ${info.slidingWindow}); enabling --swa-full (mode=${mode}) - full-size SWA KV ~${(fullSwaKvBytesEstimate! / GB).toFixed(1)}GB fits with ~${(headroom / GB).toFixed(1)}GB headroom.`);
@@ -2366,7 +2483,7 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 	 * clamped context and resolved KV precision; without one it measures the conservative minimum footprint.
 	 * Callers treat undefined as "fits" so we never block or degrade a launch we can't reason about.
 	 */
-	private async _computeFit(modelPath: string, backend: LlamaBackend, discreteVramBytes: number | undefined, extraResidentBytes: number = 0, tuning?: LlamaServerTuning): Promise<{ requiredBytes: number; usableBytes: number; weightBytes: number } | undefined> {
+	private async _computeFit(modelPath: string, backend: LlamaBackend, discreteVramBytes: number | undefined, extraResidentBytes: number = 0, tuning?: LlamaServerTuning): Promise<IModelFit | undefined> {
 		const weightBytes = await this._weightBytesOnDisk(modelPath);
 		if (weightBytes <= 0) {
 			return undefined; // unknown size -> can't reason about it.
@@ -2389,15 +2506,20 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 		// 2-3.5x larger than they really are and prompted "Run anyway" even after auto-tuning made them fit.
 		// Callers without a finalized plan (MLX / speculative-extra screening) retain the conservative minimum.
 		const contextTokens = tuning
-			? Math.max(MIN_CLAMPED_CONTEXT, tuning.contextSize ?? DEFAULT_LLAMA_CONTEXT_SIZE)
+			? Math.max(ABSOLUTE_MIN_CONTEXT, tuning.contextSize ?? DEFAULT_LLAMA_CONTEXT_SIZE)
 			: MIN_CLAMPED_CONTEXT;
-		const kvType = tuning
-			? resolveKvCacheType(tuning.kvCacheType ?? 'auto', contextTokens)
-			: 'f16';
-		const kvBytesPerElement = kvCacheBytesPerElem(kvType);
+		// Honour the plan the launch planner pinned (including the asymmetric q4/q8 rung) so the gate charges
+		// exactly the cache the launch will allocate; without a plan fall back to the settings-derived type.
+		const kvPlan = tuning
+			? (tuning.kvCachePlan ?? resolveKvCachePlan(tuning.kvCacheType ?? 'auto', contextTokens))
+			: symmetricKvPlan('f16');
+		const kvBytesPerElement = kvPlanBytesPerElem(kvPlan);
 		const perTokenPerLayer = (info && kvBytesPerTokenPerLayer(info, kvBytesPerElement))
 			|| DEFAULT_KV_BYTES_PER_TOKEN_PER_LAYER_F16 * kvBytesPerElement / kvCacheBytesPerElem('f16');
-		const layerCount = info?.layerCount && info.layerCount > 0 ? info.layerCount : 32;
+		// Same fallback the context clamp uses (DEFAULT_CLAMP_LAYER_COUNT). A lower number here would make the
+		// gate charge LESS KV than the clamp budgeted for an unknown-geometry model - admitting a launch the
+		// clamp had already sized as marginal.
+		const layerCount = info?.layerCount && info.layerCount > 0 ? info.layerCount : DEFAULT_CLAMP_LAYER_COUNT;
 		// Windowed-aware KV: a sliding-window model with --swa-full off holds only `window` tokens on its SWA
 		// layers, so its real footprint is far below `contextTokens * perTok * allLayers`. Mirror the clamp so
 		// the gate doesn't reject the large windowed context the clamp granted. swaFull true => full on all layers.
@@ -2416,15 +2538,87 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 		// so an MTP + vision model passed this gate and then OOM-ed the GPU at decode.
 		const requiredBytes = weightBytes + kvBytes + runtimeOverhead + Math.max(0, extraResidentBytes);
 
+		// Discrete GPU: measure the TWO pools separately. VRAM holds the offloaded weights, the entire KV cache
+		// and the compute buffers, and overflowing it is a hard driver OOM (no swap sits behind VRAM); host RAM
+		// holds the CPU-resident remainder and only pages when short. Summing them into one "usable" figure - the
+		// old behavior - admitted launches whose KV could never fit the card because spare system RAM covered the
+		// difference on paper. We report whichever pool is tighter, so the caller's single comparison still works
+		// and now fails on the pool that will actually fail.
+		if (backend === 'cuda' || backend === 'vulkan') {
+			const hw = await this._getHardwareInfo();
+			const vramBudget = this._discreteVramBudgetBytes(backend, hw);
+			if (vramBudget && vramBudget > 0) {
+				const hostBudget = usableSystemMemoryBytes(mem.totalmem);
+				// Weight bytes that will really live in VRAM after the offload plan the tuner produced. A pinned
+				// --n-gpu-layers (dense partial offload) scales proportionally; an expert-offload plan (MoE) keeps
+				// attention on the device; no plan at all means llama.cpp will offload everything that fits.
+				const gpuWeightBytes = this._gpuResidentWeightBytes(weightBytes, vramBudget, info, tuning);
+				const split = splitDiscreteGpuFootprint({
+					weightBytes,
+					gpuWeightBytes,
+					kvBytes,
+					overheadBytes: runtimeOverhead,
+					extraResidentBytes: Math.max(0, extraResidentBytes),
+				});
+				const vramHeadroom = vramBudget - split.vramRequiredBytes;
+				const hostHeadroom = hostBudget - split.hostRequiredBytes;
+				const tighter = vramHeadroom <= hostHeadroom
+					? { requiredBytes: split.vramRequiredBytes, usableBytes: vramBudget }
+					: { requiredBytes: split.hostRequiredBytes, usableBytes: hostBudget };
+				return {
+					...tighter,
+					weightBytes,
+					// The live-RAM gate below measures HOST availability only, so it needs the host half even when
+					// VRAM is the tighter pool - re-deriving it from a VRAM-side total would be meaningless.
+					hostRequiredBytes: split.hostRequiredBytes,
+					gpuWeightBytes,
+				};
+			}
+			// VRAM unprobeable: fall through to the combined figure rather than blocking on what we can't measure.
+		}
+
 		// Usable memory:
 		//  - metal (Apple Silicon): the WIRED working-set ceiling (~70% of unified RAM). macOS caps a Metal
 		//    app there; using the looser 85% system figure (the old bug) let a model clear this gate and then
 		//    bust the GPU ceiling at decode (kIOGPUCommandBufferCallbackErrorOutOfMemory).
-		//  - cuda/vulkan/cpu: system RAM left for inference (85%), plus discrete VRAM when weights offload to a GPU.
+		//  - cpu (and an unprobeable GPU): system RAM left for inference, plus any VRAM weights can offload to.
 		const usableBytes = backend === 'metal'
 			? metalOffloadBudgetBytes(mem.totalmem, (await this._getHardwareInfo())?.metalWiredLimitBytes)
 			: usableSystemMemoryBytes(mem.totalmem) + (discreteVramBytes && discreteVramBytes > 0 ? discreteVramBytes : 0);
 		return { requiredBytes, usableBytes, weightBytes };
+	}
+
+	/**
+	 * Weight bytes that will reside in VRAM once the offload plan runs. Mirrors what `_augmentTuningWithHardware`
+	 * decided so the gate charges the device exactly what the launch will put on it:
+	 *  - explicit `--n-gpu-layers` (dense partial offload): that share of the layers, plus the non-layer tensors
+	 *    (embeddings/output) which llama.cpp keeps on the device whenever any layer is offloaded;
+	 *  - MoE expert offload (`--n-cpu-moe` / `-ot`): the experts moved to CPU leave the device, the rest stays;
+	 *  - no plan: everything that fits the weight share of the VRAM budget.
+	 */
+	private _gpuResidentWeightBytes(weightBytes: number, vramBudget: number, info: IGgufModelInfo | undefined, tuning?: LlamaServerTuning): number {
+		const layerCount = info?.layerCount && info.layerCount > 0 ? info.layerCount : DEFAULT_CLAMP_LAYER_COUNT;
+		if (tuning?.gpuLayers !== undefined && tuning.gpuLayers >= 0) {
+			const offloaded = Math.max(0, Math.min(Math.floor(tuning.gpuLayers), layerCount));
+			const nonLayer = info?.nonLayerWeightBytes && info.nonLayerWeightBytes > 0 ? info.nonLayerWeightBytes : 0;
+			// Real per-layer sizes when the GGUF tensor section gave them (layers are NOT uniform - the first and
+			// last blocks differ); otherwise spread the weights evenly across the layer count.
+			const layerBytes = info?.perLayerWeightBytes?.length
+				? info.perLayerWeightBytes.slice(0, offloaded).reduce((a, b) => a + b, 0)
+				: (Math.max(0, weightBytes - nonLayer) / layerCount) * offloaded;
+			return Math.min(weightBytes, layerBytes + (offloaded > 0 ? nonLayer : 0));
+		}
+		if (tuning?.cpuMoeLayers !== undefined && tuning.cpuMoeLayers > 0 && info?.perLayerExpertBytes?.length) {
+			// --n-cpu-moe offloads the experts of the FIRST N blocks; everything else stays on the device.
+			const movedToCpu = info.perLayerExpertBytes.slice(0, tuning.cpuMoeLayers).reduce((a, b) => a + b, 0);
+			return Math.max(0, weightBytes - movedToCpu);
+		}
+		if (tuning?.overrideTensors?.length) {
+			// A `-ot` expert-offload rule was rendered but we can't cheaply re-derive which blocks it names;
+			// assume the plan sized itself to the weight share of the budget, which is what produced the rule.
+			return Math.min(weightBytes, Math.floor(vramBudget * (1 - KV_BUDGET_FRACTION)));
+		}
+		return Math.min(weightBytes, Math.floor(vramBudget * (1 - KV_BUDGET_FRACTION)));
 	}
 
 	/**
@@ -2517,7 +2711,10 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 			// genuine "won't fit". Only raise the strong Run-anyway dialog on a CLEAR overflow past a tolerance band
 			// that approximates the real ceiling; within the band, launch and surface the plain-language tight-fit
 			// notice instead. (Metal's fraction understates the ceiling more than the already-realistic CPU/VRAM ones.)
-			const fitTolerance = backend === 'metal' ? 0.18 : 0.05;
+			// Metal's wired fraction is a conservative guess that sits below the device's true working-set ceiling,
+			// so a small overage there is not a real shortfall. VRAM is the opposite: it is an exact, hard limit
+			// with no swap behind it, so anything over budget is a genuine driver OOM and gets NO tolerance.
+			const fitTolerance = backend === 'metal' ? 0.18 : ((backend === 'cuda' || backend === 'vulkan') ? 0 : 0.05);
 			if (interactive && fit.requiredBytes <= fit.usableBytes * (1 + fitTolerance)) {
 				this._log(`[LoCoPilot Runner] ${modelId} marginally over the conservative budget (~${needGb}GB vs ~${haveGb}GB, within ${Math.round(fitTolerance * 100)}%); launching with a soft notice - the watchdog is the backstop.`);
 				if (!this._tightContextNoticed.has(modelId)) {
@@ -3823,7 +4020,34 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 		if (model.provider === 'huggingface' && isAppleSiliconMac()) {
 			const hasGguf = await this.pathResolvesToGguf(model.localPath);
 			if (shouldUseMlxServerForHfModel(model, hasGguf, true)) {
-				if (!await this._memoryAllowsLaunch(modelId, interactive, 'metal')) {
+				const mlxModelDir = await this.getMlxModelRootPath(model.localPath);
+				// Plan the MLX launch BEFORE either gate, exactly as the llama.cpp path does. Previously the
+				// context/prompt-cache plan was computed inside _startMlxServerInTerminal - i.e. AFTER both gates -
+				// so the gates measured a generic minimum footprint rather than the configuration that would really
+				// launch, and could warn about a model the plan had already made fit (or wave through one it hadn't).
+				const mlxPlan = await this._computeMlxPlan(modelId, mlxModelDir);
+				// Present the plan to the shared gates in llama.cpp tuning terms so both engines are measured by the
+				// same arithmetic. MLX exposes no KV quantization, so the cache is always f16, and the client is
+				// single-user, so there is exactly one slot.
+				const mlxFitTuning: LlamaServerTuning = {
+					contextSize: mlxPlan.contextSize,
+					kvCachePlan: symmetricKvPlan('f16'),
+					parallelSlots: 1,
+					ubatchSize: mlxPlan.tuning.prefillStepSize ?? 2048,
+				};
+				// Same plain-language tight-fit notice the llama.cpp path shows: the plan granted the largest window
+				// that fits but it landed below the comfort floor on a model whose own window is larger, i.e. the
+				// DEVICE is the limit. Informational only - the model still runs, and the watchdog is the backstop.
+				const mlxWindowCeiling = model.contextWindow && model.contextWindow > 0 ? model.contextWindow : 0;
+				if (interactive
+					&& mlxPlan.contextSize < TARGET_MIN_CONTEXT
+					&& mlxWindowCeiling >= TARGET_MIN_CONTEXT
+					&& !this._oomContextCap.has(modelId)
+					&& !this._tightContextNoticed.has(modelId)) {
+					this._tightContextNoticed.add(modelId);
+					showTransientNotification(this.notificationService, Severity.Warning, `"${model.displayName || model.modelName}" is a tight fit for your system's memory. You can still use it, but it may slow down or stop on its own during longer chats. For smoother performance, close some apps to free up memory, or pick a smaller model.`, { timeoutMs: 15000 });
+				}
+				if (!await this._memoryAllowsLaunch(modelId, interactive, 'metal', mlxFitTuning)) {
 					return;
 				}
 				// Same pre-flight fit check as the llama.cpp path: MLX runs on Apple Silicon unified memory via
@@ -3832,9 +4056,14 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 				// weights from the RESOLVED model root, not the raw localPath, so this matches the transient gate
 				// and the actual launch (Q4). The prompt-cache headroom is reserved in the SOFT transient gate
 				// (_memoryAllowsLaunch), not here - it is a growable, throttled cache, not a hard capability limit.
-				const mlxModelDir = await this.getMlxModelRootPath(model.localPath);
-				if (!await this._checkModelFitsOrNotify(modelId, mlxModelDir, 'metal', undefined, interactive)) {
+				if (!await this._checkModelFitsOrNotify(modelId, mlxModelDir, 'metal', undefined, interactive, 0, mlxFitTuning)) {
 					return;
+				}
+				// The transient gate may have shrunk the window to fit memory free RIGHT NOW; adopt that result so
+				// the launched server and the gate that admitted it agree on the context.
+				if (mlxFitTuning.contextSize && mlxFitTuning.contextSize < mlxPlan.contextSize) {
+					this._log(`[LoCoPilot Runner] MLX context reduced by the availability gate: ${mlxPlan.contextSize} -> ${mlxFitTuning.contextSize}.`);
+					mlxPlan.contextSize = mlxFitTuning.contextSize;
 				}
 				// Both gates passed (or the user chose "Run anyway"): NOW evict the previous model to make room.
 				await this._enforceResidentBudget(modelId);
@@ -3842,7 +4071,7 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 				// watchdog / Auto label / later gates read reflects post-eviction reality, not the pre-switch
 				// figure (which is what made a clean switch look like "still out of memory").
 				await this._getMemoryStatus();
-				await this._startMlxServerInTerminal(modelId, model as ICustomLanguageModel & { localPath: string });
+				await this._startMlxServerInTerminal(modelId, model as ICustomLanguageModel & { localPath: string }, mlxPlan);
 				return;
 			}
 		} else if (model.provider === 'huggingface' && !isAppleSiliconMac()) {
@@ -4007,7 +4236,12 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 		// Finalize all automatic reductions BEFORE either user-facing memory gate. The gate must assess the
 		// configuration we will really launch (clamped context, q8/q4 KV, offload plan, stripped extras), not an
 		// earlier worst-case approximation that can warn even though auto-tuning has already made the model fit.
-		const tuning = await this._augmentTuningWithHardware(modelPath, backend, baseTuning, extraResidentBytes);
+		// An active OOM-ladder cap is the one case allowed below the usability floor, so the clamp must be told
+		// not to raise it back up (otherwise the degraded relaunch requests the same window that just OOM-ed).
+		const oomLadderCap = this._oomContextCap.get(modelId);
+		const tuning = await this._augmentTuningWithHardware(
+			modelPath, backend, baseTuning, extraResidentBytes,
+			oomLadderCap && oomLadderCap > 0 ? oomLadderCap : undefined);
 		// Tight-fit notice: the clamp granted the largest context that fits, but it landed below the comfort floor
 		// (TARGET_MIN) on a model whose own window is larger - i.e. the DEVICE, not the model, is the limit. The
 		// model still runs (at best fit; the watchdog auto-stops it if memory later runs out), so this is a plain-
@@ -4048,7 +4282,7 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 		this._lastLaunchContext.set(modelId, launchContext);
 		// Remember the resolved KV cache type this server uses, so slot save/restore only reuses a byte-compatible
 		// blob (see _lastLaunchKvType / _slotCacheFileName). Mirrors getLlamaCppServerCommand's own resolution.
-		this._lastLaunchKvType.set(modelId, resolveKvCacheType(tuning.kvCacheType ?? 'auto', launchContext));
+		this._lastLaunchKvType.set(modelId, kvPlanId(tuning.kvCachePlan ?? resolveKvCachePlan(tuning.kvCacheType ?? 'auto', launchContext)));
 		const { command, args } = getLlamaCppServerCommand(modelPath, backend, serverPath, port, tuning);
 		// Remember whether this launch carries speculative flags, so a crash caused by an old build rejecting
 		// them can be told apart from a real failure and self-healed (relaunch without speculation).
@@ -4532,15 +4766,15 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 		// A requested long context is not a reason to block a model that can safely serve normal turns at a
 		// smaller window. The hardware tuner has already resolved KV quantization/offload/extras; now search for
 		// the largest 1024-token context that fits CURRENT available memory and mutate the same tuning object that
-		// is passed to getLlamaCppServerCommand. Thus the gate and actual allocation cannot disagree. The 4K floor
-		// remains the minimum useful agent context; only a model that still misses there reaches the dialog.
+		// is passed to getLlamaCppServerCommand. Thus the gate and actual allocation cannot disagree. The usability
+		// floor is the minimum useful agent context; only a model that still misses there reaches the dialog.
 		const requestedContext = tuning?.contextSize ?? 0;
 		if (tuning && requestedContext > MIN_CLAMPED_CONTEXT && fit.pressure !== 'critical') {
-			const fitAt = (contextSize: number) => this._computeLaunchFit(
+			const fitAt = (contextSize: number, kvCachePlan?: KvCachePlan) => this._computeLaunchFit(
 				modelId,
 				interactive,
 				backend,
-				{ ...tuning, contextSize },
+				{ ...tuning, contextSize, ...(kvCachePlan ? { kvCachePlan } : {}) },
 				extraResidentBytes,
 				memoryStatus
 			);
@@ -4568,6 +4802,7 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 				}
 				tuning.contextSize = Math.min(requestedContext, bestContext);
 				this._log(`[LoCoPilot Runner] Auto-reduced launch context for ${modelId}: ${requestedContext} -> ${tuning.contextSize} tokens; optimized footprint ~${bestFit.needGb}GB fits ~${bestFit.haveGb}GB currently available.`);
+				await this._reclaimKvQualityForContext(modelId, tuning, fitAt);
 				return true;
 			}
 			// If even 4K misses, show/record numbers for that minimum viable plan rather than alarming the user
@@ -4584,6 +4819,48 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 		}
 		// Transient shortfall (soft): eviction is already credited above, so "Run anyway" usually fits.
 		return this._promptRunAnyway(modelId, fit.name, fit.needGb, fit.haveGb, false);
+	}
+
+	/**
+	 * Re-plans KV precision after the transient gate shrank the context, and upgrades it as far as the freed
+	 * bytes allow. The launch planner picked the precision for the ORIGINAL window - e.g. it dropped to a 4-bit
+	 * K cache purely to reach the comfort floor at 65K. Once available memory forces that window down to, say,
+	 * 20K, the cache is several times smaller and a higher-quality rung usually fits again; keeping the lossier
+	 * one would give away quality that nothing is buying. Walks {@link KV_CACHE_TIERS} best-first and adopts the
+	 * highest-quality rung that still fits at the reduced context.
+	 *
+	 * No-op when the user pinned a fixed KV type (their choice is not ours to upgrade), when the plan is already
+	 * the best rung, or when the fit becomes unmeasurable - the existing plan is always a safe fallback since it
+	 * is never more expensive than the one that just passed.
+	 */
+	private async _reclaimKvQualityForContext(
+		modelId: string,
+		tuning: LlamaServerTuning,
+		fitAt: (contextSize: number, kvCachePlan?: KvCachePlan) => Promise<{ fits: boolean } | undefined>
+	): Promise<void> {
+		if ((tuning.kvCacheType ?? 'auto') !== 'auto' || !tuning.contextSize) {
+			return;
+		}
+		const current = tuning.kvCachePlan;
+		if (!current) {
+			return;
+		}
+		const currentIndex = KV_CACHE_TIERS.findIndex(t => t.k === current.k && t.v === current.v);
+		if (currentIndex <= 0) {
+			return; // unknown plan, or already the highest-quality rung
+		}
+		// f16 is deliberately not reclaimed for large windows: above the auto-quant threshold q8_0's quality
+		// delta is unmeasurable while its cache is half the size, so "upgrading" there would only spend memory.
+		const startIndex = tuning.contextSize >= DEFAULT_LLAMA_CONTEXT_SIZE ? 1 : 0;
+		for (let i = startIndex; i < currentIndex; i++) {
+			const candidate = KV_CACHE_TIERS[i];
+			const candidateFit = await fitAt(tuning.contextSize, candidate);
+			if (candidateFit?.fits) {
+				this._log(`[LoCoPilot Runner] Reclaimed KV quality for ${modelId} at the reduced ${tuning.contextSize}-token window: ${kvPlanId(current)} -> ${kvPlanId(candidate)}.`);
+				tuning.kvCachePlan = candidate;
+				return;
+			}
+		}
 	}
 
 	async wouldModelFitForLaunch(modelId: string): Promise<boolean> {
@@ -4651,15 +4928,27 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 		// touch. Metal weights become wired: charge 90%. CPU mmap can page cold tensors, but a sustained decode
 		// touches most layers: charge 70% (100% with --mlock). On a discrete GPU charge only the portion that
 		// remains in host RAM after the conservative VRAM weight allowance.
-		const nonWeightBytes = Math.max(0, fit.requiredBytes - fit.weightBytes);
+		// Discrete GPU: the host half was already computed exactly by _computeFit (weights that did NOT offload,
+		// plus the host share of runtime overhead), so use it directly instead of re-deriving one from a total
+		// that may now describe the VRAM pool. The VRAM half is not measurable against host availability at all -
+		// it is enforced by the capability gate, which compares it to the live free-VRAM budget.
+		const hostWeightBytes = fit.gpuWeightBytes !== undefined
+			? Math.max(0, fit.weightBytes - fit.gpuWeightBytes)
+			: fit.weightBytes;
+		const nonWeightBytes = fit.hostRequiredBytes !== undefined
+			? Math.max(0, fit.hostRequiredBytes - hostWeightBytes)
+			: Math.max(0, fit.requiredBytes - fit.weightBytes);
 		let residentWeightBytes: number;
 		if (!interactive) {
-			residentWeightBytes = fit.weightBytes;
+			residentWeightBytes = hostWeightBytes;
 		} else if (backend === 'metal') {
 			residentWeightBytes = fit.weightBytes * 0.9;
 		} else if (backend === 'cpu') {
 			const mlock = this.configurationService.getValue<boolean>(ChatConfiguration.LocopilotLlamaCppMlock) === true;
 			residentWeightBytes = fit.weightBytes * (mlock ? 1 : 0.7);
+		} else if (fit.gpuWeightBytes !== undefined) {
+			// Only the CPU-resident remainder competes for host RAM; it is mmap-backed and pages like any weight file.
+			residentWeightBytes = hostWeightBytes * 0.7;
 		} else {
 			const vramWeightAllowance = (discreteVramBytes ?? 0) * (1 - KV_BUDGET_FRACTION) * 0.9;
 			residentWeightBytes = Math.max(0, fit.weightBytes - vramWeightAllowance);
@@ -4809,7 +5098,95 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 	/**
 	 * Starts `mlx_lm.server` for downloaded Hugging Face MLX weights (Apple Silicon only).
 	 */
-	private async _startMlxServerInTerminal(modelId: string, model: ICustomLanguageModel & { localPath: string }): Promise<void> {
+	/**
+	 * Plans an MLX launch: the effective context window and every mlx_lm.server memory knob, sized from the
+	 * model's REAL attention geometry (`config.json`) against the same Metal wired budget the llama.cpp path
+	 * uses. Runs BEFORE the memory gates so they can measure the configuration that will actually launch.
+	 *
+	 * MLX has no KV-quantization lever - `mlx_lm.server` exposes no `--kv-bits`, and injecting it via the
+	 * bootstrap was tried and reverted (see MLX_MEMORY_LIMIT_BOOTSTRAP) - so where llama.cpp trades KV precision
+	 * for context, MLX can only trade context. That makes the context clamp the whole of the quality ladder
+	 * here, and the weight quant chosen at download time the only other lever.
+	 */
+	private async _computeMlxPlan(modelId: string, modelDir: string): Promise<IMlxLaunchPlan> {
+		const model = this.customLanguageModelsService.getCustomModels().find(m => m.id === modelId);
+		const tuning: MlxServerTuning = {};
+		const info = await this._getModelInfo(modelDir).catch(() => undefined);
+		// Same precedence as llama.cpp: the model's own window (set or derived), else the global setting.
+		const requestedContext = model?.contextWindow && model.contextWindow > 0
+			? model.contextWindow
+			: (this.configurationService.getValue<number>(ChatConfiguration.LocopilotLlamaCppContextSize) || DEFAULT_LLAMA_CONTEXT_SIZE);
+		const autoTuned = this.configurationService.getValue<boolean>(ChatConfiguration.LocopilotMlxAutoTune) !== false
+			&& !this._mlxExtraFlagsUnsupported;
+		if (!autoTuned) {
+			return { tuning, contextSize: requestedContext, autoTuned };
+		}
+		const mem = await this._getSystemMemory();
+		if (!mem?.totalmem || mem.totalmem <= 0) {
+			return { tuning, contextSize: requestedContext, autoTuned };
+		}
+		// Cap MLX's total Metal allocation at the same wired budget the llama.cpp path uses. MLX's own default is
+		// ~95% of unified RAM - far past the wired ceiling - and mlx_lm.server only pins the wired limit, so
+		// nothing upstream stops a long prompt's KV growth from paging the machine. Applied via the -c bootstrap
+		// in getMlxLmServerCommand (no CLI flag exists); soft cap - MLX throttles instead of hard-failing. Also
+		// cap the freed-buffer reuse cache, which otherwise defaults to the memory limit and can hoard GBs.
+		const wiredBudget = metalOffloadBudgetBytes(mem.totalmem, (await this._getHardwareInfo())?.metalWiredLimitBytes);
+		tuning.memoryLimitBytes = wiredBudget;
+		tuning.cacheLimitBytes = Math.floor(mem.totalmem * 0.10);
+		const weightBytes = await this._weightBytesOnDisk(modelDir);
+		// Weight-aware prompt (KV) cache, mirroring llama.cpp's computeKvBudgetBytes: cap it so weights + cache +
+		// runtime overhead stay inside the wired budget, instead of a flat 15% of RAM that ignores the weights.
+		const flatCache = Math.floor(mem.totalmem * 0.15);
+		const kvBudgetBytes = weightBytes > 0 && wiredBudget > 0 ? computeKvBudgetBytes(wiredBudget, weightBytes) : undefined;
+		tuning.promptCacheBytes = kvBudgetBytes && kvBudgetBytes > 0
+			? Math.max(MLX_MIN_PROMPT_CACHE_BYTES, Math.min(flatCache, kvBudgetBytes))
+			: MLX_MIN_PROMPT_CACHE_BYTES;
+		// MLX has no `-c`, so the effective window is what we advertise to the provider / context manager. It is
+		// now solved with the SAME clamp as llama.cpp, from the model's real attention geometry rather than the
+		// old flat 128 KiB/token guess - which over-charged a modern GQA model several-fold and needlessly
+		// collapsed its window. The usability floor, the trained-window cap and the OOM ladder all apply here too.
+		const oomLadderCap = this._oomContextCap.get(modelId);
+		const f16PerTokenPerLayer = (info && kvBytesPerTokenPerLayer(info, kvCacheBytesPerElem('f16')))
+			?? DEFAULT_KV_BYTES_PER_TOKEN_PER_LAYER_F16;
+		const contextSize = clampContextSize({
+			requestedContext,
+			modelContextLength: info?.contextLength,
+			kvBudgetBytes,
+			layerCount: info?.layerCount,
+			kvBytesPerTokenPerLayer: f16PerTokenPerLayer,
+			// MLX keeps a full KV cache on every layer - it has no windowed-SWA mode to model.
+			minContext: oomLadderCap && oomLadderCap > 0 ? oomLadderCap : undefined,
+		});
+		if (contextSize < requestedContext) {
+			this._log(`[LoCoPilot Runner] Clamped MLX effective context ${requestedContext} -> ${contextSize} tokens to fit the weight-aware wired budget (~${Math.round(f16PerTokenPerLayer)} B/tok/layer x ${info?.layerCount ?? '?'} layers).`);
+		}
+		// Single-user client: requests arrive one at a time, so the server's parallel batching (decode 32 /
+		// prompt 8) only multiplies the peak KV + scratch - the top cause of the command-buffer OOM. Pin both
+		// to 1 to remove that multiplier with no real throughput loss.
+		tuning.decodeConcurrency = 1;
+		tuning.promptConcurrency = 1;
+		// Tight fit (little wired budget left after the weights): shrink the prefill chunk and hold fewer distinct
+		// KV caches so BOTH the transient peak and the resident cache stay small. Roomy fits keep the server
+		// defaults (fields left unset) for full prefill speed. (Official mlx_lm.server flags - no monkeypatching.)
+		const leftoverAfterWeights = wiredBudget - weightBytes - RUNTIME_OVERHEAD_BYTES;
+		const tightFit = weightBytes > 0 && leftoverAfterWeights < MLX_TIGHT_FIT_HEADROOM_BYTES;
+		const performanceProfile = this.configurationService.getValue<'performance' | 'balanced' | 'quiet'>(ChatConfiguration.LocopilotLocalPerformanceProfile) ?? 'performance';
+		if (tightFit) {
+			tuning.prefillStepSize = 512;
+			tuning.promptCacheCount = 2;
+			this._log(`[LoCoPilot Runner] MLX tight fit (~${(leftoverAfterWeights / 1e9).toFixed(1)}GB left after weights): prefill-step 512, prompt-cache-size 2.`);
+		}
+		if (performanceProfile === 'quiet') {
+			tuning.prefillStepSize = 256;
+			tuning.promptCacheCount = 1;
+		} else if (performanceProfile === 'balanced' && !tightFit) {
+			tuning.prefillStepSize = 512;
+		}
+		this._log(`[LoCoPilot Runner] MLX plan: context ${contextSize}, set_memory_limit ~${Math.round(wiredBudget / 1e9)}GB, set_cache_limit ~${Math.round(tuning.cacheLimitBytes / 1e9)}GB, prompt-cache ~${(tuning.promptCacheBytes / 1e9).toFixed(1)}GB (weight-aware), decode/prompt concurrency 1.`);
+		return { tuning, contextSize, autoTuned };
+	}
+
+	private async _startMlxServerInTerminal(modelId: string, model: ICustomLanguageModel & { localPath: string }, plan?: IMlxLaunchPlan): Promise<void> {
 		// Preflight: never spawn mlx_lm.server with a missing/empty model path. Doing so builds `--model ''`,
 		// which makes the server start without weights and then either crash with a Python traceback or hang
 		// (GET /v1/models keeps returning 200 while chat requests block forever). Fail fast with a clear,
@@ -4828,77 +5205,14 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 		const modelDir = await this.getMlxModelRootPath(localPath!);
 		const port = await this.findAvailablePort(LOCOPILOT_MLX_SERVER_PORT);
 		const pythonCmd = await this.resolveMlxPython();
-		const requestedContext = model.contextWindow && model.contextWindow > 0
-			? model.contextWindow
-			: (this.configurationService.getValue<number>(ChatConfiguration.LocopilotLlamaCppContextSize) || DEFAULT_LLAMA_CONTEXT_SIZE);
-		this._lastLaunchContext.set(modelId, requestedContext);
-
-		// Automatic mlx-lm tuning (default on): cap the server's cross-request prompt cache to a slice of
-		// total RAM (upstream default is unbounded, which lets cached KV crowd out a small machine), and use
-		// the catalog-paired small draft model for speculative decoding when it is downloaded and fits.
-		// Skipped for the session once an older mlx-lm rejected the flags (argparse exits on unknown args;
-		// detected below and relaunched without them).
-		const mlxTuning: MlxServerTuning = {};
-		const mlxAutoTune = this.configurationService.getValue<boolean>(ChatConfiguration.LocopilotMlxAutoTune) !== false
-			&& !this._mlxExtraFlagsUnsupported;
-		if (mlxAutoTune) {
-			const mem = await this._getSystemMemory();
-			if (mem?.totalmem && mem.totalmem > 0) {
-				// Cap MLX's total Metal allocation at the same wired budget the llama.cpp path uses. MLX's own
-				// default is ~95% of unified RAM - far past the wired ceiling - and mlx_lm.server only pins the
-				// wired limit, so nothing upstream stops a long prompt's KV growth from paging the machine.
-				// Applied via the -c bootstrap in getMlxLmServerCommand (no CLI flag exists); soft cap - MLX
-				// throttles allocation instead of hard-failing. Also cap the freed-buffer reuse cache, which
-				// otherwise defaults to the memory limit and can hoard GBs after a big prefill.
-				const wiredBudget = metalOffloadBudgetBytes(mem.totalmem, (await this._getHardwareInfo())?.metalWiredLimitBytes);
-				mlxTuning.memoryLimitBytes = wiredBudget;
-				mlxTuning.cacheLimitBytes = Math.floor(mem.totalmem * 0.10);
-				// Weight-aware prompt (KV) cache, mirroring llama.cpp's computeKvBudgetBytes: cap it so weights +
-				// cache + runtime overhead stay inside the wired budget, instead of a flat 15% of RAM that ignores
-				// the weights. A big model (e.g. 27B-4bit on 32GB) leaves little room, so this trims the cache that
-				// was previously booked ON TOP of the weights and helped bust the Metal ceiling at decode.
-				const weightBytes = await this._weightBytesOnDisk(modelDir);
-				const flatCache = Math.floor(mem.totalmem * 0.15);
-				const weightAwareCache = weightBytes > 0 && wiredBudget > 0 ? computeKvBudgetBytes(wiredBudget, weightBytes) : 0;
-				mlxTuning.promptCacheBytes = weightAwareCache > 0
-					? Math.max(MLX_MIN_PROMPT_CACHE_BYTES, Math.min(flatCache, weightAwareCache))
-					: MLX_MIN_PROMPT_CACHE_BYTES;
-				// MLX has no llama.cpp-style `-c` hard limit, so expose a conservative effective context to the
-				// provider/context manager. This prevents a nominal 128K/256K model from being fed a prompt whose
-				// KV cannot fit the same weight-aware wired budget. The 128 KiB/token fallback is shared with the
-				// resident estimator for non-GGUF models.
-				const MLX_KV_BYTES_PER_TOKEN = 128 * 1024;
-				const maxContextByMemory = Math.max(MIN_CLAMPED_CONTEXT, Math.floor(weightAwareCache / MLX_KV_BYTES_PER_TOKEN / 1024) * 1024);
-				const effectiveContext = Math.max(MIN_CLAMPED_CONTEXT, Math.min(requestedContext, maxContextByMemory));
-				this._lastLaunchContext.set(modelId, effectiveContext);
-				if (effectiveContext < requestedContext) {
-					this._log(`[LoCoPilot Runner] Clamped MLX effective context ${requestedContext} -> ${effectiveContext} tokens to fit the weight-aware wired-memory budget.`);
-				}
-				// Single-user client: requests arrive one at a time, so the server's parallel batching (decode 32 /
-				// prompt 8) only multiplies the peak KV + scratch - the top cause of the command-buffer OOM. Pin
-				// both to 1 to remove that multiplier with no real throughput loss.
-				mlxTuning.decodeConcurrency = 1;
-				mlxTuning.promptConcurrency = 1;
-				// Tight fit (little wired budget left after the weights): shrink the prefill chunk and hold fewer
-				// distinct KV caches so BOTH the transient peak and the resident cache stay small. Roomy fits keep
-				// the server defaults (fields left unset) for full prefill speed. (These are official mlx_lm.server
-				// CLI flags - no monkeypatching. KV quantization was tried here but reverted; see the bootstrap.)
-				const leftoverAfterWeights = wiredBudget - weightBytes - RUNTIME_OVERHEAD_BYTES;
-				const tightFit = weightBytes > 0 && leftoverAfterWeights < MLX_TIGHT_FIT_HEADROOM_BYTES;
-				const performanceProfile = this.configurationService.getValue<'performance' | 'balanced' | 'quiet'>(ChatConfiguration.LocopilotLocalPerformanceProfile) ?? 'performance';
-				if (tightFit) {
-					mlxTuning.prefillStepSize = 512;
-					mlxTuning.promptCacheCount = 2;
-					this._log(`[LoCoPilot Runner] MLX tight fit (~${(leftoverAfterWeights / 1e9).toFixed(1)}GB left after weights): prefill-step 512, prompt-cache-size 2.`);
-				}
-				if (performanceProfile === 'quiet') {
-					mlxTuning.prefillStepSize = 256;
-					mlxTuning.promptCacheCount = 1;
-				} else if (performanceProfile === 'balanced' && !tightFit) {
-					mlxTuning.prefillStepSize = 512;
-				}
-				this._log(`[LoCoPilot Runner] MLX limits: set_memory_limit ~${Math.round(wiredBudget / 1e9)}GB, set_cache_limit ~${Math.round(mlxTuning.cacheLimitBytes / 1e9)}GB, prompt-cache ~${(mlxTuning.promptCacheBytes / 1e9).toFixed(1)}GB (weight-aware), decode/prompt concurrency 1.`);
-			}
+		// The caller plans BEFORE the memory gates so they measure the real configuration; only a direct call
+		// without a plan (defensive) computes one here.
+		const mlxPlan = plan ?? await this._computeMlxPlan(modelId, modelDir);
+		const mlxTuning = mlxPlan.tuning;
+		this._lastLaunchContext.set(modelId, mlxPlan.contextSize);
+		// The catalog-paired draft is resolved here rather than in the planner: it depends on a background
+		// download completing and is a pure add-on that either fits alongside the planned footprint or is dropped.
+		if (mlxPlan.autoTuned) {
 			const draft = await this._resolvePairedDraft(model, 'mlx');
 			if (draft && await this._extrasFitBudget(modelDir, 'metal', undefined, draft.bytes)) {
 				mlxTuning.draftModelDir = draft.path;

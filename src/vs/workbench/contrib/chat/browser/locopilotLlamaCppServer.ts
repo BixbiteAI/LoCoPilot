@@ -177,6 +177,51 @@ export type FlashAttentionMode = 'auto' | 'on' | 'off';
  */
 export type KvCacheType = 'auto' | 'f16' | 'q8_0' | 'q4_0';
 
+/** A concrete KV precision (no 'auto'), as accepted by `--cache-type-k` / `--cache-type-v`. */
+export type KvCacheElemType = Exclude<KvCacheType, 'auto'>;
+
+/**
+ * The K and V halves of the KV cache, quantized INDEPENDENTLY. llama.cpp takes `--cache-type-k` and
+ * `--cache-type-v` separately, and the two halves do not degrade equally: 4-bit K costs very little accuracy
+ * while 4-bit V is where most of the quality loss of a "q4 KV cache" actually comes from. Keeping V at q8_0
+ * while dropping K to q4_0 therefore buys ~75% of the memory saving of a symmetric q4 cache for a fraction of
+ * the quality cost - which is exactly the trade we want when the budget can't reach the comfort context at q8.
+ */
+export interface KvCachePlan {
+	k: KvCacheElemType;
+	v: KvCacheElemType;
+}
+
+/**
+ * The automatic KV precision ladder, best quality first. Each rung is strictly cheaper per token than the one
+ * above it, so {@link selectAutomaticKvCache} can walk it and stop at the first rung that reaches the context
+ * we're aiming for. The asymmetric q4/q8 rung sits between the two symmetric ones and is the reason a
+ * memory-tight machine no longer has to jump straight from q8 to a full 4-bit cache.
+ *
+ * Bytes per element: f16/f16 = 2.0, q8/q8 = 1.0625, q4/q8 = 0.8125, q4/q4 = 0.5625.
+ */
+export const KV_CACHE_TIERS: readonly KvCachePlan[] = [
+	{ k: 'f16', v: 'f16' },
+	{ k: 'q8_0', v: 'q8_0' },
+	{ k: 'q4_0', v: 'q8_0' },
+	{ k: 'q4_0', v: 'q4_0' },
+];
+
+/** Stable short id for a KV plan ('q8_0', 'q4_0-q8_0', ...). Used for logging and the slot-cache file key. */
+export function kvPlanId(plan: KvCachePlan): string {
+	return plan.k === plan.v ? plan.k : `${plan.k}-${plan.v}`;
+}
+
+/** Average bytes-per-element across the K and V halves - what the cache actually costs per token. */
+export function kvPlanBytesPerElem(plan: KvCachePlan): number {
+	return (kvCacheBytesPerElem(plan.k) + kvCacheBytesPerElem(plan.v)) / 2;
+}
+
+/** A symmetric plan (both halves at the same precision), for a user-pinned fixed KV type. */
+export function symmetricKvPlan(type: KvCacheElemType): KvCachePlan {
+	return { k: type, v: type };
+}
+
 /** Default context window when none is configured. Smaller than before for a smaller, faster KV cache. */
 export const DEFAULT_LLAMA_CONTEXT_SIZE = 16384;
 
@@ -253,6 +298,73 @@ export const USABLE_SYSTEM_MEMORY_FRACTION = 0.85;
 export const SYSTEM_MEMORY_RESERVE_FRACTION = 0.20;
 export const SYSTEM_MEMORY_RESERVE_MIN_BYTES = 2 * 1024 * 1024 * 1024;  // never reserve less than 2 GB
 export const SYSTEM_MEMORY_RESERVE_MAX_BYTES = 6 * 1024 * 1024 * 1024;  // never reserve more than 6 GB
+
+/**
+ * VRAM (bytes) held back on a discrete GPU for the display/compositor and the driver's own allocations. Unlike
+ * system RAM there is no swap behind VRAM: an allocation past the limit fails outright and the server dies with
+ * a CUDA/Vulkan out-of-memory error rather than degrading, so the reserve is an absolute floor rather than a
+ * fraction. 768 MiB covers a desktop compositor plus driver context on both vendors.
+ */
+export const VRAM_DRIVER_RESERVE_BYTES = 768 * 1024 * 1024;
+
+/**
+ * Usable VRAM (bytes) for inference on a discrete GPU: what is FREE right now, less the driver/display reserve,
+ * and never more than the card physically has. Sizing off free rather than total is what makes the budget
+ * account for other GPU consumers (a browser, a game, another model, a compositor on a shared card) - charging
+ * the full card when half of it is already committed is exactly how a launch passes the gate and then dies at
+ * the first large allocation. Falls back to total when the free figure is unknown (0), which is the old,
+ * more permissive behavior. Returns 0 when nothing usable is left.
+ */
+export function discreteVramBudgetBytes(totalVramBytes: number, freeVramBytes?: number): number {
+	if (!(totalVramBytes > 0)) {
+		return 0;
+	}
+	const available = freeVramBytes && freeVramBytes > 0 ? Math.min(freeVramBytes, totalVramBytes) : totalVramBytes;
+	return Math.max(0, Math.floor(available - VRAM_DRIVER_RESERVE_BYTES));
+}
+
+/**
+ * Splits a llama.cpp launch's footprint across the TWO pools a discrete-GPU run actually draws on, because they
+ * fail differently and cannot be summed: VRAM holds the offloaded weights, the whole KV cache and the compute
+ * buffers, and overflowing it is a hard OOM; host RAM holds the CPU-resident weight remainder and the engine's
+ * host-side allocations, and overflowing that only pages. Summing the two pools into one "usable" number (the
+ * old gate) admitted a launch whose KV could never fit the card, because the machine's spare system RAM covered
+ * the difference on paper.
+ *
+ * `gpuWeightBytes` is the weight portion that will actually reside in VRAM after the offload plan; the caller
+ * derives it from `--n-gpu-layers` / the MoE expert split.
+ */
+export function splitDiscreteGpuFootprint(inputs: {
+	weightBytes: number;
+	gpuWeightBytes: number;
+	kvBytes: number;
+	/** Total engine overhead; the GPU share (driver context + compute graphs) is charged to VRAM. */
+	overheadBytes: number;
+	/** Extra co-resident weights (draft model, vision projector) - they load wherever the main weights do. */
+	extraResidentBytes: number;
+	/** Fraction of `overheadBytes` charged to VRAM rather than host RAM. */
+	gpuOverheadFraction?: number;
+}): { vramRequiredBytes: number; hostRequiredBytes: number } {
+	const gpuWeights = Math.max(0, Math.min(inputs.gpuWeightBytes, inputs.weightBytes));
+	const hostWeights = Math.max(0, inputs.weightBytes - gpuWeights);
+	const gpuShare = Math.min(1, Math.max(0, inputs.gpuOverheadFraction ?? DISCRETE_GPU_OVERHEAD_FRACTION));
+	const overhead = Math.max(0, inputs.overheadBytes);
+	// Extras follow the main weights: fully offloaded -> VRAM, partially offloaded -> the same proportion.
+	const offloadRatio = inputs.weightBytes > 0 ? gpuWeights / inputs.weightBytes : 1;
+	const extras = Math.max(0, inputs.extraResidentBytes);
+	return {
+		// The KV cache lives entirely on the device that runs attention - it is never split.
+		vramRequiredBytes: gpuWeights + Math.max(0, inputs.kvBytes) + overhead * gpuShare + extras * offloadRatio,
+		hostRequiredBytes: hostWeights + overhead * (1 - gpuShare) + extras * (1 - offloadRatio),
+	};
+}
+
+/**
+ * Share of the engine's runtime overhead that lands in VRAM on a discrete GPU (compute graphs, driver context,
+ * scratch buffers) rather than host RAM (tokenizer, host prompt cache, bookkeeping). Most of the growth terms in
+ * {@link runtimeOverheadBytesForTuning} are compute buffers, so the majority is charged to the device.
+ */
+export const DISCRETE_GPU_OVERHEAD_FRACTION = 0.75;
 
 /**
  * Fraction of the memory budget reserved for the KV cache when deciding WEIGHT OFFLOAD: the weight-offload
@@ -459,13 +571,26 @@ export function resolveKvCacheType(kvCacheType: KvCacheType, contextSize: number
 	return contextSize >= KV_AUTO_QUANT_CONTEXT_THRESHOLD ? 'q8_0' : 'f16';
 }
 
+/**
+ * Resolves the K/V plan for a launch that did NOT go through {@link selectAutomaticKvCache} (no memory budget
+ * known, or a user-pinned fixed type). A pinned type is honoured symmetrically - the asymmetric q4/q8 rung is
+ * an automatic choice only, so "I set q4_0" keeps meaning exactly q4_0 on both halves.
+ */
+export function resolveKvCachePlan(kvCacheType: KvCacheType, contextSize: number): KvCachePlan {
+	return symmetricKvPlan(resolveKvCacheType(kvCacheType, contextSize));
+}
+
 /** Inputs for {@link clampContextSize}; all optional except the requested size. */
 export interface ContextClampInputs {
 	/** Context the caller wants (from per-model setting or the global default). */
 	requestedContext: number;
 	/** The model's trained context window from GGUF (`<arch>.context_length`); we never exceed it. */
 	modelContextLength?: number;
-	/** Bytes of memory the KV cache may use (a slice of the free RAM/VRAM budget). */
+	/**
+	 * Bytes of memory the KV cache may use (a slice of the free RAM/VRAM budget). `undefined` = unknown, skip
+	 * the memory clamp entirely. `0` is NOT the same as unknown - it means the weights plus runtime overhead
+	 * already consumed the whole budget, and clamps the window to the floor.
+	 */
 	kvBudgetBytes?: number;
 	/** Transformer block count, used to size the KV cache. */
 	layerCount?: number;
@@ -492,10 +617,34 @@ export interface ContextClampInputs {
 	 * safe - a larger windowed context simply keeps swa-full off, never past the budget.
 	 */
 	swaFullOnAllLayers?: boolean;
+	/**
+	 * Overrides the usability floor ({@link MIN_CLAMPED_CONTEXT}) this clamp refuses to go below. Only the
+	 * post-OOM degradation ladder passes this ({@link ABSOLUTE_MIN_CONTEXT}): the machine has already proven it
+	 * cannot hold the planned window, so the ladder's smaller cap must survive the clamp instead of being
+	 * silently raised back to the floor - which would relaunch straight into the same OOM.
+	 */
+	minContext?: number;
 }
 
-/** Smallest context we will ever clamp down to, so a tiny budget can't make the model unusable. */
-export const MIN_CLAMPED_CONTEXT = 4096;
+/**
+ * Smallest context the PLANNER will ever clamp down to. This is a usability floor, not a memory one: this
+ * agent's system prompt plus tool schemas alone run ~7-10K tokens, so a window below ~16K cannot hold a system
+ * prompt, a file, and a couple of tool round-trips - the model launches "successfully" and then fails every
+ * multi-turn task, which is worse than a model that tells you it's a tight fit. So we always ask for at least
+ * this much (the runtime memory watchdog is the backstop if the machine genuinely can't sustain it) rather than
+ * silently handing back a 5K window.
+ *
+ * A model whose own trained window is smaller than this is capped by its own window instead - the floor never
+ * inflates a context past what the model was trained for (see {@link clampContextSize}).
+ */
+export const MIN_CLAMPED_CONTEXT = 16384;
+
+/**
+ * Absolute smallest context anything may run at - used ONLY by the post-OOM degradation ladder, where the
+ * machine has already proven at runtime that it cannot hold the planned window and the choice is between a
+ * cramped model and no model. The planner never targets this; {@link MIN_CLAMPED_CONTEXT} is its floor.
+ */
+export const ABSOLUTE_MIN_CONTEXT = 4096;
 
 /**
  * Absolute backstop on the context window. The real ceiling is the model's own trained window (or a per-model
@@ -566,7 +715,10 @@ export function clampContextSize(inputs: ContextClampInputs): number {
 	if (inputs.modelContextLength && inputs.modelContextLength > 0) {
 		ctx = Math.min(ctx, inputs.modelContextLength);
 	}
-	if (inputs.kvBudgetBytes && inputs.kvBudgetBytes > 0) {
+	// `undefined` means "no budget known" (skip the clamp); ZERO means "the weights and overhead already consumed
+	// the entire budget", which must clamp to the floor - NOT skip. Reading 0 as unknown let a model whose weights
+	// filled the budget escape with its full trained window, the exact opposite of what an exhausted budget means.
+	if (inputs.kvBudgetBytes !== undefined && inputs.kvBudgetBytes >= 0) {
 		const perTokenPerLayer = inputs.kvBytesPerTokenPerLayer && inputs.kvBytesPerTokenPerLayer > 0
 			? inputs.kvBytesPerTokenPerLayer
 			: DEFAULT_KV_BYTES_PER_TOKEN_PER_LAYER_F16; // conservative f16 estimate when the geometry is unknown.
@@ -594,9 +746,25 @@ export function clampContextSize(inputs: ContextClampInputs): number {
 	}
 	// Never exceed the practical maximum, even when trained length and memory both allow more.
 	ctx = Math.min(ctx, MAX_CLAMPED_CONTEXT);
-	// Round down to a 1024 multiple and never go below the floor.
+	// Round down to a 1024 multiple and never go below the usability floor. The floor is itself capped by the
+	// model's own trained window, so an 8K-trained model floors at 8K rather than being pushed past its rope
+	// scaling to 16K.
 	ctx = Math.floor(ctx / 1024) * 1024;
-	return Math.max(MIN_CLAMPED_CONTEXT, ctx);
+	// The usability floor exists to stop the MEMORY BUDGET from collapsing the window to something unusable -
+	// it is not a minimum we impose on anyone who deliberately asked for less. So it is itself capped by what
+	// was asked for and by what the model was trained for: an explicit 8K request stays 8K, an 8K-trained model
+	// stays at its window, and only a budget-driven collapse is lifted back up to the floor.
+	const requestedFloor = inputs.minContext && inputs.minContext > 0
+		? Math.min(MIN_CLAMPED_CONTEXT, Math.floor(inputs.minContext))
+		: MIN_CLAMPED_CONTEXT;
+	const ceilings = [requestedFloor];
+	if (inputs.modelContextLength && inputs.modelContextLength > 0) {
+		ceilings.push(inputs.modelContextLength);
+	}
+	if (inputs.requestedContext > 0) {
+		ceilings.push(inputs.requestedContext);
+	}
+	return Math.max(Math.min(...ceilings), ctx);
 }
 
 /**
@@ -625,6 +793,15 @@ export function kvCacheBytesForContext(inputs: {
 	return perTok * layers * ctx;
 }
 
+/**
+ * How much longer a cheaper KV rung must make the context before {@link selectAutomaticKvCache} will accept it
+ * over a higher-quality one, when NEITHER reaches the comfort floor. 1.05 = "at least 5% more tokens". This is
+ * what stops a pointless walk to the bottom of the ladder when the context is pinned by something other than
+ * the KV budget (the model's own trained window, the usability floor, or MAX_CLAMPED_CONTEXT) and every rung
+ * therefore returns an identical number.
+ */
+export const KV_TIER_DOWNGRADE_MIN_GAIN = 1.05;
+
 export interface AutomaticKvCacheSelectionInputs extends ContextClampInputs {
 	/**
 	 * Model-specific f16 KV bytes per token per layer from GGUF attention geometry. Quantized candidates
@@ -634,37 +811,51 @@ export interface AutomaticKvCacheSelectionInputs extends ContextClampInputs {
 }
 
 export interface AutomaticKvCacheSelection {
-	kvCacheType: Exclude<KvCacheType, 'auto'>;
+	/** The K/V precision pair to launch with. */
+	kvCachePlan: KvCachePlan;
 	contextSize: number;
 }
 
 /**
- * Selects automatic KV precision from the model's real geometry and memory budget. Small contexts retain
- * f16 when it fits; normal/large contexts prefer near-lossless q8_0; q4_0 is used only when a higher precision
- * can't reach the {@link TARGET_MIN_CONTEXT} comfort floor - i.e. q4 is a floor-REACHING tool, not a maximize-
- * context tool, so a model that already clears the floor at q8 keeps q8's quality rather than trading it for a
- * longer-but-lossier window. Selection happens before launch and remains stable for the server lifetime, so an
- * active conversation never loses its cache to a precision change.
+ * Selects automatic KV precision + context from the model's real geometry and memory budget, by walking
+ * {@link KV_CACHE_TIERS} best-quality-first and stopping at the first rung that reaches the comfort context.
+ *
+ * The ladder is quality-ordered, so the rule is simply "spend precision only to buy context you don't have":
+ *  - f16 is considered only for genuinely small windows, where the cache is cheap and full precision is free.
+ *  - q8_0 is the normal answer: ~half the bytes of f16 at a quality delta too small to measure.
+ *  - q4_0 K + q8_0 V is the first fallback - it recovers ~24% more context than q8 while leaving the V half
+ *    (where 4-bit actually hurts) intact.
+ *  - q4_0 on both halves is last, for machines that still can't reach the floor.
+ *
+ * A rung is accepted as soon as it clears the {@link TARGET_MIN_CONTEXT} comfort floor at its own fitting
+ * context - we never trade quality down just to win length past the floor. When NO rung reaches the floor we
+ * return the rung that granted the most context, but only if a cheaper rung actually bought a MATERIALLY longer
+ * window ({@link KV_TIER_DOWNGRADE_MIN_GAIN}): swapping precision for a rounding-error's worth of extra tokens
+ * is a pure quality loss. Selection happens before launch and stays fixed for the server lifetime, so an active
+ * conversation never loses its cache to a precision change mid-session.
  */
 export function selectAutomaticKvCache(inputs: AutomaticKvCacheSelectionInputs): AutomaticKvCacheSelection {
 	const targetContext = clampContextSize({
 		requestedContext: inputs.requestedContext,
 		modelContextLength: inputs.modelContextLength,
+		minContext: inputs.minContext,
 	});
 	// The bar a precision must clear to be "good enough": the comfort floor, but never above what the model's
 	// own window allows (a 16K-trained model is satisfied by 16K, we don't drop to q4 chasing an impossible 32K).
 	const satisfiedAt = Math.min(targetContext, TARGET_MIN_CONTEXT);
-	const preferred: Exclude<KvCacheType, 'auto'>[] = targetContext < KV_AUTO_QUANT_CONTEXT_THRESHOLD
-		? ['f16', 'q8_0', 'q4_0']
-		: ['q8_0', 'q4_0'];
+	// f16 is only in play for small windows; above the threshold the cache dominates memory and q8_0's quality
+	// delta is negligible, so starting at f16 would just cost a rung and land on half the context for nothing.
+	const tiers = targetContext < KV_AUTO_QUANT_CONTEXT_THRESHOLD
+		? KV_CACHE_TIERS
+		: KV_CACHE_TIERS.filter(tier => !(tier.k === 'f16' && tier.v === 'f16'));
 	const f16Bytes = inputs.kvBytesPerTokenPerLayerF16 && inputs.kvBytesPerTokenPerLayerF16 > 0
 		? inputs.kvBytesPerTokenPerLayerF16
 		: (inputs.kvBytesPerTokenPerLayer && inputs.kvBytesPerTokenPerLayer > 0
 			? inputs.kvBytesPerTokenPerLayer
 			: DEFAULT_KV_BYTES_PER_TOKEN_PER_LAYER_F16);
 	let best: AutomaticKvCacheSelection | undefined;
-	for (const kvCacheType of preferred) {
-		const perTokenPerLayer = f16Bytes * kvCacheBytesPerElem(kvCacheType) / kvCacheBytesPerElem('f16');
+	for (const kvCachePlan of tiers) {
+		const perTokenPerLayer = f16Bytes * kvPlanBytesPerElem(kvCachePlan) / kvCacheBytesPerElem('f16');
 		const contextSize = clampContextSize({
 			requestedContext: inputs.requestedContext,
 			modelContextLength: inputs.modelContextLength,
@@ -673,18 +864,22 @@ export function selectAutomaticKvCache(inputs: AutomaticKvCacheSelectionInputs):
 			kvBytesPerTokenPerLayer: perTokenPerLayer,
 			slidingWindow: inputs.slidingWindow,
 			swaFullOnAllLayers: inputs.swaFullOnAllLayers,
+			minContext: inputs.minContext,
 		});
-		const candidate = { kvCacheType, contextSize };
+		const candidate = { kvCachePlan, contextSize };
 		// Accept the FIRST (highest-quality) precision that clears the comfort floor at its full fitting context -
 		// don't drop to a lossier cache just because it would grant even more length past the floor.
 		if (contextSize >= satisfiedAt) {
 			return candidate;
 		}
-		if (!best || contextSize > best.contextSize) {
+		// Below the floor: keep the cheaper rung only when it bought a materially longer window. Without this a
+		// model pinned at the MIN_CLAMPED_CONTEXT floor (every rung returns the same number) would still walk all
+		// the way down to q4/q4 and lose quality for literally zero extra tokens.
+		if (!best || contextSize >= best.contextSize * KV_TIER_DOWNGRADE_MIN_GAIN) {
 			best = candidate;
 		}
 	}
-	return best ?? { kvCacheType: resolveKvCacheType('auto', targetContext), contextSize: targetContext };
+	return best ?? { kvCachePlan: resolveKvCachePlan('auto', targetContext), contextSize: targetContext };
 }
 
 /**
@@ -699,6 +894,13 @@ export interface LlamaServerTuning {
 	flashAttention?: FlashAttentionMode;
 	/** KV cache quantization (`--cache-type-k/v`). 'f16' = no quantization (always safe). */
 	kvCacheType?: KvCacheType;
+	/**
+	 * Resolved K/V precision pair, pinned by the launch planner after {@link selectAutomaticKvCache} has sized
+	 * the context against the memory budget. When present it WINS over {@link kvCacheType} - the planner already
+	 * decided, and re-resolving 'auto' from the (possibly clamped-down) window here would flip the precision the
+	 * clamp budgeted for. Absent -> the type is resolved from `kvCacheType` symmetrically.
+	 */
+	kvCachePlan?: KvCachePlan;
 	/**
 	 * Multi-Token Prediction / NextN speculative decoding. Only valid for MTP-trained models on a
 	 * recent llama.cpp build (~b9180+). When on, emits `mtpArgs` ALONE (default `--spec-type draft-mtp`) so
@@ -1020,13 +1222,14 @@ export function buildExpertOffloadOverride(layerIndices: readonly number[]): str
  */
 export function getLlamaCppServerCommand(modelPath: string, backend: LlamaBackend, serverPath?: string, port: number = LOCOPILOT_LLAMA_SERVER_PORT, tuning: LlamaServerTuning = {}): { command: string; args: string[] } {
 	const contextSize = tuning.contextSize && tuning.contextSize > 0 ? Math.floor(tuning.contextSize) : DEFAULT_LLAMA_CONTEXT_SIZE;
-	// 'auto' resolves to f16 for small windows and q8_0 for large ones (see resolveKvCacheType).
-	const kvCacheType = resolveKvCacheType(tuning.kvCacheType ?? 'auto', contextSize);
+	// A plan pinned by the launch planner wins; otherwise 'auto' resolves to f16 for small windows and q8_0 for
+	// large ones (see resolveKvCachePlan), and a fixed user type is applied to both halves.
+	const kvCachePlan = tuning.kvCachePlan ?? resolveKvCachePlan(tuning.kvCacheType ?? 'auto', contextSize);
 
-	// V-cache quantization requires Flash Attention. If the user quantizes the KV cache but disabled FA,
+	// KV quantization requires Flash Attention. If the KV cache is quantized but the user disabled FA,
 	// promote 'off' -> 'auto' so the server never errors out on an unsupported combination.
 	let flashAttention: FlashAttentionMode = tuning.flashAttention ?? 'auto';
-	if (kvCacheType !== 'f16' && flashAttention === 'off') {
+	if ((kvCachePlan.k !== 'f16' || kvCachePlan.v !== 'f16') && flashAttention === 'off') {
 		flashAttention = 'auto';
 	}
 
@@ -1061,9 +1264,15 @@ export function getLlamaCppServerCommand(modelPath: string, backend: LlamaBacken
 		args.push('--n-gpu-layers', String(tuning.gpuLayers));
 	}
 
-	// KV cache quantization shrinks the cache (more context on-GPU, faster). f16 = default (no flag needed).
-	if (kvCacheType !== 'f16') {
-		args.push('--cache-type-k', kvCacheType, '--cache-type-v', kvCacheType);
+	// KV cache quantization shrinks the cache (more context on-GPU, faster). f16 = the server default, so each
+	// half only needs a flag when it differs. The halves are emitted independently because the automatic ladder
+	// includes an asymmetric rung (4-bit K with an 8-bit V), which is a materially better quality-per-byte point
+	// than a symmetric 4-bit cache.
+	if (kvCachePlan.k !== 'f16') {
+		args.push('--cache-type-k', kvCachePlan.k);
+	}
+	if (kvCachePlan.v !== 'f16') {
+		args.push('--cache-type-v', kvCachePlan.v);
 	}
 
 	// Multi-Token Prediction / NextN speculative decoding. OPT-IN and default off: only models trained
