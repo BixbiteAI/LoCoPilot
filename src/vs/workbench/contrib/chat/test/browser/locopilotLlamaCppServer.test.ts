@@ -10,6 +10,8 @@ import {
 	computeCpuMoeLayers,
 	computeKvBudgetBytes,
 	swaFullKvHeadroomBytes,
+	maxContextForFullSwa,
+	MIN_FULL_SWA_CONTEXT,
 	SWA_FULL_GRAPH_MARGIN_FRACTION,
 	clampContextSize,
 	kvCacheBytesForContext,
@@ -450,6 +452,54 @@ suite('LoCoPilot llama.cpp server', () => {
 			const h = swaFullKvHeadroomBytes({ budgetBytes: 20 * GB, ...base });
 			const expected = 20 * GB - 4 * GB - 4 * GB - RUNTIME_OVERHEAD_BYTES - 2 * GB - Math.floor(20 * GB * SWA_FULL_GRAPH_MARGIN_FRACTION);
 			assert.strictEqual(h, expected);
+		});
+	});
+
+	suite('maxContextForFullSwa', () => {
+		const GB = 1024 * 1024 * 1024;
+		// gemma-4-E4B on an M3: ~11.8GiB Metal budget, weights+overhead ~7.8GiB, and a full-SWA KV that costs
+		// ~91KB/token at the context the clamp picked. The old yes/no gate saw 80K tokens (~6.8GB) not fitting
+		// and gave up; solving for the context instead should still land well above the floor.
+		const base = {
+			budgetBytes: 11.84 * GB,
+			residentWeightBytes: 6.3 * GB,
+			fullSwaBytesPerToken: 91392,
+			promptCacheReserveBytes: 0,
+		};
+
+		test('trades context down to something that fits instead of giving up', () => {
+			const ctx = maxContextForFullSwa({ ...base, requestedContext: 79872 });
+			assert.ok(ctx >= MIN_FULL_SWA_CONTEXT, `expected a usable traded context, got ${ctx}`);
+			assert.ok(ctx < 79872, `expected the context to be reduced, got ${ctx}`);
+			assert.strictEqual(ctx % 1024, 0, 'traded context must stay a 1024 multiple');
+		});
+
+		test('never hands back more than was requested', () => {
+			// A tiny model on a huge budget could "afford" far more than the caller asked for.
+			const ctx = maxContextForFullSwa({ ...base, budgetBytes: 128 * GB, requestedContext: 8192 });
+			assert.strictEqual(ctx, 8192);
+		});
+
+		test('returns 0 when the weights alone exhaust the budget', () => {
+			const ctx = maxContextForFullSwa({ ...base, residentWeightBytes: 11.5 * GB, requestedContext: 32768 });
+			assert.strictEqual(ctx, 0);
+		});
+
+		test('returns 0 when the per-token cost is unknown', () => {
+			const ctx = maxContextForFullSwa({ ...base, fullSwaBytesPerToken: 0, requestedContext: 32768 });
+			assert.strictEqual(ctx, 0);
+		});
+
+		test('agrees with the headroom gate at the context it returns', () => {
+			// The solver's result must actually pass the yes/no gate, otherwise the two disagree at the boundary.
+			const ctx = maxContextForFullSwa({ ...base, requestedContext: 79872 });
+			const headroom = swaFullKvHeadroomBytes({
+				budgetBytes: base.budgetBytes,
+				residentWeightBytes: base.residentWeightBytes,
+				fullSwaKvBytes: ctx * base.fullSwaBytesPerToken,
+				promptCacheReserveBytes: base.promptCacheReserveBytes,
+			});
+			assert.ok(headroom >= 0, `solver returned ${ctx} but the gate rejects it (headroom ${headroom})`);
 		});
 	});
 

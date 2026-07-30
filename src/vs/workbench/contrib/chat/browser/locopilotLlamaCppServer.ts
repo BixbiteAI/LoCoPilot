@@ -400,6 +400,55 @@ export function swaFullKvHeadroomBytes(inputs: {
 }
 
 /**
+ * Smallest context we will accept in exchange for turning `--swa-full` on. Below this a sliding-window model
+ * is not usable for agent work (a system prompt alone can be ~7K), so we keep the larger windowed context and
+ * pay the per-turn re-prefill instead. This is a FLOOR on the result, not a target: when the budget allows more
+ * we keep more, capped by the context the caller already asked for.
+ */
+export const MIN_FULL_SWA_CONTEXT = 16384;
+
+/**
+ * Largest context whose FULL-size SWA KV cache still fits the memory budget - the inverse of
+ * {@link swaFullKvHeadroomBytes}. The old gate asked "does --swa-full fit at the context we already picked?"
+ * and gave up when it didn't, which silently left cross-turn prompt-cache reuse off on every sliding-window
+ * model (measured: a 7.4K-token turn re-prefilling in 33s instead of resuming in 62ms). Trading context for
+ * reuse is almost always the right call for chat/agent work, so instead we solve for the context that DOES
+ * fit and clamp to it.
+ *
+ * Returns 0 when nothing usable fits, or when the per-token cost is unknown - callers keep the windowed cache.
+ * The result is rounded down to a 1024 multiple and never exceeds `requestedContext`.
+ */
+export function maxContextForFullSwa(inputs: {
+	budgetBytes: number;
+	residentWeightBytes: number;
+	/** KV bytes per token across ALL layers with --swa-full on (every layer holds the full context). */
+	fullSwaBytesPerToken: number;
+	requestedContext: number;
+	promptCacheReserveBytes: number;
+	overheadBytes?: number;
+	graphMarginFraction?: number;
+}): number {
+	if (!(inputs.fullSwaBytesPerToken > 0) || !(inputs.budgetBytes > 0) || !(inputs.requestedContext > 0)) {
+		return 0;
+	}
+	// Headroom with a zero-size KV cache: everything the budget must hold regardless of context.
+	const available = swaFullKvHeadroomBytes({
+		budgetBytes: inputs.budgetBytes,
+		residentWeightBytes: inputs.residentWeightBytes,
+		fullSwaKvBytes: 0,
+		promptCacheReserveBytes: inputs.promptCacheReserveBytes,
+		overheadBytes: inputs.overheadBytes,
+		graphMarginFraction: inputs.graphMarginFraction,
+	});
+	if (available <= 0) {
+		return 0;
+	}
+	const maxTokens = Math.floor(available / inputs.fullSwaBytesPerToken);
+	const ctx = Math.floor(Math.min(maxTokens, inputs.requestedContext) / 1024) * 1024;
+	return Math.max(0, ctx);
+}
+
+/**
  * Resolves the concrete KV cache type to use. 'auto' chooses q8_0 once the context window reaches
  * {@link KV_AUTO_QUANT_CONTEXT_THRESHOLD}, else f16. A fixed type is returned unchanged.
  */

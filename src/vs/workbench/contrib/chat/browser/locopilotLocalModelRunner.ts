@@ -52,6 +52,8 @@ import {
 	DEFAULT_CLAMP_LAYER_COUNT,
 	MTP_DRAFT_KV_LAYER_EQUIV,
 	swaFullKvHeadroomBytes,
+	maxContextForFullSwa,
+	MIN_FULL_SWA_CONTEXT,
 	type LlamaServerTuning,
 	type FlashAttentionMode,
 	type KvCacheType
@@ -1945,8 +1947,18 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 		// GGUF), then the global setting, which itself defaults to DEFAULT_LLAMA_CONTEXT_SIZE. This way a
 		// long-context model gets a matching `-c` instead of every model sharing one global window.
 		const perModelContext = model?.contextWindow && model.contextWindow > 0 ? model.contextWindow : undefined;
+		// An EXPLICIT global setting wins over the per-model window. The per-model value is usually auto-derived
+		// from the GGUF, so treating it as higher priority made `locopilot.llamaCpp.contextSize` unreachable for
+		// every downloaded model - you could set it and nothing happened. Only fall back to the per-model window
+		// when the user hasn't set the global one.
+		const globalContextInspect = cfg.inspect<number>(ChatConfiguration.LocopilotLlamaCppContextSize);
+		const explicitGlobalContext = globalContextInspect?.userValue
+			?? globalContextInspect?.workspaceValue
+			?? globalContextInspect?.workspaceFolderValue;
 		return {
-			contextSize: perModelContext ?? cfg.getValue<number>(ChatConfiguration.LocopilotLlamaCppContextSize),
+			contextSize: (explicitGlobalContext && explicitGlobalContext > 0 ? explicitGlobalContext : undefined)
+				?? perModelContext
+				?? cfg.getValue<number>(ChatConfiguration.LocopilotLlamaCppContextSize),
 			flashAttention: cfg.getValue<FlashAttentionMode>(ChatConfiguration.LocopilotLlamaCppFlashAttention),
 			kvCacheType: cfg.getValue<KvCacheType>(ChatConfiguration.LocopilotLlamaCppKvCacheType),
 			multiTokenPrediction: perModelMtp !== undefined ? perModelMtp : globalMtp,
@@ -2141,6 +2153,9 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 		// --swa-full allocates. Captured at the FINAL clamped context + precision so the gate can verify the full
 		// cache genuinely fits before forcing it on (vs. windowed SWA, which is far smaller on models like Gemma).
 		let fullSwaKvBytesEstimate: number | undefined;
+		// Same estimate expressed per token, so the gate below can SOLVE for the largest context whose full-size
+		// SWA cache fits instead of only answering yes/no at the context the clamp happened to pick.
+		let fullSwaBytesPerTokenEstimate: number | undefined;
 
 		// #5 Context clamp: never request more than the model supports, nor more than the KV budget can hold.
 		// The KV allowance is weight-aware (computeKvBudgetBytes): at most KV_BUDGET_FRACTION of the budget,
@@ -2220,7 +2235,8 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 			// Full-size KV the SWA layers would take with --swa-full, at the final context + precision. Mirrors
 			// clampContextSize's own layer-count fallback so the estimate matches what the clamp budgeted.
 			const layersForKv = info.layerCount && info.layerCount > 0 ? info.layerCount : DEFAULT_CLAMP_LAYER_COUNT;
-			fullSwaKvBytesEstimate = perTokenPerLayer * layersForKv * (tuning.contextSize ?? 0);
+			fullSwaBytesPerTokenEstimate = perTokenPerLayer * layersForKv;
+			fullSwaKvBytesEstimate = fullSwaBytesPerTokenEstimate * (tuning.contextSize ?? 0);
 		}
 
 		// SWA full cache: sliding-window models (Gemma 2/3/4) default to a window-sized KV for their SWA layers,
@@ -2263,15 +2279,38 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 						overheadBytes: runtimeOverheadBytesForTuning(tuning, backend),
 					})
 					: -1;
+				// The full cache doesn't fit at the context the clamp picked - but it may fit at a SMALLER one, and
+				// that trade is worth taking. A windowed SWA cache makes the server discard its prompt cache and
+				// re-prefill the whole conversation every turn (measured on gemma-4-E4B: 33s for a 7.4K-token turn
+				// vs 62ms with --swa-full on). So rather than give up, solve for the largest context whose full
+				// cache DOES fit and clamp to it - as long as that stays at or above MIN_FULL_SWA_CONTEXT.
+				const tradedContext = (canEstimate && headroom < 0)
+					? maxContextForFullSwa({
+						budgetBytes: budget,
+						residentWeightBytes: residentWeights,
+						fullSwaBytesPerToken: fullSwaBytesPerTokenEstimate ?? 0,
+						requestedContext: tuning.contextSize ?? 0,
+						promptCacheReserveBytes: promptCacheReserve,
+						overheadBytes: runtimeOverheadBytesForTuning(tuning, backend),
+					})
+					: 0;
 				if (canEstimate && headroom >= 0) {
 					tuning.swaFull = true;
 					this._log(`[LoCoPilot Runner] SWA model (window ${info.slidingWindow}); enabling --swa-full (mode=${mode}) - full-size SWA KV ~${(fullSwaKvBytesEstimate! / GB).toFixed(1)}GB fits with ~${(headroom / GB).toFixed(1)}GB headroom.`);
+				} else if (tradedContext >= MIN_FULL_SWA_CONTEXT) {
+					// Trade window length for cross-turn reuse. Internal and automatic - the user picks neither the
+					// context nor the flag; we just keep the largest window that still lets the prompt cache work.
+					const previousContext = tuning.contextSize ?? 0;
+					tuning.swaFull = true;
+					tuning.contextSize = tradedContext;
+					fullSwaKvBytesEstimate = (fullSwaBytesPerTokenEstimate ?? 0) * tradedContext;
+					this._log(`[LoCoPilot Runner] SWA model (window ${info.slidingWindow}); enabling --swa-full (mode=${mode}) by trading context ${previousContext} -> ${tradedContext} - the full-size KV ~${(fullSwaKvBytesEstimate / GB).toFixed(1)}GB fits there. Cross-turn prompt reuse is ON (no per-turn re-prefill).`);
 				} else if (!canEstimate && mode === 'on') {
 					// Can't size the cache (unknown geometry) and the user explicitly forced it: honor the force.
 					tuning.swaFull = true;
 					this._log(`[LoCoPilot Runner] Forcing --swa-full (mode=on) - cache size unknown, honoring the explicit setting.`);
 				} else {
-					this._log(`[LoCoPilot Runner] SWA model (window ${info.slidingWindow}); keeping WINDOWED SWA cache (mode=${mode}) - the full-size KV ~${canEstimate ? (fullSwaKvBytesEstimate! / GB).toFixed(1) + 'GB' : 'unknown'} doesn't fit the budget with margin (headroom ~${(headroom / GB).toFixed(1)}GB). Cross-turn reuse is off, but the model fits and won't over-warn at launch.`);
+					this._log(`[LoCoPilot Runner] SWA model (window ${info.slidingWindow}); keeping WINDOWED SWA cache (mode=${mode}) - the full-size KV ~${canEstimate ? (fullSwaKvBytesEstimate! / GB).toFixed(1) + 'GB' : 'unknown'} doesn't fit the budget with margin (headroom ~${(headroom / GB).toFixed(1)}GB), and the largest context that would fit (${tradedContext}) is below the ${MIN_FULL_SWA_CONTEXT}-token floor. Cross-turn reuse is off, but the model fits and won't over-warn at launch.`);
 				}
 			} else if (wantSwaFull && mode === 'on') {
 				// No memory budget known at all (e.g. web) but explicitly forced: honor it.
