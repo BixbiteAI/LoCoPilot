@@ -87,7 +87,7 @@ import {
 } from './locopilotMlxServer.js';
 import { showTransientNotification } from './locopilotNotify.js';
 import { findDraftPairing, type IAutoModelPlan, type IHardwareProfile } from './locopilotModelCatalog.js';
-import { LoCoPilotModelDownloadService, modelDownloadDirName, isMmprojGgufPath } from './locopilotModelDownloadService.js';
+import { LoCoPilotModelDownloadService, modelDownloadDirName, isMmprojGgufPath, isMtpGgufPath } from './locopilotModelDownloadService.js';
 import { joinPath } from '../../../../base/common/resources.js';
 import { streamToBuffer, VSBuffer } from '../../../../base/common/buffer.js';
 import { generateUuid } from '../../../../base/common/uuid.js';
@@ -3308,13 +3308,16 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 		try {
 			const stat = await this.fileService.stat(uri);
 			if (stat.isFile && localPath.toLowerCase().endsWith('.gguf')) {
-				// A prior download bug could persist mmproj as localPath; recover by picking a sibling weight GGUF.
-				if (!isMmprojGgufPath(localPath)) {
+				// A prior download bug could persist mmproj - or, until the MTP guard was added to the quant
+				// pickers, a standalone `mtp-*.gguf` draft head - as localPath. Both are non-model GGUFs, so
+				// recover by picking a sibling weight GGUF. This self-heals installs made by older builds.
+				if (!isMmprojGgufPath(localPath) && !isMtpGgufPath(localPath)) {
 					return localPath;
 				}
 				const sibling = await this._firstWeightGgufInDir(dirname(localPath));
 				if (sibling) {
-					this._log(`[LoCoPilot Runner] localPath pointed at mmproj; using sibling weights instead: ${sibling}`);
+					const kind = isMmprojGgufPath(localPath) ? 'mmproj' : 'an MTP draft head';
+					this._log(`[LoCoPilot Runner] localPath pointed at ${kind}; using sibling weights instead: ${sibling}`);
 					return sibling;
 				}
 				return localPath;
@@ -3340,11 +3343,12 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 		return localPath;
 	}
 
-	/** First non-mmproj `.gguf` in a directory, or undefined. */
+	/** First real weight `.gguf` in a directory (skips mmproj projectors and MTP draft heads), or undefined. */
 	private async _firstWeightGgufInDir(dirPath: string): Promise<string | undefined> {
 		try {
 			const resolved = await this.fileService.resolve(URI.file(dirPath));
-			const gguf = (resolved.children ?? []).find(c => c.isFile && c.name.toLowerCase().endsWith('.gguf') && !isMmprojGgufPath(c.name));
+			const gguf = (resolved.children ?? []).find(c => c.isFile && c.name.toLowerCase().endsWith('.gguf')
+				&& !isMmprojGgufPath(c.name) && !isMtpGgufPath(c.name));
 			return gguf?.resource.fsPath;
 		} catch {
 			return undefined;

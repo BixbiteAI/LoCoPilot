@@ -13,6 +13,7 @@ import {
 	modelParamsBillionsFromName,
 	estimateLayerCountFromModelName,
 	MAX_AUTO_GGUF_QUANT,
+	isMtpGgufPath,
 } from '../../browser/locopilotModelDownloadService.js';
 
 const GB = 1024 * 1024 * 1024;
@@ -49,6 +50,47 @@ suite('LoCoPilot model download - hardware-aware quant selection', () => {
 
 		test('unrecognised quant scores lowest', () => {
 			assert.strictEqual(quantQualityScore('m-weird.gguf'), 0);
+		});
+	});
+
+	suite('isMtpGgufPath / MTP draft heads are never picked as the model', () => {
+		// Real layout of a Gemma 4 repo (both the regular and the QAT builds ship these).
+		const gemma4Qat = [
+			{ path: 'gemma-4-12B-it-qat-UD-Q4_K_XL.gguf', size: 6.26 * GB },
+			{ path: 'MTP/mtp-gemma-4-12B-it-Q8_0.gguf', size: 0.43 * GB },
+			{ path: 'MTP/mtp-gemma-4-12B-it-BF16.gguf', size: 0.8 * GB },
+			{ path: 'MTP/mtp-gemma-4-12B-it-Q4_0.gguf', size: 0.24 * GB },
+			{ path: 'mtp-gemma-4-12B-it.gguf', size: 0.24 * GB },
+			{ path: 'mmproj-F16.gguf', size: 0.16 * GB },
+		];
+
+		test('recognises MTP heads in a subfolder and at the repo root', () => {
+			assert.ok(isMtpGgufPath('MTP/mtp-gemma-4-12B-it-Q8_0.gguf'));
+			assert.ok(isMtpGgufPath('mtp-gemma-4-12B-it.gguf'));
+			assert.ok(isMtpGgufPath('mtp_llama.gguf'));
+		});
+
+		test('does NOT treat a real weight file as an MTP head just because MTP is in its name', () => {
+			// Regression guard: six catalog entries download from `-MTP-GGUF` repos whose weights are named
+			// like this. Excluding these would break every one of them.
+			assert.ok(!isMtpGgufPath('Qwen3.5-9B-Q4_K_M.gguf'));
+			assert.ok(!isMtpGgufPath('Qwen3.5-9B-MTP-Q4_K_M.gguf'));
+			assert.ok(!isMtpGgufPath('some-mtp-model-Q4_K_M.gguf'));
+		});
+
+		test('picks the real weights even though a Q8_0 MTP head scores higher and fits easily', () => {
+			// The bug this guards: MTP heads are published as Q8_0/BF16, so they top the quality order, and at
+			// a few hundred MB they fit any budget - the picker chose a 0.43GB draft head over the model.
+			// 11GB is the Metal budget of a 16GB Mac, where this actually happened.
+			const pick = pickBestGgufForBudget(gemma4Qat, 11 * GB, { layerCount: 48 });
+			assert.strictEqual(pick, 'gemma-4-12B-it-qat-UD-Q4_K_XL.gguf');
+		});
+
+		test('still avoids MTP heads when nothing fits and it falls back to the smallest weight file', () => {
+			// Tiny budget -> the "nothing fits" path returns the smallest *weight*, which must not be a head.
+			const pick = pickBestGgufForBudget(gemma4Qat, 1 * GB, { layerCount: 48 });
+			assert.strictEqual(pick, 'gemma-4-12B-it-qat-UD-Q4_K_XL.gguf');
+			assert.ok(!isMtpGgufPath(pick!));
 		});
 	});
 

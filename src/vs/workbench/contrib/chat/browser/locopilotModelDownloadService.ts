@@ -171,9 +171,31 @@ export function isMmprojGgufPath(path: string): boolean {
 	return /(^|\/)mmproj[^/]*\.gguf$/i.test(path);
 }
 
-/** Weight GGUFs only (excludes mmproj / CLIP projectors). */
+/**
+ * True for standalone Multi-Token-Prediction draft heads (`mtp-*.gguf`, usually under an `MTP/` folder).
+ * Like mmproj projectors these sit NEXT TO the language weights - Gemma 4 repos ship them in both the
+ * regular and the QAT builds - and must never be chosen as the main `-m` model: they are 0.1-0.9 GB
+ * prediction heads, not the model.
+ *
+ * They are pure poison for the quant pickers, which is why this guard exists. The heads are published as
+ * `Q8_0`/`BF16`, so {@link quantQualityScore} ranks them at the TOP of the quality order, and at a few
+ * hundred MB they fit any budget - so {@link pickBestGgufForBudget} would sort a draft head above the real
+ * weights and "helpfully" download it whenever the genuine Q8_0 was too big for the machine (a 16 GB Mac
+ * asking for Gemma 4 12B got the 0.43 GB head instead of the model). For a repo that ships no `Q4_K_M` at
+ * all - every Gemma 4 QAT build - {@link filterPathsByFormat} also fell through its priority list onto the
+ * head, breaking the download on every machine rather than only tight ones.
+ *
+ * Nothing needs these files: llama.cpp MTP self-drafts from the embedded head in the main GGUF via
+ * `--spec-type draft-mtp` alone (see the MTP launch path in locopilotLocalModelRunner), so the standalone
+ * copy is never passed to the server.
+ */
+export function isMtpGgufPath(path: string): boolean {
+	return /(^|\/)mtp[-_.][^/]*\.gguf$/i.test(path);
+}
+
+/** Weight GGUFs only (excludes mmproj / CLIP projectors and standalone MTP draft heads). */
 function isWeightGgufPath(path: string): boolean {
-	return path.toLowerCase().endsWith('.gguf') && !isMmprojGgufPath(path);
+	return path.toLowerCase().endsWith('.gguf') && !isMmprojGgufPath(path) && !isMtpGgufPath(path);
 }
 
 /**

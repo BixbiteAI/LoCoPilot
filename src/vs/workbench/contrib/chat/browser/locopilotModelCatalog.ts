@@ -113,17 +113,30 @@ export const LOCOPILOT_DEFAULT_CATALOG: readonly ICatalogModel[] = [
 	// comment out whichever you do not want to ship.
 	// =========================================================================================
 
-	// ---- Gemma 4 (Google) ----
+	// ---- Gemma 4 (Google) - QAT builds ----
+	// All five entries below point at Google's QAT (Quantization-Aware Training) GGUFs rather than the
+	// regular post-training-quantized ones. QAT simulates 4-bit rounding DURING the final training run, so
+	// the int4 weights keep far more of the BF16 quality than rounding BF16 down afterwards does - and they
+	// come out SMALLER too (fewer tensors need a high-precision fallback), 6-16% off each download.
+	//
+	// `format: 'Q4_K_XL'` is REQUIRED, not a preference: the QAT repos ship no `Q4_K_M` file at all. With the
+	// old 'Q4_K_M' the format filter would miss, fall through GGUF_QUANT_PRIORITY, and land on a `Q8_0`-tagged
+	// MTP draft head. (That trap is now also blocked at the source by isMtpGgufPath in the download service.)
+	//
+	// TRADE-OFF, deliberate: these repos are effectively single-quant (12B/26B/31B ship exactly one weight
+	// file; E2B/E4B add only a UD-Q2_K_XL). That disables the two-way hardware-aware quant sizing - a 64 GB
+	// machine can no longer be upgraded to Q8_0, a tight one can't be downgraded to Q3. We trade adaptive
+	// sizing for better quality at one fixed, smaller size.
 	{
 		catalogId: 'gemma4-e2b-gguf',
 		displayName: 'Gemma 4 E2B',
 		vendor: 'Google',
 		blurb: 'Smallest Gemma 4 (edge-class ~2B effective); tool calling + vision. Runs on 8 GB.',
-		repoId: 'unsloth/gemma-4-E2B-it-GGUF',
+		repoId: 'unsloth/gemma-4-E2B-it-qat-GGUF',
 		supportsVision: true,
-		format: 'Q4_K_M',
+		format: 'Q4_K_XL',
 		engine: 'gguf',
-		approxSizeBytes: Math.round(2.9 * GB),
+		approxSizeBytes: Math.round(2.44 * GB),
 		minRamGB: 8,
 		tier: '8 GB',
 		contextWindow: 131072,
@@ -133,30 +146,29 @@ export const LOCOPILOT_DEFAULT_CATALOG: readonly ICatalogModel[] = [
 		displayName: 'Gemma 4 E4B',
 		vendor: 'Google',
 		blurb: 'Latest small Gemma (edge-class ~4B effective); tool calling + vision.',
-		repoId: 'unsloth/gemma-4-E4B-it-GGUF',
+		repoId: 'unsloth/gemma-4-E4B-it-qat-GGUF',
 		supportsVision: true,
-		format: 'Q4_K_M',
+		format: 'Q4_K_XL',
 		engine: 'gguf',
-		approxSizeBytes: Math.round(3 * GB),
+		approxSizeBytes: Math.round(3.93 * GB),
 		minRamGB: 8,
 		tier: '8 GB',
 		contextWindow: 131072,
 	},
-	// NOTE: No MLX twin for Gemma 4 E4B. It is a multimodal checkpoint (vision/audio towers, weights
-	// prefixed `language_model.*`), which the text-only MLX engine (mlx-lm) cannot load - it errors with
-	// "Received N parameters not in model" and the server hangs. The GGUF build above runs fine on
-	// llama.cpp (text), so Apple Silicon users get Gemma 4 E4B via that entry. Re-add an MLX twin only
-	// once a text-only MLX build (or mlx-vlm support) is available.
+	// RESOLVED 2026-07: Gemma 4 E4B now HAS an MLX twin (`gemma4-e4b-mlx`, at the bottom of this file).
+	// The old note here said mlx-lm could not load it; that stopped being true once mlx-lm gained a
+	// `gemma4` module - it loads the language tower and ignores the vision one. Only the *12B* and the
+	// QAT builds remain unloadable, because those report `model_type: gemma4_unified`.
 	{
 		catalogId: 'gemma4-12b-gguf',
 		displayName: 'Gemma 4 12B',
 		vendor: 'Google',
 		blurb: 'Latest mid-size Gemma; native audio, tools + vision. Fits 16 GB.',
-		repoId: 'unsloth/gemma-4-12b-it-GGUF',
+		repoId: 'unsloth/gemma-4-12b-it-qat-GGUF',
 		supportsVision: true,
-		format: 'Q4_K_M',
+		format: 'Q4_K_XL',
 		engine: 'gguf',
-		approxSizeBytes: Math.round(7 * GB),
+		approxSizeBytes: Math.round(6.26 * GB),
 		minRamGB: 16,
 		tier: '16 GB',
 		contextWindow: 262144,
@@ -166,11 +178,11 @@ export const LOCOPILOT_DEFAULT_CATALOG: readonly ICatalogModel[] = [
 		displayName: 'Gemma 4 26B-A4B MoE',
 		vendor: 'Google',
 		blurb: 'Mixture-of-experts Gemma 4: 26B total, ~4B active - fast for its quality.',
-		repoId: 'unsloth/gemma-4-26B-A4B-it-GGUF',
+		repoId: 'unsloth/gemma-4-26B-A4B-it-qat-GGUF',
 		supportsVision: true,
-		format: 'Q4_K_M',
+		format: 'Q4_K_XL',
 		engine: 'gguf',
-		approxSizeBytes: Math.round(16 * GB),
+		approxSizeBytes: Math.round(13.27 * GB),
 		minRamGB: 32,
 		tier: '32 GB+',
 		contextWindow: 262144,
@@ -180,11 +192,11 @@ export const LOCOPILOT_DEFAULT_CATALOG: readonly ICatalogModel[] = [
 		displayName: 'Gemma 4 31B',
 		vendor: 'Google',
 		blurb: 'Largest dense Gemma 4; top quality for 32 GB+ machines.',
-		repoId: 'unsloth/gemma-4-31B-it-GGUF',
+		repoId: 'unsloth/gemma-4-31B-it-qat-GGUF',
 		supportsVision: true,
-		format: 'Q4_K_M',
+		format: 'Q4_K_XL',
 		engine: 'gguf',
-		approxSizeBytes: Math.round(19 * GB),
+		approxSizeBytes: Math.round(16.1 * GB),
 		minRamGB: 32,
 		tier: '32 GB+',
 		contextWindow: 262144,
@@ -205,9 +217,9 @@ export const LOCOPILOT_DEFAULT_CATALOG: readonly ICatalogModel[] = [
 		tier: '32 GB+',
 		contextWindow: 262144,
 	},
-	// NOTE: No MLX twin for Qwen3.6 27B - the MLX build (unsloth/Qwen3.6-27B-UD-MLX-4bit) is a multimodal
-	// (image-text-to-text) checkpoint, which the text-only MLX engine (mlx-lm) cannot load. The GGUF build
-	// above runs on llama.cpp instead.
+	// RESOLVED 2026-07: Qwen3.6 27B now HAS an MLX twin (`qwen36-27b-mlx`, at the bottom of this file),
+	// using the mlx-community 4bit build. The old note assumed the multimodal checkpoint was unloadable;
+	// mlx-lm dispatches on `model_type` (`qwen3_5`, present since 0.31.x) and loads the text tower.
 	{
 		catalogId: 'qwen36-35b-a3b-gguf',
 		displayName: 'Qwen3.6 35B-A3B MoE',
@@ -222,8 +234,8 @@ export const LOCOPILOT_DEFAULT_CATALOG: readonly ICatalogModel[] = [
 		tier: '32 GB+',
 		contextWindow: 262144,
 	},
-	// NOTE: No MLX twin for Qwen3.6 35B-A3B - the MLX build (unsloth/Qwen3.6-35B-A3B-UD-MLX-4bit) is a
-	// multimodal (image-text-to-text) checkpoint that mlx-lm cannot load. Use the GGUF build above.
+	// RESOLVED 2026-07: Qwen3.6 35B-A3B now HAS an MLX twin (`qwen36-35b-a3b-mlx`, bottom of this file).
+	// Same correction as the 27B above: `model_type: qwen3_5_moe` is supported by the bundled mlx-lm.
 
 	// ---- Qwen 3.5 MTP (Alibaba) - GGUF builds with Multi-Token Prediction heads (llama.cpp --spec-type mtp) ----
 	// NOTE on minRamGB/tier for MTP entries: these are sized for the BASE model (single weight copy), NOT the
@@ -356,7 +368,9 @@ export const LOCOPILOT_DEFAULT_CATALOG: readonly ICatalogModel[] = [
 		minRamGB: 32,
 		tier: '32 GB+',
 		mtp: true,
-		defaultHidden: true,
+		// Unhidden 2026-07: at ~1.42M downloads this is the most-pulled repo in the whole catalog, and
+		// it is strictly the faster way to run Qwen3.6 27B (embedded MTP draft head). Surfaced via
+		// DEFAULT_VISIBLE_CATALOG_IDS below rather than left behind Show in "My Models".
 		contextWindow: 262144,
 	},
 	{
@@ -540,24 +554,9 @@ export const LOCOPILOT_DEFAULT_CATALOG: readonly ICatalogModel[] = [
 		contextWindow: 131072,
 	},
 	*/
-	{
-		catalogId: 'deepseek-r1-distill-14b-gguf',
-		displayName: 'DeepSeek-R1 Distill 14B',
-		vendor: 'DeepSeek',
-		blurb: 'Reasoning-focused distill; strong step-by-step problem solving.',
-		repoId: 'unsloth/DeepSeek-R1-Distill-Qwen-14B-GGUF',
-		supportsVision: false,
-		format: 'Q4_K_M',
-		engine: 'gguf',
-		approxSizeBytes: Math.round(9 * GB),
-		minRamGB: 16,
-		tier: '16 GB',
-		useNativeTools: false,
-		contextWindow: 131072,
-		// Same distill family (Qwen2.5 tokenizer): the 1.5B distill drafts for the 14B/32B targets.
-		draftRepoId: 'unsloth/DeepSeek-R1-Distill-Qwen-1.5B-GGUF',
-		draftFormat: 'Q4_K_M',
-	},
+	// REMOVED (2026-07): DeepSeek-R1 Distill 14B/32B (+ their 1.5B draft pairing). Both shipped with
+	// `useNativeTools: false` - they cannot call tools, which is the core loop of this editor - and their
+	// reasoning is superseded by Qwen3.5 9B/27B (MTP), which reason AND call tools at the same tier.
 
 	// ---- Tier 3: 32 GB+ (power users) ----
 	// SUPERSEDED (commented out 2026-07): Devstral Small 2507 -> Devstral Small 2 (2512). Uncomment to restore.
@@ -591,20 +590,8 @@ export const LOCOPILOT_DEFAULT_CATALOG: readonly ICatalogModel[] = [
 		tier: '32 GB+',
 		contextWindow: 262144,
 	},
-	{
-		catalogId: 'mistral-small-24b-gguf',
-		displayName: 'Mistral Small 24B',
-		vendor: 'Mistral',
-		blurb: 'Capable general-purpose model with a permissive license.',
-		repoId: 'bartowski/Mistral-Small-24B-Instruct-2501-GGUF',
-		supportsVision: false,
-		format: 'Q4_K_M',
-		engine: 'gguf',
-		approxSizeBytes: Math.round(14 * GB),
-		minRamGB: 32,
-		tier: '32 GB+',
-		contextWindow: 32768,
-	},
+	// REMOVED (2026-07): Mistral Small 24B Instruct 2501 (Jan 2025, 32K ctx) - Devstral Small 2 24B above is
+	// the same size from the same vendor with 262K context and a newer training run.
 	// SUPERSEDED (commented out 2026-06): Qwen3 32B (MLX) -> Qwen3.6 27B. Uncomment to restore.
 	/*
 	{
@@ -623,24 +610,6 @@ export const LOCOPILOT_DEFAULT_CATALOG: readonly ICatalogModel[] = [
 		contextWindow: 32768,
 	},
 	*/
-	{
-		catalogId: 'deepseek-r1-distill-32b-gguf',
-		displayName: 'DeepSeek-R1 Distill 32B',
-		vendor: 'DeepSeek',
-		blurb: 'Strongest distilled reasoner that still runs on a single machine.',
-		repoId: 'unsloth/DeepSeek-R1-Distill-Qwen-32B-GGUF',
-		supportsVision: false,
-		format: 'Q4_K_M',
-		engine: 'gguf',
-		approxSizeBytes: Math.round(20 * GB),
-		minRamGB: 32,
-		tier: '32 GB+',
-		useNativeTools: false,
-		contextWindow: 131072,
-		draftRepoId: 'unsloth/DeepSeek-R1-Distill-Qwen-1.5B-GGUF',
-		draftFormat: 'Q4_K_M',
-	},
-
 	// ---- Tier 4: prior-gen Qwen3 MoE (fast, only ~3B active) - both formats ----
 	// SUPERSEDED (commented out 2026-06): Qwen3 30B-A3B (GGUF + MLX) -> Qwen3.6 35B-A3B (and MTP twin).
 	// Uncomment to restore.
@@ -831,124 +800,297 @@ export const LOCOPILOT_DEFAULT_CATALOG: readonly ICatalogModel[] = [
 	},
 
 	// =========================================================================================
-	// Dedicated code models (2026 additions): widen provider + size variety across RAM tiers.
-	// Mistral Codestral (FIM autocomplete), DeepSeek-Coder-V2-Lite (light MoE), BigCode StarCoder2
-	// ladder, plus Microsoft Phi-4 full and 01.AI Yi-Coder for extra provider coverage. Repo ids
-	// verified as public HuggingFace GGUF repos.
+	// REMOVED (2026-07): the "dedicated code models" block that used to sit here - BigCode StarCoder2
+	// 3B/7B/15B (Mar 2024, 16K ctx), DeepSeek-Coder-V2-Lite (Jun 2024), Mistral Codestral 22B v0.1
+	// (Jun 2024, non-commercial MNPL), Microsoft Phi-4 14B (Jan 2025, 16K ctx) and 01.AI Yi-Coder 9B
+	// (Sep 2024). All were 2024/early-2025 checkpoints whose upstreams have shipped no successor; each
+	// is beaten at its own size by a current-gen entry above (Qwen3.5 2B/4B/9B MTP, Ornith 1.0 9B/35B,
+	// Devstral Small 2 24B, GLM-4.7-Flash). Phi-4 *mini* is deliberately KEPT above as the universal
+	// 8 GB fallback - nothing else in the catalog fills that "always works anywhere" role.
 	// =========================================================================================
 
-	// ---- StarCoder2 (BigCode) - fully-open code models; 3B/7B are base completion (great for FIM) ----
+	// =========================================================================================
+	// July 2026 additions. Repo ids, on-disk Q4 sizes, context windows and licenses verified against
+	// the HuggingFace API. Every entry ships a plain or UD- `Q4_K_M` weight file, so `format: 'Q4_K_M'`
+	// resolves via pickBestGGUFFile's substring match (a repo with only `Q4_K_XL` would NOT - it would
+	// fall through the quant priority list, so do not copy this format onto a QAT-style repo).
+	// =========================================================================================
+
+	// ---- Ornith 1.0 (DeepReinforce) - MIT-licensed agentic coders that learn their own RL scaffold ----
 	{
-		catalogId: 'starcoder2-3b-gguf',
-		displayName: 'StarCoder2 3B',
-		vendor: 'BigCode',
-		blurb: 'Tiny fully-open code model; strong fill-in-the-middle completion. Runs on 8 GB.',
-		repoId: 'second-state/StarCoder2-3B-GGUF',
+		catalogId: 'ornith-1_0-9b-gguf',
+		displayName: 'Ornith 1.0 9B',
+		vendor: 'DeepReinforce',
+		blurb: 'Agentic coder punching far above 9B (69.4 SWE-bench Verified); MIT. Best pick for 16 GB.',
+		repoId: 'unsloth/Ornith-1.0-9B-GGUF',
+		supportsVision: true,
+		format: 'Q4_K_M',
+		engine: 'gguf',
+		approxSizeBytes: Math.round(5.31 * GB),
+		minRamGB: 16,
+		tier: '16 GB',
+		contextWindow: 262144,
+	},
+	{
+		catalogId: 'ornith-1_0-35b-gguf',
+		displayName: 'Ornith 1.0 35B MoE',
+		vendor: 'DeepReinforce',
+		blurb: 'MoE agentic coder; 64.2 Terminal-Bench 2.1, ahead of far larger models. MIT.',
+		repoId: 'unsloth/Ornith-1.0-35B-GGUF',
+		supportsVision: true,
+		format: 'Q4_K_M',
+		engine: 'gguf',
+		approxSizeBytes: Math.round(20.61 * GB),
+		minRamGB: 32,
+		tier: '32 GB+',
+		contextWindow: 262144,
+	},
+
+	// ---- North Mini Code 1.0 (Cohere) - dedicated coder MoE with a 500K window ----
+	{
+		catalogId: 'north-mini-code-1_0-gguf',
+		displayName: 'North Mini Code 1.0',
+		vendor: 'Cohere',
+		blurb: 'Cohere coder MoE with a 500K context window; Apache 2.0. Fits 32 GB.',
+		repoId: 'unsloth/North-Mini-Code-1.0-GGUF',
 		supportsVision: false,
 		format: 'Q4_K_M',
 		engine: 'gguf',
-		approxSizeBytes: Math.round(1.9 * GB),
+		approxSizeBytes: Math.round(17.88 * GB),
+		minRamGB: 32,
+		tier: '32 GB+',
+		contextWindow: 500000,
+		defaultHidden: true,
+	},
+
+	// ---- Laguna XS 2.1 (poolside) - coder-first model, OpenMDW license ----
+	{
+		catalogId: 'laguna-xs-2_1-gguf',
+		displayName: 'Laguna XS 2.1',
+		vendor: 'poolside',
+		blurb: 'Coding-first model from poolside; 262K context. Fits 32 GB.',
+		repoId: 'poolside/Laguna-XS-2.1-GGUF',
+		supportsVision: false,
+		format: 'Q4_K_M',
+		engine: 'gguf',
+		approxSizeBytes: Math.round(18.88 * GB),
+		minRamGB: 32,
+		tier: '32 GB+',
+		contextWindow: 262144,
+		defaultHidden: true,
+	},
+
+	// ---- Granite 4.1 ladder (IBM) - 3B and 30B siblings of the 8B already seeded above ----
+	{
+		catalogId: 'granite-4_1-3b-gguf',
+		displayName: 'Granite 4.1 3B',
+		vendor: 'IBM',
+		blurb: 'Tiny IBM Granite; solid tool-calling in under 2 GB. Runs on 8 GB.',
+		repoId: 'unsloth/granite-4.1-3b-GGUF',
+		supportsVision: false,
+		format: 'Q4_K_M',
+		engine: 'gguf',
+		approxSizeBytes: Math.round(1.96 * GB),
 		minRamGB: 8,
 		tier: '8 GB',
-		contextWindow: 16384,
-		defaultHidden: true,
-	},
-	{
-		catalogId: 'starcoder2-7b-gguf',
-		displayName: 'StarCoder2 7B',
-		vendor: 'BigCode',
-		blurb: 'Mid-size fully-open code model; base completion / FIM. Fits 16 GB.',
-		repoId: 'second-state/StarCoder2-7B-GGUF',
-		supportsVision: false,
-		format: 'Q4_K_M',
-		engine: 'gguf',
-		approxSizeBytes: Math.round(4.3 * GB),
-		minRamGB: 16,
-		tier: '16 GB',
-		contextWindow: 16384,
-		defaultHidden: true,
-	},
-	{
-		catalogId: 'starcoder2-15b-instruct-gguf',
-		displayName: 'StarCoder2 15B',
-		vendor: 'BigCode',
-		blurb: 'Self-aligned instruct code model, permissive & transparent pipeline; 600+ languages.',
-		repoId: 'bartowski/starcoder2-15b-instruct-GGUF',
-		supportsVision: false,
-		format: 'Q4_K_M',
-		engine: 'gguf',
-		approxSizeBytes: Math.round(9.6 * GB),
-		minRamGB: 16,
-		tier: '16 GB',
-		contextWindow: 16384,
-		defaultHidden: true,
-	},
-
-	// ---- DeepSeek-Coder-V2-Lite (DeepSeek) - 16B MoE, ~2.4B active: fast, low-RAM friendly ----
-	{
-		catalogId: 'deepseek-coder-v2-lite-gguf',
-		displayName: 'DeepSeek-Coder-V2-Lite 16B MoE',
-		vendor: 'DeepSeek',
-		blurb: 'MoE coder (16B total, ~2.4B active - fast); strong code + FIM. Fits 16 GB.',
-		repoId: 'bartowski/DeepSeek-Coder-V2-Lite-Instruct-GGUF',
-		supportsVision: false,
-		format: 'Q4_K_M',
-		engine: 'gguf',
-		approxSizeBytes: Math.round(10.4 * GB),
-		minRamGB: 16,
-		tier: '16 GB',
-		contextWindow: 163840,
-		defaultHidden: true,
-	},
-
-	// ---- Codestral 22B (Mistral) - best fill-in-the-middle / autocomplete; 80+ languages ----
-	{
-		catalogId: 'codestral-22b-gguf',
-		displayName: 'Codestral 22B',
-		vendor: 'Mistral',
-		blurb: 'Purpose-built coder; best fill-in-the-middle autocomplete, 80+ languages.',
-		repoId: 'bartowski/Codestral-22B-v0.1-GGUF',
-		supportsVision: false,
-		format: 'Q4_K_M',
-		engine: 'gguf',
-		approxSizeBytes: Math.round(13.3 * GB),
-		minRamGB: 24,
-		tier: '32 GB+',
-		contextWindow: 32768,
-		defaultHidden: true,
-	},
-
-	// ---- Phi-4 14B (Microsoft) - full model (you already ship the mini) ----
-	{
-		catalogId: 'phi-4-14b-gguf',
-		displayName: 'Phi-4 14B',
-		vendor: 'Microsoft',
-		blurb: 'Microsoft Phi-4 (14B); strong reasoning + code for its size. Fits 16 GB.',
-		repoId: 'unsloth/phi-4-GGUF',
-		supportsVision: false,
-		format: 'Q4_K_M',
-		engine: 'gguf',
-		approxSizeBytes: Math.round(9 * GB),
-		minRamGB: 16,
-		tier: '16 GB',
-		contextWindow: 16384,
-		defaultHidden: true,
-	},
-
-	// ---- Yi-Coder 9B (01.AI) - extra provider variety; 128K context ----
-	{
-		catalogId: 'yi-coder-9b-chat-gguf',
-		displayName: 'Yi-Coder 9B',
-		vendor: '01.AI',
-		blurb: 'Compact 01.AI coder with 128K context; good repo-level tasks. Fits 16 GB.',
-		repoId: 'bartowski/Yi-Coder-9B-Chat-GGUF',
-		supportsVision: false,
-		format: 'Q4_K_M',
-		engine: 'gguf',
-		approxSizeBytes: Math.round(5 * GB),
-		minRamGB: 16,
-		tier: '16 GB',
 		contextWindow: 131072,
+		defaultHidden: true,
+	},
+	{
+		catalogId: 'granite-4_1-30b-gguf',
+		displayName: 'Granite 4.1 30B',
+		vendor: 'IBM',
+		blurb: 'Largest IBM Granite 4.1; enterprise tasks + tool calling. Fits 32 GB.',
+		repoId: 'unsloth/granite-4.1-30b-GGUF',
+		supportsVision: false,
+		format: 'Q4_K_M',
+		engine: 'gguf',
+		approxSizeBytes: Math.round(16.29 * GB),
+		minRamGB: 32,
+		tier: '32 GB+',
+		contextWindow: 131072,
+		defaultHidden: true,
+	},
+
+	// ---- Nemotron 3 Nano 4B (NVIDIA) - small text-only sibling of the Nano-Omni entry above ----
+	{
+		catalogId: 'nemotron-3-nano-4b-gguf',
+		displayName: 'Nemotron 3 Nano 4B',
+		vendor: 'NVIDIA',
+		blurb: 'Compact NVIDIA reasoner (hybrid Mamba-Transformer); 262K context. Runs on 8 GB.',
+		repoId: 'unsloth/NVIDIA-Nemotron-3-Nano-4B-GGUF',
+		supportsVision: false,
+		format: 'Q4_K_M',
+		engine: 'gguf',
+		approxSizeBytes: Math.round(2.7 * GB),
+		minRamGB: 8,
+		tier: '8 GB',
+		contextWindow: 262144,
+		defaultHidden: true,
+	},
+
+	// =========================================================================================
+	// Apple Silicon (MLX) twins, July 2026. Before this block the ONLY MLX entries were the two
+	// 32 GB+ ones above, so every 8/16 GB Apple Silicon machine - i.e. most MacBook Airs - silently
+	// fell back to llama.cpp and lost the MLX speedup. These fill the 8 GB and 16 GB rungs.
+	//
+	// SUPPORT WAS VERIFIED, NOT ASSUMED: mlx-lm dispatches on config.json `model_type` (via
+	// mlx_lm.utils.MODEL_REMAPPING -> `mlx_lm.models.<type>`), NOT on `architectures`. Every entry
+	// below resolves to a module present in the bundled mlx-lm (0.31.3): `qwen3_5`, `qwen3_5_moe`,
+	// `gemma4`, `granite`, `glm4_moe_lite`. That is why the "no MLX twin, mlx-lm cannot load it"
+	// notes further up are obsolete for Qwen3.6 and Gemma 4 - they predate those modules.
+	//
+	// DELIBERATELY ABSENT (checked, and they genuinely fail):
+	//  - Gemma 4 *12B* MLX and every Gemma 4 *QAT* MLX build -> `model_type: gemma4_unified`, which
+	//    mlx-lm 0.31.3 has no module for ("Model type gemma4_unified not supported"). Note 26B/31B
+	//    are plain `gemma4` and would work; only 12B and the QAT line are unified builds.
+	//  - North Mini Code 1.0 MLX -> `cohere2_moe`, likewise absent. It stays GGUF-only above.
+	//
+	// mlx-lm is a TEXT-only engine: it loads the language tower and ignores the vision one, so these
+	// carry supportsVision: false even where the checkpoint itself is multimodal.
+	//
+	// Draft pairing: every `qwen3_5*` entry here shares one tokenizer (vocab_size 248320, verified
+	// across all six repos), so Qwen3.5 0.8B (0.61 GB) is a safe `--draft-model` for them. It is
+	// paired only where the target/draft size ratio clears ~8x - below that the doc comment on
+	// draftRepoId says the speedup stops paying for the RAM, which is why 4B has no pairing.
+	// =========================================================================================
+
+	// ---- 8 GB tier ----
+	{
+		catalogId: 'qwen35-4b-mlx',
+		displayName: 'Qwen3.5 4B (MLX)',
+		vendor: 'Alibaba (Qwen)',
+		blurb: 'The picker-floor model tuned for Apple Silicon via MLX - fastest small option on M-series.',
+		repoId: 'mlx-community/Qwen3.5-4B-MLX-4bit',
+		supportsVision: false,
+		format: 'mlx',
+		engine: 'mlx',
+		approxSizeBytes: Math.round(2.85 * GB),
+		minRamGB: 8,
+		tier: '8 GB',
+		requiresAppleSilicon: true,
+		contextWindow: 262144,
+	},
+	{
+		catalogId: 'gemma4-e4b-mlx',
+		displayName: 'Gemma 4 E4B (MLX)',
+		vendor: 'Google',
+		blurb: 'Latest small Gemma tuned for Apple Silicon via MLX (text-only build).',
+		repoId: 'mlx-community/gemma-4-e4b-it-4bit',
+		supportsVision: false,
+		format: 'mlx',
+		engine: 'mlx',
+		// 4.82 GB of weights is a tight-but-runnable fit on an 8 GB Mac (its GGUF twin is 3.0 GB). Kept at
+		// the twin's tier on purpose: the launch fit gate and OOM ladder are what guard this case, and
+		// raising minRamGB would falsely mark a runnable model 'too-big' and hide it from Auto.
+		approxSizeBytes: Math.round(4.82 * GB),
+		minRamGB: 8,
+		tier: '8 GB',
+		requiresAppleSilicon: true,
+		contextWindow: 131072,
+	},
+
+	// ---- 16 GB tier ----
+	{
+		catalogId: 'ornith-1_0-9b-mlx',
+		displayName: 'Ornith 1.0 9B (MLX)',
+		vendor: 'DeepReinforce',
+		blurb: 'Best 16 GB coder, tuned for Apple Silicon via MLX - 30-50% faster on M-series chips.',
+		repoId: 'mlx-community/Ornith-1.0-9B-4bit',
+		supportsVision: false,
+		format: 'mlx',
+		engine: 'mlx',
+		approxSizeBytes: Math.round(5.57 * GB),
+		minRamGB: 16,
+		tier: '16 GB',
+		requiresAppleSilicon: true,
+		contextWindow: 262144,
+		draftRepoId: 'mlx-community/Qwen3.5-0.8B-MLX-4bit',
+		draftFormat: 'mlx',
+	},
+	{
+		catalogId: 'qwen35-9b-mlx',
+		displayName: 'Qwen3.5 9B (MLX)',
+		vendor: 'Alibaba (Qwen)',
+		blurb: 'The 16 GB recommended model tuned for Apple Silicon via MLX.',
+		repoId: 'mlx-community/Qwen3.5-9B-MLX-4bit',
+		supportsVision: false,
+		format: 'mlx',
+		engine: 'mlx',
+		approxSizeBytes: Math.round(5.57 * GB),
+		minRamGB: 16,
+		tier: '16 GB',
+		requiresAppleSilicon: true,
+		contextWindow: 262144,
+		draftRepoId: 'mlx-community/Qwen3.5-0.8B-MLX-4bit',
+		draftFormat: 'mlx',
+	},
+	{
+		catalogId: 'granite-4_1-8b-mlx',
+		displayName: 'Granite 4.1 8B (MLX)',
+		vendor: 'IBM',
+		blurb: 'IBM Granite 4.1 tuned for Apple Silicon via MLX; strong tool calling.',
+		repoId: 'mlx-community/granite-4.1-8b-4bit',
+		supportsVision: false,
+		format: 'mlx',
+		engine: 'mlx',
+		approxSizeBytes: Math.round(4.89 * GB),
+		minRamGB: 16,
+		tier: '16 GB',
+		requiresAppleSilicon: true,
+		contextWindow: 131072,
+		defaultHidden: true,
+	},
+
+	// ---- 32 GB+ tier ----
+	{
+		catalogId: 'qwen36-27b-mlx',
+		displayName: 'Qwen3.6 27B (MLX)',
+		vendor: 'Alibaba (Qwen)',
+		blurb: 'Latest top dense coder tuned for Apple Silicon via MLX.',
+		repoId: 'mlx-community/Qwen3.6-27B-4bit',
+		supportsVision: false,
+		format: 'mlx',
+		engine: 'mlx',
+		approxSizeBytes: Math.round(14.98 * GB),
+		minRamGB: 32,
+		tier: '32 GB+',
+		requiresAppleSilicon: true,
+		contextWindow: 262144,
+		draftRepoId: 'mlx-community/Qwen3.5-0.8B-MLX-4bit',
+		draftFormat: 'mlx',
+	},
+	{
+		catalogId: 'qwen36-35b-a3b-mlx',
+		displayName: 'Qwen3.6 35B-A3B MoE (MLX)',
+		vendor: 'Alibaba (Qwen)',
+		blurb: 'Latest Qwen MoE (~3B active - fast) tuned for Apple Silicon via MLX.',
+		repoId: 'mlx-community/Qwen3.6-35B-A3B-4bit',
+		supportsVision: false,
+		format: 'mlx',
+		engine: 'mlx',
+		approxSizeBytes: Math.round(19.03 * GB),
+		minRamGB: 32,
+		tier: '32 GB+',
+		requiresAppleSilicon: true,
+		contextWindow: 262144,
+		draftRepoId: 'mlx-community/Qwen3.5-0.8B-MLX-4bit',
+		draftFormat: 'mlx',
+	},
+	{
+		catalogId: 'glm-4_7-flash-mlx',
+		displayName: 'GLM-4.7-Flash (MLX)',
+		vendor: 'Zhipu (GLM)',
+		blurb: 'Fast coding MoE tuned for Apple Silicon via MLX.',
+		repoId: 'mlx-community/GLM-4.7-Flash-4bit',
+		supportsVision: false,
+		format: 'mlx',
+		engine: 'mlx',
+		approxSizeBytes: Math.round(15.71 * GB),
+		minRamGB: 32,
+		tier: '32 GB+',
+		requiresAppleSilicon: true,
+		contextWindow: 202752,
 		defaultHidden: true,
 	},
 ];
@@ -991,6 +1133,19 @@ const DEFAULT_VISIBLE_CATALOG_IDS: ReadonlySet<string> = new Set([
 	'qwen35-9b-mtp-gguf',
 	'qwen36-35b-a3b-gguf',
 	'gemma4-e4b-gguf',
+	// 16 GB tier: the strongest coder that fits there (69.4 SWE-bench Verified at 5.3 GB Q4), so it is
+	// visible rather than buried behind Show - a hidden entry is effectively an entry nobody finds.
+	'ornith-1_0-9b-gguf',
+	// The catalog's most-downloaded repo (~1.42M): Qwen3.6 27B with MTP speculative decoding.
+	'qwen36-27b-mtp-gguf',
+	// Apple Silicon: one MLX pick per tier so an M-series machine always sees a native-engine option
+	// in the picker (the rest of the MLX set is seeded hidden and surfaced via Show).
+	'qwen35-4b-mlx',
+	'gemma4-e4b-mlx',
+	'ornith-1_0-9b-mlx',
+	'qwen35-9b-mlx',
+	'qwen36-27b-mlx',
+	'qwen36-35b-a3b-mlx',
 	// 32 GB+ tier: the curated "Best for you" pick (dedicated coder MoE), visible so it shows badged in the picker.
 	'qwen3-coder-30b-a3b-gguf',
 	// 64 GB+ tier: the curated "Best for you" pick, visible so workstation users see it badged in the picker.
@@ -1019,7 +1174,10 @@ export function getDefaultPickerRepoId(ramGB: number): string {
 		return 'unsloth/Qwen3.6-27B-GGUF'; // 32 GB-tier flagship on a 64 GB+ workstation: comfortable headroom.
 	}
 	if (ramGB >= 32) {
-		return 'unsloth/gemma-4-12b-it-GGUF'; // 16 GB-tier model on a 32 GB+ machine: comfortable headroom.
+		// 16 GB-tier model on a 32 GB+ machine: comfortable headroom. Must track the catalog entry's repoId
+		// exactly (the provider matches on it to flag the picker default), so this moved to the QAT repo
+		// along with the entry itself.
+		return 'unsloth/gemma-4-12b-it-qat-GGUF';
 	}
 	// 16 GB and 8 GB machines (and unknown RAM) both land on the floor: tiny, fast, always-works.
 	return DEFAULT_PICKER_FLOOR_REPO_ID;
