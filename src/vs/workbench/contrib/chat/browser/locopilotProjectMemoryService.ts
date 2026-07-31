@@ -206,7 +206,9 @@ export class LoCoPilotProjectMemoryService implements ILoCoPilotProjectMemorySer
 		if (!tree) {
 			return undefined;
 		}
-		return `# WORKSPACE STRUCTURE (live view - reflects the latest files; may change as you edit)\n\`\`\`\n${tree}\n\`\`\``;
+		// Deliberately not a markdown heading: this block is nested inside the turn's <editor_context>
+		// wrapper, and an H1 in there reads as a new top-level section to a small model.
+		return `**Workspace structure** (live view - reflects the latest files; may change as you edit):\n\`\`\`\n${tree}\n\`\`\``;
 	}
 
 	// ---- Phase 1: memory file ------------------------------------------------

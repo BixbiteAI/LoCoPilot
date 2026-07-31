@@ -42,7 +42,8 @@ import { ITimerService } from '../../../../services/timer/browser/timerService.j
 import { LOCOPILOT_SETTINGS_SECTION_LIST_MODELS } from '../chatManagement/locopilotSettingsEditorInput.js';
 import { IFileService } from '../../../../../platform/files/common/files.js';
 import { ITextModelService } from '../../../../../editor/common/services/resolverService.js';
-import { basename, relativePath } from '../../../../../base/common/resources.js';
+import { basename, isEqual, relativePath } from '../../../../../base/common/resources.js';
+import { Schemas } from '../../../../../base/common/network.js';
 import { VSBuffer } from '../../../../../base/common/buffer.js';
 import { IEditorService } from '../../../../services/editor/common/editorService.js';
 import { ICodeEditorService } from '../../../../../editor/browser/services/codeEditorService.js';
@@ -927,6 +928,17 @@ function isSystemNotice(value: string): boolean {
 	return value.startsWith(LOCOPILOT_SYSTEM_NOTICE_SENTINEL);
 }
 
+/**
+ * Whether a URI is a file the user would actually call "open" - something on disk (or an unsaved
+ * buffer destined for disk). The editor list is full of inputs that are not that: LoCoPilot Settings
+ * and other workbench editors carry no resource at all, while Output (`output:`), the settings JSON
+ * (`vscode-userdata:`), walkthroughs and webviews carry synthetic ones. Reporting any of those as an
+ * open file misleads the model - small models in particular then try to read or reason about them.
+ */
+function isUserFileResource(uri: URI): boolean {
+	return uri.scheme === Schemas.file || uri.scheme === Schemas.vscodeRemote || uri.scheme === Schemas.untitled;
+}
+
 // ---- Download prompt helpers (module-level so they can be used without a class instance) ----------
 
 /** Human-readable size string from a byte count. */
@@ -1530,7 +1542,7 @@ Preserve: key facts, decisions, code changes, file names and paths, user prefere
 
 		if (activeEditor && activeEditorInput) {
 			const uri = activeEditorInput.resource;
-			if (uri) {
+			if (uri && isUserFileResource(uri)) {
 				context += `\n**Active File:** \`${uri.fsPath}\`\n`;
 
 				// Get cursor position
@@ -1559,23 +1571,37 @@ Preserve: key facts, decisions, code changes, file names and paths, user prefere
 			}
 		}
 
-		// Get all open editors
-		const editors = this.editorService.editors;
-		if (editors.length > 0) {
-			context += `\n**Open Files (${editors.length}):**\n`;
-			const filesToShow = editors.slice(0, 10); // Limit to 10 files
-			for (const editor of filesToShow) {
-				if (editor.resource) {
-					const fileName = basename(editor.resource);
-					context += `- \`${fileName}\``;
-					if (editor.resource === activeEditorInput?.resource) {
-						context += ` *(active)*`;
-					}
-					context += `\n`;
-				}
+		// Get all open editors. Only real, on-disk (or unsaved) files count: the editor list also holds
+		// inputs the user would never call "an open file" - LoCoPilot Settings, Output, the settings JSON
+		// (vscode-userdata:), walkthroughs, diff/merge parts. Filtering BEFORE counting is what matters:
+		// the header used to be printed from the unfiltered length while the bullets were filtered, so
+		// opening LoCoPilot Settings alone produced "**Open Files (1):**" with an empty list - and a small
+		// model then read whatever text followed (the user's own message) as the missing filename.
+		const openFileUris: URI[] = [];
+		const seenUris = new Set<string>();
+		for (const editor of this.editorService.editors) {
+			const uri = editor.resource;
+			if (!uri || !isUserFileResource(uri)) {
+				continue;
 			}
-			if (editors.length > 10) {
-				context += `*... and ${editors.length - 10} more files*\n`;
+			// The same file split across two groups is two inputs - list it once.
+			const key = uri.toString();
+			if (seenUris.has(key)) {
+				continue;
+			}
+			seenUris.add(key);
+			openFileUris.push(uri);
+		}
+
+		if (openFileUris.length > 0) {
+			context += `\n**Open Files (${openFileUris.length}):**\n`;
+			for (const uri of openFileUris.slice(0, 10)) { // Limit to 10 files
+				// isEqual, not ===: the same file in another group is a different URI instance.
+				const active = isEqual(uri, activeEditorInput?.resource) ? ` *(active)*` : ``;
+				context += `- \`${basename(uri)}\`${active}\n`;
+			}
+			if (openFileUris.length > 10) {
+				context += `*... and ${openFileUris.length - 10} more files*\n`;
 			}
 		}
 
@@ -2138,6 +2164,10 @@ Focus on making the exact changes requested while preserving code structure and 
 
 		// 3. Add current request with variables
 		const currentContent: IChatMessage['content'] = [];
+		// Set once an ambient block is prepended: the user's message then needs its own delimiter so it
+		// cannot be read as a continuation of that block. Left false when nothing is prepended, so a plain
+		// chat turn keeps going over the wire as bare text.
+		let wrappedUserRequest = false;
 
 		// Volatile editor context (open files, active file, cursor, selection) lives in the CURRENT
 		// user turn - NOT the system prompt - so it never busts the cached system+tools prefix. It is
@@ -2155,10 +2185,16 @@ Focus on making the exact changes requested while preserving code structure and 
 			]);
 			const ambient = [gitSnapshot, structureTree, editorContext.trim() ? editorContext : undefined].filter(Boolean).join('\n\n');
 			if (ambient) {
+				// Delimit with an explicit closing tag rather than a markdown heading. All text parts of a
+				// user turn are flattened with a single "\n" before they hit the wire, so a heading-only
+				// opener left the user's message sitting directly under the block's last line - e.g. right
+				// beneath "**Open Files (N):**", where a short message reads exactly like a filename bullet.
+				// A closed tag gives the model an unambiguous end marker; small models rely on it.
 				currentContent.push({
 					type: 'text',
-					value: `# CURRENT EDITOR CONTEXT (ambient reference only - the user's request below is the task)\n${ambient}`
+					value: `<editor_context>\nAmbient reference only - this is the state of the user's workspace, NOT the task. The task is the text inside <user_request> below.\n\n${ambient}\n</editor_context>`
 				});
+				wrappedUserRequest = true;
 			}
 		}
 
@@ -2169,7 +2205,10 @@ Focus on making the exact changes requested while preserving code structure and 
 		}
 
 		// Add the actual message text (kept last so the user's request is what the model focuses on)
-		currentContent.push({ type: 'text', value: request.message });
+		currentContent.push({
+			type: 'text',
+			value: wrappedUserRequest ? `<user_request>\n${request.message}\n</user_request>` : request.message
+		});
 
 		messages.push({
 			role: ChatMessageRole.User,
