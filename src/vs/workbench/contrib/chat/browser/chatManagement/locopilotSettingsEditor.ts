@@ -2559,7 +2559,9 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 	 */
 	private isRecommendedForSystem(model: ICustomLanguageModel): boolean {
 		const ramGB = this.detectedRamGB();
-		return ramGB > 0 && model.modelName === getRecommendedRepoId(ramGB);
+		// Same inputs as the chat picker's badge (see modelPickerActionItem): identical RAM figure AND the
+		// runner's shared hardware profile, so the two surfaces cannot disagree about what is "best".
+		return ramGB > 0 && model.modelName === getRecommendedRepoId(ramGB, this.localModelRunner.getHardwareProfile());
 	}
 
 	private renderSelectedSection(): void {

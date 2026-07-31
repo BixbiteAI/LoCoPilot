@@ -37,7 +37,7 @@ import { IChatRequestToolEntry, IChatRequestVariableEntry, isPromptFileVariableE
 import { ChatAgentLocation, ChatConfiguration, ChatModeKind } from '../../common/constants.js';
 import { ChatMessageRole, IChatMessage, ILanguageModelsService } from '../../common/languageModels.js';
 import { ICustomLanguageModelsService, ICustomLanguageModel, getCustomModelListLabel, needsDownloadOrPullRetry, LOCOPILOT_AUTO_MODEL_ID } from '../../common/customLanguageModelsService.js';
-import { findCatalogEntry, getAutoStarterPicks, resolveAutoModelPinned, IAutoStarterPick } from '../locopilotModelCatalog.js';
+import { findCatalogEntry, getAutoStarterPicks, resolveAutoModelPinned, IAutoStarterPick, type IHardwareProfile } from '../locopilotModelCatalog.js';
 import { ITimerService } from '../../../../services/timer/browser/timerService.js';
 import { LOCOPILOT_SETTINGS_SECTION_LIST_MODELS } from '../chatManagement/locopilotSettingsEditorInput.js';
 import { IFileService } from '../../../../../platform/files/common/files.js';
@@ -1006,7 +1006,7 @@ function buildDownloadPromptMarkdown(model: Parameters<typeof getCustomModelList
  * download is already running show live progress instead of the Download link. Picks whose seeded model
  * record was deleted by the user are skipped; if none remain, fall back to pointing at the model list.
  */
-function buildAutoStarterPicksMarkdown(ramGB: number, allModels: readonly ICustomLanguageModel[]): MarkdownString {
+function buildAutoStarterPicksMarkdown(ramGB: number, allModels: readonly ICustomLanguageModel[], profile?: IHardwareProfile): MarkdownString {
 	const openModelList = createMarkdownCommandLink({
 		title: 'Open Model List',
 		id: 'workbench.action.chat.openLoCoPilotSettings',
@@ -1016,7 +1016,7 @@ function buildAutoStarterPicksMarkdown(ramGB: number, allModels: readonly ICusto
 	// Match each pick to its seeded model record (the download command needs the stored model id). Seeded
 	// models store the catalog repoId as modelName; match on that (format may have been enriched away).
 	const rows: { pick: IAutoStarterPick; model: ICustomLanguageModel }[] = [];
-	for (const pick of getAutoStarterPicks(ramGB)) {
+	for (const pick of getAutoStarterPicks(ramGB, profile)) {
 		const model = allModels.find(m => m.provider === 'huggingface' && m.modelName === pick.entry.repoId);
 		if (model && !model.localPath) {
 			rows.push({ pick, model });
@@ -1248,7 +1248,8 @@ export class LoCoPilotBuiltInAgent extends Disposable implements IChatAgentImple
 		return resolveAutoModelPinned(
 			this.customLanguageModelsService,
 			this._detectedRamGB(),
-			id => this.localModelRunner.isServerRunning(id) || this.localModelRunner.isServerStarting(id)
+			id => this.localModelRunner.isServerRunning(id) || this.localModelRunner.isServerStarting(id),
+			id => this.localModelRunner.getAutoPlan(id)
 		);
 	}
 
@@ -2319,7 +2320,7 @@ Message: ${firstMessage.substring(0, 500)}`;
 		if (modelId === LOCOPILOT_AUTO_MODEL_ID) {
 			const resolved = this._resolveAutoModel();
 			if (!resolved) {
-				progress([{ kind: 'markdownContent', content: buildAutoStarterPicksMarkdown(this._detectedRamGB(), this.customLanguageModelsService.getCustomModels()) }]);
+				progress([{ kind: 'markdownContent', content: buildAutoStarterPicksMarkdown(this._detectedRamGB(), this.customLanguageModelsService.getCustomModels(), this.localModelRunner.getHardwareProfile()) }]);
 				return {};
 			}
 			this._log(`[LoCoPilot] Auto resolved to model: ${getCustomModelListLabel(resolved)} (${resolved.id})`);

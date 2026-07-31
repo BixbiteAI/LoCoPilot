@@ -248,7 +248,7 @@ function isServerWarm(localModelRunner: ILoCoPilotLocalModelRunner): (id: string
  * pickAutoModelForPicker (below) and the request path commit.
  */
 function peekAutoModelForPicker(customLanguageModelsService: ICustomLanguageModelsService, localModelRunner: ILoCoPilotLocalModelRunner, timerService: ITimerService): ICustomLanguageModel | undefined {
-	return peekAutoModel(customLanguageModelsService, detectedRamGB(timerService), isServerWarm(localModelRunner));
+	return peekAutoModel(customLanguageModelsService, detectedRamGB(timerService), isServerWarm(localModelRunner), id => localModelRunner.getAutoPlan(id));
 }
 
 /**
@@ -257,7 +257,7 @@ function peekAutoModelForPicker(customLanguageModelsService: ICustomLanguageMode
  * Call only after the selection has been stored as Auto.
  */
 function pickAutoModelForPicker(customLanguageModelsService: ICustomLanguageModelsService, localModelRunner: ILoCoPilotLocalModelRunner, timerService: ITimerService): ICustomLanguageModel | undefined {
-	return resolveAutoModelPinned(customLanguageModelsService, detectedRamGB(timerService), isServerWarm(localModelRunner));
+	return resolveAutoModelPinned(customLanguageModelsService, detectedRamGB(timerService), isServerWarm(localModelRunner), id => localModelRunner.getAutoPlan(id));
 }
 
 /** Picker-button label for Auto: "Auto (<resolved model>)", or plain "Auto" when nothing is downloaded yet. */
@@ -295,7 +295,10 @@ function modelDelegateToWidgetActionsProvider(delegate: IModelPickerDelegate, te
 			// 16 GB, not Gemma 4 12B). Shared with the model-list editor via getRecommendedRepoId so both agree.
 			// This is the "best upgrade" signpost; the picker still AUTO-SELECTS the even-safer conservative default.
 			const ramGB = detectedRamGB(timerService);
-			const recommendedRepoId = getRecommendedRepoId(ramGB);
+			// Pass the runner's shared hardware profile so the badge is computed from the same GPU/VRAM/Metal
+			// facts as the model-list chip - and so a machine whose curated tier pick would NOT run comfortably
+			// here (discrete-GPU or CPU-only boxes especially) gets a recommendation that actually fits.
+			const recommendedRepoId = getRecommendedRepoId(ramGB, localModelRunner.getHardwareProfile());
 			const isBestForSystem = (m: ICustomLanguageModel): boolean => m.modelName === recommendedRepoId;
 			// Custom models are sourced here (not from delegate.getModels()), so locopilot vendor models are
 			// filtered out of the standard list below to avoid listing them twice. Use the VISIBLE set (not

@@ -435,7 +435,8 @@ export class LoCoPilotLanguageModelProvider extends Disposable implements ILangu
 				this.customLanguageModelsService.getCustomModels(),
 				ram,
 				isActive,
-				ceiling
+				ceiling,
+				id => this.localModelRunner.getAutoPlan(id)
 			);
 			if (!resolved) {
 				break;
@@ -450,8 +451,13 @@ export class LoCoPilotLanguageModelProvider extends Disposable implements ILangu
 			if (!entry) {
 				break; // shouldn't happen (isAutoCandidate requires a catalog entry), but don't spin
 			}
-			this._log(`[LoCoPilot Provider] Auto pick ${getCustomModelListLabel(resolved)} won't fit right now; stepping down below ~${(entry.approxSizeBytes / (1024 ** 3)).toFixed(1)}GB.`);
-			ceiling = entry.approxSizeBytes;
+			// Step down by what this copy ACTUALLY weighs when we've measured it: the catalog's nominal size can
+			// be ~2x off now that the download picker chooses the quant per machine, which would make the ladder
+			// skip candidates (ceiling too high) or strand itself on one (ceiling too low).
+			const measured = this.localModelRunner.getAutoPlan(resolved.id)?.weightBytes;
+			const stepBelow = measured && measured > 0 ? measured : entry.approxSizeBytes;
+			this._log(`[LoCoPilot Provider] Auto pick ${getCustomModelListLabel(resolved)} won't fit right now; stepping down below ~${(stepBelow / (1024 ** 3)).toFixed(1)}GB${measured ? ' (measured on disk)' : ''}.`);
+			ceiling = stepBelow;
 		}
 		if (smallest) {
 			this._log(`[LoCoPilot Provider] Auto: no pick fit cleanly; using smallest candidate ${getCustomModelListLabel(smallest)} (${smallest.id}) - the launch gate will offer "Run anyway".`);

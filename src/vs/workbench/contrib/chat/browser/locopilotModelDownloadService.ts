@@ -34,7 +34,7 @@ import { LOCOPILOT_SETTINGS_SECTION_LIST_MODELS } from './chatManagement/locopil
 import { usableSystemMemoryBytes, metalOffloadBudgetBytes, kvCacheBytesPerElem, kvPlanBytesPerElem, DEFAULT_KV_BYTES_PER_TOKEN_PER_LAYER_F16, RUNTIME_OVERHEAD_BYTES, TARGET_MIN_CONTEXT, MIN_CLAMPED_CONTEXT } from './locopilotLlamaCppServer.js';
 import { IConfigurationService } from '../../../../platform/configuration/common/configuration.js';
 import { ChatConfiguration } from '../common/constants.js';
-import { findDraftPairing } from './locopilotModelCatalog.js';
+import { findDraftPairing, estimateLayerCountFromModelName, modelParamsBillionsFromName } from './locopilotModelCatalog.js';
 import { ITerminalService, ITerminalInstance } from '../../terminal/browser/terminal.js';
 import { getBundledMlxPython } from './locopilotMlxServer.js';
 import { showTransientNotification } from './locopilotNotify.js';
@@ -191,46 +191,10 @@ function estimateLayerCountFromWeightBytes(weightBytes: number): number {
 	return 84;                                  // ~70B+
 }
 
-/** Transformer-layer count bucketed from a model's TOTAL parameter count (billions). Layers track a model's
- * DEPTH, which tracks total params for dense models and is the memory-safe over-estimate for MoE (whose depth
- * is lower than a dense model of the same total). Quant-INDEPENDENT, unlike the file-size fallback. */
-function estimateLayerCountFromParamsB(paramsB: number): number {
-	if (paramsB <= 1.5) { return 24; }
-	if (paramsB <= 4) { return 30; }
-	if (paramsB <= 9) { return 36; }
-	if (paramsB <= 16) { return 48; }
-	if (paramsB <= 40) { return 64; }
-	return 80;
-}
-
-/**
- * Approximate TOTAL parameter count (billions) parsed from a model name / repo id. Handles dense names
- * ("Qwen3-4B" -> 4), MoE names ("Qwen3.6-35B-A3B" -> 35 total, NOT the 3B active - KV scales with the model's
- * full transformer depth and the total is the memory-safe over-estimate), and Gemma effective sizes
- * ("gemma-4-E4B" -> 4). The active "A<n>B" token is deliberately ignored. Returns undefined when no size token
- * is present (e.g. "Phi-4-mini"), so callers fall back to the quant-dependent file-size bucket.
- */
-export function modelParamsBillionsFromName(name: string): number | undefined {
-	if (!name) {
-		return undefined;
-	}
-	// A standalone <N>B or E<N>B token at a word boundary; the leading 'A' of an active-param "A3B" tag is not
-	// in the boundary class, so active tokens never match - only total/dense sizes do.
-	const matches = [...name.matchAll(/(?:^|[-_/ ])E?(\d+(?:\.\d+)?)\s*B(?![a-z])/gi)];
-	if (matches.length === 0) {
-		return undefined;
-	}
-	// The total is the largest size token (an MoE's active "A<n>B" is always smaller and never matches anyway).
-	return Math.max(...matches.map(m => parseFloat(m[1])));
-}
-
-/** Layer count for a model from its NAME (params-based, quant-independent, MoE-aware), or undefined when the
- * name carries no size token. Preferred over {@link estimateLayerCountFromWeightBytes} because the same model's
- * higher-quant (larger) file must not be charged more KV layers than its lower-quant file. */
-export function estimateLayerCountFromModelName(name: string): number | undefined {
-	const paramsB = modelParamsBillionsFromName(name);
-	return paramsB !== undefined ? estimateLayerCountFromParamsB(paramsB) : undefined;
-}
+// Model-name -> params -> layer-count estimation lives in the catalog module, which is the lowest layer that
+// needs it (the "Best for you" recommendation sizes NOT-yet-downloaded models from their names). Re-exported
+// here so existing importers of this module keep working.
+export { modelParamsBillionsFromName, estimateLayerCountFromModelName };
 
 /**
  * The two service levels the download picker sizes a quant against. Weights are a PERMANENT choice while the KV

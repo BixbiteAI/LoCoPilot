@@ -4,6 +4,15 @@
  *--------------------------------------------------------------------------------------------*/
 
 import { ICustomLanguageModel, ICustomLanguageModelsService } from '../common/customLanguageModelsService.js';
+import {
+	metalOffloadBudgetBytes,
+	usableSystemMemoryBytes,
+	discreteVramBudgetBytes,
+	kvPlanBytesPerElem,
+	kvCacheBytesPerElem,
+	DEFAULT_KV_BYTES_PER_TOKEN_PER_LAYER_F16,
+	RUNTIME_OVERHEAD_BYTES,
+} from './locopilotLlamaCppServer.js';
 
 /**
  * Built-in model catalog: a curated set of local (HuggingFace) models that are seeded into a fresh
@@ -1030,7 +1039,62 @@ export function getDefaultPickerRepoId(ramGB: number): string {
  * Distinct from {@link getDefaultPickerRepoId}: that is the even-safer model AUTO-SELECTED on first run; this
  * is the recommended upgrade the badge points at. `ramGB <= 0` (RAM unknown) -> the safe small build.
  */
-export function getRecommendedRepoId(ramGB: number): string {
+export function getRecommendedRepoId(ramGB: number, profile?: IHardwareProfile): string {
+	const curated = curatedRecommendedRepoId(ramGB);
+	if (!profile || !(profile.totalRamBytes > 0)) {
+		return curated; // no hardware detail yet - the curated tier pick is the best guess we have.
+	}
+	const budget = inferenceBudgetBytes(profile);
+	if (!(budget > 0)) {
+		return curated;
+	}
+	// Does the curated pick actually run WELL here? The tier switch only knows total RAM, which is the wrong
+	// number on three common machines: a Mac (Metal wires ~66-75% of RAM), a PC with a discrete card (bounded by
+	// VRAM, and past it the driver OOMs rather than paging), and a CPU-only box (holds the weights, decodes far
+	// too slowly to be "best"). So verify the curated entry against the real budget and fall back to a ranked
+	// search when it does not clear the comfort bar.
+	// Walk the curated ladder DOWN from this machine's tier and take the first pick that genuinely runs
+	// comfortably here. Every rung is a hand-chosen, coder-oriented model, so descending the ladder keeps that
+	// judgement intact - which a size-ranked search does not: scored purely on bytes, a large general-purpose
+	// model outranks a smaller dedicated coder that is far better for this product's actual job.
+	for (const repoId of CURATED_RECOMMENDATION_LADDER) {
+		if (curatedRank(repoId) < curatedRank(curated)) {
+			continue; // above this machine's tier - never recommend upward
+		}
+		const entry = LOCOPILOT_DEFAULT_CATALOG.find(e => e.repoId === repoId && e.engine === 'gguf')
+			?? findCatalogEntryByRepoId(repoId);
+		if (entry && recommendationScore(entry, budget, profile) > 0
+			&& estimateCatalogContextTokens(entry, budget) >= AUTO_COMFORT_CONTEXT) {
+			return repoId;
+		}
+	}
+	// No curated pick clears the comfort bar (an unusual machine - tiny VRAM, CPU-only, or a raised Metal
+	// limit). Fall back to the widest catalog search so the badge still points somewhere runnable.
+	const ranked = rankRecommendations(budget, profile);
+	return ranked[0]?.repoId ?? curated;
+}
+
+/**
+ * The curated "Best for you" picks, most capable first - the ladder {@link getRecommendedRepoId} descends when
+ * a machine cannot comfortably run its nominal tier's pick. Every entry is chosen for coding work specifically
+ * (dedicated coders, then the strong general models), which is the judgement a size-based ranking loses.
+ */
+const CURATED_RECOMMENDATION_LADDER: readonly string[] = [
+	'unsloth/Qwen3-Coder-Next-GGUF',                    // 64 GB+ tier
+	'unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF',        // 32 GB+ tier
+	'unsloth/Qwen3.5-9B-MTP-GGUF',                      // 16 GB tier
+	DEFAULT_PICKER_FLOOR_REPO_ID,                       // 8 GB tier / floor
+];
+
+/** Position of a repo on the curated ladder; unknown ids sort to the bottom so they never block a descent. */
+function curatedRank(repoId: string): number {
+	const i = CURATED_RECOMMENDATION_LADDER.indexOf(repoId);
+	return i < 0 ? CURATED_RECOMMENDATION_LADDER.length : i;
+}
+
+/** The hand-curated pick per RAM tier - quality judgements (coder-tuned, MoE speed) that sizing can't derive.
+ * Kept as the PREFERENCE, applied only once the hardware check above confirms it runs comfortably here. */
+function curatedRecommendedRepoId(ramGB: number): string {
 	if (ramGB >= 64) {
 		return 'unsloth/Qwen3-Coder-Next-GGUF'; // flagship dense coder (~45 GB Q4); comfortable on 64 GB+.
 	}
@@ -1041,6 +1105,73 @@ export function getRecommendedRepoId(ramGB: number): string {
 		return 'unsloth/Qwen3.5-9B-MTP-GGUF'; // ~5.5 GB Q4; smooth on 16 GB alongside the editor.
 	}
 	return DEFAULT_PICKER_FLOOR_REPO_ID; // 8 GB / unknown: the tiny fast build is the comfortable best.
+}
+
+/**
+ * Weight (billions of ACTIVE parameters) above which a dense model is too slow to recommend on a CPU-only
+ * machine. MoE checkpoints activate a fraction of their weights per token, so they are judged on that fraction
+ * instead. Memory-fit alone would happily recommend a 30B dense model to a 32 GB CPU box that decodes it at
+ * single-digit tokens/second - runnable, but not anyone's "best".
+ */
+export const CPU_ONLY_MAX_ACTIVE_PARAMS_B = 9;
+
+/** Active parameters (billions) per token: the "A<n>B" tag for MoE checkpoints, else the full param count. */
+export function activeParamsBillions(entry: ICatalogModel): number | undefined {
+	const active = /-A(\d+(?:\.\d+)?)B/i.exec(entry.repoId) ?? /\bA(\d+(?:\.\d+)?)B\b/i.exec(entry.displayName);
+	if (active) {
+		return parseFloat(active[1]);
+	}
+	return modelParamsBillionsFromName(entry.displayName) ?? modelParamsBillionsFromName(entry.repoId);
+}
+
+/**
+ * How good a recommendation this entry is for the given machine. `0` = not recommendable at all (won't reach a
+ * usable window here, or is too slow for this backend); higher is better. Ranking is by achievable CONTEXT
+ * first, then curated quality signals - the same "runs well, not merely loads" bar the launch planner enforces.
+ */
+function recommendationScore(entry: ICatalogModel, budgetBytes: number, profile: IHardwareProfile): number {
+	if (entry.requiresAppleSilicon && !profile.isAppleSilicon) {
+		return 0;
+	}
+	const context = estimateCatalogContextTokens(entry, budgetBytes);
+	if (context <= 0) {
+		return 0; // cannot even reach the usability floor on this hardware
+	}
+	if (isCpuOnlyProfile(profile)) {
+		const active = activeParamsBillions(entry);
+		if (active !== undefined && active > CPU_ONLY_MAX_ACTIVE_PARAMS_B) {
+			return 0; // fits memory, decodes too slowly to call "best"
+		}
+	}
+	// Service level dominates: a comfortable window beats a bigger model stuck at the floor.
+	let score = (context >= AUTO_COMFORT_CONTEXT ? 2 : 1) * 1_000_000;
+	// Within a service level, prefer the more capable model - approximated by its published weight size, which
+	// is what the curated tiers already track.
+	score += Math.min(999, Math.round(entry.approxSizeBytes / GB)) * 1000;
+	if (entry.recommended) {
+		score += 500;
+	}
+	if (isMoEEntry(entry)) {
+		score += 300; // few active params per token: the best quality-per-second on any backend.
+	} else if (entry.mtp) {
+		score += 200;
+	}
+	if (entry.engine === 'mlx' && profile.isAppleSilicon) {
+		score += 100;
+	}
+	return score;
+}
+
+/**
+ * Every catalog entry that is a defensible recommendation for this machine, best first. Exported so callers
+ * can offer a runner-up (and so the ranking is testable); {@link getRecommendedRepoId} takes the head.
+ */
+export function rankRecommendations(budgetBytes: number, profile: IHardwareProfile): ICatalogModel[] {
+	return LOCOPILOT_DEFAULT_CATALOG
+		.map(entry => ({ entry, score: recommendationScore(entry, budgetBytes, profile) }))
+		.filter(s => s.score > 0)
+		.sort((a, b) => b.score - a.score)
+		.map(s => s.entry);
 }
 
 /** Whether a catalog entry should be seeded hidden: explicit `defaultHidden` wins, else hidden unless allowlisted. */
@@ -1129,6 +1260,173 @@ function isMoEEntry(entry: ICatalogModel): boolean {
 	return /-A\d+(\.\d+)?B/i.test(entry.repoId) || /\bMoE\b/i.test(entry.displayName);
 }
 
+// ---- hardware-aware sizing (shared with the launch planner) ------------------------------------------
+//
+// These let the catalog answer "will this run WELL here?" for models that are NOT downloaded yet, using the
+// same arithmetic the launch planner applies to real files: name -> params -> layers -> KV cost, weighed
+// against the platform's real inference budget.
+
+/** Transformer-layer count bucketed from a model's TOTAL parameter count (billions). Layers track a model's
+ * DEPTH, which tracks total params for dense models and is the memory-safe over-estimate for MoE (whose depth
+ * is lower than a dense model of the same total). Quant-INDEPENDENT, unlike the file-size fallback. */
+function estimateLayerCountFromParamsB(paramsB: number): number {
+	if (paramsB <= 1.5) { return 24; }
+	if (paramsB <= 4) { return 30; }
+	if (paramsB <= 9) { return 36; }
+	if (paramsB <= 16) { return 48; }
+	if (paramsB <= 40) { return 64; }
+	return 80;
+}
+
+/**
+ * Approximate TOTAL parameter count (billions) parsed from a model name / repo id. Handles dense names
+ * ("Qwen3-4B" -> 4), MoE names ("Qwen3.6-35B-A3B" -> 35 total, NOT the 3B active - KV scales with the model's
+ * full transformer depth and the total is the memory-safe over-estimate), and Gemma effective sizes
+ * ("gemma-4-E4B" -> 4). The active "A<n>B" token is deliberately ignored. Returns undefined when no size token
+ * is present (e.g. "Phi-4-mini"), so callers fall back to the quant-dependent file-size bucket.
+ */
+export function modelParamsBillionsFromName(name: string): number | undefined {
+	if (!name) {
+		return undefined;
+	}
+	// A standalone <N>B or E<N>B token at a word boundary; the leading 'A' of an active-param "A3B" tag is not
+	// in the boundary class, so active tokens never match - only total/dense sizes do.
+	const matches = [...name.matchAll(/(?:^|[-_/ ])E?(\d+(?:\.\d+)?)\s*B(?![a-z])/gi)];
+	if (matches.length === 0) {
+		return undefined;
+	}
+	// The total is the largest size token (an MoE's active "A<n>B" is always smaller and never matches anyway).
+	return Math.max(...matches.map(m => parseFloat(m[1])));
+}
+
+/** Layer count for a model from its NAME (params-based, quant-independent, MoE-aware), or undefined when the
+ * name carries no size token. Preferred over {@link estimateLayerCountFromWeightBytes} because the same model's
+ * higher-quant (larger) file must not be charged more KV layers than its lower-quant file. */
+export function estimateLayerCountFromModelName(name: string): number | undefined {
+	const paramsB = modelParamsBillionsFromName(name);
+	return paramsB !== undefined ? estimateLayerCountFromParamsB(paramsB) : undefined;
+}
+
+/**
+ * The hardware facts the "Best for you" recommendation needs. Supplied by the local-model runner so the chat
+ * picker and the model-list editor read the SAME numbers (see its `getHardwareProfile`).
+ *
+ * Total RAM alone cannot rank models: a 16 GB Mac can wire ~10.5 GB for inference, a 16 GB PC with an 8 GB
+ * discrete card is bounded by VRAM and hard-OOMs past it, and a 16 GB CPU-only laptop can hold the weights but
+ * decodes at a fraction of the speed. All three used to receive an identical recommendation.
+ */
+export interface IHardwareProfile {
+	readonly totalRamBytes: number;
+	readonly isAppleSilicon: boolean;
+	/** User-raised Metal wired limit (`iogpu.wired_limit_mb`), 0/undefined when unset. */
+	readonly metalWiredLimitBytes?: number;
+	/** Total VRAM of the target discrete GPU, 0 when there is none. */
+	readonly discreteVramBytes: number;
+	/** Free VRAM on that GPU at probe time, 0 when unknown. */
+	readonly discreteVramFreeBytes: number;
+}
+
+/**
+ * Memory a recommendation may assume for weights + KV + runtime, using the SAME budget functions the launch
+ * planner uses - so a badge can never promise a model the planner would then refuse or cramp.
+ */
+export function inferenceBudgetBytes(profile: IHardwareProfile): number {
+	if (profile.isAppleSilicon) {
+		return metalOffloadBudgetBytes(profile.totalRamBytes, profile.metalWiredLimitBytes || undefined);
+	}
+	// A discrete GPU is the binding pool when present - weights and the whole KV must fit VRAM or the driver
+	// OOMs outright. Without one, inference runs from system RAM.
+	const vram = discreteVramBudgetBytes(profile.discreteVramBytes, profile.discreteVramFreeBytes);
+	return vram > 0 ? vram : usableSystemMemoryBytes(profile.totalRamBytes);
+}
+
+/** True when this machine has no GPU to offload to, so decode speed is bounded by CPU throughput. */
+export function isCpuOnlyProfile(profile: IHardwareProfile): boolean {
+	return !profile.isAppleSilicon && profile.discreteVramBytes <= 0;
+}
+
+/**
+ * Estimated runtime footprint of a NOT-yet-downloaded catalog entry at a given service level: its published
+ * weight size, plus a KV cache for `contextTokens` at q8_0, plus engine overhead. Mirrors the download
+ * picker's estimate so the badge, the download quant choice and the launch clamp all agree on what a model
+ * costs. Layers come from the model NAME (quant-independent and MoE-aware).
+ */
+export function estimateCatalogFootprintBytes(entry: ICatalogModel, contextTokens: number): number {
+	const layers = estimateLayerCountFromModelName(entry.displayName) ?? estimateLayerCountFromModelName(entry.repoId) ?? 48;
+	const perTokenPerLayer = DEFAULT_KV_BYTES_PER_TOKEN_PER_LAYER_F16 * kvPlanBytesPerElem({ k: 'q8_0', v: 'q8_0' }) / kvCacheBytesPerElem('f16');
+	return entry.approxSizeBytes + perTokenPerLayer * layers * contextTokens + RUNTIME_OVERHEAD_BYTES;
+}
+
+/** The largest of {@link AUTO_COMFORT_CONTEXT} / {@link AUTO_USABLE_CONTEXT} this entry could run at here, or 0
+ * when even the usability floor does not fit. Capped by the model's own trained window. */
+export function estimateCatalogContextTokens(entry: ICatalogModel, budgetBytes: number): number {
+	if (!(budgetBytes > 0)) {
+		return 0;
+	}
+	const trained = entry.contextWindow && entry.contextWindow > 0 ? entry.contextWindow : AUTO_COMFORT_CONTEXT;
+	for (const target of [AUTO_COMFORT_CONTEXT, AUTO_USABLE_CONTEXT]) {
+		const want = Math.min(target, trained);
+		if (estimateCatalogFootprintBytes(entry, want) <= budgetBytes) {
+			return want;
+		}
+	}
+	return 0;
+}
+
+/**
+ * What a downloaded model would ACTUALLY do on this machine, measured by the launch planner rather than read
+ * off the catalog. Supplied to Auto by the local-model runner (see its `getAutoPlan`).
+ *
+ * Auto's catalog fields describe the model in the abstract; these describe the copy on THIS disk running on
+ * THIS hardware. The two now diverge in two ways that matter:
+ *  - the download picker chooses a quant per machine, so the same catalog entry can be a 4.7 GB Q4_K_M here
+ *    and an 8.1 GB Q8_0 there, while `approxSizeBytes` says one fixed number;
+ *  - the launch planner solves for a context window, and "fits" only guarantees the usability floor - so two
+ *    models that both "fit" can differ by 4x in usable context, which the catalog cannot express at all.
+ */
+export interface IAutoModelPlan {
+	/** Real weight bytes on disk (the quant actually downloaded), 0 when not yet measured. */
+	readonly weightBytes: number;
+	/** Context window the launch planner would grant on this machine, 0 when not yet measured. */
+	readonly plannedContext: number;
+}
+
+/** Looks up the planner's verdict for a model; undefined = not measured yet, fall back to catalog figures. */
+export type AutoModelPlanProbe = (modelId: string) => IAutoModelPlan | undefined;
+
+/**
+ * How much usable context a pick is expected to deliver, in the terms the launch planner already uses. This is
+ * the dimension Auto was missing: it maximized model SIZE subject to fitting at all, and since "fits" now means
+ * "reaches {@link AUTO_USABLE_CONTEXT}", a big model pinned at the floor outranked a smaller one running four
+ * times longer. For a coding agent that is backwards - a window that cannot hold the file being edited plus a
+ * couple of tool round-trips fails the task regardless of how capable the weights are.
+ */
+export const enum AutoServiceTier {
+	/** Below the usability floor - runnable, but cramped enough to break multi-turn work. */
+	Tight = 0,
+	/** At or above the floor: every task works, with less room to spare. */
+	Usable = 1,
+	/** At or above the comfort target: full multi-file, multi-turn headroom. */
+	Comfort = 2,
+}
+
+/**
+ * Context thresholds for {@link AutoServiceTier}. Deliberately duplicated from the llama.cpp planner's
+ * MIN_CLAMPED_CONTEXT / TARGET_MIN_CONTEXT rather than imported: this module is a dependency-free leaf that
+ * both the runner and the picker import, and pulling the server module in here would make that cycle.
+ */
+export const AUTO_USABLE_CONTEXT = 16384;
+export const AUTO_COMFORT_CONTEXT = 32768;
+
+/** The service tier a planned context falls into. An unmeasured (0) context is treated as Comfort so an
+ * un-probed model ranks exactly as it did before this dimension existed - never demoted for missing data. */
+export function autoServiceTier(plannedContext: number): AutoServiceTier {
+	if (!(plannedContext > 0) || plannedContext >= AUTO_COMFORT_CONTEXT) {
+		return AutoServiceTier.Comfort;
+	}
+	return plannedContext >= AUTO_USABLE_CONTEXT ? AutoServiceTier.Usable : AutoServiceTier.Tight;
+}
+
 /** A stored model is in Auto's candidate pool when it is a downloaded, visible catalog llama.cpp/MLX model. */
 export function isAutoCandidate(model: ICustomLanguageModel): boolean {
 	return model.type === 'local'
@@ -1167,7 +1465,8 @@ export function resolveAutoModel(
 	models: readonly ICustomLanguageModel[],
 	ramGB: number,
 	isServerActive: (modelId: string) => boolean,
-	maxSizeBytesExclusive?: number
+	maxSizeBytesExclusive?: number,
+	getPlan?: AutoModelPlanProbe
 ): ICustomLanguageModel | undefined {
 	const candidates = models.filter(isAutoCandidate);
 	if (candidates.length === 0) {
@@ -1182,6 +1481,11 @@ export function resolveAutoModel(
 	for (const model of candidates) {
 		const entry = findCatalogEntryByRepoId(model.modelName)!;
 		const running = isServerActive(model.id);
+		const plan = getPlan?.(model.id);
+		// Real bytes on disk beat the catalog's nominal size wherever we have them: the download picker chooses
+		// the quant per machine, so approxSizeBytes can be ~2x off in either direction and the step-down ladder
+		// below would otherwise step by the wrong amounts.
+		const sizeBytes = plan?.weightBytes && plan.weightBytes > 0 ? plan.weightBytes : entry.approxSizeBytes;
 		if (entry.minRamGB > effectiveRam && !running) {
 			// Bigger than this machine's TOTAL RAM tier - never auto-picked... unless it is ALREADY RUNNING.
 			// The tier ceiling is an aspiration guard for COLD picks; a loaded server has empirically proven
@@ -1192,11 +1496,16 @@ export function resolveAutoModel(
 			// tier - which used to exclude every running 16/32 GB-tier model outright.
 			continue;
 		}
-		if (maxSizeBytesExclusive !== undefined && entry.approxSizeBytes >= maxSizeBytesExclusive) {
+		if (maxSizeBytesExclusive !== undefined && sizeBytes >= maxSizeBytesExclusive) {
 			continue; // step-down: this pick (or a bigger one) already failed the launch gate this pass.
 		}
 
-		let score = entry.minRamGB * 1000; // capability: the highest RAM tier the hardware supports.
+		// Service tier FIRST, capability second: a model that only reaches the cramped floor is worse for agent
+		// work than a smaller one with a comfortable window, however capable its weights are. Weighted above the
+		// stickiness bonus on purpose - a one-time cold swap is cheaper than every turn running in a window too
+		// small to hold the task. Unmeasured models score as Comfort, so this never demotes on missing data.
+		let score = autoServiceTier(plan?.plannedContext ?? 0) * 1_000_000;
+		score += entry.minRamGB * 1000; // capability: the highest RAM tier the hardware supports.
 		if (running) {
 			// Stickiness: keep a warm model over a bigger cold rival so re-resolving Auto doesn't cold-swap.
 			score += 200_000;
@@ -1262,13 +1571,14 @@ function warmPinnedAutoModel(
 export function resolveAutoModelPinned(
 	service: ICustomLanguageModelsService,
 	ramGB: number,
-	isServerActive: (modelId: string) => boolean
+	isServerActive: (modelId: string) => boolean,
+	getPlan?: AutoModelPlanProbe
 ): ICustomLanguageModel | undefined {
 	const warm = warmPinnedAutoModel(service, isServerActive);
 	if (warm) {
 		return warm;
 	}
-	const resolved = resolveAutoModel(service.getCustomModels(), ramGB, isServerActive);
+	const resolved = resolveAutoModel(service.getCustomModels(), ramGB, isServerActive, undefined, getPlan);
 	service.setPinnedAutoModelId(resolved?.id);
 	return resolved;
 }
@@ -1285,10 +1595,11 @@ export function resolveAutoModelPinned(
 export function peekAutoModel(
 	service: ICustomLanguageModelsService,
 	ramGB: number,
-	isServerActive: (modelId: string) => boolean
+	isServerActive: (modelId: string) => boolean,
+	getPlan?: AutoModelPlanProbe
 ): ICustomLanguageModel | undefined {
 	return warmPinnedAutoModel(service, isServerActive)
-		?? resolveAutoModel(service.getCustomModels(), ramGB, isServerActive);
+		?? resolveAutoModel(service.getCustomModels(), ramGB, isServerActive, undefined, getPlan);
 }
 
 export type AutoStarterSlot = 'best' | 'balanced' | 'fast';
@@ -1311,13 +1622,13 @@ const AUTO_FAST_REPO_ID = 'unsloth/Qwen3.5-2B-MTP-GGUF';
  * ({@link getDefaultPickerRepoId}, one tier below max), fast = the smallest current-gen build. Slots that
  * collapse to the same repo on small machines are deduped (first slot wins), so 8 GB users may see two.
  */
-export function getAutoStarterPicks(ramGB: number): IAutoStarterPick[] {
+export function getAutoStarterPicks(ramGB: number, profile?: IHardwareProfile): IAutoStarterPick[] {
 	const slots: { slot: AutoStarterSlot; title: string; reason: string; repoId: string }[] = [
 		{
 			slot: 'best',
 			title: 'Best for your system',
 			reason: 'Highest quality that runs comfortably on your hardware.',
-			repoId: getRecommendedRepoId(ramGB),
+			repoId: getRecommendedRepoId(ramGB, profile),
 		},
 		{
 			slot: 'balanced',

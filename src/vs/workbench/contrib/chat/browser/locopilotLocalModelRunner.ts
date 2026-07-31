@@ -86,7 +86,7 @@ import {
 	type MlxServerTuning,
 } from './locopilotMlxServer.js';
 import { showTransientNotification } from './locopilotNotify.js';
-import { findDraftPairing } from './locopilotModelCatalog.js';
+import { findDraftPairing, type IAutoModelPlan, type IHardwareProfile } from './locopilotModelCatalog.js';
 import { LoCoPilotModelDownloadService, modelDownloadDirName, isMmprojGgufPath } from './locopilotModelDownloadService.js';
 import { joinPath } from '../../../../base/common/resources.js';
 import { streamToBuffer, VSBuffer } from '../../../../base/common/buffer.js';
@@ -283,6 +283,28 @@ export interface ILoCoPilotLocalModelRunner {
 	 * (non-RAM backend, no probe, unknown footprint - i.e. the real gate wouldn't block either).
 	 */
 	wouldModelFitForLaunch(modelId: string): Promise<boolean>;
+
+	/**
+	 * What the launch planner would ACTUALLY give `modelId` on this machine - the real weight bytes on disk
+	 * (whichever quant was downloaded) and the context window the clamp would grant. Feeds Auto's ranking so it
+	 * prefers a model that runs WELL over the biggest one that merely loads (see {@link IAutoModelPlan}).
+	 *
+	 * SYNCHRONOUS and cache-backed by design: Auto resolves on render paths (the picker label redraws on every
+	 * dropdown open), which cannot await. A miss returns undefined - meaning "not measured yet, use the catalog
+	 * figures" - and schedules a background measurement, so the first paint after a model appears is catalog-
+	 * accurate and every later one is planner-accurate.
+	 */
+	getAutoPlan(modelId: string): IAutoModelPlan | undefined;
+
+	/**
+	 * This machine's hardware facts for the "Best for you" recommendation - total RAM, Apple Silicon, and the
+	 * target GPU's VRAM. Sourced here (rather than each UI reading `startupMetrics.totalmem` on its own) so the
+	 * chat picker's badge and the model-list chip are computed from IDENTICAL inputs and cannot disagree.
+	 *
+	 * Synchronous and cache-backed for the same reason as {@link getAutoPlan}: these are render paths. Returns
+	 * undefined until the GPU probe completes, which callers treat as "fall back to the curated tier pick".
+	 */
+	getHardwareProfile(): IHardwareProfile | undefined;
 	/**
 	 * The reason a recent launch of `modelId` was abandoned at a memory/fit gate (user declined "Run anyway",
 	 * or a pre-warm skipped a too-big model), or undefined when there is none / it has gone stale. Lets the
@@ -508,6 +530,13 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 	 * server-side "mismatched key type" restore error on an incompatible blob saved under the same name.
 	 */
 	private readonly _lastLaunchKvType = new Map<string, string>();
+	/** Measured launch plans (real weight bytes + planned context) backing the synchronous {@link getAutoPlan}. */
+	private readonly _autoPlanCache = new Map<string, IAutoModelPlan>();
+	/** Models whose plan measurement is already running, so a redrawing picker can't spawn duplicates. */
+	private readonly _autoPlanInFlight = new Set<string>();
+	/** Cached hardware facts backing the synchronous {@link getHardwareProfile}. */
+	private _hardwareProfile: IHardwareProfile | undefined;
+	private _hardwareProfileInFlight: Promise<void> | undefined;
 
 	constructor(
 		@ICustomLanguageModelsService private readonly customLanguageModelsService: ICustomLanguageModelsService,
@@ -541,6 +570,17 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 		this._register(this.fileService.onDidFilesChange(e => {
 			if (e.contains(lockUri)) {
 				this._scheduleLockSync();
+			}
+		}));
+		// Auto's measured plans describe a specific model file under specific settings, so drop them whenever
+		// either can change: a finished download can swap the quant on disk (the picker sizes it per machine),
+		// and the context/KV settings feed the same clamp the measurement runs.
+		this._register(this.customLanguageModelsService.onDidChangeCustomModels(() => this._invalidateAutoPlans()));
+		this._register(this.configurationService.onDidChangeConfiguration(e => {
+			if (e.affectsConfiguration(ChatConfiguration.LocopilotLlamaCppContextSize)
+				|| e.affectsConfiguration(ChatConfiguration.LocopilotLlamaCppKvCacheType)
+				|| e.affectsConfiguration(ChatConfiguration.LocopilotLlamaCppSwaFull)) {
+				this._invalidateAutoPlans();
 			}
 		}));
 		this._register(toDisposable(() => {
@@ -4871,6 +4911,118 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 				return;
 			}
 		}
+	}
+
+	getHardwareProfile(): IHardwareProfile | undefined {
+		if (this._hardwareProfile) {
+			return this._hardwareProfile;
+		}
+		if (!this._hardwareProfileInFlight) {
+			// Fire-and-forget from a render path; the result lands in the cache for the next paint.
+			this._hardwareProfileInFlight = (async () => {
+				const [hw, mem] = await Promise.all([this._getHardwareInfo(), this._getSystemMemory()]);
+				if (!hw || !mem?.totalmem) {
+					return;
+				}
+				const appleSilicon = hw.gpus.some(g => g.vendor === 'apple') || isAppleSiliconMac();
+				// Only DISCRETE VRAM is a separate pool; Apple's unified memory reports 0 here.
+				const target = appleSilicon ? undefined : hw.gpus.reduce<IGpuInfo | undefined>(
+					(best, g) => g.vendor !== 'apple' && g.totalVramBytes > 0 && (!best || g.totalVramBytes > best.totalVramBytes) ? g : best,
+					undefined);
+				this._hardwareProfile = {
+					totalRamBytes: mem.totalmem,
+					isAppleSilicon: appleSilicon,
+					metalWiredLimitBytes: hw.metalWiredLimitBytes,
+					discreteVramBytes: target?.totalVramBytes ?? 0,
+					discreteVramFreeBytes: target?.freeVramBytes ?? 0,
+				};
+				this._onDidAvailableRamChange.fire(); // nudge the badges to redraw with real hardware facts
+			})().catch(e => this._log(`[LoCoPilot Runner] Hardware profile probe failed (ignored): ${e}`))
+				.finally(() => { this._hardwareProfileInFlight = undefined; });
+		}
+		return undefined;
+	}
+
+	getAutoPlan(modelId: string): IAutoModelPlan | undefined {
+		const cached = this._autoPlanCache.get(modelId);
+		if (cached) {
+			return cached;
+		}
+		if (!this._autoPlanInFlight.has(modelId)) {
+			this._autoPlanInFlight.add(modelId);
+			// Fire-and-forget: this call is on a render path. The result lands in the cache for the next paint.
+			this._measureAutoPlan(modelId)
+				.then(plan => {
+					if (plan) {
+						this._autoPlanCache.set(modelId, plan);
+						this._onDidServerStateChange.fire(modelId); // nudge the picker to redraw with real numbers
+					}
+				})
+				.catch(e => this._log(`[LoCoPilot Runner] Auto plan measurement failed for ${modelId} (ignored): ${e}`))
+				.finally(() => this._autoPlanInFlight.delete(modelId));
+		}
+		return undefined;
+	}
+
+	/**
+	 * Measures one model's real launch plan: the weight bytes actually on disk and the context the clamp would
+	 * grant, using the SAME budget/geometry/KV-ladder path a launch uses. Deliberately does not run the offload
+	 * planner or the live-RAM gate - Auto only needs the steady-state shape of the pick, and the request path's
+	 * `wouldModelFitForLaunch` step-down still applies the momentary check.
+	 */
+	private async _measureAutoPlan(modelId: string): Promise<IAutoModelPlan | undefined> {
+		const model = this.customLanguageModelsService.getCustomModels().find(m => m.id === modelId);
+		if (!model?.localPath) {
+			return undefined;
+		}
+		const kind = await this._intendedServerKind(modelId);
+		let modelPath: string;
+		try {
+			modelPath = kind === 'mlx' ? await this.getMlxModelRootPath(model.localPath) : await this.resolveModelFilePath(model.localPath);
+		} catch {
+			return undefined;
+		}
+		const weightBytes = await this._weightBytesOnDisk(modelPath);
+		if (weightBytes <= 0) {
+			return undefined;
+		}
+		const backend: LlamaBackend = kind === 'mlx' ? 'metal' : await this._resolveBackendForFit();
+		const hw = await this._getHardwareInfo();
+		const budget = hw ? await this._memoryBudgetBytes(backend, hw) : undefined;
+		if (!budget || budget <= 0) {
+			return { weightBytes, plannedContext: 0 }; // size is known, context isn't - catalog tier still applies
+		}
+		const info = await this._getModelInfo(modelPath).catch(() => undefined);
+		const requestedContext = model.contextWindow && model.contextWindow > 0
+			? model.contextWindow
+			: (info?.contextLength ?? DEFAULT_LLAMA_CONTEXT_SIZE);
+		const kvBudgetBytes = computeKvBudgetBytes(budget, weightBytes, RUNTIME_OVERHEAD_BYTES);
+		const f16PerTokenPerLayer = (info && kvBytesPerTokenPerLayer(info, kvCacheBytesPerElem('f16')))
+			?? DEFAULT_KV_BYTES_PER_TOKEN_PER_LAYER_F16;
+		// MLX has no KV quantization, so it is measured at f16; llama.cpp runs the same automatic ladder a
+		// launch would, including the sliding-window sizing that decides how much context a Gemma really gets.
+		const plannedContext = kind === 'mlx'
+			? clampContextSize({
+				requestedContext,
+				modelContextLength: info?.contextLength,
+				kvBudgetBytes,
+				layerCount: info?.layerCount,
+				kvBytesPerTokenPerLayer: f16PerTokenPerLayer,
+			})
+			: selectAutomaticKvCache({
+				requestedContext,
+				modelContextLength: info?.contextLength,
+				kvBudgetBytes,
+				layerCount: info?.layerCount,
+				kvBytesPerTokenPerLayerF16: f16PerTokenPerLayer,
+				slidingWindow: info?.slidingWindow,
+			}).contextSize;
+		return { weightBytes, plannedContext };
+	}
+
+	/** Drops measured Auto plans so they are re-measured against current conditions (RAM, downloads, quants). */
+	private _invalidateAutoPlans(): void {
+		this._autoPlanCache.clear();
 	}
 
 	async wouldModelFitForLaunch(modelId: string): Promise<boolean> {
