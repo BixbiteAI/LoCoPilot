@@ -1255,6 +1255,41 @@ export function findCatalogEntryByRepoId(repoId: string | undefined): ICatalogMo
 	return repoId ? LOCOPILOT_DEFAULT_CATALOG.find(e => e.repoId === repoId) : undefined;
 }
 
+/**
+ * The catalog entry behind a STORED model, tolerant of the format rewrite a download performs.
+ *
+ * {@link findCatalogEntry} matches repoId + exact format, which only works BEFORE a download: post-download
+ * enrichment replaces the stored format with the detected family (`detectFormatFamily`), so a GGUF entry
+ * seeded as `Q4_K_M` becomes `gguf` and the exact match silently misses. Every hardware-fit signal keyed off
+ * that lookup then degrades to "unknown" the moment a model is downloaded - which is how a too-big model
+ * stopped being grouped as oversized and lost its "Needs N GB RAM" chip exactly when it mattered most.
+ * (The download-time quant picker widens the gap further: it may store a quant the catalog never named.)
+ *
+ * Resolution order, most specific first:
+ *  1. exact repoId + format (an un-downloaded seed, or MLX where the family name IS the format);
+ *  2. repoId + the ENGINE implied by the stored format family, so a repo offering both builds resolves to the
+ *     one actually downloaded;
+ *  3. repoId alone.
+ */
+export function findCatalogEntryForStoredModel(repoId: string | undefined, format: string | undefined): ICatalogModel | undefined {
+	if (!repoId) {
+		return undefined;
+	}
+	const exact = findCatalogEntry(repoId, format);
+	if (exact) {
+		return exact;
+	}
+	const family = (format ?? '').trim().toLowerCase();
+	const engine: CatalogEngine | undefined = family.includes('mlx') ? 'mlx' : (family.includes('gguf') ? 'gguf' : undefined);
+	if (engine) {
+		const byEngine = LOCOPILOT_DEFAULT_CATALOG.find(e => e.repoId === repoId && e.engine === engine);
+		if (byEngine) {
+			return byEngine;
+		}
+	}
+	return findCatalogEntryByRepoId(repoId);
+}
+
 /** MoE checkpoints ("35B-A3B") activate few parameters per token - fast for their quality, so Auto prefers them. */
 function isMoEEntry(entry: ICatalogModel): boolean {
 	return /-A\d+(\.\d+)?B/i.test(entry.repoId) || /\bMoE\b/i.test(entry.displayName);

@@ -51,7 +51,7 @@ import { IMarkdownRendererService } from '../../../../../platform/markdown/brows
 import { ILoCoPilotLocalModelRunner } from '../locopilotLocalModelRunner.js';
 import { ITimerService } from '../../../../services/timer/browser/timerService.js';
 import { isAppleSiliconMac } from '../locopilotMlxServer.js';
-import { findCatalogEntry, getCatalogSuitability, getRecommendedRepoId, ModelSuitability } from '../locopilotModelCatalog.js';
+import { findCatalogEntryForStoredModel, getCatalogSuitability, getRecommendedRepoId, ModelSuitability } from '../locopilotModelCatalog.js';
 // [engine-ui] Only needed by the commented-out engine dropdown in renderAgentSettings; uncomment to restore.
 // import { isMacintosh } from '../../../../../base/common/platform.js';
 import { IConfigurationService } from '../../../../../platform/configuration/common/configuration.js';
@@ -1231,7 +1231,7 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 			const chip = addChip(localize('customLanguageModels.bestForYou', 'Best for you'), 'best');
 			chip.title = localize('customLanguageModels.bestForYou.tooltip', 'Recommended: sized for your system memory.');
 		} else if (suitability === 'too-big') {
-			const entry = findCatalogEntry(model.modelName, model.format);
+			const entry = findCatalogEntryForStoredModel(model.modelName, model.format);
 			const chip = addChip(localize('customLanguageModels.needsRam', 'Needs {0} GB RAM', entry?.minRamGB ?? '?'), 'warn');
 			chip.title = localize('customLanguageModels.needsRam.tooltip', 'Needs more memory than detected; may run slowly or fail to load.');
 		} else if (suitability === 'incompatible') {
@@ -1444,8 +1444,8 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 		// Closest-to-runnable first: "needs 24 GB" before "needs 64 GB", so the models a user might
 		// unlock by freeing memory (or a RAM upgrade) surface at the top of the expanded group.
 		const sorted = [...models].sort((a, b) => {
-			const ra = findCatalogEntry(a.modelName, a.format)?.minRamGB ?? Number.MAX_SAFE_INTEGER;
-			const rb = findCatalogEntry(b.modelName, b.format)?.minRamGB ?? Number.MAX_SAFE_INTEGER;
+			const ra = findCatalogEntryForStoredModel(a.modelName, a.format)?.minRamGB ?? Number.MAX_SAFE_INTEGER;
+			const rb = findCatalogEntryForStoredModel(b.modelName, b.format)?.minRamGB ?? Number.MAX_SAFE_INTEGER;
 			if (ra !== rb) { return ra - rb; }
 			return getCustomModelListLabel(a).localeCompare(getCustomModelListLabel(b));
 		});
@@ -2547,7 +2547,10 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 
 	/** How well a stored model fits this machine. Non-catalog (custom/cloud) models return 'unknown'. */
 	private modelSuitability(model: ICustomLanguageModel): ModelSuitability {
-		const entry = findCatalogEntry(model.modelName, model.format);
+		// Format-tolerant lookup: a downloaded model's stored format is rewritten to its family ('gguf'), which
+		// the exact repoId+format match misses - so every downloaded model used to read as 'unknown' and escape
+		// both the oversized group and the "Needs N GB RAM" chip.
+		const entry = findCatalogEntryForStoredModel(model.modelName, model.format);
 		return getCatalogSuitability(entry, this.detectedRamGB(), isAppleSiliconMac());
 	}
 
