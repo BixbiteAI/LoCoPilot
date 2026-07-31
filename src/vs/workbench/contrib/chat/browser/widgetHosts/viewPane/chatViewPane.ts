@@ -28,6 +28,7 @@ import { IInstantiationService } from '../../../../../../platform/instantiation/
 import { ServiceCollection } from '../../../../../../platform/instantiation/common/serviceCollection.js';
 import { IKeybindingService } from '../../../../../../platform/keybinding/common/keybinding.js';
 import { ILogService } from '../../../../../../platform/log/common/log.js';
+import { INotificationHandle, INotificationService, Severity } from '../../../../../../platform/notification/common/notification.js';
 import { IOpenerService } from '../../../../../../platform/opener/common/opener.js';
 import { IStorageService, StorageScope, StorageTarget } from '../../../../../../platform/storage/common/storage.js';
 import { ITelemetryService } from '../../../../../../platform/telemetry/common/telemetry.js';
@@ -47,7 +48,8 @@ import { ChatContextKeys } from '../../../common/actions/chatContextKeys.js';
 import { IChatModel, IChatModelInputState } from '../../../common/model/chatModel.js';
 import { CHAT_PROVIDER_ID } from '../../../common/participants/chatParticipantContribTypes.js';
 import { IChatModelReference, IChatService } from '../../../common/chatService/chatService.js';
-import { IChatSessionsService, localChatSessionType } from '../../../common/chatSessionsService.js';
+import { IChatSessionsService, isSessionInProgressStatus, localChatSessionType } from '../../../common/chatSessionsService.js';
+import { showTransientNotification } from '../../locopilotNotify.js';
 import { LocalChatSessionUri, getChatSessionType } from '../../../common/model/chatUri.js';
 import { ChatAgentLocation, ChatConfiguration, ChatModeKind } from '../../../common/constants.js';
 import { AgentSessionsControl } from '../../agentSessions/agentSessionsControl.js';
@@ -121,6 +123,7 @@ export class ChatViewPane extends ViewPane implements IViewWelcomeDelegate {
 		@IChatEntitlementService private readonly chatEntitlementService: IChatEntitlementService,
 		@ICommandService private readonly commandService: ICommandService,
 		@IActivityService private readonly activityService: IActivityService,
+		@INotificationService private readonly notificationService: INotificationService,
 	) {
 		super(options, keybindingService, contextMenuService, configurationService, contextKeyService, viewDescriptorService, instantiationService, openerService, themeService, hoverService);
 
@@ -569,6 +572,8 @@ export class ChatViewPane extends ViewPane implements IViewWelcomeDelegate {
 	private tabsControl: ChatViewTabsControl | undefined;
 	private openTabs: URI[];
 	private readonly activeModelTabListener = this._register(new MutableDisposable());
+	private parallelRequestNotification: INotificationHandle | undefined;
+	private suppressParallelRequestWarning = false;
 
 	private createChatTabsControl(parent: HTMLElement): void {
 		this.tabsControl = this._register(this.instantiationService.createInstance(ChatViewTabsControl, parent, {
@@ -625,6 +630,52 @@ export class ChatViewPane extends ViewPane implements IViewWelcomeDelegate {
 		return localize('newChatTab', "New Chat");
 	}
 
+	/**
+	 * Opening a new tab while something is still generating is allowed, but both
+	 * chats then compete for the same local model, so let the user know.
+	 */
+	private warnAboutParallelRequest(): void {
+		if (this.suppressParallelRequestWarning) {
+			return;
+		}
+
+		if (this.parallelRequestNotification) {
+			return; // a notice is already on screen
+		}
+
+		const busySessionName = this.getBusySessionName();
+		if (!busySessionName) {
+			return;
+		}
+
+		this.parallelRequestNotification = showTransientNotification(
+			this.notificationService,
+			Severity.Info,
+			localize('chat.parallelRequestRunning', "\"{0}\" is still working on a reply. You can start this chat right away, but both share the same local model, so each one gets slower - letting the first finish usually gets you there sooner.", busySessionName),
+			{ timeoutMs: 8000 }
+		);
+		this.parallelRequestNotification.onDidClose(() => this.parallelRequestNotification = undefined);
+	}
+
+	private getBusySessionName(): string | undefined {
+
+		// The session currently shown in the widget
+		const activeModel = this.modelRef.value?.object;
+		if (activeModel?.requestInProgress.get()) {
+			return activeModel.title ? renderAsPlaintext(new MarkdownString(activeModel.title)) : localize('thisChat', "This chat");
+		}
+
+		// Any other session that has a tab open
+		for (const resource of this.openTabs) {
+			const session = this.agentSessionsService.model.getSession(resource);
+			if (session && isSessionInProgressStatus(session.status)) {
+				return session.label;
+			}
+		}
+
+		return undefined;
+	}
+
 	private trackTab(resource: URI): void {
 		if (!this.openTabs.some(tab => tab.toString() === resource.toString())) {
 			this.openTabs.push(resource);
@@ -649,7 +700,14 @@ export class ChatViewPane extends ViewPane implements IViewWelcomeDelegate {
 		if (next) {
 			await this.loadSession(next);
 		} else {
-			await this.clear(); // no tabs left: start a fresh session
+			// No tabs left: start a fresh session. Not a parallel run,
+			// the user just closed the chat that was busy.
+			this.suppressParallelRequestWarning = true;
+			try {
+				await this.clear();
+			} finally {
+				this.suppressParallelRequestWarning = false;
+			}
 		}
 	}
 
@@ -856,6 +914,9 @@ export class ChatViewPane extends ViewPane implements IViewWelcomeDelegate {
 	}
 
 	private async clear(): Promise<void> {
+
+		// Heads up when the chat we are leaving behind is still generating
+		this.warnAboutParallelRequest();
 
 		// Grab the widget's latest view state because it will be loaded back into the widget
 		this.updateViewState();
