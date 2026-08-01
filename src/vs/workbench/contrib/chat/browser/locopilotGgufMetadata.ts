@@ -191,6 +191,42 @@ class GgufCursor {
 		return v;
 	}
 
+	/**
+	 * Reads a numeric ARRAY value (the cursor must sit just after the ARRAY type tag), returning its elements.
+	 * Returns `undefined` when the array isn't numeric or is longer than `maxCount` - but ALWAYS leaves the
+	 * cursor exactly at the end of the value either way, so the KV scan stays aligned.
+	 *
+	 * Needed because hybrid (Mamba/attention) architectures write the per-block attention keys as ARRAYS with
+	 * one entry per block (`0` on the recurrent blocks) rather than a single scalar. Skipping those, as the
+	 * scalar-only reader did, left the KV geometry unknown and made every caller fall back to charging a full
+	 * attention layer's cache to all ~60 blocks - several GB of phantom KV on a model where most blocks hold none.
+	 */
+	async numArray(maxCount: number = 4096): Promise<number[] | undefined> {
+		const elemType = await this.u32() as GgufType;
+		const count = await this.u64();
+		const elemSize = scalarSize(elemType);
+		if (elemSize === undefined) {
+			// String / nested arrays: consume exactly like skipValue would, and report "not numeric".
+			if (elemType === GgufType.STRING) {
+				for (let i = 0; i < count; i++) {
+					const len = await this.u64();
+					await this.skip(len);
+				}
+				return undefined;
+			}
+			throw new Error(`gguf: nested array element type ${elemType} unsupported`);
+		}
+		if (count > maxCount) {
+			await this.skip(elemSize * count); // pathological length - don't materialise it
+			return undefined;
+		}
+		const out: number[] = [];
+		for (let i = 0; i < count; i++) {
+			out.push(await this.scalar(elemType));
+		}
+		return out;
+	}
+
 	/** Skips over a metadata value of the given type without decoding it (used for keys we don't need). */
 	async skipValue(type: GgufType): Promise<void> {
 		const size = scalarSize(type);
@@ -306,10 +342,32 @@ export interface IGgufModelInfo {
 	/**
 	 * `<arch>.attention.head_count_kv` - number of *key/value* attention heads (GQA). Equals the query
 	 * head count for MHA models. Drives the KV-cache-per-token estimate (see {@link kvBytesPerTokenPerLayer}).
+	 *
+	 * Hybrid architectures write this per-block as an ARRAY (`0` on recurrent blocks); we take the LARGEST
+	 * non-zero entry, so the per-layer estimate reflects the most expensive attention block rather than an
+	 * average - the memory-safe direction. See {@link attentionLayerCount} for how many blocks it applies to.
 	 */
 	readonly kvHeadCount: number | undefined;
 	/** `<arch>.attention.head_count` - number of *query* heads; fallback to derive head dim from embedding. */
 	readonly headCount: number | undefined;
+	/**
+	 * How many transformer blocks actually hold a KV cache. `undefined` for a conventional model, where the
+	 * attention keys are scalars and EVERY block is an attention block ({@link layerCount} is then the answer).
+	 * Set only for hybrid stacks (Nemotron-H / Mamba / Jamba style), where the per-block `head_count_kv` array
+	 * shows most blocks are recurrent or plain MLP and hold no KV at all.
+	 *
+	 * Use {@link kvLayerCount} rather than reading this directly - KV sizing must use it, while weight-placement
+	 * decisions (`--n-gpu-layers`, expert offload) must keep using the full {@link layerCount}.
+	 */
+	readonly attentionLayerCount: number | undefined;
+	/** `<arch>.ssm.conv_kernel` - Mamba short-convolution width (`d_conv`). Present only on recurrent models. */
+	readonly ssmConvKernel: number | undefined;
+	/** `<arch>.ssm.inner_size` - Mamba inner/expanded dimension (`d_inner`). */
+	readonly ssmInnerSize: number | undefined;
+	/** `<arch>.ssm.state_size` - Mamba per-channel state width (`d_state`). */
+	readonly ssmStateSize: number | undefined;
+	/** `<arch>.ssm.group_count` - Mamba-2 group count (`n_group`); absent/0 on Mamba-1. */
+	readonly ssmGroupCount: number | undefined;
 	/** `<arch>.embedding_length` - model hidden size; used to derive head dim when key/value lengths absent. */
 	readonly embeddingLength: number | undefined;
 	/** `<arch>.attention.key_length` - per-head key dimension; preferred head dim for the KV estimate. */
@@ -374,6 +432,62 @@ export function kvBytesPerTokenPerLayer(info: IGgufModelInfo, bytesPerElem: numb
 	return (kvHeads * keyDim + kvHeads * valueDim) * bytesPerElem;
 }
 
+/**
+ * Transformer blocks that actually allocate a KV cache - the number KV sizing must multiply by. On a
+ * conventional model this is just {@link IGgufModelInfo.layerCount}; on a hybrid stack it is the far smaller
+ * count of real attention blocks ({@link IGgufModelInfo.attentionLayerCount}).
+ *
+ * NOT interchangeable with `layerCount`: weight placement (`--n-gpu-layers`, MoE expert offload) still spans
+ * every block. Returns `undefined` only when neither is known, so callers keep their own conservative default.
+ */
+export function kvLayerCount(info: IGgufModelInfo): number | undefined {
+	if (info.attentionLayerCount !== undefined && info.attentionLayerCount > 0) {
+		return info.attentionLayerCount;
+	}
+	return info.layerCount && info.layerCount > 0 ? info.layerCount : undefined;
+}
+
+/**
+ * True for a hybrid recurrent architecture (Mamba/SSM blocks interleaved with attention - Nemotron-H, Jamba,
+ * Granite-H). These behave unlike a pure transformer in two ways that matter to us: most blocks hold no KV
+ * cache (see {@link kvLayerCount}), and the recurrent blocks instead hold a FIXED per-sequence state that does
+ * not grow with the context window ({@link recurrentStateBytes}). llama.cpp also cannot partially rewind that
+ * state, so a diverging prompt prefix forces a full re-process rather than a cheap cache hit.
+ */
+export function isHybridRecurrentModelInfo(info: IGgufModelInfo): boolean {
+	return (info.ssmStateSize ?? 0) > 0 && (info.ssmInnerSize ?? 0) > 0;
+}
+
+/**
+ * Bytes of Mamba/SSM recurrent state the engine holds per sequence slot - a FIXED cost, independent of the
+ * context window, which is why it belongs in the footprint estimate rather than the per-token KV term.
+ *
+ * Mirrors llama.cpp's own sizing: each recurrent block keeps a short-convolution state of
+ * `(d_conv - 1) * (d_inner + 2 * n_group * d_state)` elements plus an SSM state of `d_inner * d_state`
+ * elements, both f32. Blocks that aren't attention blocks are all counted as recurrent: a hybrid stack may
+ * also contain plain MLP blocks, and over-counting state is the memory-safe direction. Returns 0 for a
+ * conventional model or when the geometry is unknown.
+ */
+export function recurrentStateBytes(info: IGgufModelInfo, seqCount: number = 1): number {
+	if (!isHybridRecurrentModelInfo(info)) {
+		return 0;
+	}
+	const layers = info.layerCount && info.layerCount > 0 ? info.layerCount : 0;
+	const attention = info.attentionLayerCount && info.attentionLayerCount > 0 ? info.attentionLayerCount : 0;
+	const recurrentLayers = Math.max(0, layers - attention);
+	if (recurrentLayers === 0) {
+		return 0;
+	}
+	const dConv = info.ssmConvKernel && info.ssmConvKernel > 0 ? info.ssmConvKernel : 4;
+	const dInner = info.ssmInnerSize ?? 0;
+	const dState = info.ssmStateSize ?? 0;
+	const nGroup = info.ssmGroupCount && info.ssmGroupCount > 0 ? info.ssmGroupCount : 1;
+	const convElems = Math.max(0, dConv - 1) * (dInner + 2 * nGroup * dState);
+	const ssmElems = dInner * dState;
+	const F32 = 4;
+	return (convElems + ssmElems) * F32 * recurrentLayers * Math.max(1, Math.floor(seqCount));
+}
+
 /** True when the GGUF metadata indicates a Mixture-of-Experts model (has routed experts). */
 export function isMoeModelInfo(info: IGgufModelInfo): boolean {
 	return (info.expertCount ?? 0) > 0;
@@ -388,6 +502,28 @@ export function isSwaModelInfo(info: IGgufModelInfo): boolean {
 }
 
 /**
+ * Reduces a per-block attention-head array to the two numbers KV sizing needs: the largest head count on any
+ * block (the most expensive attention block - sizing to the max is the memory-safe direction) and how many
+ * blocks are attention blocks at all. Returns undefined for a missing/empty array or one that is entirely
+ * zeros, so the caller leaves the fields untouched rather than recording a nonsensical zero.
+ */
+function summarizePerBlockHeads(arr: number[] | undefined): { maxHeads: number; attentionBlocks: number } | undefined {
+	if (!arr || arr.length === 0) {
+		return undefined;
+	}
+	let maxHeads = 0;
+	let attentionBlocks = 0;
+	for (const raw of arr) {
+		const n = Number.isFinite(raw) ? Math.floor(raw) : 0;
+		if (n > 0) {
+			attentionBlocks++;
+			if (n > maxHeads) { maxHeads = n; }
+		}
+	}
+	return attentionBlocks > 0 ? { maxHeads, attentionBlocks } : undefined;
+}
+
+/**
  * Single-pass GGUF header read returning {@link IGgufModelInfo}. Stops as soon as all three keys are
  * found (or the metadata block ends). Only the header is read - never the multi-GB tensor data.
  */
@@ -397,6 +533,11 @@ export async function readGgufModelInfo(fileService: IFileService, filePath: str
 	let contextLength: number | undefined;
 	let kvHeadCount: number | undefined;
 	let headCount: number | undefined;
+	let attentionLayerCount: number | undefined;
+	let ssmConvKernel: number | undefined;
+	let ssmInnerSize: number | undefined;
+	let ssmStateSize: number | undefined;
+	let ssmGroupCount: number | undefined;
 	let embeddingLength: number | undefined;
 	let keyLength: number | undefined;
 	let valueLength: number | undefined;
@@ -404,17 +545,23 @@ export async function readGgufModelInfo(fileService: IFileService, filePath: str
 	let perLayerWeightBytes: number[] | undefined;
 	let perLayerExpertBytes: number[] | undefined;
 	let nonLayerWeightBytes: number | undefined;
+	/** Every field except the tensor-section extras; keeps the three early returns in sync with the final one. */
+	const base = () => ({
+		layerCount, expertCount, contextLength, kvHeadCount, headCount, attentionLayerCount,
+		ssmConvKernel, ssmInnerSize, ssmStateSize, ssmGroupCount,
+		embeddingLength, keyLength, valueLength, slidingWindow,
+	});
 	try {
 		const uri = URI.file(filePath);
 		const cursor = new GgufCursor(fileService, uri);
 
 		const magic = await cursor.u32();
 		if (magic !== GGUF_MAGIC) {
-			return { layerCount, expertCount, contextLength, kvHeadCount, headCount, embeddingLength, keyLength, valueLength, slidingWindow }; // not a GGUF file
+			return base(); // not a GGUF file
 		}
 		const version = await cursor.u32();
 		if (version < 2) {
-			return { layerCount, expertCount, contextLength, kvHeadCount, headCount, embeddingLength, keyLength, valueLength, slidingWindow }; // v1 used uint32 length prefixes; not supported
+			return base(); // v1 used uint32 length prefixes; not supported
 		}
 		const tensorCount = await cursor.u64(); // tensor infos follow the KV block; drive per-layer accounting
 		const kvCount = await cursor.u64();
@@ -444,6 +591,31 @@ export async function readGgufModelInfo(fileService: IFileService, filePath: str
 			} else if (isScalar && key.endsWith('.attention.head_count')) {
 				const n = await cursor.scalar(valueType);
 				headCount = Number.isFinite(n) && n > 0 ? Math.floor(n) : undefined;
+			} else if (valueType === GgufType.ARRAY && key.endsWith('.attention.head_count_kv')) {
+				// Hybrid stack: one entry per block, 0 where the block is recurrent/MLP and holds no KV.
+				const arr = await cursor.numArray();
+				const heads = summarizePerBlockHeads(arr);
+				kvHeadCount = heads?.maxHeads ?? kvHeadCount;
+				attentionLayerCount = heads?.attentionBlocks ?? attentionLayerCount;
+			} else if (valueType === GgufType.ARRAY && key.endsWith('.attention.head_count')) {
+				const arr = await cursor.numArray();
+				const heads = summarizePerBlockHeads(arr);
+				headCount = heads?.maxHeads ?? headCount;
+				// Only fills the gap when head_count_kv wasn't an array too (it is emitted first on every
+				// hybrid we've seen, but the fallback keeps a reordered header working).
+				attentionLayerCount = attentionLayerCount ?? heads?.attentionBlocks;
+			} else if (isScalar && key.endsWith('.ssm.conv_kernel')) {
+				const n = await cursor.scalar(valueType);
+				ssmConvKernel = Number.isFinite(n) && n > 0 ? Math.floor(n) : undefined;
+			} else if (isScalar && key.endsWith('.ssm.inner_size')) {
+				const n = await cursor.scalar(valueType);
+				ssmInnerSize = Number.isFinite(n) && n > 0 ? Math.floor(n) : undefined;
+			} else if (isScalar && key.endsWith('.ssm.state_size')) {
+				const n = await cursor.scalar(valueType);
+				ssmStateSize = Number.isFinite(n) && n > 0 ? Math.floor(n) : undefined;
+			} else if (isScalar && key.endsWith('.ssm.group_count')) {
+				const n = await cursor.scalar(valueType);
+				ssmGroupCount = Number.isFinite(n) && n > 0 ? Math.floor(n) : undefined;
 			} else if (isScalar && key.endsWith('.embedding_length')) {
 				const n = await cursor.scalar(valueType);
 				embeddingLength = Number.isFinite(n) && n > 0 ? Math.floor(n) : undefined;
@@ -521,5 +693,5 @@ export async function readGgufModelInfo(fileService: IFileService, filePath: str
 		// before attention.sliding_window, which then misses SWA detection) is diagnosable instead of hidden.
 		onError?.(e);
 	}
-	return { layerCount, expertCount, contextLength, kvHeadCount, headCount, embeddingLength, keyLength, valueLength, slidingWindow, perLayerWeightBytes, perLayerExpertBytes, nonLayerWeightBytes };
+	return { ...base(), perLayerWeightBytes, perLayerExpertBytes, nonLayerWeightBytes };
 }

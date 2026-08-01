@@ -22,11 +22,28 @@ import type { IGgufModelInfo } from './locopilotGgufMetadata.js';
  * Every field is optional in practice: a config that omits a key simply leaves that field undefined and the
  * callers keep their conservative defaults. Never throws - an unreadable/absent config returns empty info.
  */
+/**
+ * The hybrid (Mamba/attention) geometry fields, left undefined for MLX.
+ *
+ * GGUF states this unambiguously - a per-block `attention.head_count_kv` array plus `<arch>.ssm.*` keys - but HF
+ * `config.json` spells it differently per architecture (`hybrid_override_pattern`, `attn_layer_indices`,
+ * `ssm_state_size` vs `mamba_d_state`, ...). Guessing wrong here would UNDER-count the KV cache, which is the
+ * direction that OOMs a machine, so MLX keeps sizing hybrids as conventional stacks (exactly as it did before
+ * the GGUF side learned about them) until a real config can be verified.
+ */
+const HYBRID_FIELDS_NOT_DERIVED = {
+	attentionLayerCount: undefined,
+	ssmConvKernel: undefined,
+	ssmInnerSize: undefined,
+	ssmStateSize: undefined,
+	ssmGroupCount: undefined,
+} as const;
+
 export async function readMlxModelInfo(fileService: IFileService, modelDirPath: string, onError?: (e: unknown) => void): Promise<IGgufModelInfo> {
 	const empty: IGgufModelInfo = {
 		layerCount: undefined, expertCount: undefined, contextLength: undefined, kvHeadCount: undefined,
 		headCount: undefined, embeddingLength: undefined, keyLength: undefined, valueLength: undefined,
-		slidingWindow: undefined,
+		slidingWindow: undefined, ...HYBRID_FIELDS_NOT_DERIVED,
 	};
 	try {
 		const configUri = joinPath(URI.file(modelDirPath), 'config.json');
@@ -58,6 +75,7 @@ export async function readMlxModelInfo(fileService: IFileService, modelDirPath: 
 			// `sliding_window` is only a real SWA window when the config doesn't also disable it outright
 			// (some configs carry the key with sliding-window attention switched off for every layer).
 			slidingWindow: cfg.use_sliding_window === false ? undefined : num(cfg.sliding_window),
+			...HYBRID_FIELDS_NOT_DERIVED,
 		};
 	} catch (e) {
 		onError?.(e);

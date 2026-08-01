@@ -34,7 +34,8 @@ import { LOCOPILOT_SETTINGS_SECTION_LIST_MODELS } from './chatManagement/locopil
 import { usableSystemMemoryBytes, metalOffloadBudgetBytes, kvCacheBytesPerElem, kvPlanBytesPerElem, DEFAULT_KV_BYTES_PER_TOKEN_PER_LAYER_F16, RUNTIME_OVERHEAD_BYTES, TARGET_MIN_CONTEXT, MIN_CLAMPED_CONTEXT } from './locopilotLlamaCppServer.js';
 import { IConfigurationService } from '../../../../platform/configuration/common/configuration.js';
 import { ChatConfiguration } from '../common/constants.js';
-import { findDraftPairing, estimateLayerCountFromModelName, modelParamsBillionsFromName } from './locopilotModelCatalog.js';
+import { findDraftPairing, estimateLayerCountFromModelName, modelParamsBillionsFromName, rankRecommendations, type IHardwareProfile } from './locopilotModelCatalog.js';
+import { IDialogService } from '../../../../platform/dialogs/common/dialogs.js';
 import { ITerminalService, ITerminalInstance } from '../../terminal/browser/terminal.js';
 import { getBundledMlxPython } from './locopilotMlxServer.js';
 import { showTransientNotification } from './locopilotNotify.js';
@@ -115,10 +116,21 @@ const HF_XET_DOWNLOAD_PY = [
 	'sys.stdout.flush()',
 ].join('\n');
 
-/** GGUF quantization preference (best quality/size tradeoff first). */
+/**
+ * GGUF quantization preference for the STATIC pick - used only when no memory budget is known (the
+ * hardware-aware {@link planGgufDownload} supersedes it whenever sizes and a budget are available).
+ *
+ * Ordered as a smooth walk outward from the Q4_K_M sweet spot rather than by raw quality: nearest-neighbour
+ * 4-bit variants first, then up through Q5/Q6/Q8, then down through the smaller 4-bit quants, and only then
+ * into the 3-bit and 2-bit range. The old order jumped `Q8_0 -> Q4_0 -> Q5_0 -> Q3_K_M`, which on a repo that
+ * shipped no Q4_K_M/Q5_K_M/Q8_0 skipped every intermediate quant and landed on Q3_K_M with Q4_K_S, IQ4_XS and
+ * Q6_K all present. F16/BF16 sit near the end: they are ~2x the bytes for no inference-relevant gain over Q8_0.
+ */
 const GGUF_QUANT_PRIORITY = [
-	'Q4_K_M', 'Q5_K_M', 'Q8_0', 'Q4_0', 'Q5_0', 'Q3_K_M', 'IQ4_XS', 'Q2_K', 'F16',
-	'Q4_K_S', 'Q5_K_S', 'Q6_K', 'Q3_K_S', 'Q3_K_L', 'Q2_K_S', 'Q4_1', 'Q4_0_4_4', 'Q4_0_4_8', 'Q4_0_8_8'
+	'Q4_K_M', 'Q4_K_L', 'Q4_K_XL', 'Q5_K_M', 'Q5_K_S', 'Q6_K', 'Q8_0',
+	'Q4_K_S', 'IQ4_XS', 'IQ4_NL', 'Q4_1', 'Q4_0', 'Q5_0',
+	'Q3_K_L', 'Q3_K_M', 'Q3_K_S', 'IQ3_M', 'IQ3_S', 'Q2_K', 'Q2_K_S',
+	'F16', 'BF16', 'Q4_0_4_4', 'Q4_0_4_8', 'Q4_0_8_8'
 ];
 
 interface HFTreeItem {
@@ -137,8 +149,11 @@ const GGUF_QUANT_QUALITY = [
 	// resolves to the exact quant (e.g. a "Q4_K_XL" file must not first match "Q4_K"). "UD-"/"-i1-" repo
 	// prefixes are ignored by the .includes() match, so dynamic (Unsloth) quants score off their core name.
 	'F32', 'F16', 'BF16', 'Q8_0', 'Q6_K_L', 'Q6_K', 'Q5_K_XL', 'Q5_K_L', 'Q5_K_M', 'Q5_K_S', 'Q5_0',
-	'Q4_K_XL', 'Q4_K_L', 'Q4_K_M', 'Q4_K_S', 'Q4_1', 'Q4_0',
-	'IQ4_XS', 'IQ4_NL', 'Q3_K_XL', 'Q3_K_L', 'Q3_K_M', 'Q3_K_S', 'IQ3_M', 'IQ3_S', 'IQ3_XXS', 'Q2_K', 'IQ2_M', 'IQ2_XS', 'IQ2_XXS'
+	// The I-quants sit ABOVE the legacy Q4_1/Q4_0 they replaced: IQ4_XS is both smaller AND measurably better
+	// than Q4_0 (importance-matrix quantization), so ranking it below made the picker prefer a bigger, worse
+	// file whenever a repo shipped both.
+	'Q4_K_XL', 'Q4_K_L', 'Q4_K_M', 'Q4_K_S', 'IQ4_NL', 'IQ4_XS', 'Q4_1', 'Q4_0',
+	'Q3_K_XL', 'Q3_K_L', 'Q3_K_M', 'Q3_K_S', 'IQ3_M', 'IQ3_S', 'IQ3_XXS', 'Q2_K', 'IQ2_M', 'IQ2_XS', 'IQ2_XXS'
 ];
 
 /**
@@ -148,6 +163,35 @@ const GGUF_QUANT_QUALITY = [
  * downloaded (see {@link pickBestGgufForBudget}). An explicit user quant choice is honoured separately.
  */
 export const MAX_AUTO_GGUF_QUANT = 'Q8_0';
+
+/**
+ * Lowest quant the picker treats as FULL quality - the ~4-bits-per-weight band (Q4_K_M, Q4_K_S, IQ4_XS, Q4_0).
+ * Everything at or above this is a quant you would happily ship: the perplexity gap up to Q8_0 is a fraction of
+ * a percent, far smaller than the gap down to 3-bit.
+ *
+ * This is the counterpart the picker was missing. {@link MAX_AUTO_GGUF_QUANT} caps the side that costs only
+ * bandwidth; without a floor on the side that costs OUTPUT QUALITY, the picker would silently choose a 2-bit
+ * quant to protect a context window - a permanently degraded model traded for an elastic resource the launch
+ * planner re-negotiates on every start.
+ */
+export const GOOD_QUANT_FLOOR = 'Q4_0';
+
+/**
+ * Lowest quant that may be selected WITHOUT asking the user. Below this (IQ3_S, IQ3_XXS, Q2_K, IQ2_*) a coding
+ * model starts failing in ways that look like bugs rather than like a small model: malformed tool-call JSON,
+ * corrupted diffs, dropped instructions. Those quants remain reachable - the caller shows the tradeoff and lets
+ * the user decide - but they are never the silent default.
+ */
+export const HARD_QUANT_FLOOR = 'IQ3_M';
+
+/**
+ * The quantization token in a GGUF filename ('Q4_K_M', 'IQ3_M', ...), or undefined when it carries none. Used
+ * to name the chosen quant in user-facing text, where the full sharded filename would be noise.
+ */
+export function quantNameFromPath(path: string): string | undefined {
+	const upper = path.toUpperCase();
+	return GGUF_QUANT_QUALITY.find(q => upper.includes(q));
+}
 
 /** Quality score for a GGUF filename: higher = better quality. Unknown quants score 0 (lowest). */
 export function quantQualityScore(filename: string): number {
@@ -196,6 +240,67 @@ export function isMtpGgufPath(path: string): boolean {
 /** Weight GGUFs only (excludes mmproj / CLIP projectors and standalone MTP draft heads). */
 function isWeightGgufPath(path: string): boolean {
 	return path.toLowerCase().endsWith('.gguf') && !isMmprojGgufPath(path) && !isMtpGgufPath(path);
+}
+
+/**
+ * Matches llama.cpp's split-GGUF naming (`<stem>-00001-of-00003.gguf`), capturing the stem and the shard index.
+ * Any quant larger than ~45 GB is published this way - 70B at Q8_0, the 120B/235B MoEs, most large Unsloth
+ * builds - so this is the normal case at the top of the size range, not an exotic one.
+ */
+const GGUF_SHARD_RE = /^(.*)-(\d{5})-of-(\d{5})\.gguf$/i;
+
+/**
+ * One selectable weights unit: a single GGUF, or the complete set of shards of a split one. The picker reasons
+ * in these rather than in files, because a shard is neither independently sizeable nor independently runnable.
+ */
+export interface GgufCandidate {
+	/** Grouping key: the shared stem for a split GGUF, the path itself otherwise. Carries the quant name. */
+	readonly key: string;
+	/** Every file to fetch, shard order preserved. One entry for an unsplit GGUF. */
+	readonly paths: readonly string[];
+	/** TOTAL bytes across all shards - what the model actually costs. */
+	readonly size: number;
+	/** True when this unit is split across multiple files. */
+	readonly sharded: boolean;
+}
+
+/**
+ * Groups weight GGUFs into selectable units, summing the bytes of split models.
+ *
+ * Without this the pickers see each shard as an independent model: a 42 GB Q4_K_M published as two 21 GB
+ * shards looks like a 21 GB file, so it passes the budget check on a machine that cannot hold it, and only the
+ * FIRST shard gets downloaded - leaving an unloadable model on disk. Entries with an unknown size are dropped
+ * from the sum's denominator by the caller (a group is only sizeable when every shard reports a size).
+ */
+export function groupGgufCandidates(files: readonly { path: string; size?: number }[]): GgufCandidate[] {
+	const groups = new Map<string, { paths: { path: string; index: number }[]; size: number; sized: boolean; sharded: boolean }>();
+	for (const file of files) {
+		if (!isWeightGgufPath(file.path)) {
+			continue;
+		}
+		const match = GGUF_SHARD_RE.exec(file.path);
+		const key = match ? match[1] : file.path;
+		const index = match ? parseInt(match[2], 10) : 0;
+		let group = groups.get(key);
+		if (!group) {
+			group = { paths: [], size: 0, sized: true, sharded: !!match };
+			groups.set(key, group);
+		}
+		group.paths.push({ path: file.path, index });
+		if (typeof file.size === 'number' && file.size > 0) {
+			group.size += file.size;
+		} else {
+			// A single unsized shard makes the whole group's total unknown - better to skip it than to
+			// under-count a split model into a budget it cannot fit.
+			group.sized = false;
+		}
+	}
+	return Array.from(groups.entries()).map(([key, group]) => ({
+		key,
+		paths: group.paths.sort((a, b) => a.index - b.index).map(p => p.path),
+		size: group.sized ? group.size : 0,
+		sharded: group.sharded,
+	}));
 }
 
 /**
@@ -275,32 +380,65 @@ export interface GgufBudgetPickOptions {
 }
 
 /**
- * Picks the GGUF file to download for this machine, by service tier rather than by weight size alone.
- *
- * Weight quant and KV cache compete for the SAME memory, and the weight choice is permanent while the context
- * is re-negotiated at every launch - so maximizing weight quality alone is the wrong objective. A Q8_0 that
- * leaves room for only a cramped window is a worse coding model than a Q5_K_M that leaves room for a comfort
- * window: the quantization gap between them is a fraction of a percent of perplexity, while the context gap
- * decides whether the file you are editing fits in the conversation at all.
- *
- * So the pick is made in tiers:
- *  1. the highest-quality quant (capped at Q8_0) that still leaves room for a **comfort** run - the target;
- *  2. failing that, the highest-quality quant that still leaves room for a **floor** run - still fully usable;
- *  3. failing that, the **smallest** weight file, so the model can at least load.
- *
- * This is two-way: on a capable machine it upgrades a small catalog quant (e.g. Q4_K_M) to Q8_0, and on a tight
- * one it downgrades. Returns undefined when there are no GGUF files or no sizes are known (caller falls back to
- * the static priority pick). Entries without a size are treated as unknown and only used as a last-resort pick.
- *
- * Multimodal projectors (`mmproj-*.gguf`) are ignored - they are tiny and would otherwise win the
- * "smallest fallback" path on memory-tight machines, which then fails at launch as architecture `clip`.
+ * How well the chosen quant actually serves this machine. Drives whether the download proceeds silently, is
+ * merely annotated, or has to be put to the user.
  */
-export function pickBestGgufForBudget(files: readonly { path: string; size?: number }[], budgetBytes: number, options: GgufBudgetPickOptions = {}): string | undefined {
-	const gguf = files.filter(f => isWeightGgufPath(f.path));
-	if (gguf.length === 0) {
+export type GgufFitVerdict =
+	/** A full-quality (>= 4-bit) quant with room for the {@link TARGET_MIN_CONTEXT} comfort window. Download silently. */
+	| 'good'
+	/** Runnable and honest, but compromised: either a >= 4-bit quant at the 16K floor window, or a 3-bit quant. Annotate. */
+	| 'tight'
+	/** Below {@link HARD_QUANT_FLOOR}, or nothing fits at all. Never silent - the caller must ask the user. */
+	| 'poor';
+
+/** The complete download decision for a repo's GGUF weights. */
+export interface GgufDownloadPlan {
+	/** Every file to fetch - more than one only for a split (`-00001-of-000NN`) quant. */
+	readonly paths: readonly string[];
+	/** Representative path (first shard) - what logs and UI name. */
+	readonly path: string;
+	/** TOTAL bytes across all shards. */
+	readonly sizeBytes: number;
+	/** Context window the pick leaves room for: 'comfort' (~32K), 'floor' (~16K), 'overflow' (does not fit). */
+	readonly tier: GgufFootprintTier | 'overflow';
+	readonly verdict: GgufFitVerdict;
+	/** True when this is a split GGUF, so callers can say so (a 3-shard 42 GB download deserves a mention). */
+	readonly sharded: boolean;
+}
+
+/**
+ * Plans the GGUF download for this machine: which quant, how many files, and how good the result will be.
+ *
+ * Weight quant and KV cache compete for the SAME memory, but they are not the same KIND of resource. The weight
+ * choice is permanent and bounds output quality; the context is re-negotiated at every launch and the planner
+ * already grows it whenever the machine has room. So the search is ordered by which resource is genuinely
+ * scarce, walking DOWN the quality bands and only then trading context inside each band:
+ *
+ *  1. best full-quality quant (>= {@link GOOD_QUANT_FLOOR}, capped at Q8_0) that affords a **comfort** window;
+ *  2. else best full-quality quant that affords the **floor** window - good weights, 16K, still fully usable;
+ *  3. else best quant down to {@link HARD_QUANT_FLOOR} (comfort first, then floor) - quality is already
+ *     compromised here, so at this point the extra context IS the better trade;
+ *  4. else the largest sub-floor quant that fits at all, reported as 'poor' for the caller to put to the user.
+ *
+ * Step 2 is the one that matters. The previous implementation looped tier-OUTERMOST, so any quant clearing the
+ * comfort tier ended the search: a 16 GB Mac asking for a 14B took **Q2_K at 32K** over the **Q4_K_S at 16K**
+ * sitting right beside it, and a 32 GB Mac took Q3_K_M over Q4_K_M for a 32B. That trades a permanent, severe
+ * quality loss for an elastic resource - exactly backwards.
+ *
+ * Returns undefined when the repo ships no weight GGUFs or no sizes are known (caller falls back to the static
+ * priority pick). Multimodal projectors (`mmproj-*.gguf`) and MTP heads are excluded throughout - they are tiny
+ * and would otherwise win the smallest-file paths, then fail at launch as architecture `clip`.
+ *
+ * The projector is deliberately NOT charged against the budget: it is loaded only when the user turns vision on
+ * for the model, and the launch path already counts its bytes as `extraResidentBytes` and shrinks the context
+ * accordingly, so charging it here too would double-count it and cost every text user a quant step.
+ */
+export function planGgufDownload(files: readonly { path: string; size?: number }[], budgetBytes: number, options: GgufBudgetPickOptions = {}): GgufDownloadPlan | undefined {
+	const candidates = groupGgufCandidates(files);
+	if (candidates.length === 0) {
 		return undefined;
 	}
-	const sized = gguf.filter(f => typeof f.size === 'number' && f.size! > 0) as { path: string; size: number }[];
+	const sized = candidates.filter(c => c.size > 0);
 	if (sized.length === 0 || budgetBytes <= 0) {
 		return undefined; // no sizes -> let the static picker decide
 	}
@@ -311,24 +449,55 @@ export function pickBestGgufForBudget(files: readonly { path: string; size?: num
 	const ceilingScore = Math.min(capScore, pinScore);
 	// Prefer candidates at/below the quality ceiling; only if NONE exist (e.g. a repo shipping only F16) do we
 	// fall back to the rest, so there is always something to download.
-	const capped = sized.filter(f => quantQualityScore(f.path) <= ceilingScore);
+	const capped = sized.filter(c => quantQualityScore(c.key) <= ceilingScore);
 	const pool = capped.length > 0 ? capped : sized;
 
-	// Tier 1 then tier 2: take the best quant that leaves room for a comfort run; if none does, settle for the
-	// best that leaves room for a floor run. Both are quality-ordered, so this never trades quality for a tier
-	// the machine could already afford.
-	for (const tier of ['comfort', 'floor'] as const) {
-		const fitting = pool.filter(f => estimateGgufRuntimeFootprintBytes(f.size, options.layerCount, tier) <= budgetBytes);
-		if (fitting.length > 0) {
-			// Highest quality among those that fit; on a tie, the larger file (more bits) wins.
-			fitting.sort((a, b) => (quantQualityScore(b.path) - quantQualityScore(a.path)) || (b.size - a.size));
-			return fitting[0].path;
-		}
+	const fits = (c: GgufCandidate, tier: GgufFootprintTier) => estimateGgufRuntimeFootprintBytes(c.size, options.layerCount, tier) <= budgetBytes;
+	// Highest quality first; on a tie the larger file (more bits) wins.
+	const best = (list: GgufCandidate[]) => list.sort((a, b) => (quantQualityScore(b.key) - quantQualityScore(a.key)) || (b.size - a.size))[0];
+	const plan = (c: GgufCandidate, tier: GgufFootprintTier | 'overflow', verdict: GgufFitVerdict): GgufDownloadPlan =>
+		({ paths: c.paths, path: c.paths[0], sizeBytes: c.size, tier, verdict, sharded: c.sharded });
+
+	const goodScore = quantQualityScore(GOOD_QUANT_FLOOR);
+	const hardScore = quantQualityScore(HARD_QUANT_FLOOR);
+	const good = pool.filter(c => quantQualityScore(c.key) >= goodScore);
+	const acceptable = pool.filter(c => quantQualityScore(c.key) >= hardScore);
+
+	// 1-2: a full-quality quant, preferring the comfort window but never giving up 4-bit weights to keep it.
+	let fitting = good.filter(c => fits(c, 'comfort'));
+	if (fitting.length > 0) {
+		return plan(best(fitting), 'comfort', 'good');
 	}
-	// Nothing fits even at the usability floor -> smallest weight file so the model is at least runnable
-	// (with a reduced context / paging / partial offload).
-	pool.sort((a, b) => a.size - b.size);
-	return pool[0].path;
+	fitting = good.filter(c => fits(c, 'floor'));
+	if (fitting.length > 0) {
+		return plan(best(fitting), 'floor', 'tight');
+	}
+	// 3: below full quality but still above the hard floor. Weight quality is already lost, so now the roles
+	// reverse and the wider window is worth more than the remaining fraction of a bit.
+	fitting = acceptable.filter(c => fits(c, 'comfort'));
+	if (fitting.length > 0) {
+		return plan(best(fitting), 'comfort', 'tight');
+	}
+	fitting = acceptable.filter(c => fits(c, 'floor'));
+	if (fitting.length > 0) {
+		return plan(best(fitting), 'floor', 'tight');
+	}
+	// 4: only sub-floor quants remain. Report the best one that fits (or, if none does, the smallest file so
+	// there is still something to offer) and let the caller put the tradeoff to the user.
+	const subFloorFitting = pool.filter(c => fits(c, 'floor'));
+	if (subFloorFitting.length > 0) {
+		return plan(best(subFloorFitting), 'floor', 'poor');
+	}
+	const smallest = [...pool].sort((a, b) => a.size - b.size)[0];
+	return plan(smallest, 'overflow', 'poor');
+}
+
+/**
+ * Back-compatible path-only view of {@link planGgufDownload}, returning the first file of the chosen quant.
+ * Prefer the plan itself: it carries the remaining shards of a split GGUF and the fit verdict.
+ */
+export function pickBestGgufForBudget(files: readonly { path: string; size?: number }[], budgetBytes: number, options: GgufBudgetPickOptions = {}): string | undefined {
+	return planGgufDownload(files, budgetBytes, options)?.path;
 }
 
 /** True when a model's `format` selects GGUF weights - either the generic 'gguf' or a specific quant name. */
@@ -352,24 +521,28 @@ export function modelDownloadDirName(repoId: string): string {
 	return repoId.replace(/\//g, '_');
 }
 
-function pickBestGGUFFile(paths: string[], preferredQuant?: string): string | undefined {
-	const gguf = paths.filter(isWeightGgufPath);
-	if (gguf.length === 0) return undefined;
+/**
+ * Static (budget-free) quant pick. Returns EVERY file of the chosen quant - a list of one for an ordinary GGUF,
+ * or the full shard set for a split one, which llama.cpp needs on disk together to load the model at all.
+ */
+function pickBestGGUFFile(paths: string[], preferredQuant?: string): string[] {
+	const candidates = groupGgufCandidates(paths.map(path => ({ path })));
+	if (candidates.length === 0) return [];
 
 	// If user specified a specific quantization (e.g. "Q4_K_M")
 	if (preferredQuant) {
 		const upperQuant = preferredQuant.toUpperCase();
-		const found = gguf.find(f => f.toUpperCase().includes(upperQuant));
-		if (found) return found;
+		const found = candidates.find(c => c.key.toUpperCase().includes(upperQuant));
+		if (found) return [...found.paths];
 	}
 
-	// Prefer file that matches best quantization from our priority list
+	// Prefer the quant that matches best from our priority list
 	for (const q of GGUF_QUANT_PRIORITY) {
-		const found = gguf.find(f => f.includes(q) || f.toUpperCase().includes(q));
-		if (found) return found;
+		const found = candidates.find(c => c.key.toUpperCase().includes(q));
+		if (found) return [...found.paths];
 	}
-	// Otherwise shortest file name often indicates a specific quant (e.g. one file)
-	return gguf.sort((a, b) => a.length - b.length)[0];
+	// Otherwise shortest name often indicates a specific quant (e.g. one file)
+	return [...candidates.sort((a, b) => a.key.length - b.key.length)[0].paths];
 }
 
 /**
@@ -407,7 +580,7 @@ function filterPathsByFormat(paths: string[], format: string): string[] {
 	// If user provided a specific GGUF quantization
 	if (GGUF_QUANT_PRIORITY.some(q => f.toUpperCase().includes(q)) || f.includes('gguf')) {
 		const best = pickBestGGUFFile(paths, f.includes('gguf') ? undefined : f);
-		return best ? [best] : paths.filter(isWeightGgufPath);
+		return best.length > 0 ? best : paths.filter(isWeightGgufPath);
 	}
 
 	if (f === 'safetensors') {
@@ -516,6 +689,7 @@ export class LoCoPilotModelDownloadService extends Disposable implements IWorkbe
 		@INativeHostService private readonly nativeHostService: INativeHostService,
 		@IConfigurationService private readonly configurationService: IConfigurationService,
 		@ITerminalService private readonly terminalService: ITerminalService,
+		@IDialogService private readonly dialogService: IDialogService,
 	) {
 		super();
 		this._registerCommands();
@@ -730,6 +904,15 @@ export class LoCoPilotModelDownloadService extends Disposable implements IWorkbe
 	 * (caller then keeps the format-filtered pick).
 	 */
 	private async _memoryBudgetForDownload(): Promise<number> {
+		return (await this._downloadHardware()).budgetBytes;
+	}
+
+	/**
+	 * This machine's inference memory budget plus the hardware profile behind it. The profile is what lets a
+	 * "this model won't run well here" prompt name a concrete catalog model that WOULD - see
+	 * {@link rankRecommendations} - instead of only saying no.
+	 */
+	private async _downloadHardware(): Promise<{ budgetBytes: number; profile: IHardwareProfile }> {
 		let total = 0;
 		try {
 			const stats = await this.nativeHostService.getOSStatistics();
@@ -738,17 +921,75 @@ export class LoCoPilotModelDownloadService extends Disposable implements IWorkbe
 		let appleSilicon = false;
 		let metalWiredLimit = 0;
 		let discreteVram = 0;
+		let discreteVramFree = 0;
 		try {
 			const hw = await this.systemInfoService.getHardwareInfo();
 			appleSilicon = hw.gpus.some(g => g.vendor === 'apple');
 			metalWiredLimit = hw.metalWiredLimitBytes ?? 0;
 			// Only DISCRETE VRAM adds capacity beyond system RAM; Apple's unified memory reports 0 here.
-			discreteVram = hw.gpus.reduce((max, g) => g.vendor === 'apple' ? max : Math.max(max, g.totalVramBytes), 0);
+			const discrete = hw.gpus.filter(g => g.vendor !== 'apple');
+			discreteVram = discrete.reduce((max, g) => Math.max(max, g.totalVramBytes), 0);
+			discreteVramFree = discrete.reduce((max, g) => Math.max(max, g.freeVramBytes ?? 0), 0);
 		} catch { /* ignore */ }
 		const ramBudget = appleSilicon
 			? metalOffloadBudgetBytes(total, metalWiredLimit || undefined)
 			: usableSystemMemoryBytes(total);
-		return Math.max(ramBudget, discreteVram);
+		return {
+			budgetBytes: Math.max(ramBudget, discreteVram),
+			profile: {
+				totalRamBytes: total,
+				isAppleSilicon: appleSilicon,
+				metalWiredLimitBytes: metalWiredLimit,
+				discreteVramBytes: discreteVram,
+				discreteVramFreeBytes: discreteVramFree,
+			},
+		};
+	}
+
+	/**
+	 * Puts a compromised quant choice to the user instead of silently downloading it. Called only for a 'poor'
+	 * verdict - below {@link HARD_QUANT_FLOOR}, or nothing in the repo fits at all - where proceeding quietly
+	 * would hand back a multi-GB model that produces broken tool calls and corrupted diffs, and the user would
+	 * reasonably read that as a bug in LoCoPilot rather than as the quantization it is.
+	 *
+	 * A 'tight' verdict never reaches here: those runs are genuinely usable, so they proceed silently (the
+	 * compromise is recorded in the download log rather than interrupting the user for an acknowledgement).
+	 */
+	private async _confirmPoorFit(model: ICustomLanguageModel, plan: GgufDownloadPlan, budgetBytes: number, profile: IHardwareProfile): Promise<boolean> {
+		const name = getCustomModelListLabel(model);
+		const gb = (bytes: number) => (bytes / 1e9).toFixed(1);
+		const quant = quantNameFromPath(plan.path) ?? 'the smallest available quantization';
+		const message = plan.tier === 'overflow'
+			? `"${name}" is too large for this computer.`
+			: `"${name}" will only run here at heavily reduced quality.`;
+		const consequence = plan.tier === 'overflow'
+			? `The smallest version in this repository is ${quant} (~${gb(plan.sizeBytes)} GB), which still needs more memory than the ~${gb(budgetBytes)} GB available for inference. It would run by swapping to disk, which is extremely slow.`
+			: `The best version that fits is ${quant} (~${gb(plan.sizeBytes)} GB) against a ~${gb(budgetBytes)} GB budget. At this quantization the model frequently produces malformed tool calls and corrupted file edits - problems that look like bugs but are caused by the compression.`;
+		// Name a model that genuinely fits, so "pick something else" is actionable rather than a dead end.
+		const alternative = rankRecommendations(budgetBytes, profile)
+			.find(entry => entry.repoId !== model.modelName.trim());
+		const suggestion = alternative
+			? ` A good alternative for this machine is ${alternative.displayName} (~${gb(alternative.approxSizeBytes)} GB).`
+			: '';
+
+		// Two buttons only, both right-aligned with Cancel leading - the dialog layer applies the platform HIG
+		// ordering itself (see the macOS branch in base/browser/ui/dialog), so `buttons` + `cancelButton` is all
+		// that is needed. The alternative model is named in the text rather than offered as a button: switching
+		// models is a choice the user makes in the model list, not something this dialog can carry out.
+		const { result } = await this.dialogService.prompt<'download' | 'cancel'>({
+			type: Severity.Warning,
+			message,
+			detail: `${consequence}${suggestion}`,
+			buttons: [{ label: 'Download anyway', run: () => 'download' as const }],
+			cancelButton: { label: 'Cancel', run: () => 'cancel' as const },
+		});
+
+		if (result === 'download') {
+			this._log(`[LoCoPilot Download] User chose "Download anyway" for ${model.modelName} at ${quant} (verdict=poor, tier=${plan.tier}).`);
+			return true;
+		}
+		this._log(`[LoCoPilot Download] User cancelled the download of ${model.modelName} at ${quant} (verdict=poor).`);
+		return false;
 	}
 
 	/**
@@ -1000,7 +1241,7 @@ export class LoCoPilotModelDownloadService extends Disposable implements IWorkbe
 			// Two-way: upgrades a small catalog quant (e.g. Q4_K_M -> Q8_0) on a capable machine and downgrades on a
 			// tight one. When the user pinned an exact quant we keep it and only ever downgrade it to fit.
 			if (toDownload.some(isWeightGgufPath)) {
-				const budget = await this._memoryBudgetForDownload();
+				const { budgetBytes: budget, profile } = await this._downloadHardware();
 				if (budget > 0) {
 					const files = allPaths.map(p => ({ path: p, size: sizes.get(p) }));
 					const userPinnedQuant = !!model.userOverrides?.format && !!format && !format.toLowerCase().includes('gguf');
@@ -1008,13 +1249,21 @@ export class LoCoPilotModelDownloadService extends Disposable implements IWorkbe
 					// MoE/quant-independent KV sizing: charge every quant the SAME layer count, derived from the model
 					// name's param size (a 35B-A3B MoE is charged its depth, not its 18 GB file size).
 					const layerCount = estimateLayerCountFromModelName(model.displayName || repoId);
-					const chosen = pickBestGgufForBudget(files, budget, { ...(userPinnedQuant && currentPick ? { noUpgradeAbove: currentPick } : {}), layerCount });
-					if (chosen && chosen !== currentPick) {
-						const chosenSize = sizes.get(chosen) ?? 0;
-						const prevSize = currentPick ? (sizes.get(currentPick) ?? 0) : 0;
-						const direction = chosenSize >= prevSize ? 'higher-quality' : 'smaller';
-						this._log(`[LoCoPilot Download] Hardware-aware quant: ${direction} ${chosen} (~${Math.round(chosenSize / 1e9)}GB, est. footprint ~${Math.round(estimateGgufRuntimeFootprintBytes(chosenSize) / 1e9)}GB) for the ~${Math.round(budget / 1e9)}GB budget${currentPick ? ` instead of ${currentPick}` : ''}.`);
-						toDownload = [chosen];
+					const plan = planGgufDownload(files, budget, { ...(userPinnedQuant && currentPick ? { noUpgradeAbove: currentPick } : {}), layerCount });
+					if (plan) {
+						// A 'poor' pick is never silent: the user decides whether a badly-degraded model is worth the
+						// download. Everything else proceeds, with a passing note when the fit is merely tight.
+						if (plan.verdict === 'poor' && !(await this._confirmPoorFit(model, plan, budget, profile))) {
+							await this.customLanguageModelsService.updateCustomModel(modelId, { isDownloading: false, downloadProgress: 0 });
+							return;
+						}
+						if (plan.path !== currentPick || plan.paths.length > 1) {
+							const prevSize = currentPick ? (sizes.get(currentPick) ?? 0) : 0;
+							const direction = plan.sizeBytes >= prevSize ? 'higher-quality' : 'smaller';
+							const shards = plan.sharded ? `, ${plan.paths.length} shards` : '';
+							this._log(`[LoCoPilot Download] Hardware-aware quant: ${direction} ${plan.path} (~${Math.round(plan.sizeBytes / 1e9)}GB${shards}, est. footprint ~${Math.round(estimateGgufRuntimeFootprintBytes(plan.sizeBytes, layerCount, plan.tier === 'overflow' ? 'floor' : plan.tier) / 1e9)}GB) for the ~${Math.round(budget / 1e9)}GB budget [${plan.verdict}/${plan.tier}]${currentPick ? ` instead of ${currentPick}` : ''}.`);
+						}
+						toDownload = [...plan.paths];
 					}
 				}
 			}

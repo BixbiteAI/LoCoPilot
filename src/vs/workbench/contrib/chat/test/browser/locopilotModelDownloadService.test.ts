@@ -7,12 +7,17 @@ import assert from 'assert';
 import { ensureNoDisposablesAreLeakedInTestSuite } from '../../../../../base/test/common/utils.js';
 import {
 	pickBestGgufForBudget,
+	planGgufDownload,
+	groupGgufCandidates,
 	estimateGgufRuntimeFootprintBytes,
 	quantQualityScore,
+	quantNameFromPath,
 	isGgufFormatRequest,
 	modelParamsBillionsFromName,
 	estimateLayerCountFromModelName,
 	MAX_AUTO_GGUF_QUANT,
+	GOOD_QUANT_FLOOR,
+	HARD_QUANT_FLOOR,
 	isMtpGgufPath,
 } from '../../browser/locopilotModelDownloadService.js';
 
@@ -133,17 +138,20 @@ suite('LoCoPilot model download - hardware-aware quant selection', () => {
 			assert.ok(estimateGgufRuntimeFootprintBytes(8.1 * GB, layerCount) > budget, 'Q8 footprint must NOT fit this budget');
 		});
 
-		test('sizes against a COMFORT run (32K @ q8 KV), not merely a loadable one', () => {
-			// The weight quant is permanent while the context is re-negotiated every launch, so a quant that only
-			// leaves room for a cramped window is the wrong trade: the quantization gap between Q6 and Q8 is a
-			// fraction of a percent, the context gap decides whether the file being edited fits at all.
+		test('inside the full-quality band, prefers the COMFORT window over extra bits', () => {
+			// Q4_K_M and Q6_K are both full-quality (>= GOOD_QUANT_FLOOR) and the gap between them is a fraction
+			// of a percent of perplexity - so when the budget affords Q4_K_M at the 32K comfort window but Q6_K
+			// only at the 16K floor, the window is worth more than the bits.
 			const layerCount = 36;
 			const comfort = estimateGgufRuntimeFootprintBytes(6.3 * GB, layerCount, 'comfort');
 			const floor = estimateGgufRuntimeFootprintBytes(6.3 * GB, layerCount, 'floor');
 			assert.ok(comfort > floor, 'the comfort tier must reserve more than the floor tier');
-			// A budget that fits Q6_K only at the floor tier must NOT be spent on Q8_0.
 			const budget = floor + 0.1 * GB;
-			assert.strictEqual(pickBestGgufForBudget(repo7b, budget, { layerCount }), 'model-Q6_K.gguf');
+			assert.ok(estimateGgufRuntimeFootprintBytes(6.3 * GB, layerCount, 'comfort') > budget, 'Q6_K must not fit comfort');
+			const plan = planGgufDownload(repo7b, budget, { layerCount })!;
+			assert.strictEqual(plan.path, 'model-Q4_K_M.gguf');
+			assert.strictEqual(plan.tier, 'comfort');
+			assert.strictEqual(plan.verdict, 'good');
 		});
 
 		test('falls back to the floor tier before falling back to the smallest file', () => {
@@ -243,6 +251,129 @@ suite('LoCoPilot model download - hardware-aware quant selection', () => {
 			const layers = estimateLayerCountFromModelName('Qwen3 4B');
 			const pick = pickBestGgufForBudget(repo4b, 10 * GB, { layerCount: layers });
 			assert.strictEqual(pick, 'm-Q8_0.gguf');
+		});
+	});
+
+	suite('quality bands: weights are permanent, context is not', () => {
+		// Typical bytes-per-parameter for each quant, so a repo can be generated at any model size. These are the
+		// real-world ratios (a 32B Q4_K_M is ~20 GB, a 32B Q8_0 is ~35 GB), which is what makes the machine/model
+		// combinations below the ones users actually hit.
+		const BYTES_PER_B: Record<string, number> = {
+			Q2_K: 0.40e9, IQ3_M: 0.47e9, Q3_K_M: 0.51e9, IQ4_XS: 0.56e9, Q4_K_S: 0.585e9,
+			Q4_K_M: 0.62e9, Q5_K_M: 0.73e9, Q6_K: 0.85e9, Q8_0: 1.09e9, F16: 2.05e9,
+		};
+		const repoFor = (paramsB: number) => Object.entries(BYTES_PER_B).map(([quant, perB]) => ({ path: `m-${quant}.gguf`, size: perB * paramsB }));
+		/** Metal wired budget of an Apple Silicon machine with `totalGB` of unified memory. */
+		const macBudget = (totalGB: number) => {
+			const total = totalGB * GB;
+			return total * (total >= 36 * GB ? 0.75 : (total < 18 * GB ? 0.66 : 0.70));
+		};
+
+		test('a 14B on a 16GB Mac gets a 4-bit quant at 16K, NOT Q2_K at 32K', () => {
+			// The regression that motivated the band ordering. The old tier-outermost loop stopped at the first
+			// tier with ANY fitting quant, and on this machine only Q2_K cleared the comfort tier - so it took a
+			// permanently broken 2-bit model to protect a context window the launch planner re-negotiates anyway.
+			const plan = planGgufDownload(repoFor(14), macBudget(16), { layerCount: 48 })!;
+			assert.strictEqual(quantNameFromPath(plan.path), 'Q4_K_S');
+			assert.strictEqual(plan.tier, 'floor');
+			assert.strictEqual(plan.verdict, 'tight');
+		});
+
+		test('a 32B on a 32GB Mac gets Q4_K_M at 16K, not Q3_K_M at 32K', () => {
+			const plan = planGgufDownload(repoFor(32), macBudget(32), { layerCount: 64 })!;
+			assert.strictEqual(quantNameFromPath(plan.path), 'Q4_K_M');
+			assert.strictEqual(plan.verdict, 'tight');
+		});
+
+		test('below the full-quality band the trade REVERSES - context wins again', () => {
+			// A 49B on a 36GB Mac cannot hold any 4-bit quant. Quality is already lost at this point, so the
+			// remaining fraction of a bit is worth less than the wider window: take the best >= HARD floor quant.
+			const plan = planGgufDownload(repoFor(49), macBudget(36), { layerCount: 80 })!;
+			assert.strictEqual(quantNameFromPath(plan.path), 'Q3_K_M');
+			assert.strictEqual(plan.verdict, 'tight');
+		});
+
+		test('a hopeless combination is reported as poor rather than silently downloaded', () => {
+			// 32B on a 16GB Mac: nothing fits, so the caller must put the tradeoff to the user instead of
+			// quietly fetching ~13 GB of Q2_K that will swap-thrash at launch.
+			const plan = planGgufDownload(repoFor(32), macBudget(16), { layerCount: 64 })!;
+			assert.strictEqual(plan.verdict, 'poor');
+			assert.strictEqual(plan.tier, 'overflow');
+		});
+
+		test('capable machines are unaffected - still full quality at the comfort window', () => {
+			for (const [totalGB, paramsB, layers, expected] of [[64, 70, 80, 'Q4_K_M'], [64, 32, 64, 'Q8_0'], [128, 70, 80, 'Q8_0']] as const) {
+				const plan = planGgufDownload(repoFor(paramsB), macBudget(totalGB), { layerCount: layers })!;
+				assert.strictEqual(quantNameFromPath(plan.path), expected, `${paramsB}B on a ${totalGB}GB Mac`);
+				assert.strictEqual(plan.verdict, 'good', `${paramsB}B on a ${totalGB}GB Mac must not be flagged`);
+			}
+		});
+
+		test('the bands are ordered and both sit inside the auto cap', () => {
+			assert.ok(quantQualityScore(MAX_AUTO_GGUF_QUANT) > quantQualityScore(GOOD_QUANT_FLOOR));
+			assert.ok(quantQualityScore(GOOD_QUANT_FLOOR) > quantQualityScore(HARD_QUANT_FLOOR));
+		});
+	});
+
+	suite('split (sharded) GGUFs are one selectable unit', () => {
+		// How HuggingFace publishes any quant over ~45 GB - 70B at Q8_0, the big MoEs, most large Unsloth builds.
+		const shardedRepo = [
+			{ path: 'Q4_K_M/model-00001-of-00002.gguf', size: 21 * GB },
+			{ path: 'Q4_K_M/model-00002-of-00002.gguf', size: 21 * GB },
+			{ path: 'model-Q2_K.gguf', size: 14 * GB },
+		];
+
+		test('sums the shards instead of sizing each one independently', () => {
+			const q4 = groupGgufCandidates(shardedRepo).find(c => c.key.includes('Q4_K_M'))!;
+			assert.strictEqual(q4.paths.length, 2);
+			assert.strictEqual(q4.size, 42 * GB);
+			assert.ok(q4.sharded);
+		});
+
+		test('a split quant too big for the machine is rejected as a WHOLE', () => {
+			// The old bug: each 21 GB shard looked like an independent model, so a 30 GB budget "fitted" a 42 GB
+			// model - and then only shard 1 was downloaded, leaving weights llama.cpp cannot load.
+			const plan = planGgufDownload(shardedRepo, 30 * GB, { layerCount: 80 })!;
+			assert.ok(!plan.paths.some(p => p.includes('00001')), 'must not select an unfittable split model');
+		});
+
+		test('a split quant that fits returns EVERY shard, first shard leading', () => {
+			const plan = planGgufDownload(shardedRepo, 60 * GB, { layerCount: 80 })!;
+			assert.strictEqual(plan.paths.length, 2);
+			assert.strictEqual(plan.sizeBytes, 42 * GB);
+			assert.ok(plan.sharded);
+			// llama.cpp is handed `-m <first shard>` and finds the rest beside it, so shard order matters.
+			assert.strictEqual(plan.path, 'Q4_K_M/model-00001-of-00002.gguf');
+		});
+
+		test('shard order is normalised regardless of listing order', () => {
+			const outOfOrder = [
+				{ path: 'm-00003-of-00003.gguf', size: 5 * GB },
+				{ path: 'm-00001-of-00003.gguf', size: 5 * GB },
+				{ path: 'm-00002-of-00003.gguf', size: 5 * GB },
+			];
+			assert.deepStrictEqual(groupGgufCandidates(outOfOrder)[0].paths, [
+				'm-00001-of-00003.gguf', 'm-00002-of-00003.gguf', 'm-00003-of-00003.gguf',
+			]);
+		});
+
+		test('a group with an unsized shard is not selectable (never under-count a split model)', () => {
+			const partial = [{ path: 'm-00001-of-00002.gguf', size: 5 * GB }, { path: 'm-00002-of-00002.gguf' }];
+			assert.strictEqual(planGgufDownload(partial, 60 * GB), undefined);
+		});
+	});
+
+	suite('quant naming and ranking', () => {
+		test('IQ4_XS outranks the legacy Q4_0 it replaced', () => {
+			// IQ4_XS is both SMALLER and better than Q4_0; ranking it below made the picker prefer a bigger,
+			// worse file on any repo shipping both.
+			assert.ok(quantQualityScore('m-IQ4_XS.gguf') > quantQualityScore('m-Q4_0.gguf'));
+			assert.ok(quantQualityScore('m-IQ4_NL.gguf') > quantQualityScore('m-Q4_1.gguf'));
+		});
+
+		test('quantNameFromPath extracts the token from a decorated, sharded filename', () => {
+			assert.strictEqual(quantNameFromPath('a/b/model-UD-Q4_K_XL-00001-of-00002.gguf'), 'Q4_K_XL');
+			assert.strictEqual(quantNameFromPath('m-weird.gguf'), undefined);
 		});
 	});
 

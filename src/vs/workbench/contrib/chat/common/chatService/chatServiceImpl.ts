@@ -1098,22 +1098,27 @@ export class ChatService extends Disposable implements IChatService {
 		}
 
 		// Rule-based title: derived from the user's first message with regex/keyword rules
-		// (see chatTitleHeuristics.ts). Costs zero tokens and no extra model round-trip, which
-		// is why the LLM titler below is disabled. It is also the fallback when the LLM titler
-		// is re-enabled and fails.
+		// (see chatTitleHeuristics.ts). Costs zero tokens and shows instantly, so the tab is never
+		// blank while the LLM titler below is in flight - and it is what stays if that titler fails.
 		const heuristicTitle = generateHeuristicChatTitle(request.message);
 		if (heuristicTitle) {
 			model.setCustomTitle(heuristicTitle);
 		}
+		this.logService.info(`[chat title] rule-based title applied: "${heuristicTitle}" (LLM titler is commented out)`);
 
 		/* ---------------------------------------------------------------------------------
-		 * LLM-BASED TITLE GENERATION - DISABLED (token saving).
+		 * LLM-BASED TITLE GENERATION - COMMENTED OUT.
 		 *
-		 * To re-enable, uncomment the block below. It overrides the heuristic title only when
-		 * the model actually returns something and the user hasn't renamed the session in the
-		 * meantime; on error/empty/cancelled, the heuristic title above simply stays.
+		 * Measured on llama.cpp (Qwen3.5-2B MTP, n_slots = 1, cache_reuse disabled by the MTP
+		 * draft context): this 53-token title prompt lands between conversation turns, and because
+		 * it shares no prefix with what is in the slot it logs "forcing full prompt re-processing"
+		 * and ERASES every context checkpoint of the ~7.7K conversation. With it commented out the
+		 * next turn instead hits "restored context checkpoint" at sim_best = 0.999. The warm-up
+		 * ping in locopilotLocalModelRunner.ts is commented out for the same reason.
 		 *
-		 * Uses a single-entry history based on the current request (no full chat history).
+		 * To re-enable, uncomment the block below. It overrides the heuristic title only when the
+		 * model returns something and the user hasn't renamed the session meanwhile; on
+		 * error/empty/cancelled the heuristic title above simply stays.
 		 *
 		const singleEntryHistory: IChatAgentHistoryEntry[] = [{
 			request,
@@ -1123,9 +1128,17 @@ export class ChatService extends Disposable implements IChatService {
 		const generate = async () => {
 			try {
 				const title = await this.chatAgentService.getChatTitle(defaultAgent.id, singleEntryHistory, token);
-				// Only replace our own heuristic title - never a title the user typed themselves.
-				if (title && !token.isCancellationRequested && model.customTitle === heuristicTitle) {
+				if (!title) {
+					this.logService.info(`[chat title] agent '${defaultAgent.id}' has no title provider or returned nothing - keeping rule-based "${heuristicTitle}"`);
+				} else if (title === heuristicTitle) {
+					// The provider itself fell back to the rule-based title (no usable model, cancelled, or threw).
+					this.logService.info(`[chat title] agent '${defaultAgent.id}' fell back to the rule-based title "${heuristicTitle}" - the model path produced nothing`);
+				} else if (!token.isCancellationRequested && model.customTitle === heuristicTitle) {
+					// Only replace our own heuristic title - never a title the user typed themselves.
 					model.setCustomTitle(title);
+					this.logService.info(`[chat title] LLM title applied: "${title}" (replaced rule-based "${heuristicTitle}")`);
+				} else {
+					this.logService.info(`[chat title] discarding LLM title "${title}" - title changed meanwhile (now "${model.customTitle}", cancelled = ${token.isCancellationRequested})`);
 				}
 			} catch (err) {
 				// Fall back to the heuristic title that is already set.

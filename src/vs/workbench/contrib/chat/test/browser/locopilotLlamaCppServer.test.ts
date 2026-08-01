@@ -51,6 +51,7 @@ import {
 	type GpuLike,
 } from '../../browser/locopilotLlamaCppServer.js';
 import { getMlxLmServerCommand, MLX_MEMORY_LIMIT_BOOTSTRAP } from '../../browser/locopilotMlxServer.js';
+import { kvLayerCount, recurrentStateBytes, type IGgufModelInfo } from '../../browser/locopilotGgufMetadata.js';
 
 suite('LoCoPilot llama.cpp server', () => {
 	ensureNoDisposablesAreLeakedInTestSuite();
@@ -294,6 +295,89 @@ suite('LoCoPilot llama.cpp server', () => {
 		test('zero / unknown total -> 0 (callers skip the budget)', () => {
 			assert.strictEqual(metalOffloadBudgetBytes(0), 0);
 			assert.strictEqual(usableSystemMemoryBytes(0), 0);
+		});
+	});
+
+	suite('hybrid (Mamba/attention) KV geometry', () => {
+		/** A Nemotron-H-shaped hybrid: 62 blocks of which only 6 are attention blocks. */
+		function hybridInfo(overrides: Partial<IGgufModelInfo> = {}): IGgufModelInfo {
+			return {
+				layerCount: 62,
+				attentionLayerCount: 6,
+				expertCount: 128,
+				contextLength: 1048576,
+				kvHeadCount: 8,
+				headCount: 40,
+				embeddingLength: 5120,
+				keyLength: 128,
+				valueLength: 128,
+				slidingWindow: undefined,
+				ssmConvKernel: 4,
+				ssmInnerSize: 8192,
+				ssmStateSize: 128,
+				ssmGroupCount: 8,
+				...overrides,
+			};
+		}
+
+		/** A conventional dense transformer: every block is an attention block. */
+		function denseInfo(): IGgufModelInfo {
+			return {
+				layerCount: 48, attentionLayerCount: undefined, expertCount: undefined, contextLength: 131072,
+				kvHeadCount: 8, headCount: 40, embeddingLength: 5120, keyLength: 128, valueLength: 128,
+				slidingWindow: undefined, ssmConvKernel: undefined, ssmInnerSize: undefined,
+				ssmStateSize: undefined, ssmGroupCount: undefined,
+			};
+		}
+
+		test('kvLayerCount charges only the attention blocks on a hybrid stack', () => {
+			assert.strictEqual(kvLayerCount(hybridInfo()), 6);
+		});
+
+		test('kvLayerCount is the full block count on a conventional model', () => {
+			assert.strictEqual(kvLayerCount(denseInfo()), 48);
+		});
+
+		test('kvLayerCount is undefined when neither count is known, so callers keep their default', () => {
+			assert.strictEqual(kvLayerCount({ ...denseInfo(), layerCount: undefined }), undefined);
+		});
+
+		test('recurrentStateBytes is zero for a conventional model', () => {
+			assert.strictEqual(recurrentStateBytes(denseInfo()), 0);
+		});
+
+		test('recurrentStateBytes matches llama.cpp conv + ssm sizing across the recurrent blocks', () => {
+			// conv = (d_conv-1) * (d_inner + 2*n_group*d_state); ssm = d_inner * d_state; both f32.
+			const conv = (4 - 1) * (8192 + 2 * 8 * 128);
+			const ssm = 8192 * 128;
+			const expected = (conv + ssm) * 4 * (62 - 6);
+			assert.strictEqual(recurrentStateBytes(hybridInfo()), expected);
+		});
+
+		test('recurrentStateBytes scales with the slot count', () => {
+			assert.strictEqual(recurrentStateBytes(hybridInfo(), 2), recurrentStateBytes(hybridInfo(), 1) * 2);
+		});
+
+		test('a hybrid model gets far more context from the same budget than charging every block', () => {
+			const perTok = 2048; // q8_0 k+v for 8 kv-heads x 128 dim
+			const kvBudgetBytes = 2 * 1024 * 1024 * 1024;
+			const asAttentionOnly = clampContextSize({
+				requestedContext: 131072,
+				kvBudgetBytes,
+				layerCount: kvLayerCount(hybridInfo()),
+				kvBytesPerTokenPerLayer: perTok,
+			});
+			const chargingEveryBlock = clampContextSize({
+				requestedContext: 131072,
+				kvBudgetBytes,
+				layerCount: hybridInfo().layerCount,
+				kvBytesPerTokenPerLayer: perTok,
+			});
+			assert.ok(asAttentionOnly > chargingEveryBlock,
+				`attention-only sizing should grant more context (${asAttentionOnly} vs ${chargingEveryBlock})`);
+			// The old behaviour collapsed straight to the usability floor; the fix clears the comfort floor.
+			assert.strictEqual(chargingEveryBlock, MIN_CLAMPED_CONTEXT);
+			assert.ok(asAttentionOnly >= TARGET_MIN_CONTEXT);
 		});
 	});
 
@@ -624,6 +708,41 @@ suite('LoCoPilot llama.cpp server', () => {
 
 		test('undefined app root -> undefined', () => {
 			assert.strictEqual(getBundledLlamaServerPath(undefined, 'vulkan'), undefined);
+		});
+	});
+
+	suite('getLlamaCppServerCommand: --no-mmap', () => {
+		test('emitted when the planner set noMmap alongside an expert-offload split', () => {
+			const { args } = getLlamaCppServerCommand('/m.gguf', 'metal', undefined, 1234, {
+				contextSize: 16384,
+				overrideTensors: ['blk\\.(3[0-9])\\.ffn_.*_exps=CPU'],
+				noMmap: true,
+			});
+			assert.ok(args.includes('--no-mmap'), 'CPU tensor overrides should drop the weight mmap');
+		});
+
+		test('emitted for the coarse --n-cpu-moe split too', () => {
+			const { args } = getLlamaCppServerCommand('/m.gguf', 'metal', undefined, 1234, {
+				contextSize: 16384,
+				cpuMoeLayers: 12,
+				noMmap: true,
+			});
+			assert.ok(args.includes('--n-cpu-moe'));
+			assert.ok(args.includes('--no-mmap'));
+		});
+
+		test('absent when nothing was offloaded to the CPU (the planner leaves noMmap unset)', () => {
+			const { args } = getLlamaCppServerCommand('/m.gguf', 'metal', undefined, 1234, { contextSize: 16384 });
+			assert.ok(!args.includes('--no-mmap'), 'a fully-resident model must keep mmap');
+		});
+
+		test('an explicit false is honoured even with tensors on the CPU', () => {
+			const { args } = getLlamaCppServerCommand('/m.gguf', 'metal', undefined, 1234, {
+				contextSize: 16384,
+				cpuMoeLayers: 12,
+				noMmap: false,
+			});
+			assert.ok(!args.includes('--no-mmap'));
 		});
 	});
 

@@ -1028,6 +1028,21 @@ export interface LlamaServerTuning {
 	/** Lock weights in RAM (`--mlock`). Can fail without privileges/RAM, so opt-in. */
 	mlock?: boolean;
 	/**
+	 * Load weights into anonymous memory instead of mapping the GGUF (`--no-mmap`).
+	 *
+	 * Set by the launch planner whenever tensors are placed on the CPU (`-ot` / `--n-cpu-moe`), which is
+	 * exactly the case llama.cpp itself warns about: "tensor overrides to CPU are used with mmap enabled -
+	 * consider using --no-mmap for better performance". Those CPU-resident tensors are touched on EVERY token,
+	 * so leaving them file-backed turns each decode step into page-cache traffic - measured at ~290 tok/s
+	 * prefill and ~25 tok/s decode for a 3B-active MoE on an M1 Max, several times below what the same split
+	 * does without mmap.
+	 *
+	 * Only safe when the whole footprint fits physical RAM: without mmap the weights become anonymous pages
+	 * that can only go to swap, whereas mmap'd pages are clean and evictable. The planner therefore gates this
+	 * on the fit check rather than setting it unconditionally (see the `-ot` branch in the runner).
+	 */
+	noMmap?: boolean;
+	/**
 	 * Keep a FULL-size KV cache for Sliding-Window Attention layers (`--swa-full`). SWA models (Gemma 2/3,
 	 * etc.) default to a window-sized KV for those layers, which invalidates the server's prompt-cache
 	 * checkpoints and forces a full prompt re-process every turn (slow on long agent prompts). Enabling this
@@ -1500,6 +1515,13 @@ export function getLlamaCppServerCommand(modelPath: string, backend: LlamaBacken
 	// Lock weights into RAM to avoid paging. Opt-in because it can fail without privileges or enough memory.
 	if (tuning.mlock) {
 		args.push('--mlock');
+	}
+
+	// Skip the weight mmap. The planner sets this when tensors are placed on the CPU (`-ot` / `--n-cpu-moe`)
+	// and the footprint still fits physical RAM: mmap'd CPU tensors are re-faulted on every token, which is
+	// the single biggest cost of an expert-offload split. See LlamaServerTuning.noMmap.
+	if (tuning.noMmap) {
+		args.push('--no-mmap');
 	}
 
 	// Full-size SWA KV cache: restores cross-turn prompt-cache reuse on Sliding-Window Attention models

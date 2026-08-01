@@ -73,7 +73,7 @@ import {
 	type KvCachePlan,
 	type KvQuantCapability
 } from './locopilotLlamaCppServer.js';
-import { readGgufModelInfo, isMoeModelInfo, isSwaModelInfo, kvBytesPerTokenPerLayer, type IGgufModelInfo } from './locopilotGgufMetadata.js';
+import { readGgufModelInfo, isMoeModelInfo, isSwaModelInfo, kvBytesPerTokenPerLayer, kvLayerCount, recurrentStateBytes, type IGgufModelInfo } from './locopilotGgufMetadata.js';
 import { readMlxModelInfo } from './locopilotMlxMetadata.js';
 import { ILoCoPilotSystemInfoService, type IGpuInfo, type IMemoryStatus, type ISystemHardwareInfo, type MemoryPressureLevel } from '../../../../platform/locopilotSystemInfo/common/locopilotSystemInfo.js';
 import { dirname } from '../../../../base/common/path.js';
@@ -1717,18 +1717,22 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 				const filePath = kind === 'llama' ? await this.resolveModelFilePath(localPath) : await this.getMlxModelRootPath(localPath);
 				const info = await this._getModelInfo(filePath);
 				const perTokenPerLayer = kvBytesPerTokenPerLayer(info, 2); // f16 k+v; MLX has no KV quantization
-				const layers = info.layerCount && info.layerCount > 0 ? info.layerCount : DEFAULT_CLAMP_LAYER_COUNT;
+				// Only the blocks that really hold a KV cache. On a hybrid (Mamba/attention) stack that is a small
+				// fraction of block_count, and charging all of them was worth several GB of cache that never exists.
+				const layers = kvLayerCount(info) ?? DEFAULT_CLAMP_LAYER_COUNT;
 				if (perTokenPerLayer && perTokenPerLayer > 0) {
 					// Windowed-aware, matching the clamp / fit gate: a sliding-window model's SWA layers hold only
 					// `window` tokens, so the old all-layers-full estimate over-counted KV (now amplified because the
 					// windowing fix lets these models launch at a much larger context) and over-evicted peers. Assume
 					// windowed (swa-full off) - the common case on the memory-tight machines where eviction matters.
+					// The recurrent blocks of a hybrid model hold a fixed per-slot state instead of a growing cache,
+					// so it is added flat rather than scaled by context (0 for a conventional model).
 					return kvCacheBytesForContext({
 						contextTokens: ctxTokens,
 						layerCount: layers,
 						kvBytesPerTokenPerLayer: perTokenPerLayer,
 						slidingWindow: info.slidingWindow,
-					});
+					}) + recurrentStateBytes(info);
 				}
 			} catch {
 				// fall through to the flat fallback below
@@ -2432,8 +2436,20 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 			// for, so the SAME weight-aware budget now sizes the largest context that holds BOTH caches - dynamic
 			// per machine, no hard cap. Only the clamp's budgeting uses this; the real layer count is kept below
 			// (layersForKv) for the --swa-full estimate, which measures the main KV alone.
-			const baseLayerCount = info.layerCount && info.layerCount > 0 ? info.layerCount : DEFAULT_CLAMP_LAYER_COUNT;
+			// KV is charged per ATTENTION block, not per transformer block. They are the same number on a
+			// conventional model, but a hybrid Mamba/attention stack (Nemotron-H, Jamba) holds a KV cache on only
+			// a small fraction of its blocks - charging all of them collapsed the window to the usability floor on
+			// machines that could comfortably hold far more context.
+			const baseLayerCount = kvLayerCount(info) ?? DEFAULT_CLAMP_LAYER_COUNT;
 			const clampLayerCount = tuning.multiTokenPrediction ? baseLayerCount + MTP_DRAFT_KV_LAYER_EQUIV : baseLayerCount;
+			// The recurrent half of a hybrid model holds a FIXED per-slot state that does not scale with the
+			// window. It is not part of the per-token KV term, so reserve it off the budget BEFORE sizing context -
+			// otherwise the clamp hands the window memory the SSM state has already taken.
+			const recurrentBytes = recurrentStateBytes(info, Math.max(1, tuning.parallelSlots ?? 1));
+			if (recurrentBytes > 0 && kvBudgetBytes !== undefined) {
+				kvBudgetBytes = Math.max(0, kvBudgetBytes - recurrentBytes);
+				this._log(`[LoCoPilot Runner] Hybrid recurrent model: reserving ~${Math.round(recurrentBytes / 1e6)}MB of fixed SSM state; KV budget for context sizing is now ~${Math.round(kvBudgetBytes / 1e9)}GB across ${baseLayerCount}/${info.layerCount ?? '?'} attention blocks.`);
+			}
 			let resolvedKvPlan: KvCachePlan;
 			let clamped: number;
 			if ((tuning.kvCacheType ?? 'auto') === 'auto') {
@@ -2483,8 +2499,9 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 			// (possibly now sub-threshold) clamped window and flip to f16. No-op when the user pinned a fixed type.
 			tuning.kvCachePlan = resolvedKvPlan;
 			// Full-size KV the SWA layers would take with --swa-full, at the final context + precision. Mirrors
-			// clampContextSize's own layer-count fallback so the estimate matches what the clamp budgeted.
-			const layersForKv = info.layerCount && info.layerCount > 0 ? info.layerCount : DEFAULT_CLAMP_LAYER_COUNT;
+			// clampContextSize's own layer-count fallback (attention blocks only) so the estimate matches what
+			// the clamp budgeted.
+			const layersForKv = kvLayerCount(info) ?? DEFAULT_CLAMP_LAYER_COUNT;
 			fullSwaBytesPerTokenEstimate = perTokenPerLayer * layersForKv;
 			fullSwaKvBytesEstimate = fullSwaBytesPerTokenEstimate * (tuning.contextSize ?? 0);
 			// Carried out of this block so the swa-full gate can re-price the cache at another precision.
@@ -2650,6 +2667,37 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 			}
 		}
 
+		// #8 Weight mmap. When ANY tensor is placed on the CPU (`-ot` / `--n-cpu-moe`), those tensors are read on
+		// every token: leaving them file-backed makes each decode step fault pages back in through the page cache,
+		// which is what llama.cpp's own "tensor overrides to CPU are used with mmap enabled - consider using
+		// --no-mmap" warning is about, and what held an expert-offloaded MoE to ~290 tok/s prefill / ~25 tok/s
+		// decode on an M1 Max.
+		//
+		// Gated on the whole footprint fitting PHYSICAL RAM, not the (much smaller) GPU/wired budget: without mmap
+		// the weights are anonymous pages that can only reach swap, while mmap'd pages are clean and can simply be
+		// dropped. So dropping mmap is the right trade exactly when the model fits RAM and is merely too big for
+		// the accelerator - and staying mmap'd is what keeps an oversized model runnable at all. A user-set value
+		// (or `--no-mmap` via extraArgs) is left alone.
+		if (tuning.noMmap === undefined) {
+			const tensorsOnCpu = (tuning.cpuMoeLayers ?? 0) > 0 || (tuning.overrideTensors?.length ?? 0) > 0;
+			if (tensorsOnCpu) {
+				const mem = await this._getSystemMemory();
+				const fit = await this._computeFit(modelPath, backend, undefined, extraResidentBytes, tuning);
+				const hostUsable = mem?.totalmem ? usableSystemMemoryBytes(mem.totalmem) : 0;
+				// What has to live in HOST memory. On a discrete GPU that is only the CPU-resident share (the rest
+				// sits in VRAM and was never mmap'd anyway); on unified memory / CPU there is one pool, and
+				// requiredBytes IS the whole footprint. Using requiredBytes on a discrete card would compare the
+				// tighter-pool figure - possibly the VRAM side - against host RAM, which means nothing.
+				const footprint = fit?.hostRequiredBytes ?? fit?.requiredBytes ?? 0;
+				if (hostUsable > 0 && footprint > 0 && footprint <= hostUsable) {
+					tuning.noMmap = true;
+					this._log(`[LoCoPilot Runner] CPU tensor overrides active and the ~${Math.round(footprint / 1e9)}GB footprint fits ~${Math.round(hostUsable / 1e9)}GB of usable RAM: launching with --no-mmap so the CPU-resident tensors aren't re-faulted every token.`);
+				} else {
+					this._log(`[LoCoPilot Runner] CPU tensor overrides active but the ~${Math.round(footprint / 1e9)}GB footprint exceeds ~${Math.round(hostUsable / 1e9)}GB of usable RAM: keeping mmap so the weights stay evictable instead of swap-backed.`);
+				}
+			}
+		}
+
 		return tuning;
 	}
 
@@ -2694,8 +2742,9 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 			|| DEFAULT_KV_BYTES_PER_TOKEN_PER_LAYER_F16 * kvBytesPerElement / kvCacheBytesPerElem('f16');
 		// Same fallback the context clamp uses (DEFAULT_CLAMP_LAYER_COUNT). A lower number here would make the
 		// gate charge LESS KV than the clamp budgeted for an unknown-geometry model - admitting a launch the
-		// clamp had already sized as marginal.
-		const layerCount = info?.layerCount && info.layerCount > 0 ? info.layerCount : DEFAULT_CLAMP_LAYER_COUNT;
+		// clamp had already sized as marginal. Attention blocks only, matching the clamp: on a hybrid stack most
+		// blocks are recurrent and hold no KV, and their fixed state is charged separately below.
+		const layerCount = (info && kvLayerCount(info)) ?? DEFAULT_CLAMP_LAYER_COUNT;
 		// Windowed-aware KV: a sliding-window model with --swa-full off holds only `window` tokens on its SWA
 		// layers, so its real footprint is far below `contextTokens * perTok * allLayers`. Mirror the clamp so
 		// the gate doesn't reject the large windowed context the clamp granted. swaFull true => full on all layers.
@@ -2709,10 +2758,13 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 		const runtimeOverhead = tuning
 			? runtimeOverheadBytesForTuning(tuning, backend)
 			: RUNTIME_OVERHEAD_BYTES;
+		// Hybrid (Mamba/attention) models hold a fixed per-slot recurrent state on top of the attention KV. It
+		// doesn't scale with context, so it is added flat here rather than folded into kvBytes; 0 elsewhere.
+		const recurrentBytes = info ? recurrentStateBytes(info, Math.max(1, tuning?.parallelSlots ?? 1)) : 0;
 		// extraResidentBytes covers a draft/MTP model (a second copy of the weights) and the mmproj projector
 		// when vision is enabled - both are loaded ON TOP of the weights+KV and previously went uncounted here,
 		// so an MTP + vision model passed this gate and then OOM-ed the GPU at decode.
-		const requiredBytes = weightBytes + kvBytes + runtimeOverhead + Math.max(0, extraResidentBytes);
+		const requiredBytes = weightBytes + kvBytes + recurrentBytes + runtimeOverhead + Math.max(0, extraResidentBytes);
 
 		// Discrete GPU: measure the TWO pools separately. VRAM holds the offloaded weights, the entire KV cache
 		// and the compute buffers, and overflowing it is a hard driver OOM (no swap sits behind VRAM); host RAM
@@ -2732,7 +2784,9 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 				const split = splitDiscreteGpuFootprint({
 					weightBytes,
 					gpuWeightBytes,
-					kvBytes,
+					// The recurrent state lives on the device alongside the KV cache, so it is charged to the
+					// same pool rather than to host RAM.
+					kvBytes: kvBytes + recurrentBytes,
 					overheadBytes: runtimeOverhead,
 					extraResidentBytes: Math.max(0, extraResidentBytes),
 				});
@@ -4719,9 +4773,12 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 			void this._deprioritizeServerProcess(terminal, model.modelName);
 
 			// Warm up in the background so the first real message has no kernel-JIT / cache lag.
-			if (this.configurationService.getValue<boolean>(ChatConfiguration.LocopilotLlamaCppWarmup) !== false) {
-				this._warmUpLocalServer(modelId, port, 'llama', model.modelName);
-			}
+			// COMMENTED OUT FOR TESTING: this 1-token ping is an unrelated prompt on the single slot,
+			// so it evicts the slot's KV/checkpoints ("forcing full prompt re-processing"). Uncomment
+			// to restore. (The MLX warm-up call is left alone - it also flips the ready phase.)
+			// if (this.configurationService.getValue<boolean>(ChatConfiguration.LocopilotLlamaCppWarmup) !== false) {
+			// 	this._warmUpLocalServer(modelId, port, 'llama', model.modelName);
+			// }
 
 			this._log(`[LoCoPilot Runner] Terminal started with: ${cmdLineForLog}`);
 		} catch (e) {
@@ -5183,9 +5240,13 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 		const requestedContext = model.contextWindow && model.contextWindow > 0
 			? model.contextWindow
 			: (info?.contextLength ?? DEFAULT_LLAMA_CONTEXT_SIZE);
-		const kvBudgetBytes = computeKvBudgetBytes(budget, weightBytes, RUNTIME_OVERHEAD_BYTES);
+		// Mirror the launch planner: the fixed recurrent state of a hybrid model comes off the budget before the
+		// per-token KV term sizes the window, and only attention blocks are charged that term.
+		const kvBudgetBytes = Math.max(0, computeKvBudgetBytes(budget, weightBytes, RUNTIME_OVERHEAD_BYTES)
+			- (info ? recurrentStateBytes(info) : 0));
 		const f16PerTokenPerLayer = (info && kvBytesPerTokenPerLayer(info, kvCacheBytesPerElem('f16')))
 			?? DEFAULT_KV_BYTES_PER_TOKEN_PER_LAYER_F16;
+		const kvLayers = info && kvLayerCount(info);
 		// MLX has no KV quantization, so it is measured at f16; llama.cpp runs the same automatic ladder a
 		// launch would, including the sliding-window sizing that decides how much context a Gemma really gets.
 		const plannedContext = kind === 'mlx'
@@ -5193,14 +5254,14 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 				requestedContext,
 				modelContextLength: info?.contextLength,
 				kvBudgetBytes,
-				layerCount: info?.layerCount,
+				layerCount: kvLayers,
 				kvBytesPerTokenPerLayer: f16PerTokenPerLayer,
 			})
 			: selectAutomaticKvCache({
 				requestedContext,
 				modelContextLength: info?.contextLength,
 				kvBudgetBytes,
-				layerCount: info?.layerCount,
+				layerCount: kvLayers,
 				kvBytesPerTokenPerLayerF16: f16PerTokenPerLayer,
 				slidingWindow: info?.slidingWindow,
 			}).contextSize;
@@ -5518,17 +5579,19 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 		const oomLadderCap = this._oomContextCap.get(modelId);
 		const f16PerTokenPerLayer = (info && kvBytesPerTokenPerLayer(info, kvCacheBytesPerElem('f16')))
 			?? DEFAULT_KV_BYTES_PER_TOKEN_PER_LAYER_F16;
+		const kvLayers = info && kvLayerCount(info);
 		const contextSize = clampContextSize({
 			requestedContext,
 			modelContextLength: info?.contextLength,
 			kvBudgetBytes,
-			layerCount: info?.layerCount,
+			// Attention blocks only - a hybrid stack's recurrent blocks hold a fixed state, not a growing cache.
+			layerCount: kvLayers,
 			kvBytesPerTokenPerLayer: f16PerTokenPerLayer,
 			// MLX keeps a full KV cache on every layer - it has no windowed-SWA mode to model.
 			minContext: oomLadderCap && oomLadderCap > 0 ? oomLadderCap : undefined,
 		});
 		if (contextSize < requestedContext) {
-			this._log(`[LoCoPilot Runner] Clamped MLX effective context ${requestedContext} -> ${contextSize} tokens to fit the weight-aware wired budget (~${Math.round(f16PerTokenPerLayer)} B/tok/layer x ${info?.layerCount ?? '?'} layers).`);
+			this._log(`[LoCoPilot Runner] Clamped MLX effective context ${requestedContext} -> ${contextSize} tokens to fit the weight-aware wired budget (~${Math.round(f16PerTokenPerLayer)} B/tok/layer x ${kvLayers ?? '?'} layers).`);
 		}
 		// Single-user client: requests arrive one at a time, so the server's parallel batching (decode 32 /
 		// prompt 8) only multiplies the peak KV + scratch - the top cause of the command-buffer OOM. Pin both
@@ -5767,6 +5830,12 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 			// it absorbs the load + Metal kernel compile ahead of the user's first message and flips the
 			// phase to ready when it completes. The request's `model` must be the served model dir (mlx_lm
 			// is per-request model-aware; a mismatched id makes it try to load a different model).
+			//
+			// KEEP THIS ONE (unlike the llama.cpp warm-up above, which is commented out): measured with
+			// it commented, nothing probes the MLX server until the user's first message, so the model
+			// sat 23s showing "not started" until a request arrived - _probeMlxGenerationReady only runs
+			// on the ensureServerForModel path. MLX also doesn't pay the llama.cpp cost here: mlx_lm keeps
+			// per-sequence prompt caches, so the 9-token ping doesn't evict the conversation.
 			if (this.configurationService.getValue<boolean>(ChatConfiguration.LocopilotLlamaCppWarmup) !== false) {
 				this._warmUpLocalServer(modelId, port, 'mlx', modelDir);
 			}
