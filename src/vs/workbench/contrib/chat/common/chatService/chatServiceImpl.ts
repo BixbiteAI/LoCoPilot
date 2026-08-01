@@ -40,6 +40,7 @@ import { ChatRequestParser } from '../requestParser/chatRequestParser.js';
 import { ChatMcpServersStarting, IChatCompleteResponse, IChatDetail, IChatFollowup, IChatModelReference, IChatProgress, IChatSendRequestData, IChatSendRequestOptions, IChatSendRequestResponseState, IChatService, IChatSessionContext, IChatSessionStartOptions, IChatUserActionEvent, ResponseModelState } from './chatService.js';
 import { ChatRequestTelemetry, ChatServiceTelemetry } from './chatServiceTelemetry.js';
 import { IChatSessionsService } from '../chatSessionsService.js';
+import { generateHeuristicChatTitle } from '../chatTitleHeuristics.js';
 import { ChatSessionStore, IChatSessionEntryMetadata } from '../model/chatSessionStore.js';
 import { IChatSlashCommandService } from '../participants/chatSlashCommands.js';
 import { IChatTransferService } from '../model/chatTransferService.js';
@@ -1092,23 +1093,47 @@ export class ChatService extends Disposable implements IChatService {
 
 	private generateInitialChatTitleIfNeeded(model: ChatModel, request: IChatAgentRequest, defaultAgent: IChatAgentData, token: CancellationToken): void {
 		// Generate a title only for the first request, and only via the default agent.
-		// Use a single-entry history based on the current request (no full chat history).
 		if (model.getRequests().length !== 1 || model.customTitle) {
 			return;
 		}
 
+		// Rule-based title: derived from the user's first message with regex/keyword rules
+		// (see chatTitleHeuristics.ts). Costs zero tokens and no extra model round-trip, which
+		// is why the LLM titler below is disabled. It is also the fallback when the LLM titler
+		// is re-enabled and fails.
+		const heuristicTitle = generateHeuristicChatTitle(request.message);
+		if (heuristicTitle) {
+			model.setCustomTitle(heuristicTitle);
+		}
+
+		/* ---------------------------------------------------------------------------------
+		 * LLM-BASED TITLE GENERATION - DISABLED (token saving).
+		 *
+		 * To re-enable, uncomment the block below. It overrides the heuristic title only when
+		 * the model actually returns something and the user hasn't renamed the session in the
+		 * meantime; on error/empty/cancelled, the heuristic title above simply stays.
+		 *
+		 * Uses a single-entry history based on the current request (no full chat history).
+		 *
 		const singleEntryHistory: IChatAgentHistoryEntry[] = [{
 			request,
 			response: [],
 			result: {}
 		}];
 		const generate = async () => {
-			const title = await this.chatAgentService.getChatTitle(defaultAgent.id, singleEntryHistory, token);
-			if (title && !model.customTitle) {
-				model.setCustomTitle(title);
+			try {
+				const title = await this.chatAgentService.getChatTitle(defaultAgent.id, singleEntryHistory, token);
+				// Only replace our own heuristic title - never a title the user typed themselves.
+				if (title && !token.isCancellationRequested && model.customTitle === heuristicTitle) {
+					model.setCustomTitle(title);
+				}
+			} catch (err) {
+				// Fall back to the heuristic title that is already set.
+				this.logService.warn(`Failed to generate LLM chat title, keeping rule-based title: ${toErrorMessage(err)}`);
 			}
 		};
 		void generate();
+		 * ------------------------------------------------------------------------------- */
 	}
 
 	private prepareContext(attachedContextVariables: IChatRequestVariableEntry[] | undefined): IChatRequestVariableEntry[] {

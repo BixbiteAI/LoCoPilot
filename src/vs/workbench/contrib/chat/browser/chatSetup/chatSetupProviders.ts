@@ -31,6 +31,7 @@ import { IChatAgentHistoryEntry, IChatAgentImplementation, IChatAgentRequest, IC
 import { ChatEntitlement, ChatEntitlementContext, IChatEntitlementService } from '../../../../services/chat/common/chatEntitlementService.js';
 import { ChatModel, ChatRequestModel, IChatRequestModel, IChatRequestVariableData, IChatRequestModeInfo } from '../../common/model/chatModel.js';
 import { ChatMode } from '../../common/chatModes.js';
+import { generateHeuristicChatTitle } from '../../common/chatTitleHeuristics.js';
 import { ChatRequestAgentPart, ChatRequestToolPart } from '../../common/requestParser/chatParserTypes.js';
 import { IChatEditorLocationData, IChatProgress, IChatService } from '../../common/chatService/chatService.js';
 import { IChatRequestToolEntry, IChatRequestVariableEntry, isPromptFileVariableEntry, isPromptTextVariableEntry } from '../../common/attachments/chatVariableEntries.js';
@@ -2220,7 +2221,11 @@ Focus on making the exact changes requested while preserving code structure and 
 
 	/**
 	 * Generate a short session title using the LLM from the first user message.
-	 * Called by the chat service for new sessions (first request only).
+	 *
+	 * NOTE: the caller (`generateInitialChatTitleIfNeeded` in chatServiceImpl.ts) currently has
+	 * this disabled to save tokens and uses the rule-based titler in chatTitleHeuristics.ts
+	 * instead, so this method is not reached today. It is kept working - and now falls back to
+	 * the same rule-based title on any failure - so re-enabling the caller is a one-line change.
 	 */
 	async provideChatTitle(history: IChatAgentHistoryEntry[], token: CancellationToken): Promise<string | undefined> {
 		if (history.length === 0) {
@@ -2230,6 +2235,8 @@ Focus on making the exact changes requested while preserving code structure and 
 		if (!firstMessage) {
 			return undefined;
 		}
+		// Rule-based title used whenever the model path yields nothing (no model, cancelled, error).
+		const fallbackTitle = generateHeuristicChatTitle(firstMessage);
 		try {
 			// Prefer the model the user has actually selected for this chat - it is known to be
 			// usable (it's what they're chatting with), so we avoid blindly grabbing models[0]
@@ -2238,7 +2245,7 @@ Focus on making the exact changes requested while preserving code structure and 
 			const selectedModelId = this.chatWidgetService.lastFocusedWidget?.input.currentLanguageModel;
 			if (selectedModelId && this.languageModelsService.lookupLanguageModel(selectedModelId)) {
 				this._log(`[LoCoPilot] Using selected model for title generation: ${selectedModelId}`);
-				return await this._generateTitleWithModel(selectedModelId, firstMessage, token);
+				return await this._generateTitleWithModel(selectedModelId, firstMessage, token) ?? fallbackTitle;
 			}
 			// Prefer LoCoPilot custom models, then fallback to any available model for title generation
 			let models = await this.languageModelsService.selectLanguageModels({ vendor: 'locopilot' });
@@ -2252,13 +2259,13 @@ Focus on making the exact changes requested while preserving code structure and 
 				models = await this.languageModelsService.selectLanguageModels({});
 			}
 			if (!models.length || token.isCancellationRequested) {
-				return undefined;
+				return fallbackTitle;
 			}
-			return await this._generateTitleWithModel(models[0], firstMessage, token);
+			return await this._generateTitleWithModel(models[0], firstMessage, token) ?? fallbackTitle;
 		} catch (e) {
-			this.logService.warn(`[LoCoPilot] Failed to generate chat title: ${e}`);
+			this.logService.warn(`[LoCoPilot] Failed to generate chat title, using rule-based title: ${e}`);
 		}
-		return undefined;
+		return fallbackTitle;
 	}
 
 	private async _generateTitleWithModel(modelId: string, firstMessage: string, token: CancellationToken): Promise<string | undefined> {
