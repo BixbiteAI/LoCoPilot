@@ -15,8 +15,9 @@
  * It is also the error fallback: if the LLM titler is re-enabled and it fails, times out, or
  * returns nothing usable, callers fall back to `generateHeuristicChatTitle`.
  *
- * Output is UPPERCASE, of the shape `INTENT: SUBJECT` (e.g. `FIX: LOGIN TOKEN REFRESH`) or just
- * `INTENT` when the message carries no meaningful subject (e.g. a bare greeting).
+ * Output is Title Case, of the shape `Intent: Subject` (e.g. `Fix: Login Token Refresh`) or just
+ * `Intent` when the message carries no meaningful subject (e.g. a bare greeting). Code identifiers
+ * keep the casing the user typed (`chatModel.ts`, `ChatWidget`, `README`).
  */
 
 /** Hard cap on the produced title. Tabs/lists elide well past this. */
@@ -26,7 +27,7 @@ const MAX_TITLE_LENGTH = 56;
 const MAX_SUBJECT_WORDS = 5;
 
 /** Title used when there is nothing at all to work with. */
-export const DEFAULT_CHAT_TITLE = 'NEW CHAT';
+export const DEFAULT_CHAT_TITLE = 'New Chat';
 
 /**
  * Intent buckets, matched in order - the FIRST match wins, so more specific intents must come
@@ -43,88 +44,88 @@ interface IIntentRule {
 const INTENT_RULES: readonly IIntentRule[] = [
 	// --- Social / non-task -----------------------------------------------------------------
 	{
-		label: 'GREETING',
+		label: 'Greeting',
 		match: /^\s*(hi|hii+|hey+|hello+|yo|sup|howdy|namaste|hola|greetings|good\s+(morning|afternoon|evening|day))\b/i,
 		subjectless: true
 	},
 	{
-		label: 'THANKS',
+		label: 'Thanks',
 		match: /^\s*(thanks?|thank\s+you|thx|ty|appreciate\s+it|nice\s+work|great\s+job|awesome|perfect)\b\s*[!.]*\s*$/i,
 		subjectless: true
 	},
 	{
-		label: 'CAPABILITIES',
+		label: 'Capabilities',
 		match: /\b(who\s+are\s+you|what\s+can\s+you\s+do|what\s+are\s+you|introduce\s+yourself|your\s+capabilities)\b/i,
 		subjectless: true
 	},
 
 	// --- Diagnosis first: "why is X broken" is a debug ask, not a plain question -------------
 	{
-		label: 'FIX',
+		label: 'Fix',
 		match: /\b(fix|repair|resolve|patch|unbreak|correct)\b/i
 	},
 	{
-		label: 'DEBUG',
+		label: 'Debug',
 		match: /\b(debug|bug|crash(es|ed|ing)?|error|exception|traceback|stack\s*trace|stacktrace|fail(s|ed|ing|ure)?|broken|not\s+working|doesn'?t\s+work|isn'?t\s+working|regression|hang(s|ing)?|freeze|frozen|leak|oom|out\s+of\s+memory|panic|segfault|timeout|throws?)\b/i
 	},
 
 	// --- Concrete engineering asks ----------------------------------------------------------
 	{
-		label: 'TEST',
+		label: 'Test',
 		match: /\b(unit\s+tests?|integration\s+tests?|write\s+tests?|add\s+tests?|test\s+coverage|testcase|test\s+case|spec\s+for|mocha|jest|pytest)\b/i
 	},
 	{
-		label: 'REVIEW',
+		label: 'Review',
 		match: /\b(review|audit|critique|code\s+smell|feedback\s+on|sanity\s+check|look\s+over)\b/i
 	},
 	{
-		label: 'REFACTOR',
+		label: 'Refactor',
 		match: /\b(refactor|clean\s*up|cleanup|restructure|reorganize|simplify|extract|dedupe|de-?duplicate|rewrite|tidy)\b/i
 	},
 	{
-		label: 'OPTIMIZE',
+		label: 'Optimize',
 		match: /\b(optimi[sz]e|speed\s+up|faster|performance|perf|latency|memory\s+usage|reduce\s+(size|cost|tokens?)|benchmark|profil(e|ing))\b/i
 	},
 	{
-		label: 'SECURITY',
+		label: 'Security',
 		match: /\b(security|vulnerabilit(y|ies)|cve|exploit|sanitiz(e|ation)|xss|sql\s*injection|csrf|auth\s+bypass|secrets?\s+leak)\b/i
 	},
 	{
-		label: 'MIGRATE',
+		label: 'Migrate',
 		match: /\b(migrat(e|ion)|upgrade|port\s+to|convert\s+to|translate\s+to|switch\s+to|move\s+from)\b/i
 	},
 	// DOCS before SETUP: "update the README with install instructions" is a docs task even though
 	// it mentions "install".
 	{
-		label: 'DOCS',
+		label: 'Docs',
 		match: /\b(document|documentation|docs|readme|changelog|comment\s+(this|the)|jsdoc|docstring|write\s+up)\b/i
 	},
 	{
-		label: 'SETUP',
+		label: 'Setup',
 		match: /\b(install|set\s*up|setup|configure|config|bootstrap|scaffold|initiali[sz]e|deploy|ci\/cd|pipeline|docker|env\s+var)\b/i
 	},
 	{
-		label: 'REMOVE',
+		label: 'Remove',
 		match: /\b(remove|delete|drop|revert|undo|roll\s*back|get\s+rid\s+of|disable|comment\s+out)\b/i
 	},
 	{
-		label: 'BUILD',
+		label: 'Build',
 		match: /\b(implement|create|build|add|generate|make|write|develop|introduce|support\s+for|new\s+(feature|component|endpoint|page|screen|api))\b/i
 	},
 	{
-		label: 'UPDATE',
+		label: 'Update',
 		match: /\b(update|change|modify|edit|adjust|tweak|rename|replace|replace\s+with|set\s+the|enhance|improve|extend)\b/i
 	},
 	{
-		label: 'SEARCH',
+		label: 'Search',
 		match: /\b(find|search|where\s+is|where\s+are|locate|look\s+for|which\s+file|grep|list\s+all|show\s+me\s+all)\b/i
 	},
 	{
-		label: 'EXPLAIN',
+		label: 'Explain',
 		match: /\b(explain|what\s+(is|are|does|do)|how\s+(do|does|can|would|to)|why\s+(is|are|does|do)|walk\s+me\s+through|understand|difference\s+between|tell\s+me\s+about|summari[sz]e|describe)\b/i
 	},
 	{
-		label: 'QUESTION',
+		label: 'Question',
 		match: /^\s*(can|could|should|would|is|are|do|does|did|will|has|have|which|who|when|where|what|why|how)\b/i
 	},
 ];
@@ -236,6 +237,26 @@ function extractSubject(text: string): string {
 	return words.slice(0, MAX_SUBJECT_WORDS).join(' ');
 }
 
+/**
+ * Title Case a phrase, leaving code identifiers alone.
+ *
+ * A word that already carries an uppercase letter somewhere other than position 0 was typed that
+ * way deliberately (`chatModel.ts`, `ChatWidget`, `README`, `API`) - re-casing it would make it
+ * wrong, so it is passed through untouched. Everything else gets first letter up, rest down, which
+ * also keeps a file extension lowercase (`parser.ts` -> `Parser.ts`).
+ */
+function toTitleCase(text: string): string {
+	return text.split(' ').map(word => {
+		if (!word) {
+			return word;
+		}
+		if (/[A-Z]/.test(word.substring(1))) {
+			return word;
+		}
+		return word.charAt(0).toUpperCase() + word.substring(1).toLowerCase();
+	}).join(' ');
+}
+
 function truncate(title: string): string {
 	if (title.length <= MAX_TITLE_LENGTH) {
 		return title;
@@ -260,17 +281,17 @@ export function classifyChatIntent(message: string): { label: string; subjectles
 			return { label: rule.label, subjectless: !!rule.subjectless };
 		}
 	}
-	return { label: 'CHAT', subjectless: false };
+	return { label: 'Chat', subjectless: false };
 }
 
 /**
- * Build an UPPERCASE session title from the user's first message using rules only - no model call.
+ * Build a Title Case session title from the user's first message using rules only - no model call.
  *
  * Examples:
- *   "hi there"                              -> "GREETING"
- *   "fix the login token refresh bug"       -> "FIX: LOGIN TOKEN REFRESH BUG"
- *   "can you explain how chatModel.ts works"-> "EXPLAIN: CHATMODEL.TS WORKS"
- *   "add a dark theme to the settings page" -> "BUILD: DARK THEME SETTINGS PAGE"
+ *   "hi there"                              -> "Greeting"
+ *   "fix the login token refresh bug"       -> "Fix: Login Token Refresh Bug"
+ *   "can you explain how chatModel.ts works"-> "Explain: chatModel.ts Works"
+ *   "add a dark theme to the settings page" -> "Build: Dark Theme Settings Page"
  */
 export function generateHeuristicChatTitle(message: string | undefined | null): string {
 	if (!message || typeof message !== 'string') {
@@ -284,7 +305,7 @@ export function generateHeuristicChatTitle(message: string | undefined | null): 
 
 	const { label, subjectless } = classifyChatIntent(text);
 	if (subjectless) {
-		return truncate(label.toUpperCase());
+		return truncate(toTitleCase(label));
 	}
 
 	const subject = extractSubject(text);
@@ -292,8 +313,8 @@ export function generateHeuristicChatTitle(message: string | undefined | null): 
 		// No content words left (e.g. "please do it") - fall back to the raw first line so the
 		// session is still recognizable rather than a wall of identical intent labels.
 		const firstLine = text.split('\n')[0].trim();
-		return truncate((firstLine || label).toUpperCase());
+		return truncate(toTitleCase(firstLine || label));
 	}
 
-	return truncate(`${label}: ${subject}`.toUpperCase());
+	return truncate(`${toTitleCase(label)}: ${toTitleCase(subject)}`);
 }

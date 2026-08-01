@@ -18,38 +18,39 @@ suite('ChatTitleHeuristics', () => {
 		assert.strictEqual(generateHeuristicChatTitle('```\nconst a = 1;\n```'), DEFAULT_CHAT_TITLE);
 	});
 
-	test('titles are always upper case', () => {
-		for (const message of ['hi', 'fix the login bug', 'explain chatModel.ts', 'please do it']) {
-			const title = generateHeuristicChatTitle(message);
-			assert.strictEqual(title, title.toUpperCase(), `not upper case: ${title}`);
-		}
+	test('titles are Title Case, and code identifiers keep their own casing', () => {
+		assert.strictEqual(generateHeuristicChatTitle('fix the login bug'), 'Fix: Login Bug');
+		assert.strictEqual(generateHeuristicChatTitle('please do it'), 'Please Do It');
+		// chatModel.ts was typed with an internal capital - it must survive untouched.
+		assert.ok(generateHeuristicChatTitle('explain how chatModel.ts works').includes('chatModel.ts'));
+		assert.ok(generateHeuristicChatTitle('update the README file').includes('README'));
 	});
 
 	test('social messages get a subjectless label', () => {
-		assert.strictEqual(generateHeuristicChatTitle('hi'), 'GREETING');
-		assert.strictEqual(generateHeuristicChatTitle('Hello there!'), 'GREETING');
-		assert.strictEqual(generateHeuristicChatTitle('good morning, ready to work?'), 'GREETING');
-		assert.strictEqual(generateHeuristicChatTitle('thanks!'), 'THANKS');
-		assert.strictEqual(generateHeuristicChatTitle('who are you?'), 'CAPABILITIES');
+		assert.strictEqual(generateHeuristicChatTitle('hi'), 'Greeting');
+		assert.strictEqual(generateHeuristicChatTitle('Hello there!'), 'Greeting');
+		assert.strictEqual(generateHeuristicChatTitle('good morning, ready to work?'), 'Greeting');
+		assert.strictEqual(generateHeuristicChatTitle('thanks!'), 'Thanks');
+		assert.strictEqual(generateHeuristicChatTitle('who are you?'), 'Capabilities');
 	});
 
 	test('classifies common coding intents', () => {
 		const expectations: [string, string][] = [
-			['fix the login token refresh bug', 'FIX'],
-			['my app crashes when I open the settings page', 'DEBUG'],
-			['write unit tests for src/utils/parser.ts', 'TEST'],
-			['review my changes before I merge', 'REVIEW'],
-			['refactor the ChatWidget class', 'REFACTOR'],
-			['optimize the model loading time on startup', 'OPTIMIZE'],
-			['migrate from webpack to vite', 'MIGRATE'],
-			['update the README with install instructions', 'DOCS'],
-			['install docker and set up CI for this repo', 'SETUP'],
-			['remove the deprecated oldApi module', 'REMOVE'],
-			['add a dark theme toggle to the settings page', 'BUILD'],
-			['rename the sessionId field to chatId', 'UPDATE'],
-			['where is the code that handles websocket reconnects?', 'SEARCH'],
-			['explain how chatModel.ts works', 'EXPLAIN'],
-			['should I use a worker here?', 'QUESTION'],
+			['fix the login token refresh bug', 'Fix'],
+			['my app crashes when I open the settings page', 'Debug'],
+			['write unit tests for src/utils/parser.ts', 'Test'],
+			['review my changes before I merge', 'Review'],
+			['refactor the ChatWidget class', 'Refactor'],
+			['optimize the model loading time on startup', 'Optimize'],
+			['migrate from webpack to vite', 'Migrate'],
+			['update the README with install instructions', 'Docs'],
+			['install docker and set up CI for this repo', 'Setup'],
+			['remove the deprecated oldApi module', 'Remove'],
+			['add a dark theme toggle to the settings page', 'Build'],
+			['rename the sessionId field to chatId', 'Update'],
+			['where is the code that handles websocket reconnects?', 'Search'],
+			['explain how chatModel.ts works', 'Explain'],
+			['should I use a worker here?', 'Question'],
 		];
 		for (const [message, label] of expectations) {
 			assert.strictEqual(classifyChatIntent(message).label, label, `wrong intent for: ${message}`);
@@ -58,36 +59,36 @@ suite('ChatTitleHeuristics', () => {
 	});
 
 	test('keeps the distinguishing words in the subject', () => {
-		assert.strictEqual(generateHeuristicChatTitle('fix the login token refresh bug'), 'FIX: LOGIN TOKEN REFRESH BUG');
-		assert.strictEqual(generateHeuristicChatTitle('migrate from webpack to vite'), 'MIGRATE: WEBPACK VITE');
+		assert.strictEqual(generateHeuristicChatTitle('fix the login token refresh bug'), 'Fix: Login Token Refresh Bug');
+		assert.strictEqual(generateHeuristicChatTitle('migrate from webpack to vite'), 'Migrate: Webpack Vite');
 	});
 
 	test('strips markdown, code fences, urls and chat references', () => {
 		const title = generateHeuristicChatTitle('**fix** the `parser` in #file:src/parser.ts see https://example.com/docs');
-		assert.strictEqual(title.includes('HTTPS'), false);
-		assert.strictEqual(title.includes('#FILE'), false);
-		assert.strictEqual(title.startsWith('FIX:'), true);
-		assert.strictEqual(title.includes('PARSER'), true);
+		assert.strictEqual(/https/i.test(title), false);
+		assert.strictEqual(title.includes('#file'), false);
+		assert.strictEqual(title.startsWith('Fix:'), true);
+		assert.strictEqual(/parser/i.test(title), true);
 	});
 
 	test('a path and its file name are not repeated in the subject', () => {
 		const title = generateHeuristicChatTitle('write unit tests for src/utils/parser.ts');
-		assert.strictEqual(title.split('PARSER.TS').length - 1, 1, `duplicated file name: ${title}`);
+		assert.strictEqual(title.split(/parser\.ts/i).length - 1, 1, `duplicated file name: ${title}`);
 	});
 
 	test('titles stay short even for long messages', () => {
 		const long = 'I want to build a full stack e-commerce application with authentication, payments, an admin dashboard, and a mobile client using React and Node';
 		const title = generateHeuristicChatTitle(long);
 		assert.ok(title.length <= 56, `title too long (${title.length}): ${title}`);
-		assert.ok(title.startsWith('BUILD:'));
+		assert.ok(title.startsWith('Build:'));
 	});
 
 	test('only the first line/sentence drives the subject', () => {
 		const title = generateHeuristicChatTitle('fix the crash on startup.\nAlso there is a totally unrelated typo in the changelog.');
-		assert.strictEqual(title.includes('CHANGELOG'), false, title);
+		assert.strictEqual(/changelog/i.test(title), false, title);
 	});
 
 	test('messages with no content words still produce a usable title', () => {
-		assert.strictEqual(generateHeuristicChatTitle('please do it'), 'PLEASE DO IT');
+		assert.strictEqual(generateHeuristicChatTitle('please do it'), 'Please Do It');
 	});
 });
