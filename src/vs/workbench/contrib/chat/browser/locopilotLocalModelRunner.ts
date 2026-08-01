@@ -88,8 +88,14 @@ import {
 	shouldUseMlxServerForHfModel,
 	MLX_MIN_PROMPT_CACHE_BYTES,
 	MLX_TIGHT_FIT_HEADROOM_BYTES,
+	MLX_PROMPT_CACHE_DIR_ENV,
+	MLX_PROMPT_CACHE_EXT,
+	MLX_PROMPT_CACHE_HELPER_FILENAME,
+	MLX_PROMPT_CACHE_RESTORE_PATH,
+	MLX_PROMPT_CACHE_SAVE_PATH,
 	type MlxServerTuning,
 } from './locopilotMlxServer.js';
+import { MLX_PROMPT_CACHE_HELPER_SOURCE } from './locopilotMlxPromptCacheScript.js';
 import { showTransientNotification } from './locopilotNotify.js';
 import { findDraftPairing, type IAutoModelPlan, type IHardwareProfile } from './locopilotModelCatalog.js';
 import { LoCoPilotModelDownloadService, modelDownloadDirName, isMmprojGgufPath, isMtpGgufPath } from './locopilotModelDownloadService.js';
@@ -931,6 +937,45 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 	 * known here (e.g. a server owned by another window) - a real launch never resolves to that tag, so such a
 	 * blob is simply never picked up by a launching window rather than mismatched.
 	 */
+	/**
+	 * Writes {@link MLX_PROMPT_CACHE_HELPER_SOURCE} into the KV-cache dir and returns its path, or undefined
+	 * when it could not be written (in which case the launch simply omits it and behaves as before).
+	 */
+	private async _writeMlxPromptCacheHelper(): Promise<string | undefined> {
+		if (!await this._ensureKvCacheDir()) {
+			return undefined;
+		}
+		const target = joinPath(this._kvCacheDir(), MLX_PROMPT_CACHE_HELPER_FILENAME);
+		try {
+			await this.fileService.writeFile(target, VSBuffer.fromString(MLX_PROMPT_CACHE_HELPER_SOURCE));
+			return target.fsPath;
+		} catch (e) {
+			this._log(`[LoCoPilot Runner] Could not write the MLX prompt-cache helper (persistence disabled): ${e}`);
+			return undefined;
+		}
+	}
+
+	/**
+	 * Filename for an MLX persisted prompt cache. Separate from {@link _slotCacheFileName} because mx.load
+	 * sniffs the format from the extension and rejects the llama path's `.bin`, and because the two engines'
+	 * blobs are not interchangeable - keeping the names distinct stops one engine ever finding the other's.
+	 */
+	private _mlxPromptCacheFileName(key: string): string {
+		return `${key.replace(/[^a-zA-Z0-9._-]/g, '_').slice(0, 180)}.mlx${MLX_PROMPT_CACHE_EXT}`;
+	}
+
+	/** POSTs to one of the helper's endpoints; resolves the parsed body plus status. */
+	private async _mlxPromptCacheRequest(port: number, path: string, filename: string, token: CancellationToken): Promise<{ status: number; body: string }> {
+		const res = await this.requestService.request({
+			type: 'POST',
+			url: `http://127.0.0.1:${port}${path}`,
+			headers: { 'Content-Type': 'application/json' },
+			data: JSON.stringify({ filename }),
+		}, token);
+		const body = await streamToBuffer(res.stream).then(b => b.toString()).catch(() => '');
+		return { status: res.res.statusCode ?? 0, body };
+	}
+
 	private _slotCacheFileName(modelId: string, key: string): string {
 		// Only trust the locally-recorded KV type when THIS window owns the server; a foreign (attached) server was
 		// launched elsewhere, so our record's type may be stale/absent - fall back to the never-restored tag.
@@ -1156,11 +1201,15 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 	}
 
 	async restoreSlotCache(modelId: string, key: string, token: CancellationToken = CancellationToken.None): Promise<boolean> {
-		// Only llama.cpp exposes the /slots save/restore API; MLX and unmanaged endpoints have none.
+		// llama.cpp exposes /slots natively; MLX gets the equivalent from the bootstrap helper. Unmanaged
+		// endpoints (localhost/ollama) have neither.
 		const running = this.runningServers.get(modelId);
-		if (!running || running.kind !== 'llama' || !running.ready) {
+		if (!running || (running.kind !== 'llama' && running.kind !== 'mlx') || !running.ready) {
 			this._log(`[LoCoPilot Runner] KV slot restore skipped for ${modelId}: server not ready (present=${!!running}, kind=${running?.kind ?? 'none'}, ready=${running?.ready ?? false}).`);
 			return false;
+		}
+		if (running.kind === 'mlx') {
+			return this._restoreMlxPromptCache(modelId, key, running.port, token);
 		}
 		// Draft-context models (MTP / separate draft): /slots restore only reloads the MAIN KV, so the restored
 		// prefix is NOT reusable (the server re-prefills the whole prompt with "lack of cache data") - yet the
@@ -1206,8 +1255,11 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 
 	async saveSlotCache(modelId: string, key: string, token: CancellationToken = CancellationToken.None): Promise<void> {
 		const running = this.runningServers.get(modelId);
-		if (!running || running.kind !== 'llama' || !running.ready) {
+		if (!running || (running.kind !== 'llama' && running.kind !== 'mlx') || !running.ready) {
 			return;
+		}
+		if (running.kind === 'mlx') {
+			return this._saveMlxPromptCache(modelId, key, running.port, token);
 		}
 		// Don't persist slot caches for draft-context models: their restored blobs aren't reusable (see
 		// restoreSlotCache / _launchedWithDraftContext), so writing them only burns disk (these are the
@@ -1245,15 +1297,69 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 	}
 
 	/**
+	 * MLX counterpart of the llama.cpp `/slots?action=restore` path. On a hit the warmed system+tools prefix
+	 * is already resident, so turn 1 skips the multi-thousand-token prefill entirely (~29 s on an M3 for the
+	 * measured 7661-token prefix).
+	 */
+	private async _restoreMlxPromptCache(modelId: string, key: string, port: number, token: CancellationToken): Promise<boolean> {
+		const filename = this._mlxPromptCacheFileName(key);
+		// A cold first-ever run has no blob yet; check before asking so that case logs as "nothing to restore"
+		// rather than as a failure.
+		try {
+			await this.fileService.stat(joinPath(this._kvCacheDir(), filename));
+		} catch {
+			this._log(`[LoCoPilot Runner] MLX prompt cache restore skipped for ${modelId}: no cache file "${filename}" in ${this._kvCacheDir().fsPath}.`);
+			return false;
+		}
+		this._log(`[LoCoPilot Runner] MLX prompt cache restore: found "${filename}", requesting restore for ${modelId}...`);
+		try {
+			const { status, body } = await this._mlxPromptCacheRequest(port, MLX_PROMPT_CACHE_RESTORE_PATH, filename, token);
+			if (status === 200) {
+				this._log(`[LoCoPilot Runner] Restored MLX prompt cache "${filename}" for ${modelId}: ${body.slice(0, 200)}`);
+				return true;
+			}
+			// 404 means this server predates the helper (or it failed to install); anything else is a real
+			// rejection, e.g. the blob was written for different weights. Either way we fall through to a warm.
+			this._log(`[LoCoPilot Runner] MLX prompt cache restore for ${modelId} returned ${status}; will warm instead: ${body.slice(0, 500) || '<empty body>'}`);
+			return false;
+		} catch (e) {
+			this._log(`[LoCoPilot Runner] MLX prompt cache restore failed (ignored) for ${modelId}: ${e}`);
+			return false;
+		}
+	}
+
+	/** MLX counterpart of `/slots?action=save`. Called right after a prefix warm, so the newest cache entry is that prefix. */
+	private async _saveMlxPromptCache(modelId: string, key: string, port: number, token: CancellationToken): Promise<void> {
+		if (!await this._ensureKvCacheDir()) {
+			return;
+		}
+		const filename = this._mlxPromptCacheFileName(key);
+		try {
+			const { status, body } = await this._mlxPromptCacheRequest(port, MLX_PROMPT_CACHE_SAVE_PATH, filename, token);
+			if (status !== 200) {
+				this._log(`[LoCoPilot Runner] MLX prompt cache save for ${modelId} returned ${status} (no file written): ${body.slice(0, 500) || '<empty body>'}`);
+				return;
+			}
+			this._log(`[LoCoPilot Runner] Saved MLX prompt cache "${filename}" for ${modelId}: ${body.slice(0, 200)}`);
+			await this._pruneSlotCaches();
+		} catch (e) {
+			this._log(`[LoCoPilot Runner] MLX prompt cache save failed (ignored) for ${modelId}: ${e}`);
+		}
+	}
+
+	/**
 	 * LRU eviction for the persisted KV-cache dir: keep the {@link MAX_SLOT_CACHE_ENTRIES} most-recently
-	 * modified `.bin` files (freshly-saved caches touch their mtime), delete the older ones. Best-effort.
+	 * modified cache blobs (freshly-saved caches touch their mtime), delete the older ones. Best-effort.
+	 *
+	 * Matches by extension rather than by "everything in the dir": the same directory also holds the MLX
+	 * bootstrap helper (a `.py`), which must survive - deleting it would silently turn persistence off.
 	 */
 	private async _pruneSlotCaches(): Promise<void> {
 		try {
 			const dir = this._kvCacheDir();
 			const stat = await this.fileService.resolve(dir, { resolveMetadata: true });
 			const caches = (stat.children ?? [])
-				.filter(c => !c.isDirectory && c.name.endsWith('.bin'))
+				.filter(c => !c.isDirectory && (c.name.endsWith('.bin') || c.name.endsWith(MLX_PROMPT_CACHE_EXT)))
 				.sort((a, b) => b.mtime - a.mtime); // newest first
 			for (const stale of caches.slice(MAX_SLOT_CACHE_ENTRIES)) {
 				try {
@@ -5674,10 +5780,20 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 			}
 		}
 		const mlxExtraFlagsUsed = !!(mlxTuning.promptCacheBytes || mlxTuning.draftModelDir);
+		// Prompt-cache persistence: mlx_lm has no /slots API, so we install one from the bootstrap. Rewritten
+		// on every launch so an app update can never leave a stale helper next to a newer runner. A failure
+		// here is not fatal - the server just starts without persistence and re-prefills as before.
+		const helperPath = await this._writeMlxPromptCacheHelper();
+		if (helperPath) {
+			mlxTuning.promptCacheHelperPath = helperPath;
+		}
 		const { command, args } = getMlxLmServerCommand(modelDir, port, pythonCmd, mlxTuning);
 		const q = (p: string) => (p.includes(' ') || p.includes('"') ? `"${p.replace(/"/g, '\\"')}"` : p);
 		const argsQuoted = args.map(a => (a === modelDir || a.includes(' ') ? q(a) : a));
-		const cmdLine = [command, ...argsQuoted].join(' ');
+		// The helper reads the cache directory from the environment. Terminals are created without an env
+		// override, so prefix the shell command - the same shape the Ollama launch uses for OLLAMA_HOST.
+		const cacheDirEnv = helperPath ? `${MLX_PROMPT_CACHE_DIR_ENV}=${q(this._kvCacheDir().fsPath)} ` : '';
+		const cmdLine = cacheDirEnv + [command, ...argsQuoted].join(' ');
 
 		this._log(`[LoCoPilot Runner] Starting mlx-lm server for model ${modelId} on port ${port}: ${cmdLine}`);
 

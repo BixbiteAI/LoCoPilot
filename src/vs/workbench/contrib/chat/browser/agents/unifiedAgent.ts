@@ -801,7 +801,12 @@ export class UnifiedAgent {
 			{ role: ChatMessageRole.System, content: [{ type: 'text', value: systemPrompt }] },
 			{ role: ChatMessageRole.User, content: [{ type: 'text', value: 'hi' }] },
 		];
-		const options: any = { locopilotForegroundTurn: false };
+		// Only the PREFILL of this request matters - the server caches the prefix KV as soon as the prompt is
+		// processed, and the generated text is thrown away by warmUpWithPrefix. Cap generation at a single
+		// token so the warm ends the instant its job is done. This matters most on mlx_lm, which serves one
+		// request at a time: an uncapped warm kept generating for over a minute past the useful work while
+		// the user's real (already cache-hitting) message waited its turn in the queue.
+		const options: any = { locopilotForegroundTurn: false, locopilotMaxOutputTokens: 1 };
 		if (tools.length > 0) {
 			options.tools = tools;
 		}

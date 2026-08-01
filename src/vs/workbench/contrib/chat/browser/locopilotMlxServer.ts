@@ -109,6 +109,12 @@ export interface MlxServerTuning {
 	prefillStepSize?: number;
 	/** Max distinct KV caches held across requests (`--prompt-cache-size`, server default 10). Fewer = less resident KV for a memory-tight big model. */
 	promptCacheCount?: number;
+	/**
+	 * Absolute path to the helper file (see locopilotMlxPromptCacheScript.ts) the runner wrote for this launch.
+	 * When set, the bootstrap execs it so the server gains the save/restore endpoints that make a warmed
+	 * prefix survive a restart. Omitted (or a missing file) simply means no persistence.
+	 */
+	promptCacheHelperPath?: string;
 }
 
 /**
@@ -123,11 +129,28 @@ export interface MlxServerTuning {
  * which read as a stuck/never-starting launch; it was reverted. mlx_lm.server has no `--kv-bits` CLI flag.)
  */
 export const MLX_MEMORY_LIMIT_BOOTSTRAP =
-	'import mlx.core as mx, runpy, sys; ' +
+	'import mlx.core as mx, os, runpy, sys; ' +
 	'getattr(mx, \'set_memory_limit\', lambda *_: None)(int(sys.argv[1])); ' +
 	'getattr(mx, \'set_cache_limit\', lambda *_: None)(int(sys.argv[2])); ' +
-	'sys.argv = [\'mlx_lm\'] + sys.argv[3:]; ' +
+	'_h = sys.argv[3]; ' +
+	'os.path.isfile(_h) and exec(compile(open(_h).read(), _h, \'exec\'), {\'__name__\': \'locopilot_mlx_prompt_cache\'}); ' +
+	'sys.argv = [\'mlx_lm\'] + sys.argv[4:]; ' +
 	'runpy.run_module(\'mlx_lm\', run_name=\'__main__\')';
+
+/** Name of the prompt-cache helper the runner writes next to the KV caches and the bootstrap execs. */
+export const MLX_PROMPT_CACHE_HELPER_FILENAME = 'locopilot_mlx_prompt_cache.py';
+/** Env var naming the directory persisted prompt-cache blobs live in; read by the helper. */
+export const MLX_PROMPT_CACHE_DIR_ENV = 'LOCOPILOT_MLX_CACHE_DIR';
+/** HTTP paths the helper adds to mlx_lm.server (llama.cpp's /slots?action=save|restore equivalent). */
+export const MLX_PROMPT_CACHE_SAVE_PATH = '/locopilot/prompt-cache/save';
+export const MLX_PROMPT_CACHE_RESTORE_PATH = '/locopilot/prompt-cache/restore';
+/**
+ * mx.load() sniffs the container format from the FILE EXTENSION, so a persisted prompt cache must end
+ * in `.safetensors` - a `.bin` (what the llama.cpp slot files use) fails to load with
+ * "Unknown file format". Verified against the bundled mlx 0.31.2.
+ */
+export const MLX_PROMPT_CACHE_EXT = '.safetensors';
+
 
 /**
  * Command to run `mlx_lm.server` for a local model directory (Hugging Face-style MLX weights).
@@ -172,16 +195,20 @@ export function getMlxLmServerCommand(modelDir: string, port: number, pythonCmd:
 		serverArgs.push('--prefill-step-size', String(Math.floor(tuning.prefillStepSize)));
 	}
 
-	// With a memory/cache limit, launch through the bootstrap (mlx_lm.server has no CLI flag for these);
-	// otherwise keep the plain `-m mlx_lm server` form, safe for any mlx-lm/mlx version.
-	if ((tuning.memoryLimitBytes && tuning.memoryLimitBytes > 0) || (tuning.cacheLimitBytes && tuning.cacheLimitBytes > 0)) {
+	// Launch through the bootstrap when there is a memory/cache limit to apply (mlx_lm.server has no CLI
+	// flag for those) OR a prompt-cache helper to install; otherwise keep the plain `-m mlx_lm server`
+	// form, safe for any mlx-lm/mlx version.
+	const helperPath = tuning.promptCacheHelperPath?.trim();
+	if ((tuning.memoryLimitBytes && tuning.memoryLimitBytes > 0) || (tuning.cacheLimitBytes && tuning.cacheLimitBytes > 0) || helperPath) {
 		const memLimit = tuning.memoryLimitBytes && tuning.memoryLimitBytes > 0 ? Math.floor(tuning.memoryLimitBytes) : 0;
 		const cacheLimit = tuning.cacheLimitBytes && tuning.cacheLimitBytes > 0 ? Math.floor(tuning.cacheLimitBytes) : 0;
 		// 0 = leave that limit at the MLX default (the bootstrap's set-call with 0 would break allocation,
 		// so substitute the other limit's "no-op" by passing the default-preserving sentinel via max()).
 		const memArg = memLimit > 0 ? memLimit : Number.MAX_SAFE_INTEGER;
 		const cacheArg = cacheLimit > 0 ? cacheLimit : Number.MAX_SAFE_INTEGER;
-		return { command: cmd, args: ['-c', MLX_MEMORY_LIMIT_BOOTSTRAP, String(memArg), String(cacheArg), 'server', ...serverArgs] };
+		// '-' is the "no helper" sentinel: the bootstrap's os.path.isfile guard skips it, so the argv
+		// positions stay fixed whether or not persistence is in play.
+		return { command: cmd, args: ['-c', MLX_MEMORY_LIMIT_BOOTSTRAP, String(memArg), String(cacheArg), helperPath || '-', 'server', ...serverArgs] };
 	}
 	return { command: cmd, args: ['-m', 'mlx_lm', 'server', ...serverArgs] };
 }

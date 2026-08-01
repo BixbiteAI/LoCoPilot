@@ -1333,6 +1333,15 @@ export class LoCoPilotLanguageModelProvider extends Disposable implements ILangu
 			?? model.contextWindow
 			?? defaultContextWindow(isLocalModel);
 		const { maxOutputTokens } = deriveTokenLimits(effectiveContext, isLocalModel);
+		// A prefix warm-up only needs the prompt PREFILLED: its KV is cached the moment prefill ends, so every
+		// token generated afterwards is discarded work. On mlx_lm that waste is not merely idle - the server
+		// serves one request at a time, so the user's real message sits queued behind it (measured on a cold
+		// MLX start: 29s of useful prefill followed by 72s of thrown-away generation before the user's turn
+		// was even looked at). Callers that only want the cached prefix pass a cap; never raise the derived
+		// limit, only lower it.
+		const cappedMaxOutput = typeof options.locopilotMaxOutputTokens === 'number' && options.locopilotMaxOutputTokens > 0
+			? Math.min(options.locopilotMaxOutputTokens, maxOutputTokens)
+			: maxOutputTokens;
 		// The request's `model` field must match what the local server actually loaded with (its `--model`
 		// value), not the catalog/HF repo name. mlx_lm.server is per-request model-aware: a mismatched id
 		// makes it try to (re)load a different model, which silently stalls the request forever. llama.cpp
@@ -1344,7 +1353,7 @@ export class LoCoPilotLanguageModelProvider extends Disposable implements ILangu
 			messages: mappedMessages,
 			stream: true,
 			temperature: 0.3,
-			max_tokens: maxOutputTokens,
+			max_tokens: cappedMaxOutput,
 			// Ask the local server (llama.cpp / mlx_lm) for real token counts and a measured generation rate
 			// so the timer bar can show exact "tokens" and "tokens/sec" instead of a word-count estimate.
 			// `timings_per_token` makes llama.cpp attach its `timings` block (predicted_n, predicted_per_second)

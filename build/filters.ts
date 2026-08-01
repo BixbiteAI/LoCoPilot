@@ -109,6 +109,8 @@ export const indentationFilter = Object.freeze<string[]>([
 	'!build/win32/**',
 	'!build/checker/**',
 	'!src/vs/workbench/contrib/terminal/common/scripts/psreadline/**',
+	// Embedded Python module (space-indented by language rule, not by choice).
+	'!src/vs/workbench/contrib/chat/browser/locopilotMlxPromptCacheScript.ts',
 
 	// except multiple specific files
 	'!**/package.json',
