@@ -662,17 +662,19 @@ suite('LoCoPilot llama.cpp server', () => {
 			assert.strictEqual(argValue(args, '--cache-type-v'), 'q8_0');
 		});
 
-		test('a half-quantized plan still promotes flash attention off -> auto', () => {
-			// KV quantization requires FA; only the K half is quantized here, which must still count.
+		test('a quantized K half survives flash attention off (only V needs FA)', () => {
+			// Only the V half is implemented inside the FA kernel, so a quantized K is fine without it and the
+			// user's explicit `-fa off` is honoured rather than silently promoted to 'auto'.
 			const { args } = getLlamaCppServerCommand('/m.gguf', 'metal', undefined, 1234, {
 				contextSize: 65536,
 				flashAttention: 'off',
 				kvCachePlan: { k: 'q4_0', v: 'f16' },
 			});
-			assert.strictEqual(argValue(args, '-fa'), 'auto');
+			assert.strictEqual(argValue(args, '-fa'), 'off');
 			assert.strictEqual(argValue(args, '--cache-type-k'), 'q4_0');
 			assert.strictEqual(args.indexOf('--cache-type-v'), -1, 'an f16 V half needs no flag');
 		});
+
 
 		test('cpu backend forces 0 gpu layers', () => {
 			const { args } = getLlamaCppServerCommand('/m.gguf', 'cpu', undefined, 1234, {});

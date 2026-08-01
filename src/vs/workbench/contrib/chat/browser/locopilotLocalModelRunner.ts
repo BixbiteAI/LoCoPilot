@@ -63,10 +63,15 @@ import {
 	MIN_FULL_SWA_CONTEXT,
 	SWA_FULL_REPLAN_TARGET_CONTEXT,
 	SWA_FULL_REPLAN_MAX_TIER,
+	applyKvQuantCapability,
+	kvCacheTiersFor,
+	detectRejectedKvQuantHalf,
+	KV_QUANT_FULLY_SUPPORTED,
 	type LlamaServerTuning,
 	type FlashAttentionMode,
 	type KvCacheType,
-	type KvCachePlan
+	type KvCachePlan,
+	type KvQuantCapability
 } from './locopilotLlamaCppServer.js';
 import { readGgufModelInfo, isMoeModelInfo, isSwaModelInfo, kvBytesPerTokenPerLayer, type IGgufModelInfo } from './locopilotGgufMetadata.js';
 import { readMlxModelInfo } from './locopilotMlxMetadata.js';
@@ -530,6 +535,24 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 	 * server-side "mismatched key type" restore error on an incompatible blob saved under the same name.
 	 */
 	private readonly _lastLaunchKvType = new Map<string, string>();
+	/**
+	 * Per-model record of which KV halves this engine could actually quantize. llama.cpp implements a quantized
+	 * V cache only in the Flash Attention kernel, so when `-fa auto` resolves to OFF for a model (its FA tensor
+	 * can't be placed on the accelerator) a `--cache-type-v q8_0` launch dies during context creation - with
+	 * exit code 0, before the server ever listens, which is why nothing else caught it. Learned from that
+	 * failure and applied to every later launch of the SAME model.
+	 *
+	 * Deliberately per-model rather than per-session (unlike {@link _cacheRamUnsupported} and friends): this is
+	 * a property of the model + its offload plan, not of the binary. Gemma-4-12B fails where Gemma-4-E4B
+	 * succeeds on the same build, so a session-wide switch would downgrade the KV cache of every other model.
+	 */
+	private readonly _kvQuantCapability = new Map<string, KvQuantCapability>();
+	/** Resolves once the persisted {@link _kvQuantCapability} map has been read from disk (or found absent). */
+	private _kvQuantCapabilityLoaded: Promise<void> | undefined;
+	/** Model ids whose LAST launch emitted a quantized `--cache-type-k`; consulted by the crash fallback. */
+	private readonly _launchedWithQuantizedK = new Set<string>();
+	/** Model ids whose LAST launch emitted a quantized `--cache-type-v`; consulted by the crash fallback. */
+	private readonly _launchedWithQuantizedV = new Set<string>();
 	/** Measured launch plans (real weight bytes + planned context) backing the synchronous {@link getAutoPlan}. */
 	private readonly _autoPlanCache = new Map<string, IAutoModelPlan>();
 	/** Models whose plan measurement is already running, so a redrawing picker can't spawn duplicates. */
@@ -845,6 +868,58 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 			})();
 		}
 		return this._kvCacheDirReady;
+	}
+
+	/**
+	 * File the learned {@link _kvQuantCapability} map is persisted to. Worth surviving a restart: without it every
+	 * app start would repeat the same failed launch (and its "couldn't start" toast) for an affected model before
+	 * healing itself again.
+	 */
+	private _kvQuantCapabilityUri(): URI {
+		return joinPath(this.environmentService.cacheHome, 'locopilot-kv-quant-support.json');
+	}
+
+	/**
+	 * Loads the persisted per-model KV-quantization capabilities once per session. Best-effort in every failure
+	 * mode: a missing, unreadable or malformed file just leaves the map empty, which means "assume both halves
+	 * work" - the same state a fresh install is in, and self-healing again on the first failure.
+	 */
+	private _ensureKvQuantCapabilityLoaded(): Promise<void> {
+		if (!this._kvQuantCapabilityLoaded) {
+			this._kvQuantCapabilityLoaded = (async () => {
+				try {
+					const buf = await this.fileService.readFile(this._kvQuantCapabilityUri());
+					const parsed = JSON.parse(buf.value.toString()) as Record<string, { k?: boolean; v?: boolean }>;
+					for (const [modelId, entry] of Object.entries(parsed ?? {})) {
+						if (entry && typeof entry === 'object') {
+							this._kvQuantCapability.set(modelId, { k: entry.k !== false, v: entry.v !== false });
+						}
+					}
+					if (this._kvQuantCapability.size > 0) {
+						this._log(`[LoCoPilot Runner] Loaded KV-quantization support for ${this._kvQuantCapability.size} model(s) from a previous session.`);
+					}
+				} catch {
+					// No file yet (the common case) or unreadable - both mean "nothing learned", which is the default.
+				}
+			})();
+		}
+		return this._kvQuantCapabilityLoaded;
+	}
+
+	/** Writes the learned capabilities back out. Best-effort: losing them only costs one self-heal next start. */
+	private async _persistKvQuantCapability(): Promise<void> {
+		try {
+			const payload: Record<string, KvQuantCapability> = {};
+			for (const [modelId, capability] of this._kvQuantCapability) {
+				// Only the restrictions are worth storing; a fully-supported model is the default.
+				if (!capability.k || !capability.v) {
+					payload[modelId] = capability;
+				}
+			}
+			await this.fileService.writeFile(this._kvQuantCapabilityUri(), VSBuffer.fromString(JSON.stringify(payload, undefined, 2)));
+		} catch (e) {
+			this._log(`[LoCoPilot Runner] Could not persist KV-quantization support (it will be re-learned next session): ${e}`);
+		}
 	}
 
 	/**
@@ -1874,6 +1949,44 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 			return;
 		}
 
+		// Self-healing for a KV cache the engine refuses to create. llama.cpp implements a quantized V cache only
+		// inside the Flash Attention kernel, and `-fa auto` legitimately resolves to OFF when the FA tensor can't
+		// be placed on the accelerator for this model + offload plan:
+		//   W sched_reserve: Flash Attention was auto, set to disabled
+		//   E llama_init_from_model: failed to initialize the context: quantized V cache was requested, but this
+		//     requires Flash Attention
+		// The process then exits BEFORE serving, with exit code 0, so the user saw only the generic "please try
+		// again" toast - for a configuration error that would fail identically on every retry, forever. Record the
+		// half the engine rejected against THIS model (not the session: it depends on the architecture and its
+		// offload plan, so Gemma-4-12B failing must not downgrade Gemma-4-E4B), persist it so the next app start
+		// doesn't repeat the failure, and relaunch. The planner then re-runs the KV ladder with that half pinned to
+		// f16 and re-clamps the context to the larger cache, so the retry is a genuinely different, viable launch.
+		const rejectedKvHalf = detectRejectedKvQuantHalf(tail);
+		if (rejectedKvHalf) {
+			const current = this._kvQuantCapability.get(modelId) ?? KV_QUANT_FULLY_SUPPORTED;
+			const launchedQuantized = rejectedKvHalf === 'k'
+				? this._launchedWithQuantizedK.has(modelId)
+				: this._launchedWithQuantizedV.has(modelId);
+			const alreadyKnown = rejectedKvHalf === 'k' ? !current.k : !current.v;
+			if (launchedQuantized && !alreadyKnown) {
+				// A rejected K half means this build wants FA for BOTH halves, so give up V at the same time
+				// rather than burning a second failed launch to discover it.
+				const healed: KvQuantCapability = rejectedKvHalf === 'k' ? { k: false, v: false } : { k: current.k, v: false };
+				this._kvQuantCapability.set(modelId, healed);
+				this._launchedWithQuantizedK.delete(modelId);
+				this._launchedWithQuantizedV.delete(modelId);
+				await this._persistKvQuantCapability();
+				this._log(`[LoCoPilot Runner] llama-server could not create a quantized ${rejectedKvHalf.toUpperCase()} cache for "${modelName}" (Flash Attention unavailable for this model). Pinning ${healed.k ? 'V' : 'K and V'} to f16 for it from now on and relaunching; the context window is re-clamped for the larger cache.`);
+				this._endStarting(modelId);
+				timeout(6000).then(() => {
+					if (!this.runningServers.has(modelId) && !this.startingServers.has(modelId)) {
+						this.startServerInTerminal(modelId).catch(e => this._log(`[LoCoPilot Runner] Relaunch with an f16 ${rejectedKvHalf.toUpperCase()} cache failed: ${e}`));
+					}
+				});
+				return;
+			}
+		}
+
 		// Self-healing for speculative decoding: when THIS launch carried spec flags and the output shows the
 		// build rejected them (old build without --spec-type) or the draft/target pair is incompatible
 		// (tokenizer mismatch), disable speculation for the session and retry once WITHOUT the flags instead
@@ -2051,6 +2164,9 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 				?? cfg.getValue<number>(ChatConfiguration.LocopilotLlamaCppContextSize),
 			flashAttention: cfg.getValue<FlashAttentionMode>(ChatConfiguration.LocopilotLlamaCppFlashAttention),
 			kvCacheType: cfg.getValue<KvCacheType>(ChatConfiguration.LocopilotLlamaCppKvCacheType),
+			// Anything this model's engine has already refused to quantize (learned from a failed launch, see
+			// _kvQuantCapability). Undefined for every model that has never failed, i.e. almost all of them.
+			kvQuantCapability: model ? this._kvQuantCapability.get(model.id) : undefined,
 			multiTokenPrediction: perModelMtp !== undefined ? perModelMtp : globalMtp,
 			mtpArgs: cfg.getValue<string>(ChatConfiguration.LocopilotLlamaCppMtpArgs),
 			cacheReuse: cfg.getValue<number>(ChatConfiguration.LocopilotLlamaCppCacheReuse),
@@ -2332,13 +2448,20 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 					slidingWindow: info.slidingWindow,
 					swaFullOnAllLayers: tuning.swaFull === true,
 					minContext,
+					// Halves the engine has refused for this model are priced as f16 INSIDE the ladder, so the
+					// context we clamp to is the one the bigger cache can actually hold.
+					kvQuantCapability: tuning.kvQuantCapability,
 				});
 				resolvedKvPlan = selection.kvCachePlan;
 				clamped = selection.contextSize;
 				this._log(`[LoCoPilot Runner] Dynamic KV selected ${kvPlanId(resolvedKvPlan)} (K ${resolvedKvPlan.k} / V ${resolvedKvPlan.v}) for ${clamped}/${tuning.contextSize} requested tokens from the model-specific memory budget${tuning.multiTokenPrediction ? ' (incl. MTP draft-context KV reserve)' : ''}.`);
 			} else {
-				// A user-pinned type applies to both halves - the asymmetric rung is an automatic choice only.
-				resolvedKvPlan = symmetricKvPlan(tuning.kvCacheType as Exclude<KvCacheType, 'auto'>);
+				// A user-pinned type applies to both halves - the asymmetric rung is an automatic choice only. A
+				// half the engine has rejected still falls back to f16: honouring the pin literally would just
+				// reproduce the startup failure the user can do nothing about.
+				resolvedKvPlan = applyKvQuantCapability(
+					symmetricKvPlan(tuning.kvCacheType as Exclude<KvCacheType, 'auto'>),
+					tuning.kvQuantCapability);
 				const fixedPerTokenPerLayer = f16PerTokenPerLayer * kvPlanBytesPerElem(resolvedKvPlan) / kvCacheBytesPerElem('f16');
 				clamped = clampContextSize({
 					requestedContext: tuning.contextSize,
@@ -2430,7 +2553,10 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 					// Descend no further than the near-lossless rung (see SWA_FULL_REPLAN_MAX_TIER) - buying context
 					// with 4-bit K/V is a different trade, and not one to make silently.
 					const floorIndex = KV_CACHE_TIERS.findIndex(t => t.k === SWA_FULL_REPLAN_MAX_TIER.k && t.v === SWA_FULL_REPLAN_MAX_TIER.v);
-					const candidates = startIndex >= 0 ? KV_CACHE_TIERS.slice(startIndex, Math.max(startIndex + 1, floorIndex + 1)) : [tradedPlan];
+					// Pin back to f16 any half this model's engine rejected, so the swa-full trade can't re-introduce
+					// the quantized V that made the launch fail in the first place.
+					const candidates = (startIndex >= 0 ? KV_CACHE_TIERS.slice(startIndex, Math.max(startIndex + 1, floorIndex + 1)) : [tradedPlan])
+						.map(plan => applyKvQuantCapability(plan, tuning.kvQuantCapability));
 					// Aim past the general comfort floor: under swa-full the clamp's windowed sizing collapses the
 					// window, and stopping at the floor (the old bar) meant f16 satisfied it on the FIRST iteration
 					// and q8 was never priced - which is why this whole re-plan was a no-op on the machine it was
@@ -2779,9 +2905,43 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 				this._endStarting(modelId);
 				return false;
 			}
-			return this._promptRunAnyway(modelId, name, needGb, haveGb, true);
+			const forced = await this._promptRunAnyway(modelId, name, needGb, haveGb, true);
+			if (forced) {
+				this._degradeForcedLaunch(modelId, name, tuning, fit.usableBytes, fit.requiredBytes);
+			}
+			return forced;
 		}
 		return true;
+	}
+
+	/**
+	 * Pre-emptive first rung of the OOM ladder for a "Run anyway" past a CLEAR shortfall (i.e. one already outside
+	 * the Metal tolerance band). Previously the forced launch went ahead at the FULL planned footprint - the exact
+	 * configuration we had just told the user does not fit - and the only correction came after it had crashed the
+	 * Metal command buffer, which on MLX means the process aborts outright. Shrinking first turns "warn, then die"
+	 * into "warn, then run smaller".
+	 *
+	 * The context is scaled by the memory ratio we're short by and never taken below the usability floor. This is
+	 * deliberately approximate - weights, not KV, are usually what overflows, so the scaled window is a
+	 * conservative under-estimate rather than a computed fit - and the runtime ladder still has BOTH of its rungs
+	 * afterwards ({@link _oomRetryCount} is untouched here). `tuning` is mutated in place because it is the very
+	 * object the launch is about to use: llama.cpp reads `contextSize` as `-c`, and the MLX path adopts a reduced
+	 * window from its fit tuning right after this gate returns.
+	 */
+	private _degradeForcedLaunch(modelId: string, name: string, tuning: LlamaServerTuning | undefined, usableBytes: number, requiredBytes: number): void {
+		const planned = tuning?.contextSize ?? 0;
+		if (!tuning || planned <= MIN_CLAMPED_CONTEXT || requiredBytes <= 0 || usableBytes <= 0) {
+			return;
+		}
+		const scaled = Math.max(MIN_CLAMPED_CONTEXT, Math.floor(planned * (usableBytes / requiredBytes) / 1024) * 1024);
+		if (scaled >= planned) {
+			return;
+		}
+		tuning.contextSize = scaled;
+		// Pin the cap so the degraded relaunches the runtime ladder may still need can't raise the window back up.
+		this._oomContextCap.set(modelId, scaled);
+		this._oomStripExtras.add(modelId);
+		this._log(`[LoCoPilot Runner] "${name}" was force-launched past a clear memory shortfall; starting it degraded rather than at the footprint that doesn't fit: context ${planned} -> ${scaled}, memory-heavy extras stripped.`);
 	}
 
 	/**
@@ -4176,6 +4336,9 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 		// the hardware-aware budget below account for the *full* resident footprint - weights + KV + a draft
 		// model (MTP) + the mmproj projector. Loading these extras without reserving for them is what OOM-ed
 		// the Metal command buffer (kIOGPUCommandBufferCallbackErrorOutOfMemory) on a 16GB Mac.
+		// Load what previous sessions learned about this engine's KV support BEFORE building the tuning, so a model
+		// that already failed on a quantized V cache launches with f16 straight away instead of failing once more.
+		await this._ensureKvQuantCapabilityLoaded();
 		const baseTuning = this._getLlamaTuning(model);
 		// Requested context CEILING: aim for the model's full window and let the memory clamp be the real limiter,
 		// instead of the legacy 16384 default silently capping every model. An EXPLICIT per-model context (set by
@@ -4270,13 +4433,16 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 				this._log(`[LoCoPilot Runner] Auto speculative decoding: draft ${draft.repoId} skipped (would exceed the memory budget); using n-gram drafting instead.`);
 			}
 		}
-		if (autoSpec && !baseTuning.multiTokenPrediction && !(baseTuning.draftModelPath && baseTuning.draftModelPath.trim()) && !baseTuning.promptLookup) {
-			// ngram-mod: drafts long runs (48-64 tokens) by matching n-grams already in the context. No extra
-			// model, no extra memory; strongest on repetitive output (code edits, file rewrites).
-			baseTuning.promptLookup = true;
-			baseTuning.promptLookupArgs = '--spec-type ngram-mod';
-			this._log('[LoCoPilot Runner] Auto speculative decoding: n-gram drafting enabled (--spec-type ngram-mod).');
-		}
+		// NOTE: n-gram drafting (`--spec-type ngram-mod`) used to be auto-enabled here as the fallback whenever
+		// neither MTP nor a paired draft model was available. It is no longer: measured across six real agent
+		// sessions (Qwen3-4B, Qwen3-30B-A3B, Qwen3.6-27B, Gemma-4-26B-A4B, Gemma-4-E4B, Nemotron-30B-A3B) it
+		// generated ZERO drafts in every single one - `#gen drafts = 0, #acc drafts = 0` in all of them - while
+		// still costing a 16 MB mod table per server plus its per-call overhead, and while being one of the
+		// `--spec-type` users that makes llama.cpp disable `cache_reuse` for the whole context. Its default
+		// `n_match=24` requires a 24-token literal repeat before it will draft anything, which agent chat traffic
+		// essentially never produces. MTP is unaffected and remains the real speculation path (it measured 45-54%
+		// acceptance on Qwen3.5-0.8B and 70-85% on Qwen3.5-9B), as does a downloaded paired draft model. Users who
+		// want n-gram drafting can still turn it on explicitly via `locopilot.llamaCpp.promptLookup`.
 		// A build that already rejected speculative flags gets them stripped so the relaunch (and every
 		// launch after) starts cleanly. This also drops MTP: same --spec-type mechanism, same rejection.
 		if (this._specFlagsUnsupported && (baseTuning.multiTokenPrediction || baseTuning.draftModelPath?.trim() || baseTuning.promptLookup)) {
@@ -4366,6 +4532,19 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 			this._launchedWithSwaFull.add(modelId);
 		} else {
 			this._launchedWithSwaFull.delete(modelId);
+		}
+		// Which KV halves this launch actually asked the engine to quantize. Recorded per half because they fail
+		// for different reasons: a quantized V needs Flash Attention, a quantized K does not. The crash handler
+		// only trusts a "quantized X cache was requested" error when THIS launch really requested it.
+		if (args.includes('--cache-type-k')) {
+			this._launchedWithQuantizedK.add(modelId);
+		} else {
+			this._launchedWithQuantizedK.delete(modelId);
+		}
+		if (args.includes('--cache-type-v')) {
+			this._launchedWithQuantizedV.add(modelId);
+		} else {
+			this._launchedWithQuantizedV.delete(modelId);
 		}
 		this._log(`[LoCoPilot Runner] Starting llama.cpp server for model ${modelId} on port ${port} with backend: ${backend}`);
 
@@ -4899,7 +5078,11 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 		if (!current) {
 			return;
 		}
-		const currentIndex = KV_CACHE_TIERS.findIndex(t => t.k === current.k && t.v === current.v);
+		// Walk the ladder the LAUNCH will use: on a model whose engine rejected a half, the plan in hand is a
+		// coerced rung (e.g. q8_0-f16) that doesn't appear in the raw ladder at all, and looking it up there would
+		// silently skip the reclaim.
+		const tiers = kvCacheTiersFor(tuning.kvQuantCapability);
+		const currentIndex = tiers.findIndex(t => t.k === current.k && t.v === current.v);
 		if (currentIndex <= 0) {
 			return; // unknown plan, or already the highest-quality rung
 		}
@@ -4907,7 +5090,7 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 		// delta is unmeasurable while its cache is half the size, so "upgrading" there would only spend memory.
 		const startIndex = tuning.contextSize >= DEFAULT_LLAMA_CONTEXT_SIZE ? 1 : 0;
 		for (let i = startIndex; i < currentIndex; i++) {
-			const candidate = KV_CACHE_TIERS[i];
+			const candidate = tiers[i];
 			const candidateFit = await fitAt(tuning.contextSize, candidate);
 			if (candidateFit?.fits) {
 				this._log(`[LoCoPilot Runner] Reclaimed KV quality for ${modelId} at the reduced ${tuning.contextSize}-token window: ${kvPlanId(current)} -> ${kvPlanId(candidate)}.`);
@@ -5244,6 +5427,27 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 	 * *multimodal* model (Gemma 3n / "E4B", Qwen-VL, etc.): mlx-lm is text-only and rejects the extra
 	 * vision/audio weights with "Received N parameters not in model", which needs mlx-vlm instead.
 	 */
+	/**
+	 * True for a line that means the MLX process has run out of Metal memory and is dying. Unlike llama.cpp -
+	 * which logs the failure, marks the backend "in error state" and stays alive (see {@link _handleWedgedBackend}) -
+	 * mlx_lm has no graceful path: the Metal command buffer fails to execute, the C++ runtime throws, and
+	 * `libc++abi` aborts the WHOLE process mid-response:
+	 *
+	 *   libc++abi: terminating due to uncaught exception of type std::runtime_error:
+	 *     [METAL] Command buffer execution failed: Insufficient Memory (00000008:kIOGPUCommandBufferCallbackErrorOutOfMemory)
+	 *
+	 * Both an OOM token AND a Metal/allocation context are required, so an unrelated command-buffer error or a
+	 * chat message that happens to contain "out of memory" can't trip the ladder.
+	 */
+	private _isFatalMlxOomLine(line: string): boolean {
+		const l = line.toLowerCase();
+		const outOfMemory = /kiogpucommandbuffercallbackerroroutofmemory|insufficient memory|out of memory|std::bad_alloc|failed to allocate|unable to allocate/.test(l);
+		if (!outOfMemory) {
+			return false;
+		}
+		return /\[metal\]|metal::|command buffer|libc\+\+abi|runtime_error|mlx/.test(l);
+	}
+
 	private _mlxLoadFailureReason(line: string, modelName: string): string | undefined {
 		const l = line.toLowerCase();
 		// Multimodal / architecture-mismatch: weights mlx-lm's text loader doesn't recognize.
@@ -5335,12 +5539,29 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 		// KV caches so BOTH the transient peak and the resident cache stay small. Roomy fits keep the server
 		// defaults (fields left unset) for full prefill speed. (Official mlx_lm.server flags - no monkeypatching.)
 		const leftoverAfterWeights = wiredBudget - weightBytes - RUNTIME_OVERHEAD_BYTES;
-		const tightFit = weightBytes > 0 && leftoverAfterWeights < MLX_TIGHT_FIT_HEADROOM_BYTES;
+		// An active OOM ladder rung counts as a tight fit regardless of what the arithmetic says: the machine has
+		// already PROVEN at runtime that this plan doesn't hold, so trust the evidence over the estimate. This is
+		// what gives MLX a real second rung - context alone is a weak lever when the transient prefill peak (not
+		// the resident cache) is what blew the command buffer.
+		const oomDegraded = this._oomStripExtras.has(modelId) || (oomLadderCap !== undefined && oomLadderCap > 0);
+		const tightFit = oomDegraded || (weightBytes > 0 && leftoverAfterWeights < MLX_TIGHT_FIT_HEADROOM_BYTES);
 		const performanceProfile = this.configurationService.getValue<'performance' | 'balanced' | 'quiet'>(ChatConfiguration.LocopilotLocalPerformanceProfile) ?? 'performance';
 		if (tightFit) {
 			tuning.prefillStepSize = 512;
 			tuning.promptCacheCount = 2;
 			this._log(`[LoCoPilot Runner] MLX tight fit (~${(leftoverAfterWeights / 1e9).toFixed(1)}GB left after weights): prefill-step 512, prompt-cache-size 2.`);
+		}
+		if (oomDegraded) {
+			// Past a real OOM, go further than the static tight-fit knobs: the smallest prefill chunk (the
+			// transient peak that actually aborts the command buffer), a single cached prefix, and the floor
+			// prompt cache. Also pull the hard allocation ceiling below the wired budget so MLX throttles at a
+			// level the device has demonstrated it can survive, instead of at the one that just failed.
+			tuning.prefillStepSize = 256;
+			tuning.promptCacheCount = 1;
+			tuning.promptCacheBytes = MLX_MIN_PROMPT_CACHE_BYTES;
+			tuning.memoryLimitBytes = Math.floor(wiredBudget * 0.85);
+			tuning.cacheLimitBytes = Math.min(tuning.cacheLimitBytes, Math.floor(mem.totalmem * 0.05));
+			this._log(`[LoCoPilot Runner] MLX OOM ladder active for ${modelId}: prefill-step 256, one cached prefix, floor prompt cache, memory limit ~${Math.round(tuning.memoryLimitBytes / 1e9)}GB (85% of the wired budget).`);
 		}
 		if (performanceProfile === 'quiet') {
 			tuning.prefillStepSize = 256;
@@ -5378,7 +5599,9 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 		this._lastLaunchContext.set(modelId, mlxPlan.contextSize);
 		// The catalog-paired draft is resolved here rather than in the planner: it depends on a background
 		// download completing and is a pure add-on that either fits alongside the planned footprint or is dropped.
-		if (mlxPlan.autoTuned) {
+		// A draft model is a second set of weights held resident - exactly the kind of extra the OOM ladder exists
+		// to shed. The llama path strips it via _oomStripExtras; MLX resolves its draft here, so it checks here.
+		if (mlxPlan.autoTuned && !this._oomStripExtras.has(modelId)) {
 			const draft = await this._resolvePairedDraft(model, 'mlx');
 			if (draft && await this._extrasFitBudget(modelDir, 'metal', undefined, draft.bytes)) {
 				mlxTuning.draftModelDir = draft.path;
@@ -5416,6 +5639,11 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 			// wait below - a listener registered only after promotion would miss it entirely.
 			const logs: string[] = [];
 			let mlxRejectedExtraFlags = false;
+			// Fresh launch: re-arm the fatal-OOM detection below, exactly as the llama path does for its
+			// wedged-backend detection. Without this a degraded relaunch that OOMs again would go unnoticed and
+			// the ladder would stop after a single rung.
+			this._wedgedBackends.delete(modelId);
+			this._intentionalStops.delete(modelId);
 			this._register(terminal.onLineData(line => {
 				logs.push(line);
 				if (logs.length > LoCoPilotLocalModelRunner.MAX_LOG_LINES) {
@@ -5447,6 +5675,37 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 							this.startServerInTerminal(modelId).catch(e => this._log(`[LoCoPilot Runner] MLX relaunch without tuning flags failed: ${e}`));
 						}
 					});
+					return;
+				}
+
+				// Fatal Metal OOM. Checked BEFORE the load-failure classifier below, which would otherwise report
+				// an out-of-memory abort as "possibly a corrupt or incomplete download" and send the user off to
+				// re-download a perfectly good model. Until now nothing caught this at all: the MLX terminal only
+				// has an onDisposed handler, and _reportServerCrash (which owns the OOM ladder) is wired to the
+				// llama path - so an MLX model that OOM-ed simply vanished and the chat panel claimed it "isn't
+				// running yet. It may still be starting", for a process that had already aborted.
+				//
+				// Route it into the SAME ladder llama.cpp uses. MLX has no KV-quantization lever (mlx_lm.server
+				// exposes no --kv-bits), so context is the whole of its ladder: the relaunch advertises a smaller
+				// window and drops the memory-heavy extras. Guarded by _wedgedBackends so a torrent of abort lines
+				// only triggers one teardown.
+				if (this._isFatalMlxOomLine(line) && !this._wedgedBackends.has(modelId) && !this._intentionalStops.has(modelId)) {
+					this._wedgedBackends.add(modelId);
+					this._log(`[LoCoPilot Runner] MLX server for "${model.modelName}" ran out of Metal memory and is aborting: ${line}`);
+					void (async () => {
+						const rec = this.runningServers.get(modelId);
+						if (rec) {
+							// Drop "ready" first so nothing keeps routing requests at a process that is already dying.
+							rec.ready = false;
+							this._onDidServerStateChange.fire(modelId);
+						}
+						await this._stopServerAndWait(modelId);
+						if (!this._oomDegradedRelaunch(modelId, model.modelName)) {
+							const oomMessage = `"${model.modelName}" ran out of memory while running, even with reduced settings. Close some applications to free up memory, or choose a smaller model.`;
+							this._endStarting(modelId, oomMessage);
+							this.notificationService.notify({ severity: Severity.Error, message: oomMessage });
+						}
+					})();
 					return;
 				}
 

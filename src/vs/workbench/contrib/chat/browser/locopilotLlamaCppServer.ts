@@ -222,6 +222,84 @@ export function symmetricKvPlan(type: KvCacheElemType): KvCachePlan {
 	return { k: type, v: type };
 }
 
+/**
+ * Which halves of the KV cache the engine can actually quantize FOR A GIVEN MODEL. llama.cpp implements a
+ * quantized V cache only inside the Flash Attention kernel, so `--cache-type-v q8_0` makes context creation
+ * FATAL whenever FA is unavailable:
+ *
+ *   W sched_reserve: layer 3 is assigned to device MTL0 but the Flash Attention tensor is assigned to device CPU
+ *   W sched_reserve: Flash Attention was auto, set to disabled
+ *   E llama_init_from_model: failed to initialize the context: quantized V cache was requested, but this
+ *     requires Flash Attention
+ *
+ * The K half has a dequantizing path outside FA, so a quantized K keeps working when FA is off - the two
+ * halves are NOT interchangeable here, which is exactly why the ladder tracks them separately.
+ *
+ * Whether FA can be placed on the GPU is not knowable before launch: it depends on the model architecture AND
+ * on the offload plan we hand it (a model whose tensors all sit on Metal gets FA; the same architecture with
+ * experts overridden to CPU can lose it). So this is discovered from a failed launch and remembered PER MODEL -
+ * never as a session-wide or build-wide switch, which would needlessly downgrade every other model.
+ */
+export interface KvQuantCapability {
+	/** false once the engine rejected a quantized K cache for this model. */
+	k: boolean;
+	/** false once the engine rejected a quantized V cache for this model (the common case: no Flash Attention). */
+	v: boolean;
+}
+
+/** Default assumption for a model we have never seen fail: both halves quantizable. */
+export const KV_QUANT_FULLY_SUPPORTED: KvQuantCapability = Object.freeze({ k: true, v: true });
+
+/**
+ * Coerces a KV plan to something the engine can actually create for this model, by pinning any half it has
+ * rejected back to f16. Quantizing the OTHER half is still worth doing - dropping only V from q8_0 to f16 keeps
+ * roughly half of the cache saving instead of falling all the way back to a full-precision cache.
+ */
+export function applyKvQuantCapability(plan: KvCachePlan, capability: KvQuantCapability | undefined): KvCachePlan {
+	if (!capability || (capability.k && capability.v)) {
+		return plan;
+	}
+	return {
+		k: capability.k ? plan.k : 'f16',
+		v: capability.v ? plan.v : 'f16',
+	};
+}
+
+/**
+ * The precision ladder restricted to what this model's engine can create: every rung has its rejected halves
+ * pinned to f16, and the duplicates that then collapse into each other are dropped (with V unquantizable,
+ * q4/q8 and q4/q4 both become q4/f16). The result keeps the ladder's two invariants - ordered best-quality
+ * first, and strictly cheaper per token as you descend - so callers can walk it exactly as before.
+ */
+export function kvCacheTiersFor(capability: KvQuantCapability | undefined, tiers: readonly KvCachePlan[] = KV_CACHE_TIERS): readonly KvCachePlan[] {
+	if (!capability || (capability.k && capability.v)) {
+		return tiers;
+	}
+	const seen = new Set<string>();
+	return tiers.map(tier => applyKvQuantCapability(tier, capability)).filter(tier => {
+		const id = kvPlanId(tier);
+		if (seen.has(id)) {
+			return false;
+		}
+		seen.add(id);
+		return true;
+	});
+}
+
+/**
+ * Detects the "engine refused this KV quantization" startup failure in a llama-server log tail and reports
+ * WHICH half it refused. Returns undefined for any other failure, so callers can fall through to their other
+ * crash handlers. Matched loosely (the sentence has been reworded across llama.cpp releases) but still anchored
+ * on all three of "quantized", the half, and "flash attention", so it can't swallow unrelated errors.
+ */
+export function detectRejectedKvQuantHalf(output: string): 'k' | 'v' | undefined {
+	const match = /quantized\s+([KV])\s+cache[^\n]*?requires[^\n]*?flash\s*attention/i.exec(output);
+	if (!match) {
+		return undefined;
+	}
+	return match[1].toLowerCase() === 'k' ? 'k' : 'v';
+}
+
 /** Default context window when none is configured. Smaller than before for a smaller, faster KV cache. */
 export const DEFAULT_LLAMA_CONTEXT_SIZE = 16384;
 
@@ -828,6 +906,12 @@ export interface AutomaticKvCacheSelectionInputs extends ContextClampInputs {
 	 * are derived from this value, ensuring all precisions are compared against exactly the same model.
 	 */
 	kvBytesPerTokenPerLayerF16?: number;
+	/**
+	 * Halves this model is allowed to quantize (see {@link KvQuantCapability}). A rejected half is pinned to f16
+	 * BEFORE the ladder is priced, so the context clamp sizes the window for the cache the engine will really
+	 * allocate - re-planning after a rejection must give back context, not silently over-commit memory.
+	 */
+	kvQuantCapability?: KvQuantCapability;
 }
 
 export interface AutomaticKvCacheSelection {
@@ -865,9 +949,12 @@ export function selectAutomaticKvCache(inputs: AutomaticKvCacheSelectionInputs):
 	const satisfiedAt = Math.min(targetContext, TARGET_MIN_CONTEXT);
 	// f16 is only in play for small windows; above the threshold the cache dominates memory and q8_0's quality
 	// delta is negligible, so starting at f16 would just cost a rung and land on half the context for nothing.
-	const tiers = targetContext < KV_AUTO_QUANT_CONTEXT_THRESHOLD
+	const openTiers = targetContext < KV_AUTO_QUANT_CONTEXT_THRESHOLD
 		? KV_CACHE_TIERS
 		: KV_CACHE_TIERS.filter(tier => !(tier.k === 'f16' && tier.v === 'f16'));
+	// Restrict to what the engine can actually create for this model before pricing anything, so the context we
+	// clamp to matches the cache that will really be allocated.
+	const tiers = kvCacheTiersFor(inputs.kvQuantCapability, openTiers);
 	const f16Bytes = inputs.kvBytesPerTokenPerLayerF16 && inputs.kvBytesPerTokenPerLayerF16 > 0
 		? inputs.kvBytesPerTokenPerLayerF16
 		: (inputs.kvBytesPerTokenPerLayer && inputs.kvBytesPerTokenPerLayer > 0
@@ -899,7 +986,10 @@ export function selectAutomaticKvCache(inputs: AutomaticKvCacheSelectionInputs):
 			best = candidate;
 		}
 	}
-	return best ?? { kvCachePlan: resolveKvCachePlan('auto', targetContext), contextSize: targetContext };
+	return best ?? {
+		kvCachePlan: applyKvQuantCapability(resolveKvCachePlan('auto', targetContext), inputs.kvQuantCapability),
+		contextSize: targetContext,
+	};
 }
 
 /**
@@ -914,6 +1004,11 @@ export interface LlamaServerTuning {
 	flashAttention?: FlashAttentionMode;
 	/** KV cache quantization (`--cache-type-k/v`). 'f16' = no quantization (always safe). */
 	kvCacheType?: KvCacheType;
+	/**
+	 * Halves this model's engine has been observed to reject (see {@link KvQuantCapability}). Learned from a
+	 * failed launch and remembered per model; a rejected half is emitted as f16 instead of failing again.
+	 */
+	kvQuantCapability?: KvQuantCapability;
 	/**
 	 * Resolved K/V precision pair, pinned by the launch planner after {@link selectAutomaticKvCache} has sized
 	 * the context against the memory budget. When present it WINS over {@link kvCacheType} - the planner already
@@ -1244,13 +1339,23 @@ export function getLlamaCppServerCommand(modelPath: string, backend: LlamaBacken
 	const contextSize = tuning.contextSize && tuning.contextSize > 0 ? Math.floor(tuning.contextSize) : DEFAULT_LLAMA_CONTEXT_SIZE;
 	// A plan pinned by the launch planner wins; otherwise 'auto' resolves to f16 for small windows and q8_0 for
 	// large ones (see resolveKvCachePlan), and a fixed user type is applied to both halves.
-	const kvCachePlan = tuning.kvCachePlan ?? resolveKvCachePlan(tuning.kvCacheType ?? 'auto', contextSize);
+	const plannedKvCachePlan = tuning.kvCachePlan ?? resolveKvCachePlan(tuning.kvCacheType ?? 'auto', contextSize);
+	// Drop back to f16 on any half this model's engine has already rejected, so a relaunch after that failure
+	// doesn't reproduce it. Only the failing half is given up; the other one keeps its saving.
+	let kvCachePlan = applyKvQuantCapability(plannedKvCachePlan, tuning.kvQuantCapability);
 
-	// KV quantization requires Flash Attention. If the KV cache is quantized but the user disabled FA,
-	// promote 'off' -> 'auto' so the server never errors out on an unsupported combination.
-	let flashAttention: FlashAttentionMode = tuning.flashAttention ?? 'auto';
-	if ((kvCachePlan.k !== 'f16' || kvCachePlan.v !== 'f16') && flashAttention === 'off') {
-		flashAttention = 'auto';
+	// Flash Attention and the V half of the KV cache are coupled: llama.cpp only implements a quantized V
+	// inside the FA kernel, so `--cache-type-v <quant>` without FA is a FATAL context-creation error (the K
+	// half has a non-FA path and is unaffected). `-fa auto` is NOT a safe carrier for a quantized V: 'auto'
+	// resolves to OFF whenever the FA tensor can't be placed on the accelerator, and the launch then dies -
+	// which is why the old "promote off -> auto so it never fails to start" trick did not hold. Two rules:
+	//  - The user explicitly disabling FA is honoured, not overridden; we give up the V quantization instead.
+	//  - With FA on/auto we still emit the quantized V, because 'auto' DOES resolve to on for most models and
+	//    forcing '-fa on' would push attention onto a slow CPU path for the rest. The launch failure on the
+	//    models where it resolves off is caught by the caller, recorded in kvQuantCapability, and healed above.
+	const flashAttention: FlashAttentionMode = tuning.flashAttention ?? 'auto';
+	if (flashAttention === 'off' && kvCachePlan.v !== 'f16') {
+		kvCachePlan = { k: kvCachePlan.k, v: 'f16' };
 	}
 
 	const args: string[] = [
