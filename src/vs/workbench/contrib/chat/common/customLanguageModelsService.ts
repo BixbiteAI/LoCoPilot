@@ -192,6 +192,13 @@ export interface ICustomLanguageModel {
 	 */
 	mtp?: boolean;
 	createdAt: number;
+	/**
+	 * Epoch ms of the last chat request this model actually served. Undefined for a model that has never
+	 * been used. Written (throttled) by {@link ICustomLanguageModelsService.recordModelUsage} so "My Models"
+	 * can float the models you actually work with to the top - the runner's own `lastUsedAt` is per-running
+	 * -server and in-memory only, so it says nothing about a model that is not currently loaded.
+	 */
+	lastUsedAt?: number;
 	hidden?: boolean; // Whether the model is hidden/disabled
 	/**
 	 * For `ollama`: false until the first successful pull finishes; set to false when a pull is cancelled.
@@ -266,6 +273,13 @@ export interface ICustomLanguageModelsService {
 	 * (and never re-enables tools that the runtime auto-disabled). Marks the model as enriched.
 	 */
 	applyDerivedMetadata(id: string, derived: Partial<Pick<ICustomLanguageModel, 'contextWindow' | 'format' | 'useNativeTools' | 'supportsVision'>>): Promise<void>;
+	/**
+	 * Stamp {@link ICustomLanguageModel.lastUsedAt} for a model that just served a request. Throttled
+	 * internally (see {@link USAGE_STAMP_THROTTLE_MS}) so a burst of turns costs one storage write, and
+	 * deliberately does NOT fire the change event - re-sorting the model list underneath a live chat would
+	 * be churn for no benefit; the list picks the new stamp up on its next render.
+	 */
+	recordModelUsage(id: string): Promise<void>;
 	/** Record one tool-shaped request failure; returns the new consecutive-failure streak. */
 	recordToolFailure(id: string): Promise<number>;
 	/** Reset the tool-failure streak after a successful tool-using request. */
@@ -285,6 +299,9 @@ export interface ICustomLanguageModelsService {
  * right now. Persisted like a normal selection so Auto survives restarts.
  */
 export const LOCOPILOT_AUTO_MODEL_ID = 'locopilot.auto';
+
+/** Minimum gap between two persisted usage stamps for the same model (see recordModelUsage). */
+const USAGE_STAMP_THROTTLE_MS = 60_000;
 
 const STORAGE_KEY = 'customLanguageModels';
 const STORAGE_KEY_SELECTED = 'customLanguageModelSelected';
@@ -590,6 +607,21 @@ export class CustomLanguageModelsService extends Disposable implements ICustomLa
 		this.models[index] = { ...model, ...updates, metadataEnriched: true };
 		await this.saveModels();
 		this._onDidChangeCustomModels.fire();
+	}
+
+	async recordModelUsage(id: string): Promise<void> {
+		const index = this.models.findIndex(m => m.id === id);
+		if (index < 0) {
+			return;
+		}
+		const now = Date.now();
+		// One write per throttle window: a chat turn can hit this several times (retry, tool round-trip),
+		// and the ordering it feeds only cares about "which model did I use most recently", not seconds.
+		if (now - (this.models[index].lastUsedAt ?? 0) < USAGE_STAMP_THROTTLE_MS) {
+			return;
+		}
+		this.models[index] = { ...this.models[index], lastUsedAt: now };
+		await this.saveModels();
 	}
 
 	async recordToolFailure(id: string): Promise<number> {

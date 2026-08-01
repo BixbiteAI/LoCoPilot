@@ -385,6 +385,11 @@ export class LoCoPilotLanguageModelProvider extends Disposable implements ILangu
 
 		this._log(`[LoCoPilot Provider] Found model: ${getCustomModelListLabel(customModel)} (${customModel.provider}), sending request...`);
 
+		// Stamp "last used" on the model that actually serves this request (post-Auto-resolution, so Auto
+		// credits the concrete model it stepped down to, not the sentinel). Throttled + fire-and-forget:
+		// it must never delay or fail a send, and it feeds ordering in "My Models" only.
+		this.customLanguageModelsService.recordModelUsage(customModel.id).catch(() => { });
+
 		if (options.tools) {
 			this._log(`[LoCoPilot Provider] Tools provided: ${Array.isArray(options.tools) ? options.tools.length : 'unknown'}`);
 		}

@@ -194,20 +194,20 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 	private agentSettingsPanel!: HTMLElement;
 	private modelSearchQuery: string = '';
 	/**
-	 * Model to pin at the very top of the list (above running models) - set when the user clicks a
+	 * Model to pin near the top of the list (directly below running models) - set when the user clicks a
 	 * "Download" link in the chat panel so the just-started download is the first thing they see,
 	 * without filtering the list down to a single search result. Cleared by {@link resetModelFilters}.
 	 */
 	private pinnedModelId: string | undefined = undefined;
 	private modelTypeFilter: 'all' | 'local' | 'cloud' = 'all';
-	private modelStatusFilter: 'all' | 'downloaded' | 'not-downloaded' = 'all';
+	private modelStatusFilter: 'all' | 'downloaded' | 'not-downloaded' | 'downloading' = 'all';
 	private modelVisibilityFilter: 'all' | 'shown' | 'hidden' = 'all';
 	/** "Best for you" filter: when 'best', show only catalog models that fit this machine's RAM/engine. */
 	private modelBestFilter: 'all' | 'best' = 'all';
-	private modelToolsFilter: boolean = false;
-	private modelMtpFilter: boolean = false;
 	/** Parameter-count range filter (billions). Undefined means "all sizes" - no constraint applied. */
 	private modelParamsFilter: { min: number; max: number } | undefined = undefined;
+	/** Which parameters-slider handle to restore focus to after the re-render a keyboard nudge triggers. */
+	private paramsHandleToRefocus: 'min' | 'max' | undefined = undefined;
 	/**
 	 * Whether the collapsed "too large for this system" group is expanded. Models that need more memory
 	 * than this machine has are tucked below a "Show N more" button so low-end systems don't scroll past
@@ -897,6 +897,13 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 		const activeEl = DOM.getActiveWindow().document.activeElement;
 		const searchWasFocused = this.listModelsContainer.contains(activeEl) &&
 			(activeEl as HTMLElement)?.classList?.contains('models-search-input');
+		// Same for the parameters slider: each arrow key commits, which re-renders and would otherwise drop
+		// focus after a single press, making the handle un-nudgeable from the keyboard.
+		const focusedParamsHandle = this.listModelsContainer.contains(activeEl)
+			? ((activeEl as HTMLElement)?.classList?.contains('models-params-handle-min') ? 'min'
+				: (activeEl as HTMLElement)?.classList?.contains('models-params-handle-max') ? 'max' : undefined)
+			: undefined;
+		this.paramsHandleToRefocus = focusedParamsHandle;
 		DOM.clearNode(this.listModelsContainer);
 		const allModels = this.customLanguageModelsService.getCustomModels();
 		if (allModels.length === 0) {
@@ -951,22 +958,6 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 			});
 		};
 
-		// Toggle filter using <fieldset>/<legend> - same border-cut label, toggle switch inside.
-		// Currently unused: the Tools and MTP toggle filters are commented out below.
-		// const makeToggleFilter = (labelText: string, checked: boolean, onToggle: (v: boolean) => void) => {
-		// 	const fieldset = DOM.append(filtersRow, $('fieldset.models-filter'));
-		// 	const legend = DOM.append(fieldset, $('legend.models-filter-label'));
-		// 	legend.textContent = labelText;
-		// 	const track = DOM.append(fieldset, $('label.models-filter-toggle-track'));
-		// 	const checkbox = DOM.append(track, $('input.models-filter-toggle-input')) as HTMLInputElement;
-		// 	checkbox.type = 'checkbox';
-		// 	checkbox.checked = checked;
-		// 	DOM.append(track, $('span.models-filter-toggle-thumb'));
-		// 	checkbox.addEventListener('change', () => {
-		// 		onToggle(checkbox.checked);
-		// 		this.renderListModels();
-		// 	});
-		// };
 
 		makeDropdownFilter(
 			localize('customLanguageModels.filter.typeLabel', 'Type'),
@@ -985,9 +976,10 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 				{ label: localize('customLanguageModels.filter.statusAll', 'All'), value: 'all' },
 				{ label: localize('customLanguageModels.filter.downloaded', 'Downloaded'), value: 'downloaded' },
 				{ label: localize('customLanguageModels.filter.notDownloaded', 'Not downloaded'), value: 'not-downloaded' },
+				{ label: localize('customLanguageModels.filter.downloadingNow', 'Downloading'), value: 'downloading' },
 			],
 			this.modelStatusFilter,
-			(v) => { this.modelStatusFilter = v as 'all' | 'downloaded' | 'not-downloaded'; }
+			(v) => { this.modelStatusFilter = v as 'all' | 'downloaded' | 'not-downloaded' | 'downloading'; }
 		);
 
 		makeDropdownFilter(
@@ -1019,21 +1011,142 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 		// Parameters range slider, rendered on its own row below the dropdown filters.
 		this.renderParamsRangeFilter(stickyTop, allModels);
 
-		// makeToggleFilter(
-		// 	localize('customLanguageModels.filter.toolsLabel', 'Tools'),
-		// 	this.modelToolsFilter,
-		// 	(v) => { this.modelToolsFilter = v; }
-		// );
+		const q = this.modelSearchQuery.toLowerCase().trim();
+		const isModelDownloaded = (m: ICustomLanguageModel): boolean => {
+			return !!(m.localPath && !needsDownloadOrPullRetry(m) && !m.isDownloading);
+		};
+		// Parameter counts are regex-scraped from the display label, so memoize per render: the comparator
+		// asks for them O(n log n) times and the filter once more per model.
+		const paramsCache = new Map<string, number | undefined>();
+		const paramsOf = (m: ICustomLanguageModel): number | undefined => {
+			let cached = paramsCache.get(m.id);
+			if (cached === undefined && !paramsCache.has(m.id)) {
+				cached = parseModelParamsB(getCustomModelListLabel(m));
+				paramsCache.set(m.id, cached);
+			}
+			return cached;
+		};
+		// "Downloaded" / "Not downloaded" only mean something for models with weights to fetch. Cloud models
+		// have none - and neither does `localhost`, which is just a URL pointing at a server the user already
+		// runs. Both are excluded from all three download buckets (they still show under Status = All).
+		const hasDownloadableWeights = (m: ICustomLanguageModel): boolean => m.type === 'local' && m.provider !== 'localhost';
+		const matchesFilters = (m: ICustomLanguageModel): boolean => {
+			if (this.modelTypeFilter !== 'all' && m.type !== this.modelTypeFilter) { return false; }
+			if (this.modelStatusFilter === 'downloaded' && (!hasDownloadableWeights(m) || !isModelDownloaded(m))) { return false; }
+			if (this.modelStatusFilter === 'not-downloaded' && (!hasDownloadableWeights(m) || isModelDownloaded(m) || m.isDownloading)) { return false; }
+			if (this.modelStatusFilter === 'downloading' && !m.isDownloading) { return false; }
+			if (this.modelVisibilityFilter === 'shown' && m.hidden) { return false; }
+			if (this.modelVisibilityFilter === 'hidden' && !m.hidden) { return false; }
+			if (this.modelBestFilter === 'best' && this.modelSuitability(m) !== 'best') { return false; }
+			// Parameter-count filter. A model whose name carries no "<n>B" hint (most cloud models, Ollama
+			// tags like "phi-4-mini") is EXCLUDED once the range is narrowed: letting unsized models through
+			// meant dragging the handles to "1B - 4B" still listed frontier cloud models, which read as the
+			// filter being broken. At full extent the filter is undefined, so nothing is dropped.
+			if (this.modelParamsFilter) {
+				const params = paramsOf(m);
+				if (params === undefined) { return false; }
+				if (params < this.modelParamsFilter.min || params > this.modelParamsFilter.max) { return false; }
+			}
+			if (!q) { return true; }
+			// Search covers what a user actually types: the label, provider/repo, type, the weight format or
+			// quant ("gguf", "mlx", "q4_k_m"), the vendor, and the catalog blurb ("coding", "reasoning").
+			const catalogEntry = findCatalogEntryForStoredModel(m.modelName, m.format);
+			const haystack = [
+				getCustomModelListLabel(m), m.provider, m.modelName, m.type, m.format,
+				this.modelVendor(m), catalogEntry?.blurb, catalogEntry?.displayName
+			];
+			return haystack.some(part => (part || '').toLowerCase().includes(q));
+		};
 
-		// makeToggleFilter(
-		// 	localize('customLanguageModels.filter.mtpLabel', 'MTP'),
-		// 	this.modelMtpFilter,
-		// 	(v) => { this.modelMtpFilter = v; }
-		// );
+		// Numeric + case-insensitive collation, so "Qwen3 4B" sorts before "Qwen3 14B" (a plain
+		// localeCompare puts "14B" first, comparing "1" against "4" character-wise).
+		const sortAZ = (a: ICustomLanguageModel, b: ICustomLanguageModel) =>
+			getCustomModelListLabel(a).localeCompare(getCustomModelListLabel(b), undefined, { numeric: true, sensitivity: 'base' });
 
-		// Pin the section headers exactly below the sticky top bar. The bar's height varies (search +
-		// three filter dropdowns may wrap on narrow widths), so measure it instead of hard-coding an
-		// offset - otherwise list items peek through the gap, or the headers overlap, while scrolling.
+		// A model counts as "running" while its local server is starting up or already serving.
+		const isRunning = (m: ICustomLanguageModel): boolean =>
+			this.localModelRunner.isServerRunning(m.id) || this.localModelRunner.isServerStarting(m.id);
+
+		// One flat list, ordered by "what the user most likely wants to touch". Rank buckets from the top:
+		//   0. running/starting models - a live server is always the first thing you want to see, above even
+		//      an explicitly pinned row: it is costing memory right now and it is what chat is talking to;
+		//   1. the pinned model (set when the user clicks a chat-panel "Download" link), so the row they just
+		//      acted on is right below the running ones;
+		//   2. downloads in flight - they group together, so several parallel downloads read as one block
+		//      instead of being scattered through the catalog;
+		//   3. ready local models - HF weights on disk or a pulled Ollama model (the daemon auto-loads those
+		//      on demand, so they are just as usable as a downloaded GGUF). Most-recently-used first;
+		//   4. the single "Best for you" curated pick - our suggestion of what to get next, so it outranks
+		//      configured cloud: this is a local-first product and the recommendation is the call to action;
+		//   5. ready cloud/localhost models - a cloud model with an API key, or an OpenAI-compatible localhost
+		//      server (needs no key): zero load time, usable right now, but still below local weights;
+		//   6. everything else - the remaining catalog, custom models, and PAUSED/interrupted downloads.
+		//      A stopped download stays here rather than being floated to the top: the user most likely
+		//      stopped it on purpose, and it is reachable through Status = "Not downloaded";
+		//   7. cloud models without an API key - "needs setup" items belong at the bottom.
+		// (Visibility and hardware fit are applied as filters in matchesFilters rather than as separate
+		// sections, so there are no sticky section titles anymore - hidden models stay in the list, just
+		// dimmed via the .hidden row class and sunk to the bottom of their own bucket.)
+		const modelRank = (m: ICustomLanguageModel): number => {
+			if (isRunning(m)) { return 0; }
+			if (m.id === this.pinnedModelId) { return 1; }
+			if (m.isDownloading) { return 2; }
+			if (m.type === 'local' && m.provider !== 'localhost' && isModelDownloaded(m)) { return 3; }
+			if (m.type === 'cloud' || m.provider === 'localhost') {
+				return (m.apiKey || m.provider === 'localhost') ? 5 : 7;
+			}
+			if (this.isRecommendedForSystem(m)) { return 4; }
+			return 6;
+		};
+		const matched = allModels.filter(matchesFilters);
+		const sortedModels = matched.sort((a, b) => {
+			const ra = modelRank(a);
+			const rb = modelRank(b);
+			if (ra !== rb) { return ra - rb; }
+			// Hidden models sink within their bucket: hiding is an explicit "show me this last" signal, so a
+			// hidden model should never sit above a shown one you could actually pick in chat.
+			if (!!a.hidden !== !!b.hidden) { return a.hidden ? 1 : -1; }
+			// Most-recently-used first. Only models that have actually served a request carry a stamp, so this
+			// floats your working set to the top of its bucket and leaves everything else to the size ranking.
+			const ua = a.lastUsedAt ?? 0;
+			const ub = b.lastUsedAt ?? 0;
+			if (ua !== ub) { return ub - ua; }
+			// Params descending, so the most capable model reads like a quality ranking; models without a
+			// "<n>B" size hint in their name sort after sized ones.
+			const pa = paramsOf(a) ?? -1;
+			const pb = paramsOf(b) ?? -1;
+			if (pa !== pb) { return pb - pa; }
+			return sortAZ(a, b);
+		});
+		const hasActiveFilter = this.modelTypeFilter !== 'all' || this.modelStatusFilter !== 'all'
+			|| this.modelVisibilityFilter !== 'all' || this.modelBestFilter !== 'all'
+			|| !!this.modelParamsFilter;
+
+		// Meta row under the filters: how much of the catalog you are looking at, plus a one-click escape
+		// from a filter combination that returned nothing (previously the only way out was resetting each
+		// dropdown by hand, or leaving the section and coming back).
+		const metaRow = DOM.append(stickyTop, $('.models-filters-meta'));
+		const countLabel = DOM.append(metaRow, $('span.models-filters-count'));
+		countLabel.textContent = (q || hasActiveFilter)
+			? localize('customLanguageModels.filter.countFiltered', '{0} of {1} models', sortedModels.length, allModels.length)
+			: localize('customLanguageModels.filter.countAll', '{0} models', allModels.length);
+		if (q || hasActiveFilter) {
+			const clearLink = DOM.append(metaRow, $('a.models-filters-clear'));
+			clearLink.textContent = localize('customLanguageModels.filter.clear', 'Clear filters');
+			clearLink.title = localize('customLanguageModels.filter.clearTooltip', 'Reset the search and every filter.');
+			clearLink.setAttribute('role', 'button');
+			clearLink.setAttribute('tabindex', '0');
+			const clearAll = () => { this.resetModelFilters(true); this.renderListModels(); };
+			this._register(DOM.addDisposableListener(clearLink, 'click', clearAll));
+			this._register(DOM.addDisposableListener(clearLink, 'keydown', (e: KeyboardEvent) => {
+				if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); clearAll(); }
+			}));
+		}
+
+		// Pin the section headers exactly below the sticky top bar. The bar's height varies (search + the
+		// filter dropdowns may wrap on narrow widths, and the count/clear row appears and disappears), so
+		// measure it AFTER the whole bar is built rather than hard-coding an offset - otherwise list items
+		// peek through the gap, or the headers overlap, while scrolling.
 		// The sticky bar uses top:-20px (it scrolls 20px up into the container padding before pinning),
 		// so the headers stick at (barHeight - 20). The -1px forces a hairline overlap; the bar has the
 		// higher z-index, so it covers the seam rather than leaving a sub-pixel gap.
@@ -1041,88 +1154,13 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 		const sectionHeaderTop = Math.max(0, stickyTopHeight - 21);
 		this.listModelsContainer.style.setProperty('--models-section-header-top', `${sectionHeaderTop}px`);
 
-		const q = this.modelSearchQuery.toLowerCase().trim();
-		const isModelDownloaded = (m: ICustomLanguageModel): boolean => {
-			return !!(m.localPath && !needsDownloadOrPullRetry(m) && !m.isDownloading);
-		};
-		const matchesFilters = (m: ICustomLanguageModel): boolean => {
-			if (this.modelTypeFilter !== 'all' && m.type !== this.modelTypeFilter) { return false; }
-			// "Downloaded" / "Not downloaded" are local-only concepts: cloud models have no weights to fetch,
-			// so they belong to neither bucket. Exclude them from both status filters (they still show under
-			// Status = All or the Type = Cloud filter).
-			if (this.modelStatusFilter === 'downloaded' && (m.type === 'cloud' || !isModelDownloaded(m))) { return false; }
-			if (this.modelStatusFilter === 'not-downloaded' && (m.type === 'cloud' || isModelDownloaded(m))) { return false; }
-			if (this.modelVisibilityFilter === 'shown' && m.hidden) { return false; }
-			if (this.modelVisibilityFilter === 'hidden' && !m.hidden) { return false; }
-			if (this.modelBestFilter === 'best' && this.modelSuitability(m) !== 'best') { return false; }
-			if (this.modelToolsFilter && !m.useNativeTools) { return false; }
-			if (this.modelMtpFilter && !m.mtp) { return false; }
-			// Parameter-count filter: only constrains models whose name carries a "<n>B" hint; others always pass.
-			if (this.modelParamsFilter) {
-				const params = parseModelParamsB(getCustomModelListLabel(m));
-				if (params !== undefined && (params < this.modelParamsFilter.min || params > this.modelParamsFilter.max)) { return false; }
-			}
-			if (!q) { return true; }
-			const label = getCustomModelListLabel(m).toLowerCase();
-			return label.includes(q) || (m.provider || '').toLowerCase().includes(q) || (m.modelName || '').toLowerCase().includes(q) || (m.type || '').toLowerCase().includes(q);
-		};
-
-		const sortAZ = (a: ICustomLanguageModel, b: ICustomLanguageModel) =>
-			getCustomModelListLabel(a).localeCompare(getCustomModelListLabel(b));
-
-		// A model counts as "running" while its local server is starting up or already serving.
-		const isRunning = (m: ICustomLanguageModel): boolean =>
-			this.localModelRunner.isServerRunning(m.id) || this.localModelRunner.isServerStarting(m.id);
-
-		// One flat list, ordered by "what the user most likely wants to touch". Rank buckets from the top:
-		//   0. the pinned model (set when the user clicks a chat-panel "Download" link), so the
-		//      just-started download is the first row they see;
-		//   1. currently running/starting models;
-		//   2. ready local models - HF weights on disk or a pulled Ollama model (the daemon auto-loads
-		//      those on demand, so they are just as usable as a downloaded GGUF);
-		//   3. ready cloud/localhost models - a cloud model with an API key, or an OpenAI-compatible
-		//      localhost server (needs no key): zero load time, usable right now, but this is a
-		//      local-first product so they sort below the downloaded local models;
-		//   4. the single "Best for you" curated pick - the first not-yet-downloaded row, since it is
-		//      literally our suggestion of what to get next;
-		//   5. everything else (remaining catalog / custom models), largest parameter count first so the
-		//      most capable model that fits this machine reads like a quality ranking;
-		//   6. cloud models without an API key - "needs setup" items belong at the bottom.
-		// A-Z is the final tiebreaker everywhere so the order stays stable and scannable.
-		// (Visibility and "Best for you" are applied as filters in matchesFilters rather than as
-		// separate sections, so there are no sticky section titles anymore - hidden models stay in
-		// place, just dimmed via the .hidden row class.)
-		const modelRank = (m: ICustomLanguageModel): number => {
-			if (m.id === this.pinnedModelId) { return 0; }
-			if (isRunning(m)) { return 1; }
-			if (m.type === 'local' && m.provider !== 'localhost' && isModelDownloaded(m)) { return 2; }
-			if (m.type === 'cloud' || m.provider === 'localhost') {
-				return (m.apiKey || m.provider === 'localhost') ? 3 : 6;
-			}
-			if (this.isRecommendedForSystem(m)) { return 4; }
-			return 5;
-		};
-		const matched = allModels.filter(matchesFilters);
-		const sortedModels = matched.sort((a, b) => {
-			const ra = modelRank(a);
-			const rb = modelRank(b);
-			if (ra !== rb) { return ra - rb; }
-			if (ra === 5) {
-				// Params descending; models without a "<n>B" size hint in their name sort after sized ones.
-				const pa = parseModelParamsB(getCustomModelListLabel(a)) ?? -1;
-				const pb = parseModelParamsB(getCustomModelListLabel(b)) ?? -1;
-				if (pa !== pb) { return pb - pa; }
-			}
-			return sortAZ(a, b);
-		});
-		const hasActiveFilter = this.modelTypeFilter !== 'all' || this.modelStatusFilter !== 'all' || this.modelVisibilityFilter !== 'all' || this.modelBestFilter !== 'all' || this.modelToolsFilter || this.modelMtpFilter || !!this.modelParamsFilter;
-
 		// A catalog model too large for this machine's RAM (or Apple-Silicon-only off Apple Silicon) is
-		// "incompatible" and gets tucked into the collapsed group. A pinned model (a just-clicked download)
-		// or a running server stays in the always-visible list even if oversized, so the user never loses
-		// sight of the model they just acted on.
+		// "incompatible" and gets tucked into the collapsed group. A pinned model (a just-clicked download),
+		// a download already in flight, or a running server stays in the always-visible list even if
+		// oversized, so the user never loses sight of the model they just acted on - burying a live progress
+		// bar inside a collapsed "too large" group would look like the download had vanished.
 		const isCollapsibleIncompatible = (m: ICustomLanguageModel): boolean => {
-			if (m.id === this.pinnedModelId || isRunning(m)) { return false; }
+			if (m.id === this.pinnedModelId || isRunning(m) || m.isDownloading) { return false; }
 			const suitability = this.modelSuitability(m);
 			return suitability === 'too-big' || suitability === 'incompatible';
 		};
@@ -1131,7 +1169,7 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 		if (sortedModels.length === 0) {
 			const noResults = DOM.append(listContainer, $('.models-section-empty'));
 			noResults.textContent = (q || hasActiveFilter)
-				? localize('customLanguageModels.list.noMatch', 'No models match your search')
+				? localize('customLanguageModels.list.noMatch', 'No models match your search and filters')
 				: localize('customLanguageModels.list.none', 'No models');
 		} else {
 			const compatibleModels = sortedModels.filter(m => !isCollapsibleIncompatible(m));
@@ -1447,7 +1485,7 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 			const ra = findCatalogEntryForStoredModel(a.modelName, a.format)?.minRamGB ?? Number.MAX_SAFE_INTEGER;
 			const rb = findCatalogEntryForStoredModel(b.modelName, b.format)?.minRamGB ?? Number.MAX_SAFE_INTEGER;
 			if (ra !== rb) { return ra - rb; }
-			return getCustomModelListLabel(a).localeCompare(getCustomModelListLabel(b));
+			return getCustomModelListLabel(a).localeCompare(getCustomModelListLabel(b), undefined, { numeric: true, sensitivity: 'base' });
 		});
 		sorted.forEach((model: ICustomLanguageModel) => this.renderListModelItem(model, listContainer));
 		addToggleLink(localize('customLanguageModels.hideIncompatible', 'Show less'), false);
@@ -2396,6 +2434,11 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 	 * smallest/largest parameter count among the models, rounded out to "nice" endpoints (e.g. 0.6B/34.8B
 	 * -> 0.5B/64B). Handles default to the full extent ("All sizes"); dragging filters the list on release.
 	 * Hidden when fewer than two distinct parameter counts exist (nothing to range over).
+	 *
+	 * The rail is LOGARITHMIC. Model sizes are distributed by order of magnitude, not linearly: on a linear
+	 * 0.5B-64B rail the 0.5-8B band that holds most local models is squeezed into ~12% of the track, so
+	 * separating a 3B from a 7B meant pixel-hunting while the 32-64B half sat nearly empty. On a log rail
+	 * every doubling gets equal width, which matches how the catalog is actually spread.
 	 */
 	private renderParamsRangeFilter(stickyTop: HTMLElement, allModels: ICustomLanguageModel[]): void {
 		let dataMin: number | undefined;
@@ -2416,7 +2459,21 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 		const LADDER = [0.5, 1, 2, 4, 8, 16, 32, 64, 128, 256, 512];
 		const railMin = [...LADDER].reverse().find(v => v <= dataMin!) ?? dataMin;
 		const railMax = LADDER.find(v => v >= dataMax!) ?? dataMax;
-		const range = railMax - railMin || 1;
+
+		// Log-space rail: position is the fraction of the way from railMin to railMax in DOUBLINGS, so each
+		// octave gets equal pixels. logSpan is guarded against 0 (railMin === railMax can't reach here, but a
+		// degenerate rail would divide by zero).
+		const logMin = Math.log(railMin);
+		const logSpan = Math.log(railMax) - logMin || 1;
+
+		// Snap step scaled to magnitude: 0.1B below 1B, 0.5B below 10B, 1B below 100B, 5B above. A single
+		// linear 0.1B step made the keyboard path ~635 presses end to end and let the pointer land on values
+		// like "37.4B" that no model has.
+		const snapStepFor = (v: number): number => (v < 1 ? 0.1 : v < 10 ? 0.5 : v < 100 ? 1 : 5);
+		const snap = (v: number): number => {
+			const step = snapStepFor(v);
+			return Math.round(Math.round(v / step) * step * 10) / 10;
+		};
 
 		// Clamp any active filter to the current rail (model set may have changed since it was set).
 		const clamp = (v: number) => Math.max(railMin, Math.min(v, railMax));
@@ -2425,8 +2482,14 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 			: { min: railMin, max: railMax };
 
 		const fieldset = DOM.append(stickyTop, $('fieldset.models-filter.models-params-filter'));
+		fieldset.title = localize('customLanguageModels.filter.paramsTooltip', 'Filter by parameter count. Models whose name carries no size (most cloud models) are hidden while a range is set.');
 		const legend = DOM.append(fieldset, $('legend.models-filter-label'));
 		legend.textContent = localize('customLanguageModels.filter.paramsLabel', 'Parameters');
+		// Live readout of the current selection, inside the caption - the scale ticks stay static below, so the
+		// user can read both "what did I pick" and "what is the scale" without the two labels fighting.
+		// (Inside the <legend> rather than beside it: a legend is laid out specially by the box model, so a
+		// sibling span would drop to its own line.)
+		const readout = DOM.append(legend, $('span.models-params-readout'));
 
 		const slider = DOM.append(fieldset, $('.models-params-slider'));
 		DOM.append(slider, $('.models-params-rail'));
@@ -2439,22 +2502,41 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 		maxHandle.setAttribute('role', 'slider');
 		minHandle.setAttribute('aria-label', localize('customLanguageModels.filter.minParams', 'Minimum parameters'));
 		maxHandle.setAttribute('aria-label', localize('customLanguageModels.filter.maxParams', 'Maximum parameters'));
+		for (const handle of [minHandle, maxHandle]) {
+			handle.setAttribute('aria-valuemin', String(railMin));
+			handle.setAttribute('aria-valuemax', String(railMax));
+		}
 
+		// Static scale: the rail's own endpoints, plus a tick at every ladder value in between. On a log rail
+		// the ticks are evenly spaced, which is what makes the scale legible at a glance.
 		const scale = DOM.append(fieldset, $('.models-params-scale'));
-		const minLabel = DOM.append(scale, $('span.models-params-minlabel'));
-		const maxLabel = DOM.append(scale, $('span.models-params-maxlabel'));
+		const pct = (v: number) => ((Math.log(v) - logMin) / logSpan) * 100;
+		for (const tick of LADDER.filter(v => v >= railMin && v <= railMax)) {
+			const tickEl = DOM.append(scale, $('span.models-params-tick'));
+			tickEl.textContent = formatParamsB(tick);
+			tickEl.style.left = `${pct(tick)}%`;
+		}
 
-		const pct = (v: number) => ((v - railMin) / range) * 100;
 		const layout = () => {
 			minHandle.style.left = `${pct(state.min)}%`;
 			maxHandle.style.left = `${pct(state.max)}%`;
 			fill.style.left = `${pct(state.min)}%`;
 			fill.style.width = `${Math.max(0, pct(state.max) - pct(state.min))}%`;
-			// At the extremes the bucket is open-ended ("< 0.5B" / "> 64B") - everything below/above is shown.
-			minLabel.textContent = state.min <= railMin ? `< ${formatParamsB(railMin)}` : formatParamsB(state.min);
-			maxLabel.textContent = state.max >= railMax ? `> ${formatParamsB(railMax)}` : formatParamsB(state.max);
+			// A handle parked at its rail end means "no bound in that direction", so say that in words rather
+			// than printing "< 0.5B" / "> 64B", which read as active bounds excluding part of the list.
+			const openMin = state.min <= railMin;
+			const openMax = state.max >= railMax;
+			readout.textContent = openMin && openMax
+				? localize('customLanguageModels.filter.paramsAll', 'All sizes')
+				: openMin
+					? localize('customLanguageModels.filter.paramsUpTo', 'Up to {0}', formatParamsB(state.max))
+					: openMax
+						? localize('customLanguageModels.filter.paramsFrom', '{0} and up', formatParamsB(state.min))
+						: localize('customLanguageModels.filter.paramsRange', '{0} - {1}', formatParamsB(state.min), formatParamsB(state.max));
 			minHandle.setAttribute('aria-valuenow', String(state.min));
 			maxHandle.setAttribute('aria-valuenow', String(state.max));
+			minHandle.setAttribute('aria-valuetext', formatParamsB(state.min));
+			maxHandle.setAttribute('aria-valuetext', formatParamsB(state.max));
 		};
 
 		const commit = () => {
@@ -2465,8 +2547,8 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 		const valueAt = (clientX: number): number => {
 			const rect = slider.getBoundingClientRect();
 			const ratio = rect.width > 0 ? (clientX - rect.left) / rect.width : 0;
-			const v = railMin + Math.max(0, Math.min(1, ratio)) * range;
-			return Math.round(v * 10) / 10; // snap to 0.1B
+			const v = Math.exp(logMin + Math.max(0, Math.min(1, ratio)) * logSpan);
+			return clamp(snap(v));
 		};
 
 		const startDrag = (which: 'min' | 'max', downEvent: PointerEvent) => {
@@ -2488,31 +2570,52 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 		this._register(DOM.addDisposableListener(minHandle, DOM.EventType.POINTER_DOWN, (e: PointerEvent) => startDrag('min', e)));
 		this._register(DOM.addDisposableListener(maxHandle, DOM.EventType.POINTER_DOWN, (e: PointerEvent) => startDrag('max', e)));
 
-		// Keyboard: arrow keys nudge the focused handle by one snap step.
+		// Keyboard: arrows nudge the focused handle by one magnitude-scaled step, Home/End jump to the rail
+		// end (which is also how you clear that side of the range).
 		const onKey = (which: 'min' | 'max', e: KeyboardEvent) => {
-			const delta = e.key === 'ArrowLeft' || e.key === 'ArrowDown' ? -0.1 : (e.key === 'ArrowRight' || e.key === 'ArrowUp' ? 0.1 : 0);
-			if (delta === 0) { return; }
+			const current = which === 'min' ? state.min : state.max;
+			const direction = e.key === 'ArrowLeft' || e.key === 'ArrowDown' ? -1 : (e.key === 'ArrowRight' || e.key === 'ArrowUp' ? 1 : 0);
+			let next: number | undefined;
+			if (direction !== 0) {
+				// Step by the granularity of where the handle is HEADING, so stepping down across a magnitude
+				// boundary (e.g. 1B -> 0.9B) uses the finer step rather than jumping back by the coarser one.
+				const step = snapStepFor(direction < 0 ? Math.max(railMin, current - 0.0001) : current);
+				next = snap(current + direction * step);
+			} else if (e.key === 'Home') {
+				next = railMin;
+			} else if (e.key === 'End') {
+				next = railMax;
+			}
+			if (next === undefined) { return; }
 			e.preventDefault();
-			if (which === 'min') { state.min = Math.max(railMin, Math.min(clamp(Math.round((state.min + delta) * 10) / 10), state.max)); }
-			else { state.max = Math.min(railMax, Math.max(clamp(Math.round((state.max + delta) * 10) / 10), state.min)); }
+			if (which === 'min') { state.min = Math.min(clamp(next), state.max); }
+			else { state.max = Math.max(clamp(next), state.min); }
 			layout();
 			commit();
 		};
 		this._register(DOM.addDisposableListener(minHandle, DOM.EventType.KEY_DOWN, (e: KeyboardEvent) => onKey('min', e)));
 		this._register(DOM.addDisposableListener(maxHandle, DOM.EventType.KEY_DOWN, (e: KeyboardEvent) => onKey('max', e)));
 
+		// Restore keyboard focus after the re-render a commit triggers (see paramsHandleToRefocus).
+		if (this.paramsHandleToRefocus === 'min') { minHandle.focus(); }
+		else if (this.paramsHandleToRefocus === 'max') { maxHandle.focus(); }
+		this.paramsHandleToRefocus = undefined;
+
 		layout();
 	}
 
-	private resetModelFilters(): void {
+	/**
+	 * Clear every filter. `keepPin` is set by the "Clear filters" button: the pinned model is a navigation
+	 * target (the download the user just started), not a filter, so clearing filters must not lose it -
+	 * whereas re-entering the section resets everything including the pin.
+	 */
+	private resetModelFilters(keepPin: boolean = false): void {
 		this.modelSearchQuery = '';
-		this.pinnedModelId = undefined;
+		if (!keepPin) { this.pinnedModelId = undefined; }
 		this.modelTypeFilter = 'all';
 		this.modelStatusFilter = 'all';
 		this.modelVisibilityFilter = 'all';
 		this.modelBestFilter = 'all';
-		this.modelToolsFilter = false;
-		this.modelMtpFilter = false;
 		this.modelParamsFilter = undefined;
 		this.modelsIncompatibleExpanded = false;
 	}
@@ -2543,6 +2646,24 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 				if (this.listModelsContainer) { this.renderListModels(); }
 			}
 		});
+	}
+
+	/**
+	 * The vendor/family a model belongs to, so searching "google" or "mistralai" finds its models even when
+	 * the vendor is nowhere in the display name. Curated catalog entries carry a real vendor ("Alibaba
+	 * (Qwen)", "Google"); for everything else the HuggingFace/Ollama repo org is the best available proxy
+	 * ("mistralai/Mistral-Small" -> "mistralai"), falling back to the provider for cloud models and localhost
+	 * URLs. Search-only - nothing behavioural keys off it.
+	 */
+	private modelVendor(model: ICustomLanguageModel): string {
+		const entry = findCatalogEntryForStoredModel(model.modelName, model.format);
+		if (entry?.vendor) { return entry.vendor; }
+		const repo = (model.modelName || '').trim();
+		const slash = repo.indexOf('/');
+		// Guard against a localhost URL in modelName ("http://localhost:8080/v1/...") - its first segment is
+		// a scheme, not an org - by only treating the prefix as an org when it isn't a URL.
+		if (slash > 0 && !/^https?:/i.test(repo)) { return repo.slice(0, slash); }
+		return model.provider || localize('customLanguageModels.filter.vendorOther', 'Other');
 	}
 
 	/** How well a stored model fits this machine. Non-catalog (custom/cloud) models return 'unknown'. */

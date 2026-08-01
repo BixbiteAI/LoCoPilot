@@ -245,14 +245,77 @@
 	outline-offset: 2px;
 }
 
+/* Static scale under the rail: one tick per ladder value, absolutely positioned at its log-rail percentage
+ * (evenly spaced, since the rail is logarithmic). translateX(-50%) centres each label on its tick; the two
+ * end ticks are pulled back inside the track so they don't overhang the container edges. */
 .models-params-scale {
-	display: flex;
-	justify-content: space-between;
+	position: relative;
 	width: 100%;
+	height: 14px;
 	margin-top: 8px;
 	font-size: 11px;
 	color: var(--vscode-descriptionForeground);
 	font-variant-numeric: tabular-nums;
+}
+
+.models-params-tick {
+	position: absolute;
+	top: 0;
+	transform: translateX(-50%);
+	white-space: nowrap;
+	opacity: 0.75;
+}
+
+.models-params-tick:first-of-type {
+	transform: none;
+}
+
+.models-params-tick:last-of-type {
+	transform: translateX(-100%);
+}
+
+/* Live readout of the selected range, rendered inside the "Parameters" caption. Opts out of the caption's
+ * uppercase/letter-spacing treatment so "All sizes" reads as a value, not as part of the label. */
+.models-params-readout {
+	margin-left: 8px;
+	font-size: 11px;
+	font-weight: 600;
+	text-transform: none;
+	letter-spacing: 0;
+	color: var(--vscode-foreground);
+	font-variant-numeric: tabular-nums;
+}
+
+/* Meta row under the filters: "N of M models" on the left, "Clear filters" on the right. */
+.models-filters-meta {
+	display: flex;
+	align-items: center;
+	justify-content: space-between;
+	gap: 12px;
+	margin-top: 12px;
+	font-size: 11px;
+	color: var(--vscode-descriptionForeground);
+}
+
+.models-filters-count {
+	font-variant-numeric: tabular-nums;
+}
+
+.models-filters-clear {
+	color: var(--vscode-textLink-foreground);
+	cursor: pointer;
+	text-decoration: none;
+}
+
+.models-filters-clear:hover {
+	color: var(--vscode-textLink-activeForeground);
+	text-decoration: underline;
+}
+
+.models-filters-clear:focus-visible {
+	outline: 1px solid var(--vscode-focusBorder);
+	outline-offset: 2px;
+	border-radius: 2px;
 }
 
 /* Section headers (sticky below the title+search+filters bar).
