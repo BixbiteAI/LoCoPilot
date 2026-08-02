@@ -17,7 +17,7 @@ import type { IRequestToFileProgressEvent } from '../../../../platform/request/c
 import { ILogService } from '../../../../platform/log/common/log.js';
 import { IFileService } from '../../../../platform/files/common/files.js';
 import { IEnvironmentService, INativeEnvironmentService } from '../../../../platform/environment/common/environment.js';
-import { ICustomLanguageModelsService, ICustomLanguageModel, MIN_CONTEXT_WINDOW, MAX_CONTEXT_WINDOW, getCustomModelListLabel } from '../common/customLanguageModelsService.js';
+import { ICustomLanguageModelsService, ICustomLanguageModel, MIN_CONTEXT_WINDOW, MAX_CONTEXT_WINDOW, getCustomModelListLabel, isCustomModelReadyForChat } from '../common/customLanguageModelsService.js';
 import { ILoCoPilotFileLog } from './locopilotFileLog.js';
 import { ILoCoPilotOllamaService } from './locopilotOllamaService.js';
 import { ILoCoPilotSystemInfoService } from '../../../../platform/locopilotSystemInfo/common/locopilotSystemInfo.js';
@@ -51,6 +51,11 @@ const HF_RESOLVE = `${HF_API_BASE}`;
  * multi-GB models this handles). Kept behind this flag so the hf_xet path can be re-enabled if desired.
  */
 const HF_XET_FAST_PATH_ENABLED = false;
+
+/** Sliding window the live download speed is averaged over. Long enough to ride out a single stalled range. */
+const DOWNLOAD_RATE_WINDOW_MS = 30_000;
+/** Minimum window width before a speed/ETA is published; below this the figure is mostly noise. */
+const DOWNLOAD_RATE_MIN_SAMPLE_SEC = 2;
 
 /**
  * Inline Python (run as `python -c`) that downloads a repo's files with huggingface_hub/hf_xet and prints its
@@ -1081,7 +1086,7 @@ export class LoCoPilotModelDownloadService extends Disposable implements IWorkbe
 			return;
 		}
 		this._log(`[LoCoPilot Download] Stop download for ${model.modelName}: no active token; pausing (partial kept for resume).`);
-		void this.customLanguageModelsService.updateCustomModel(modelId, { isDownloading: false, downloadPaused: true });
+		void this.customLanguageModelsService.updateCustomModel(modelId, { isDownloading: false, downloadPaused: true, downloadRateBps: undefined, downloadEtaSeconds: undefined });
 	}
 
 	/**
@@ -1101,10 +1106,47 @@ export class LoCoPilotModelDownloadService extends Disposable implements IWorkbe
 					tooltip: '',
 					class: undefined,
 					enabled: true,
-					run: () => this.commandService.executeCommand('workbench.action.chat.open'),
+					run: async () => {
+						// Clicking this is an explicit "use THIS model now", so make it the picker's selection -
+						// opening chat on whatever was selected before would leave the just-downloaded model unused.
+						await this._selectDownloadedModelForChat(model.id);
+						await this.commandService.executeCommand('workbench.action.chat.open');
+					},
 				}],
 			},
 		});
+	}
+
+	/**
+	 * Make a just-downloaded model the active chat selection: unhide it if it was hidden (a hidden model is
+	 * filtered out of the picker, so selecting it would be a no-op) and then select it.
+	 *
+	 * State is re-read here rather than taken from the captured model: the toast outlives the download, and the
+	 * completion fields (`localPath`, `isDownloading`) are written after the object the toast closed over. The
+	 * selection is only applied once the model actually passes the picker's readiness test, otherwise
+	 * `_clearSelectedIfUnavailable` would immediately drop it again and the user would land on a silently
+	 * unchanged picker.
+	 */
+	private async _selectDownloadedModelForChat(modelId: string): Promise<void> {
+		try {
+			const model = this.customLanguageModelsService.getCustomModels().find(m => m.id === modelId);
+			if (!model) {
+				return;
+			}
+			if (model.hidden) {
+				await this.customLanguageModelsService.hideCustomModel(modelId, false);
+			}
+			const current = this.customLanguageModelsService.getCustomModels().find(m => m.id === modelId);
+			if (current && isCustomModelReadyForChat(current)) {
+				this.customLanguageModelsService.setSelectedCustomModelId(modelId);
+				this._log(`[LoCoPilot Download] Selected "${getCustomModelListLabel(current)}" in the model picker after download.`);
+			} else {
+				this._log(`[LoCoPilot Download] Not selecting ${modelId} after download: not chat-ready yet.`);
+			}
+		} catch (e) {
+			// Never let a selection failure swallow the click - opening the chat panel still has to happen.
+			this._log(`[LoCoPilot Download] Could not select ${modelId} after download: ${toErrorMessage(e)}`);
+		}
 	}
 
 	private async _pullOllamaModel(model: ICustomLanguageModel, cancel: CancellationToken): Promise<void> {
@@ -1214,6 +1256,21 @@ export class LoCoPilotModelDownloadService extends Disposable implements IWorkbe
 		}
 	}
 
+	/**
+	 * True when `fileUri` is already on disk at EXACTLY `expectedBytes` - i.e. an earlier run finished it. Used to
+	 * skip completed files when resuming a download. Anything else (missing, wrong size, unreadable, a directory)
+	 * returns false and the file is fetched again: the safe direction, since a partial must never be adopted as
+	 * complete.
+	 */
+	private async _isFileComplete(fileUri: URI, expectedBytes: number): Promise<boolean> {
+		try {
+			const stat = await this.fileService.stat(fileUri);
+			return !stat.isDirectory && stat.size === expectedBytes;
+		} catch {
+			return false;
+		}
+	}
+
 	private async _downloadHuggingFaceModel(model: ICustomLanguageModel, cancel: CancellationToken): Promise<void> {
 		const modelId = model.id;
 		const token = model.token;
@@ -1313,6 +1370,44 @@ export class LoCoPilotModelDownloadService extends Disposable implements IWorkbe
 				}
 			}
 
+			// Progress is weighted by BYTES, not by file count. A repo's `config.json` and its 5 GB safetensors shard
+			// are one file each, so an index-based bar lurches, and a resume looks like it jumps backwards to the
+			// index the loop restarts scanning from. Falls back to the old equal-per-file weighting only when HF
+			// didn't report a size for every file.
+			const targetSizes = targets.map(({ relPath }) => sizes.get(relPath) ?? 0);
+			const totalBytes = targetSizes.every(s => s > 0) ? targetSizes.reduce((a, b) => a + b, 0) : 0;
+			let completedBytes = 0;
+
+			// Live speed + ETA. Samples are recorded on EVERY transfer callback (cheap, in-memory) so the window
+			// stays dense and accurate, but the value is only published alongside a percentage change - piggybacking
+			// on the existing update points adds no extra storage writes or model-list refreshes. A short sliding
+			// window rather than an all-time average, so the number tracks what the link is doing now and recovers
+			// quickly after a stall. Needs `totalBytes` (an ETA without a known total is meaningless).
+			const rateWindow: { t: number; bytes: number }[] = [];
+			const recordBytes = (bytesSoFar: number): void => {
+				const now = Date.now();
+				rateWindow.push({ t: now, bytes: bytesSoFar });
+				while (rateWindow.length > 2 && now - rateWindow[0].t > DOWNLOAD_RATE_WINDOW_MS) {
+					rateWindow.shift();
+				}
+			};
+			// Returns an empty patch until the window is wide enough to mean anything; the previously published
+			// figure then simply stays on screen instead of flickering to a garbage value.
+			const rateAndEta = (bytesSoFar: number): { downloadRateBps?: number; downloadEtaSeconds?: number } => {
+				const oldest = rateWindow[0];
+				if (!oldest || totalBytes <= 0) {
+					return {};
+				}
+				const elapsedSec = (Date.now() - oldest.t) / 1000;
+				const moved = bytesSoFar - oldest.bytes;
+				if (elapsedSec < DOWNLOAD_RATE_MIN_SAMPLE_SEC || moved <= 0) {
+					return {};
+				}
+				const downloadRateBps = moved / elapsedSec;
+				const remaining = Math.max(0, totalBytes - bytesSoFar);
+				return { downloadRateBps, downloadEtaSeconds: Math.round(remaining / downloadRateBps) };
+			};
+
 			// Downloading: we use the multi-connection, RESUMABLE ranged downloader (in requestToFile) on every
 			// platform, so a stopped/crashed download continues from where it left off and the progress bar
 			// reflects true cumulative bytes. The Apple-Silicon hf_xet fast path is faster on very high-bandwidth
@@ -1334,6 +1429,23 @@ export class LoCoPilotModelDownloadService extends Disposable implements IWorkbe
 			if (!downloadedViaHf) {
 				for (let i = 0; i < targets.length; i++) {
 					const { relPath, segments, fileUri } = targets[i];
+					const expectedBytes = targetSizes[i];
+
+					// Already finished by an earlier run: skip it. Byte-level resume lives in the `<dest>.part` +
+					// `.part.json` manifest pair, and BOTH are removed the moment a file is renamed into place - so
+					// without this check a resume re-fetches every completed file from byte 0, and a download that
+					// died at 100% restarts the ENTIRE repo. Only an exact size match counts as complete, so a
+					// truncated file is always re-downloaded rather than adopted.
+					if (expectedBytes > 0 && await this._isFileComplete(fileUri, expectedBytes)) {
+						completedBytes += expectedBytes;
+						const skipPct = totalBytes > 0
+							? Math.min(99, Math.round((completedBytes / totalBytes) * 100))
+							: Math.round(((i + 1) / total) * 100);
+						await this.customLanguageModelsService.updateCustomModel(modelId, { downloadProgress: skipPct });
+						this._log(`[LoCoPilot Download] ${repoId}: ${relPath} already complete (${expectedBytes} bytes); skipping.`);
+						continue;
+					}
+
 					// Use path segment encoding so "org/repo" stays as org/repo in URL path (HF CDN expects it)
 					const repoPathEnc = repoId.split('/').map(encodeURIComponent).join('/');
 					const filePathEnc = relPath.split('/').map(encodeURIComponent).join('/');
@@ -1355,13 +1467,20 @@ export class LoCoPilotModelDownloadService extends Disposable implements IWorkbe
 								const filePct = contentLength && contentLength > 0
 									? Math.min(100, Math.round((evt.bytesReceived / contentLength) * 100))
 									: 0;
-								// Overall progress: completed files + current file progress
-								const pct = total <= 1
-									? filePct
-									: Math.min(99, Math.round((i / total) * 100 + (filePct / 100) * (1 / total) * 100));
+								// Overall progress: bytes already on disk + this file's bytes so far. `bytesReceived` is
+								// cumulative for this file and already counts chunks adopted from a resumed `.part`.
+								const overallBytes = completedBytes + Math.min(evt.bytesReceived, expectedBytes);
+								const pct = totalBytes > 0
+									? Math.min(99, Math.round((overallBytes / totalBytes) * 100))
+									: total <= 1
+										? filePct
+										: Math.min(99, Math.round((i / total) * 100 + (filePct / 100) * (1 / total) * 100));
+								if (totalBytes > 0) {
+									recordBytes(overallBytes);
+								}
 								if (pct !== lastPct && pct >= 0) {
 									lastPct = pct;
-									this.customLanguageModelsService.updateCustomModel(modelId, { downloadProgress: pct });
+									this.customLanguageModelsService.updateCustomModel(modelId, { downloadProgress: pct, ...rateAndEta(overallBytes) });
 								}
 							})
 							: undefined;
@@ -1380,7 +1499,10 @@ export class LoCoPilotModelDownloadService extends Disposable implements IWorkbe
 						}
 						await this.fileService.writeFile(fileUri, res.stream);
 					}
-					const pct = Math.round(((i + 1) / total) * 100);
+					completedBytes += expectedBytes;
+					const pct = totalBytes > 0
+						? Math.min(99, Math.round((completedBytes / totalBytes) * 100))
+						: Math.round(((i + 1) / total) * 100);
 					await this.customLanguageModelsService.updateCustomModel(modelId, { downloadProgress: pct });
 					this._log(`[LoCoPilot Download] ${repoId} progress: ${pct}% (${i + 1}/${total})`);
 				}
@@ -1391,7 +1513,10 @@ export class LoCoPilotModelDownloadService extends Disposable implements IWorkbe
 			if (mainModelFileUri && isMmprojGgufPath(mainModelFileUri.fsPath)) {
 				mainModelFileUri = undefined;
 			}
-			if (!mainModelFileUri && toDownload.some(isWeightGgufPath) === false) {
+			// Only meaningful for a GGUF (llama.cpp) fetch: MLX/safetensors/transformers repos legitimately ship no
+			// GGUF at all and load from the FOLDER, so this must never fire for them - unscoped, it threw at 100%
+			// on every completed MLX download.
+			if (!mainModelFileUri && isGgufDownload) {
 				throw new Error(localize(
 					'locopilot.download.error.noWeightGguf',
 					'No language-model GGUF was selected for "{0}" (only a vision projector was available). Try again or pick a smaller quant.',
@@ -1403,6 +1528,9 @@ export class LoCoPilotModelDownloadService extends Disposable implements IWorkbe
 				isDownloading: false,
 				downloadPaused: false,
 				downloadProgress: 100,
+				// Nothing is transferring any more, so the last rate/ETA must not linger on the row.
+				downloadRateBps: undefined,
+				downloadEtaSeconds: undefined,
 				localPath,
 				// A projector on disk is ground truth that this model can read images, so enable vision.
 				...(mmprojRelPath ? { supportsVision: true } : {})
@@ -1421,7 +1549,7 @@ export class LoCoPilotModelDownloadService extends Disposable implements IWorkbe
 			// Stop/interrupt/error: KEEP the partial on disk and mark the row paused (progress preserved) so it
 			// shows "Resume download" and continues from here next time - never wipe progress on a stop. Only an
 			// explicit Remove/Delete (deleteModelFiles) clears the partial.
-			await this.customLanguageModelsService.updateCustomModel(modelId, { isDownloading: false, downloadPaused: true });
+			await this.customLanguageModelsService.updateCustomModel(modelId, { isDownloading: false, downloadPaused: true, downloadRateBps: undefined, downloadEtaSeconds: undefined });
 
 			const userCancelled = cancel.isCancellationRequested || isCancellationError(e);
 			if (userCancelled) {

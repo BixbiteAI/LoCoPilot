@@ -36,7 +36,7 @@ import { defaultButtonStyles, getInputBoxStyle, getSelectBoxStyles, defaultToggl
 import { settingsSelectBackground, settingsSelectBorder, settingsSelectForeground, settingsSelectListBorder, settingsTextInputBackground, settingsTextInputBorder, settingsTextInputForeground } from '../../../preferences/common/settingsEditorColorRegistry.js';
 import { Toggle } from '../../../../../base/browser/ui/toggle/toggle.js';
 import { SelectBox, ISelectOptionItem, ISelectData } from '../../../../../base/browser/ui/selectBox/selectBox.js';
-import { ICustomLanguageModelsService, ICustomLanguageModel, getCustomModelListLabel, customModelSupportsVision, customModelVisionEnabled, needsDownloadOrPullRetry, hasRemovableLocalDownload, DEFAULT_CONTEXT_WINDOW_CLOUD, DEFAULT_CONTEXT_WINDOW_LOCAL, MIN_CONTEXT_WINDOW, MAX_CONTEXT_WINDOW } from '../../common/customLanguageModelsService.js';
+import { ICustomLanguageModelsService, ICustomLanguageModel, getCustomModelListLabel, customModelSupportsVision, customModelVisionEnabled, needsDownloadOrPullRetry, hasRemovableLocalDownload, formatDownloadRateAndEta, DEFAULT_CONTEXT_WINDOW_CLOUD, DEFAULT_CONTEXT_WINDOW_LOCAL, MIN_CONTEXT_WINDOW, MAX_CONTEXT_WINDOW } from '../../common/customLanguageModelsService.js';
 import { IDialogService } from '../../../../../platform/dialogs/common/dialogs.js';
 import Severity from '../../../../../base/common/severity.js';
 import { IClipboardService } from '../../../../../platform/clipboard/common/clipboardService.js';
@@ -1434,12 +1434,18 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 			const row3 = DOM.append(itemContainer, $('.model-item-row.model-item-row3'));
 			const progressWrap = DOM.append(row3, $('.model-download-progress-wrap'));
 			const progressLabel = DOM.append(progressWrap, $('.model-download-progress-label'));
-			progressLabel.textContent = localize('customLanguageModels.downloadProgressShort', 'Downloading... {0}%', model.downloadProgress ?? 0);
+			// Speed + ETA when we have a real measurement; plain percentage until the rate window fills.
+			const transferDetail = formatDownloadRateAndEta(model);
+			progressLabel.textContent = transferDetail
+				? localize('customLanguageModels.downloadProgressDetail', 'Downloading... {0}% · {1}', model.downloadProgress ?? 0, transferDetail)
+				: localize('customLanguageModels.downloadProgressShort', 'Downloading... {0}%', model.downloadProgress ?? 0);
 			const progressTrack = DOM.append(progressWrap, $('.model-download-progress-track'));
 			const progressFill = DOM.append(progressTrack, $('.model-download-progress-fill'));
 			const pct = Math.min(100, Math.max(0, model.downloadProgress ?? 0));
 			progressFill.style.setProperty('width', `${pct}%`);
-			progressWrap.setAttribute('aria-label', localize('customLanguageModels.downloadProgress', 'Download progress {0}%', pct));
+			progressWrap.setAttribute('aria-label', transferDetail
+				? localize('customLanguageModels.downloadProgressAriaDetail', 'Download progress {0}%, {1}', pct, transferDetail)
+				: localize('customLanguageModels.downloadProgress', 'Download progress {0}%', pct));
 		}
 		const showInstalledPathRow = !model.isDownloading && model.localPath && (model.provider === 'huggingface' || isOllama) && !needsDownloadOrPullRetry(model);
 		if (showInstalledPathRow) {

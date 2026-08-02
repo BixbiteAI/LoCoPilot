@@ -9,6 +9,7 @@ import { createDecorator } from '../../../../platform/instantiation/common/insta
 import { IStorageService, StorageScope, StorageTarget } from '../../../../platform/storage/common/storage.js';
 import { ISecretStorageService } from '../../../../platform/secrets/common/secrets.js';
 import { localize } from '../../../../nls.js';
+import { ByteSize } from '../../../../platform/files/common/files.js';
 
 export const ICustomLanguageModelsService = createDecorator<ICustomLanguageModelsService>('customLanguageModelsService');
 
@@ -41,6 +42,41 @@ export function isCustomModelReadyForChat(model: ICustomLanguageModel): boolean 
 		return model.ollamaPullComplete !== false;
 	}
 	return true;
+}
+
+/** "12 min left" / "45s left" / "1 hr 20 min left" - coarse on purpose, since the estimate is itself coarse. */
+function formatDownloadEta(seconds: number): string {
+	if (seconds < 60) {
+		return localize('customLanguageModels.etaSeconds', '{0}s left', Math.max(1, Math.round(seconds)));
+	}
+	const minutes = Math.round(seconds / 60);
+	if (minutes < 60) {
+		return localize('customLanguageModels.etaMinutes', '{0} min left', minutes);
+	}
+	const hours = Math.floor(minutes / 60);
+	const remainder = minutes % 60;
+	return remainder > 0
+		? localize('customLanguageModels.etaHoursMinutes', '{0} hr {1} min left', hours, remainder)
+		: localize('customLanguageModels.etaHours', '{0} hr left', hours);
+}
+
+/**
+ * Human-readable live transfer detail for a running download - `3.05MB/s · 12 min left`. Returns undefined when
+ * there is nothing honest to show yet: the download isn't running, or the rate window is still too narrow to
+ * produce a figure (callers then fall back to the plain percentage rather than displaying a made-up number).
+ */
+export function formatDownloadRateAndEta(model: ICustomLanguageModel): string | undefined {
+	if (!model.isDownloading) {
+		return undefined;
+	}
+	const parts: string[] = [];
+	if (typeof model.downloadRateBps === 'number' && model.downloadRateBps > 0) {
+		parts.push(localize('customLanguageModels.downloadRate', '{0}/s', ByteSize.formatSize(model.downloadRateBps)));
+	}
+	if (typeof model.downloadEtaSeconds === 'number' && model.downloadEtaSeconds >= 0) {
+		parts.push(formatDownloadEta(model.downloadEtaSeconds));
+	}
+	return parts.length > 0 ? parts.join(' · ') : undefined;
 }
 
 export function needsDownloadOrPullRetry(model: ICustomLanguageModel): boolean {
@@ -168,6 +204,13 @@ export interface ICustomLanguageModel {
 	 * completion or when the partial is explicitly removed.
 	 */
 	downloadPaused?: boolean;
+	/**
+	 * Live transfer rate in bytes/sec, smoothed over the last few seconds. Only meaningful while
+	 * {@link isDownloading}; cleared when the download finishes, pauses, or is reloaded from storage.
+	 */
+	downloadRateBps?: number;
+	/** Estimated seconds remaining at the current {@link downloadRateBps}. Same lifetime as the rate. */
+	downloadEtaSeconds?: number;
 	/** Local path where the model is stored */
 	localPath?: string;
 	modelName: string;
@@ -346,6 +389,9 @@ export class CustomLanguageModelsService extends Disposable implements ICustomLa
 					isDownloading: false,
 					downloadProgress: interrupted ? m.downloadProgress : (m.isDownloading ? undefined : m.downloadProgress),
 					downloadPaused: interrupted ? true : (m.downloadPaused ?? false),
+					// Rate/ETA describe a transfer that is no longer running, so a persisted value is always stale.
+					downloadRateBps: undefined,
+					downloadEtaSeconds: undefined,
 					hidden: m.hidden ?? false,
 					useNativeTools: m.useNativeTools ?? true,
 					mtp: m.mtp ?? false,

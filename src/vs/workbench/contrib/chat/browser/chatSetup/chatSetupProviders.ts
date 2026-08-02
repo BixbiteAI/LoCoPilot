@@ -37,7 +37,7 @@ import { IChatEditorLocationData, IChatProgress, IChatService } from '../../comm
 import { IChatRequestToolEntry, IChatRequestVariableEntry, isPromptFileVariableEntry, isPromptTextVariableEntry } from '../../common/attachments/chatVariableEntries.js';
 import { ChatAgentLocation, ChatConfiguration, ChatModeKind } from '../../common/constants.js';
 import { ChatMessageRole, IChatMessage, ILanguageModelsService } from '../../common/languageModels.js';
-import { ICustomLanguageModelsService, ICustomLanguageModel, getCustomModelListLabel, needsDownloadOrPullRetry, LOCOPILOT_AUTO_MODEL_ID } from '../../common/customLanguageModelsService.js';
+import { ICustomLanguageModelsService, ICustomLanguageModel, getCustomModelListLabel, needsDownloadOrPullRetry, formatDownloadRateAndEta, LOCOPILOT_AUTO_MODEL_ID } from '../../common/customLanguageModelsService.js';
 import { findCatalogEntry, getAutoStarterPicks, resolveAutoModelPinned, IAutoStarterPick, type IHardwareProfile } from '../locopilotModelCatalog.js';
 import { ITimerService } from '../../../../services/timer/browser/timerService.js';
 import { LOCOPILOT_SETTINGS_SECTION_LIST_MODELS } from '../chatManagement/locopilotSettingsEditorInput.js';
@@ -1059,7 +1059,8 @@ function buildAutoStarterPicksMarkdown(ramGB: number, allModels: readonly ICusto
 					id: 'locopilot.cancelModelDownload',
 					arguments: [model.id],
 				});
-				lines.push(`${specs.map(s => `\`${s}\``).join('  ')} - downloading, ${model.downloadProgress ?? 0}% complete | ${stopLink}`);
+				const transferDetail = formatDownloadRateAndEta(model);
+				lines.push(`${specs.map(s => `\`${s}\``).join('  ')} - downloading, ${model.downloadProgress ?? 0}% complete${transferDetail ? ` (${transferDetail})` : ''} | ${stopLink}`);
 			} else {
 				const downloadLink = createMarkdownCommandLink({
 					title: 'Download',
