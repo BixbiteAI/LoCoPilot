@@ -3439,6 +3439,33 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 	}
 
 	/**
+	 * How long the warm-up generation may take before we stop waiting for it. A 30B+ MLX model on a busy
+	 * machine needs minutes to get its weights resident before it can emit a single token, so this matches
+	 * the patience of the real-request path ({@link _waitForServerReady}) rather than guessing a short
+	 * fixed timeout - see the comment at the generation phase for why a short one actively misled the UI.
+	 */
+	private static readonly WARMUP_GENERATION_BUDGET_MS = 300_000;
+
+	/**
+	 * Reason an in-flight or pending warm-up should stop, or undefined to keep going. Covers teardown
+	 * (stopped/evicted/crashed) and the case where something else - typically a real request going through
+	 * {@link ensureServerForModel} - already proved the server ready, leaving us nothing to prove.
+	 */
+	private _warmUpAbortReason(modelId: string): string | undefined {
+		if (this._crashedBeforeReady.has(modelId)) {
+			return 'the server crashed before it became ready';
+		}
+		const rec = this.runningServers.get(modelId);
+		if (!rec) {
+			return 'the server is no longer running';
+		}
+		if (rec.ready) {
+			return 'the server is already marked ready';
+		}
+		return undefined;
+	}
+
+	/**
 	 * Best-effort warm-up for a just-launched local server (llama.cpp or mlx-lm): poll until the HTTP
 	 * endpoint answers, then fire a tiny 1-token request so GPU/Metal kernels are compiled and the prompt
 	 * cache is primed before the user's first message. Fire-and-forget; all failures are swallowed (the
@@ -3465,8 +3492,9 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 		for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
 			// Stop immediately if the server crashed or was stopped/evicted - otherwise we'd keep hitting a
 			// dead port with ERR_CONNECTION_REFUSED for the full 2 minutes.
-			if (this._crashedBeforeReady.has(modelId) || !this.runningServers.has(modelId)) {
-				this._log(`[LoCoPilot Runner] Warm-up aborted for ${modelId}: server is no longer running.`);
+			const abortReason = this._warmUpAbortReason(modelId);
+			if (abortReason) {
+				this._log(`[LoCoPilot Runner] Warm-up aborted for ${modelId}: ${abortReason}.`);
 				return;
 			}
 			try {
@@ -3493,15 +3521,40 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 			this._log(`[LoCoPilot Runner] Warm-up skipped: server on port ${port} did not become ready in time.`);
 			return;
 		}
-		try {
+		// Generation phase. This request - not the endpoint probe above - is the one that blocks until the
+		// weights are actually resident, so it must be as patient as the real-request path. It used to carry
+		// a fixed 15s cancel, which large MLX models blew through every time: the ping was abandoned mid-load,
+		// the ready flip below never ran, and the model showed grey until the user's first message re-probed
+		// it - even though the abandoned ping finished loading the weights moments later. Cancelling only
+		// ends OUR read; mlx_lm keeps computing regardless, so the short timeout hid the result without ever
+		// saving the work. Retries exist for a server that rejects the request outright (still starting up);
+		// a slow load is not a failure and is simply waited out, up to the shared budget.
+		const deadline = Date.now() + LoCoPilotLocalModelRunner.WARMUP_GENERATION_BUDGET_MS;
+		const body = JSON.stringify({
+			model: requestModel,
+			messages: [{ role: 'user', content: 'ping' }],
+			max_tokens: 1,
+			stream: false,
+		});
+		for (let attempt = 1; Date.now() < deadline; attempt++) {
+			const abortReason = this._warmUpAbortReason(modelId);
+			if (abortReason) {
+				this._log(`[LoCoPilot Runner] Warm-up stopped for ${modelId}: ${abortReason}.`);
+				return;
+			}
 			const cts = new CancellationTokenSource(token);
-			const timer = setTimeout(() => cts.cancel(), 15_000);
-			const body = JSON.stringify({
-				model: requestModel,
-				messages: [{ role: 'user', content: 'ping' }],
-				max_tokens: 1,
-				stream: false,
-			});
+			// A single attempt may legitimately stay in flight for the whole remaining budget (it is blocked
+			// on the load), so instead of a fixed timeout we watch for teardown - or for someone else marking
+			// the server ready - while it runs, and cancel only then.
+			let watchTimer: ReturnType<typeof setTimeout> | undefined;
+			const watch = () => {
+				if (this._warmUpAbortReason(modelId) || Date.now() >= deadline) {
+					cts.cancel();
+					return;
+				}
+				watchTimer = setTimeout(watch, 2000);
+			};
+			watchTimer = setTimeout(watch, 2000);
 			try {
 				const res = await this.requestService.request({
 					type: 'POST',
@@ -3509,24 +3562,31 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 					headers: { 'Content-Type': 'application/json' },
 					data: body,
 				}, cts.token);
+				const status = res.res.statusCode ?? 0;
 				await streamToBuffer(res.stream).catch(() => undefined);
+				if (status >= 200 && status < 300) {
+					this._log(`[LoCoPilot Runner] Warm-up request completed for ${kind} server on port ${port}.`);
+					// A completed generation is the strongest readiness signal there is (for MLX it is the ONLY
+					// reliable one - see above). Flip the phase so the UI turns green without waiting for a real
+					// request to run through ensureServerForModel.
+					const rec = this.runningServers.get(modelId);
+					if (rec && !rec.ready) {
+						rec.ready = true;
+						rec.loadProgress = undefined;
+						this._onDidServerStateChange.fire(modelId);
+					}
+					return;
+				}
+				this._log(`[LoCoPilot Runner] Warm-up attempt ${attempt} got HTTP ${status} from the ${kind} server on port ${port}; retrying.`);
+			} catch (e) {
+				this._log(`[LoCoPilot Runner] Warm-up attempt ${attempt} failed (ignored): ${e}`);
 			} finally {
-				clearTimeout(timer);
+				clearTimeout(watchTimer);
 				cts.dispose();
 			}
-			this._log(`[LoCoPilot Runner] Warm-up request completed for ${kind} server on port ${port}.`);
-			// A completed generation is the strongest readiness signal there is (for MLX it is the ONLY
-			// reliable one - see above). Flip the phase so the UI turns green without waiting for a real
-			// request to run through ensureServerForModel.
-			const rec = this.runningServers.get(modelId);
-			if (rec && !rec.ready) {
-				rec.ready = true;
-				rec.loadProgress = undefined;
-				this._onDidServerStateChange.fire(modelId);
-			}
-		} catch (e) {
-			this._log(`[LoCoPilot Runner] Warm-up request failed (ignored): ${e}`);
+			await timeout(1000);
 		}
+		this._log(`[LoCoPilot Runner] Warm-up gave up: ${kind} server on port ${port} did not generate within ${Math.round(LoCoPilotLocalModelRunner.WARMUP_GENERATION_BUDGET_MS / 1000)}s.`);
 	}
 
 	/**
@@ -5508,14 +5568,22 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 		return undefined;
 	}
 
-	/** MLX `/models` becomes available before its worker has loaded weights; a tiny generation is readiness. */
+	/**
+	 * MLX `/models` becomes available before its worker has loaded weights; a tiny generation is readiness.
+	 *
+	 * The timeout is deliberately long. Cancelling only ends OUR read of the response - mlx_lm still runs the
+	 * ping to completion on its single decode thread - so a short timeout doesn't free the server, it just
+	 * leaves an abandoned request queued ahead of the user's real one. At 10s a multi-minute load stacked up
+	 * a fresh orphan every ~11s; one patient probe per minute costs the same information for a fraction of
+	 * the queue. Callers poll this serially, so at most one probe is ever in flight.
+	 */
 	private async _probeMlxGenerationReady(baseUrl: string, modelId: string, token: CancellationToken): Promise<boolean> {
 		const rec = this.runningServers.get(modelId);
 		if (!rec || rec.kind !== 'mlx' || !rec.servedModelId) {
 			return false;
 		}
 		const cts = new CancellationTokenSource(token);
-		const timer = setTimeout(() => cts.cancel(), 10_000);
+		const timer = setTimeout(() => cts.cancel(), 60_000);
 		try {
 			const res = await this.requestService.request({
 				type: 'POST',
@@ -5552,7 +5620,11 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 		// full extra second of 1s-granularity polling, then back off to 1s for the long tail.
 		const fastAttempts = 20; // 20 x 250ms = first 5 seconds
 		const maxAttempts = fastAttempts + 295;
-		for (let attempt = 0; attempt < maxAttempts; attempt++) {
+		// Wall-clock backstop alongside the attempt count. Each MLX attempt can now block for up to a minute
+		// on its generation probe (see _probeMlxGenerationReady), so the attempt count alone would let a
+		// server that answers /models but never generates hold this loop for hours instead of minutes.
+		const deadline = Date.now() + 10 * 60_000;
+		for (let attempt = 0; attempt < maxAttempts && Date.now() < deadline; attempt++) {
 			if (token.isCancellationRequested) {
 				return false;
 			}
