@@ -11,6 +11,7 @@ import { Disposable, DisposableStore } from '../../../../base/common/lifecycle.j
 import { dirname, isEqual, isEqualOrParent, joinPath } from '../../../../base/common/resources.js';
 import { URI } from '../../../../base/common/uri.js';
 import { generateUuid } from '../../../../base/common/uuid.js';
+import { escapeRegExpCharacters } from '../../../../base/common/strings.js';
 import { localize } from '../../../../nls.js';
 import { IRequestService } from '../../../../platform/request/common/request.js';
 import type { IRequestToFileProgressEvent } from '../../../../platform/request/common/requestIpc.js';
@@ -134,7 +135,7 @@ const HF_XET_DOWNLOAD_PY = [
 const GGUF_QUANT_PRIORITY = [
 	'Q4_K_M', 'Q4_K_L', 'Q4_K_XL', 'Q5_K_M', 'Q5_K_S', 'Q6_K', 'Q8_0',
 	'Q4_K_S', 'IQ4_XS', 'IQ4_NL', 'Q4_1', 'Q4_0', 'Q5_0',
-	'Q3_K_L', 'Q3_K_M', 'Q3_K_S', 'IQ3_M', 'IQ3_S', 'Q2_K', 'Q2_K_S',
+	'Q3_K_L', 'Q3_K_M', 'Q3_K_S', 'IQ3_M', 'IQ3_S', 'Q2_0', 'Q2_K', 'Q2_K_S',
 	'F16', 'BF16', 'Q4_0_4_4', 'Q4_0_4_8', 'Q4_0_8_8'
 ];
 
@@ -158,7 +159,12 @@ const GGUF_QUANT_QUALITY = [
 	// than Q4_0 (importance-matrix quantization), so ranking it below made the picker prefer a bigger, worse
 	// file whenever a repo shipped both.
 	'Q4_K_XL', 'Q4_K_L', 'Q4_K_M', 'Q4_K_S', 'IQ4_NL', 'IQ4_XS', 'Q4_1', 'Q4_0',
-	'Q3_K_XL', 'Q3_K_L', 'Q3_K_M', 'Q3_K_S', 'IQ3_M', 'IQ3_S', 'IQ3_XXS', 'Q2_K', 'IQ2_M', 'IQ2_XS', 'IQ2_XXS'
+	// Q2_0 (and its `PQ2_0` packed twin) is the ternary format that landed in llama.cpp on 2026-07-30: 1.71
+	// bits/weight with FP16 group scales. It sits just above Q2_K because the models that ship it are TRAINED
+	// ternary rather than squeezed down to 2-bit after the fact - Ternary Bonsai 27B holds ~94.6% of its FP16
+	// baseline at this quant. It stays inside the 2-bit band all the same: this table is global, and a generic
+	// checkpoint quantized to Q2_0 would be exactly the poor pick the band implies.
+	'Q3_K_XL', 'Q3_K_L', 'Q3_K_M', 'Q3_K_S', 'IQ3_M', 'IQ3_S', 'IQ3_XXS', 'Q2_0', 'Q2_K', 'IQ2_M', 'IQ2_XS', 'IQ2_XXS'
 ];
 
 /**
@@ -212,12 +218,18 @@ export function quantQualityScore(filename: string): number {
 }
 
 /**
- * True for multimodal projector files (`mmproj-*.gguf`). These sit next to language weights in vision
- * GGUF repos and must NEVER be chosen as the main `-m` model - llama.cpp rejects them with
+ * True for multimodal projector files (`mmproj-*.gguf`, `<model>-mmproj-*.gguf`). These sit next to language
+ * weights in vision GGUF repos and must NEVER be chosen as the main `-m` model - llama.cpp rejects them with
  * `unsupported model architecture: 'clip'`. Exported for the runner's directory scan.
+ *
+ * The `mmproj` token is matched anywhere a delimiter precedes it, not only at the start of the name. Unsloth
+ * and bartowski put it first (`mmproj-F16.gguf`), but PrismML prefixes the model name
+ * (`Ternary-Bonsai-27B-mmproj-Q8_0.gguf`) - and a start-anchored test classified those 0.63 GB projectors as
+ * WEIGHTS, which both hid the real projector from `pickMmprojFile` (so vision silently never worked) and left
+ * a Q8_0-tagged file in the candidate pool for the auto-picker to choose as the model.
  */
 export function isMmprojGgufPath(path: string): boolean {
-	return /(^|\/)mmproj[^/]*\.gguf$/i.test(path);
+	return /(^|\/|[-_.])mmproj[^/]*\.gguf$/i.test(path);
 }
 
 /**
@@ -242,9 +254,23 @@ export function isMtpGgufPath(path: string): boolean {
 	return /(^|\/)mtp[-_.][^/]*\.gguf$/i.test(path);
 }
 
-/** Weight GGUFs only (excludes mmproj / CLIP projectors and standalone MTP draft heads). */
+/**
+ * True for PrismML DSpark speculative-drafter files (`*-dspark-*.gguf`). Exactly the same hazard as the
+ * standalone MTP heads above: Ternary Bonsai 27B ships `Ternary-Bonsai-27B-dspark-Q4_1.gguf` (1.95 GB) and
+ * `-dspark-bf16.gguf` (7.29 GB) next to the real weights, and BOTH carry quant tokens the picker ranks - Q4_1
+ * outranks every 2-bit quant in the repo, so a plain scan would download the 1.95 GB drafter and hand it to
+ * llama.cpp as the model. The drafter is only ever useful via `--model-draft`, never as `-m`.
+ */
+export function isDsparkGgufPath(path: string): boolean {
+	return /[-_.]dspark[-_.][^/]*\.gguf$/i.test(path);
+}
+
+/** Weight GGUFs only (excludes mmproj / CLIP projectors, standalone MTP heads and DSpark drafters). */
 function isWeightGgufPath(path: string): boolean {
-	return path.toLowerCase().endsWith('.gguf') && !isMmprojGgufPath(path) && !isMtpGgufPath(path);
+	return path.toLowerCase().endsWith('.gguf')
+		&& !isMmprojGgufPath(path)
+		&& !isMtpGgufPath(path)
+		&& !isDsparkGgufPath(path);
 }
 
 /**
@@ -537,6 +563,13 @@ function pickBestGGUFFile(paths: string[], preferredQuant?: string): string[] {
 	// If user specified a specific quantization (e.g. "Q4_K_M")
 	if (preferredQuant) {
 		const upperQuant = preferredQuant.toUpperCase();
+		// Try a DELIMITED match first, so a pinned quant cannot be captured by a longer name that merely
+		// contains it: 'Q2_0' must select `Ternary-Bonsai-27B-Q2_0.gguf`, not the `-PQ2_0.gguf` packed variant
+		// that precedes it in the repo listing (same idea as Q4_0 vs Q4_0_4_4). Falls back to the original
+		// substring match, so repos whose filenames run the quant together with other tokens still resolve.
+		const delimited = candidates.find(c => new RegExp(`(^|[-_.])${escapeRegExpCharacters(upperQuant)}([-_.]|$)`)
+			.test(c.key.toUpperCase().replace(/\.GGUF$/, '')));
+		if (delimited) return [...delimited.paths];
 		const found = candidates.find(c => c.key.toUpperCase().includes(upperQuant));
 		if (found) return [...found.paths];
 	}

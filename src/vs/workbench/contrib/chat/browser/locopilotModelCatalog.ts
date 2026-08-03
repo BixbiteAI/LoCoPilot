@@ -304,36 +304,9 @@ export const LOCOPILOT_DEFAULT_CATALOG: readonly ICatalogModel[] = [
 		mtp: true,
 		contextWindow: 262144,
 	},
-	{
-		catalogId: 'qwen35-27b-mtp-gguf',
-		displayName: 'Qwen3.5 27B (MTP)',
-		vendor: 'Alibaba (Qwen)',
-		blurb: 'Dense 27B MTP build; high quality with faster decoding.',
-		repoId: 'unsloth/Qwen3.5-27B-MTP-GGUF',
-		supportsVision: true,
-		format: 'Q4_K_M',
-		engine: 'gguf',
-		approxSizeBytes: Math.round(16 * GB),
-		minRamGB: 32,
-		tier: '32 GB+',
-		mtp: true,
-		contextWindow: 262144,
-	},
-	{
-		catalogId: 'qwen35-35b-a3b-mtp-gguf',
-		displayName: 'Qwen3.5 35B-A3B MoE (MTP)',
-		vendor: 'Alibaba (Qwen)',
-		blurb: 'MoE 35B/~3B-active MTP build; fast and high quality.',
-		repoId: 'unsloth/Qwen3.5-35B-A3B-MTP-GGUF',
-		supportsVision: true,
-		format: 'Q4_K_M',
-		engine: 'gguf',
-		approxSizeBytes: Math.round(20 * GB),
-		minRamGB: 32,
-		tier: '32 GB+',
-		mtp: true,
-		contextWindow: 262144,
-	},
+	// REMOVED (2026-08): Qwen3.5 27B (MTP) and Qwen3.5 35B-A3B (MTP). Both sat at 32 GB+ with the same
+	// footprint as their Qwen3.6 successors (`qwen36-27b-mtp-gguf` 16 GB, `qwen36-35b-a3b-mtp-gguf` 21 GB),
+	// which are a generation newer at equal size. The 3.5 line stays for 0.8B/2B/4B/9B, where 3.6 has no build.
 
 	// ---- DiffusionGemma 26B-A4B (Google) - diffusion LM, hidden until stable ----
 	{
@@ -393,23 +366,12 @@ export const LOCOPILOT_DEFAULT_CATALOG: readonly ICatalogModel[] = [
 	// =========================================================================================
 	// June 2026 additions: cross-platform GGUF coder + extra current-gen small models.
 	// =========================================================================================
-	{
-		catalogId: 'qwen3-coder-30b-a3b-gguf',
-		displayName: 'Qwen3 Coder 30B-A3B',
-		vendor: 'Alibaba (Qwen)',
-		blurb: 'Top MoE coder (30B total, ~3B active - fast); GGUF build runs on any platform via llama.cpp.',
-		repoId: 'unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF',
-		supportsVision: false,
-		format: 'Q4_K_M',
-		engine: 'gguf',
-		approxSizeBytes: Math.round(17 * GB),
-		minRamGB: 32,
-		tier: '32 GB+',
-		contextWindow: 262144,
-		// Qwen3 tokenizer family: the 0.6B sibling is the canonical draft (Q8_0 ~0.6 GB, ~50x size ratio).
-		draftRepoId: 'unsloth/Qwen3-0.6B-GGUF',
-		draftFormat: 'Q8_0',
-	},
+	// REMOVED (2026-08): Qwen3 Coder 30B-A3B (GGUF). Prior-generation Qwen3-era coder that occupied the same
+	// 32 GB+ tier at a LARGER footprint (17 GB) than Qwen3.6 27B (16 GB), which supersedes it on quality and
+	// adds vision. Its only edge was ~3B active params for decode speed - covered by `qwen36-35b-a3b-gguf`
+	// (also ~3B active) and by the MTP twin's embedded draft head. The 32 GB+ "Best for you" pick moved to
+	// `unsloth/Qwen3.6-27B-MTP-GGUF` (see CURATED_RECOMMENDATION_LADDER). Its 0.6B draft pairing went with it:
+	// `unsloth/Qwen3-0.6B-GGUF` was never a catalog entry and had no other referent.
 	{
 		catalogId: 'granite-4_1-8b-gguf',
 		displayName: 'Granite 4.1 8B',
@@ -458,23 +420,9 @@ export const LOCOPILOT_DEFAULT_CATALOG: readonly ICatalogModel[] = [
 	// =========================================================================================
 
 	// ---- Tier 1: 8 GB (entry, runs almost anywhere) ----
-	// SUPERSEDED (commented out 2026-06): Qwen3 4B -> Qwen3.5 4B (MTP); Gemma 3 4B -> Gemma 4 E2B/E4B.
-	// Uncomment to bring either back.
+	// REMOVED (2026-08): Qwen3 4B - superseded by Qwen3.5 4B (MTP), same tier and footprint, newer generation.
+	// SUPERSEDED (commented out 2026-06): Gemma 3 4B -> Gemma 4 E2B/E4B. Uncomment to bring it back.
 	/*
-	{
-		catalogId: 'qwen3-4b-gguf',
-		displayName: 'Qwen3 4B',
-		vendor: 'Alibaba (Qwen)',
-		blurb: 'Fast, capable tiny all-rounder; great first model on low-RAM machines.',
-		repoId: 'unsloth/Qwen3-4B-GGUF',
-		supportsVision: false,
-		format: 'Q4_K_M',
-		engine: 'gguf',
-		approxSizeBytes: Math.round(2.5 * GB),
-		minRamGB: 8,
-		tier: '8 GB',
-		contextWindow: 32768,
-	},
 	{
 		catalogId: 'gemma3-4b-gguf',
 		displayName: 'Gemma 3 4B',
@@ -506,39 +454,11 @@ export const LOCOPILOT_DEFAULT_CATALOG: readonly ICatalogModel[] = [
 	},
 
 	// ---- Tier 2: 16 GB (sweet spot) ----
-	// SUPERSEDED (commented out 2026-06): Qwen3 8B (GGUF + MLX) -> Qwen3.5 9B (MTP);
-	// Gemma 3 12B -> Gemma 4 12B. Uncomment to bring any back. (DeepSeek R1 distill kept below.)
+	// REMOVED (2026-08): Qwen3 8B (GGUF + MLX) - superseded by Qwen3.5 9B (MTP) and Qwen3.5 9B (MLX) at the
+	// same 16 GB tier, newer generation with a 262K window against the 32K these shipped with.
+	// SUPERSEDED (commented out 2026-06): Gemma 3 12B -> Gemma 4 12B. Uncomment to bring it back.
+	// (DeepSeek R1 distill kept below.)
 	/*
-	{
-		catalogId: 'qwen3-8b-gguf',
-		displayName: 'Qwen3 8B',
-		vendor: 'Alibaba (Qwen)',
-		blurb: 'Best small coder; the recommended default for 16 GB machines.',
-		repoId: 'unsloth/Qwen3-8B-GGUF',
-		supportsVision: false,
-		format: 'Q4_K_M',
-		engine: 'gguf',
-		approxSizeBytes: Math.round(4.8 * GB),
-		minRamGB: 16,
-		tier: '16 GB',
-		recommended: true,
-		contextWindow: 32768,
-	},
-	{
-		catalogId: 'qwen3-8b-mlx',
-		displayName: 'Qwen3 8B (MLX)',
-		vendor: 'Alibaba (Qwen)',
-		blurb: 'Same model tuned for Apple Silicon via MLX - 30-50% faster on M-series chips.',
-		repoId: 'mlx-community/Qwen3-8B-4bit',
-		supportsVision: false,
-		format: 'mlx',
-		engine: 'mlx',
-		approxSizeBytes: Math.round(4.6 * GB),
-		minRamGB: 16,
-		tier: '16 GB',
-		requiresAppleSilicon: true,
-		contextWindow: 32768,
-	},
 	{
 		catalogId: 'gemma3-12b-gguf',
 		displayName: 'Gemma 3 12B',
@@ -592,58 +512,10 @@ export const LOCOPILOT_DEFAULT_CATALOG: readonly ICatalogModel[] = [
 	},
 	// REMOVED (2026-07): Mistral Small 24B Instruct 2501 (Jan 2025, 32K ctx) - Devstral Small 2 24B above is
 	// the same size from the same vendor with 262K context and a newer training run.
-	// SUPERSEDED (commented out 2026-06): Qwen3 32B (MLX) -> Qwen3.6 27B. Uncomment to restore.
-	/*
-	{
-		catalogId: 'qwen3-32b-mlx',
-		displayName: 'Qwen3 32B (MLX)',
-		vendor: 'Alibaba (Qwen)',
-		blurb: 'Top dense Qwen3 coder; Apple Silicon build, needs 32 GB+.',
-		repoId: 'mlx-community/Qwen3-32B-4bit',
-		supportsVision: false,
-		format: 'mlx',
-		engine: 'mlx',
-		approxSizeBytes: Math.round(18 * GB),
-		minRamGB: 32,
-		tier: '32 GB+',
-		requiresAppleSilicon: true,
-		contextWindow: 32768,
-	},
-	*/
-	// ---- Tier 4: prior-gen Qwen3 MoE (fast, only ~3B active) - both formats ----
-	// SUPERSEDED (commented out 2026-06): Qwen3 30B-A3B (GGUF + MLX) -> Qwen3.6 35B-A3B (and MTP twin).
-	// Uncomment to restore.
-	/*
-	{
-		catalogId: 'qwen3-30b-a3b-gguf',
-		displayName: 'Qwen3 30B-A3B MoE',
-		vendor: 'Alibaba (Qwen)',
-		blurb: 'Mixture-of-experts: 30B total, ~3B active - punches above its speed/size.',
-		repoId: 'unsloth/Qwen3-30B-A3B-GGUF',
-		supportsVision: false,
-		format: 'Q4_K_M',
-		engine: 'gguf',
-		approxSizeBytes: Math.round(18 * GB),
-		minRamGB: 32,
-		tier: '32 GB+',
-		contextWindow: 32768,
-	},
-	{
-		catalogId: 'qwen3-30b-a3b-mlx',
-		displayName: 'Qwen3 30B-A3B MoE (MLX)',
-		vendor: 'Alibaba (Qwen)',
-		blurb: 'Same fast Qwen3 MoE tuned for Apple Silicon via MLX.',
-		repoId: 'mlx-community/Qwen3-30B-A3B-4bit',
-		supportsVision: false,
-		format: 'mlx',
-		engine: 'mlx',
-		approxSizeBytes: Math.round(17 * GB),
-		minRamGB: 32,
-		tier: '32 GB+',
-		requiresAppleSilicon: true,
-		contextWindow: 32768,
-	},
-	*/
+	// REMOVED (2026-08): Qwen3 32B (MLX) - superseded by `qwen36-27b-mlx`, which is both newer and smaller
+	// (15 GB against 18 GB) at the same 32 GB+ tier.
+	// REMOVED (2026-08): Qwen3 30B-A3B MoE (GGUF + MLX) - superseded by Qwen3.6 35B-A3B in both formats
+	// (plus the GGUF MTP twin), same ~3B-active speed profile a generation on.
 	{
 		catalogId: 'gpt-oss-20b-mlx',
 		displayName: 'GPT-OSS 20B (MLX)',
@@ -659,24 +531,9 @@ export const LOCOPILOT_DEFAULT_CATALOG: readonly ICatalogModel[] = [
 		requiresAppleSilicon: true,
 		contextWindow: 131072,
 	},
-	{
-		catalogId: 'qwen3-coder-30b-a3b-mlx',
-		displayName: 'Qwen3 Coder 30B-A3B (MLX)',
-		vendor: 'Alibaba (Qwen)',
-		blurb: 'Top MoE coder (30B total, ~3B active - fast) tuned for Apple Silicon via MLX.',
-		repoId: 'mlx-community/Qwen3-Coder-30B-A3B-Instruct-4bit',
-		supportsVision: false,
-		format: 'mlx',
-		engine: 'mlx',
-		approxSizeBytes: Math.round(17 * GB),
-		minRamGB: 32,
-		tier: '32 GB+',
-		requiresAppleSilicon: true,
-		contextWindow: 262144,
-		// Qwen3 tokenizer family: 0.6B MLX build drafts for the big coder via mlx-lm --draft-model.
-		draftRepoId: 'mlx-community/Qwen3-0.6B-4bit',
-		draftFormat: 'mlx',
-	},
+	// REMOVED (2026-08): Qwen3 Coder 30B-A3B (MLX), the Apple Silicon twin of the GGUF entry removed above.
+	// Superseded at the same tier by `qwen36-27b-mlx` (15 GB) and `qwen36-35b-a3b-mlx` (19 GB), both already
+	// picker-visible. Its `mlx-community/Qwen3-0.6B-4bit` draft pairing had no other referent either.
 
 	// =========================================================================================
 	// Tier 5: 64 GB+ (workstation-class). Models whose Q4 weights need ~45-60 GB; only seeded as a
@@ -930,6 +787,98 @@ export const LOCOPILOT_DEFAULT_CATALOG: readonly ICatalogModel[] = [
 	},
 
 	// =========================================================================================
+	// August 2026 additions. GGUF/llama.cpp only by request - MLX twins deferred, including for
+	// Bonsai (which does publish `prism-ml/Ternary-Bonsai-27B-mlx-2bit`) and for KAT-Coder and
+	// Qwen3.5 122B (which publish none at all today).
+	// =========================================================================================
+
+	// ---- KAT-Coder V2.5 Dev (Kwaipilot) - agentic coder post-trained on Qwen3.6-35B-A3B ----
+	{
+		catalogId: 'kat-coder-v2_5-dev-gguf',
+		displayName: 'KAT-Coder V2.5 Dev',
+		vendor: 'Kwaipilot',
+		blurb: 'Agentic coder (35B total, ~3B active); 69.4% SWE-bench Verified. Fits 32 GB.',
+		repoId: 'bartowski/Kwaipilot_KAT-Coder-V2.5-Dev-GGUF',
+		supportsVision: false,
+		format: 'Q4_K_M',
+		engine: 'gguf',
+		approxSizeBytes: Math.round(21.4 * GB),
+		minRamGB: 32,
+		tier: '32 GB+',
+		contextWindow: 262144,
+		// Seeded VISIBLE: it is post-trained from `qwen36-35b-a3b-gguf`, which we already ship, and beats that
+		// base on SWE-bench Verified (69.4 vs 64.4) at the same size and active-param count - a strictly better
+		// pick at this tier, so it should not sit behind Show. Note the GGUF is bartowski's; Kwaipilot ships
+		// only the safetensors, and no unsloth or MLX build exists yet.
+	},
+
+	// ---- Ternary Bonsai 27B (PrismML) - ternary-compressed Qwen3.6-27B, 27B quality at 16 GB ----
+	{
+		catalogId: 'ternary-bonsai-27b-gguf',
+		displayName: 'Ternary Bonsai 27B',
+		vendor: 'PrismML',
+		blurb: 'Ternary-compressed Qwen3.6 27B: ~94.6% of full quality at 7 GB. Fits 16 GB.',
+		repoId: 'prism-ml/Ternary-Bonsai-27B-gguf',
+		supportsVision: true,
+		format: 'Q2_0',
+		engine: 'gguf',
+		approxSizeBytes: Math.round(7.17 * GB),
+		minRamGB: 16,
+		tier: '16 GB',
+		contextWindow: 262144,
+		// Hidden until tested in-app, for two reasons beyond the usual caution:
+		//  1. ENGINE FLOOR. The Q2_0 kernels landed upstream in llama.cpp on 2026-07-30; anything older fails
+		//     to load these weights outright. Our bundled engine tracks the latest ggml-org release (b10241 at
+		//     time of writing), so a fresh fetch is fine - a pinned older build is not.
+		//  2. Q2_0 is this checkpoint's NATIVE format, not a lossy downgrade of a fatter one: 1.71 bits/weight
+		//     with FP16 group scales, retaining ~94.6% of the FP16 baseline. It is deliberately ranked in the
+		//     2-bit band of GGUF_QUANT_QUALITY anyway, because that table is global and a *generic* model's
+		//     Q2_0 really would be a poor pick - see the note there.
+		defaultHidden: true,
+	},
+
+	// ---- Laguna S 2.1 (poolside) - the 64 GB+ sibling of the Laguna XS 2.1 seeded above ----
+	{
+		catalogId: 'laguna-s-2_1-gguf',
+		displayName: 'Laguna S 2.1',
+		vendor: 'poolside',
+		blurb: 'Larger poolside coder; 1M context. Needs a 64 GB+ workstation.',
+		repoId: 'unsloth/Laguna-S-2.1-GGUF',
+		supportsVision: false,
+		format: 'IQ4_XS',
+		engine: 'gguf',
+		// IQ4_XS (57.6 GB) is the ONLY quant of this model that fits the tier: poolside's own GGUF repo ships
+		// Q4_K_M at 96 GB, so the entry deliberately points at unsloth's dynamic build and pins the quant.
+		approxSizeBytes: Math.round(57.6 * GB),
+		minRamGB: 64,
+		tier: '64 GB+',
+		// Trained window is 1M, but the launch planner would never afford it here and the clamp does the real
+		// work; 262144 keeps the seeded value in the same band as the rest of the 64 GB+ tier.
+		contextWindow: 262144,
+		defaultHidden: true,
+	},
+
+	// ---- Qwen3.5 122B-A10B (MTP) - the largest Qwen3.5 MTP build that fits a 64 GB workstation ----
+	{
+		catalogId: 'qwen35-122b-a10b-mtp-gguf',
+		displayName: 'Qwen3.5 122B-A10B MoE (MTP)',
+		vendor: 'Alibaba (Qwen)',
+		blurb: 'Large Qwen MoE (122B total, ~10B active) with MTP decoding. Needs 64 GB+.',
+		repoId: 'unsloth/Qwen3.5-122B-A10B-MTP-GGUF',
+		supportsVision: true,
+		format: 'IQ4_XS',
+		engine: 'gguf',
+		// 61.9 GB at IQ4_XS - the tightest entry in the catalog. Q4_K_S is already 73.4 GB, past any 64 GB box,
+		// so the quant is pinned rather than left to the picker.
+		approxSizeBytes: Math.round(61.9 * GB),
+		minRamGB: 64,
+		tier: '64 GB+',
+		mtp: true,
+		contextWindow: 262144,
+		defaultHidden: true,
+	},
+
+	// =========================================================================================
 	// Apple Silicon (MLX) twins, July 2026. Before this block the ONLY MLX entries were the two
 	// 32 GB+ ones above, so every 8/16 GB Apple Silicon machine - i.e. most MacBook Airs - silently
 	// fell back to llama.cpp and lost the MLX speedup. These fill the 8 GB and 16 GB rungs.
@@ -1122,9 +1071,9 @@ export function catalogModelToSeed(entry: ICatalogModel): Omit<ICustomLanguageMo
  * hidden and can be surfaced via Show in "My Models".
  */
 const DEFAULT_VISIBLE_CATALOG_IDS: ReadonlySet<string> = new Set([
-	// Current-generation Qwen line only (3.5 MTP + 3.6). The prior-gen `qwen3-4b-gguf` / `qwen3-8b-gguf`
-	// are intentionally NOT here: they are superseded by Qwen3.5 4B/9B (MTP) and stay seeded hidden, so the
-	// picker shows one clean generation with no duplicates. Users can still surface them via Show in My Models.
+	// Current-generation Qwen line only (3.5 MTP + 3.6). The prior-gen Qwen3 entries were deleted outright in
+	// 2026-08 rather than seeded hidden - every one had a same-tier successor at equal or smaller size, so the
+	// picker shows one clean generation with no duplicates. Qwen3 Coder Next survives as the sole 64 GB+ Qwen.
 	'gemma4-12b-gguf',
 	'qwen36-27b-gguf',
 	'devstral-small-2-24b-gguf',
@@ -1136,7 +1085,8 @@ const DEFAULT_VISIBLE_CATALOG_IDS: ReadonlySet<string> = new Set([
 	// 16 GB tier: the strongest coder that fits there (69.4 SWE-bench Verified at 5.3 GB Q4), so it is
 	// visible rather than buried behind Show - a hidden entry is effectively an entry nobody finds.
 	'ornith-1_0-9b-gguf',
-	// The catalog's most-downloaded repo (~1.42M): Qwen3.6 27B with MTP speculative decoding.
+	// The catalog's most-downloaded repo (~1.42M): Qwen3.6 27B with MTP speculative decoding. Also the curated
+	// 32 GB+ "Best for you" pick (see CURATED_RECOMMENDATION_LADDER), so it must stay visible to show badged.
 	'qwen36-27b-mtp-gguf',
 	// Apple Silicon: one MLX pick per tier so an M-series machine always sees a native-engine option
 	// in the picker (the rest of the MLX set is seeded hidden and surfaced via Show).
@@ -1146,10 +1096,11 @@ const DEFAULT_VISIBLE_CATALOG_IDS: ReadonlySet<string> = new Set([
 	'qwen35-9b-mlx',
 	'qwen36-27b-mlx',
 	'qwen36-35b-a3b-mlx',
-	// 32 GB+ tier: the curated "Best for you" pick (dedicated coder MoE), visible so it shows badged in the picker.
-	'qwen3-coder-30b-a3b-gguf',
 	// 64 GB+ tier: the curated "Best for you" pick, visible so workstation users see it badged in the picker.
 	'qwen3-coder-next-gguf',
+	// 32 GB+ tier: beats the Qwen3.6 35B-A3B base it was post-trained from (69.4 vs 64.4 SWE-bench Verified)
+	// at the same size, so it belongs in the picker rather than behind Show.
+	'kat-coder-v2_5-dev-gguf',
 ]);
 
 /**
@@ -1239,7 +1190,7 @@ export function getRecommendedRepoId(ramGB: number, profile?: IHardwareProfile):
  */
 const CURATED_RECOMMENDATION_LADDER: readonly string[] = [
 	'unsloth/Qwen3-Coder-Next-GGUF',                    // 64 GB+ tier
-	'unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF',        // 32 GB+ tier
+	'unsloth/Qwen3.6-27B-MTP-GGUF',                     // 32 GB+ tier
 	'unsloth/Qwen3.5-9B-MTP-GGUF',                      // 16 GB tier
 	DEFAULT_PICKER_FLOOR_REPO_ID,                       // 8 GB tier / floor
 ];
@@ -1257,7 +1208,7 @@ function curatedRecommendedRepoId(ramGB: number): string {
 		return 'unsloth/Qwen3-Coder-Next-GGUF'; // flagship dense coder (~45 GB Q4); comfortable on 64 GB+.
 	}
 	if (ramGB >= 32) {
-		return 'unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF'; // dedicated coder MoE (~3B active - fast); comfortable on 32 GB+.
+		return 'unsloth/Qwen3.6-27B-MTP-GGUF'; // latest dense coder (~16 GB Q4) with an embedded MTP draft head for fast decode.
 	}
 	if (ramGB >= 16) {
 		return 'unsloth/Qwen3.5-9B-MTP-GGUF'; // ~5.5 GB Q4; smooth on 16 GB alongside the editor.

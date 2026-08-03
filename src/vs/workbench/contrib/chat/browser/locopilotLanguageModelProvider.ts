@@ -1534,12 +1534,26 @@ export class LoCoPilotLanguageModelProvider extends Disposable implements ILangu
 				} catch (streamErr: unknown) {
 					const dropMsg = streamErr && typeof (streamErr as Error).message === 'string' ? (streamErr as Error).message : String(streamErr);
 					const nothingEmittedYet = emittedContentLen === 0 && emittedThinkLen === 0 && accumulatedToolCalls.size === 0;
+					// The retry above is only correct while the server PROCESS is still there - it exists for a
+					// server that is up but not yet able to stream. A drop with no server record left means the
+					// process went away underneath us, and by far the most common cause is the user pressing
+					// "Stop server" while a request (often a background prefix warm-up) was still streaming.
+					// Retrying then re-enters ensureServerForModel with no record to wait on, so it takes the full
+					// LAUNCH path - which restarts the very model the user just stopped and, when it no longer
+					// fits free RAM, pops the "Run anyway?" fit dialog a few hundred ms after the Stop click.
+					// Treat a vanished server as terminal instead: report the drop rather than resurrect it.
+					const serverStillPresent = this.localModelRunner.isServerRunning(model.id)
+						|| this.localModelRunner.isServerStarting(model.id);
 					const canRetry = this._isTransientLocalStreamDrop(dropMsg)
 						&& nothingEmittedYet
+						&& serverStillPresent
 						&& streamAttempt < maxStreamWarmupRetries
 						&& !token.isCancellationRequested
 						&& !this._isCanceledError(dropMsg);
 					if (!canRetry) {
+						if (!serverStillPresent && this._isTransientLocalStreamDrop(dropMsg)) {
+							this._log(`[LoCoPilot Provider] Stream for ${model.id} dropped and its server is gone (stopped or evicted); not relaunching.`);
+						}
 						throw streamErr;
 					}
 					this._log(`[LoCoPilot Provider] Local server dropped the stream while warming up (attempt ${streamAttempt + 1}/${maxStreamWarmupRetries}); re-waiting for readiness and retrying: ${dropMsg}`);

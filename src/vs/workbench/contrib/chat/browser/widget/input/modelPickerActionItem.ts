@@ -172,6 +172,16 @@ function buildStartStopControl(
 	const isReady = phase === 'ready';
 	const isLaunching = phase === 'starting' || phase === 'loading';
 
+	if (phase === 'stopping') {
+		// Teardown is asynchronous: the process lingers briefly and its RAM comes back later still. Keep an
+		// inert spinner until the runner says the memory is free, so the play icon can't invite a restart that
+		// would gate against the dying model's own footprint.
+		return {
+			icon: ThemeIcon.modify(Codicon.loading, 'spin'),
+			tooltip: localize('chat.modelPicker.serverStopping', 'Stopping...'),
+			run: () => { }
+		};
+	}
 	if (isLaunching) {
 		return {
 			icon: ThemeIcon.modify(Codicon.loading, 'spin'),
@@ -184,7 +194,7 @@ function buildStartStopControl(
 			icon: Codicon.stopCircle,
 			tooltip: localize('chat.modelPicker.stopServer', 'Stop server'),
 			run: () => {
-				runner.stopServer(modelId);
+				void runner.stopServerAndAwaitTeardown(modelId).finally(() => actionWidgetService.refreshItems());
 				actionWidgetService.refreshItems();
 			}
 		};

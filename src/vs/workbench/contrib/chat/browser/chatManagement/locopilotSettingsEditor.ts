@@ -1612,8 +1612,24 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 		const phase = this.localModelRunner.getServerPhase(modelId);
 		const isReady = phase === 'ready';
 		const isLaunching = phase === 'starting' || phase === 'loading';
+		const isStopping = phase === 'stopping';
 
-		if (isLaunching) {
+		if (isStopping) {
+			// The process exits asynchronously and the OS releases its weights a moment after that, so between
+			// the Stop click and a genuinely free machine the model is neither running nor startable. Showing
+			// "Start server" there invited a restart that gates against RAM the dying model still holds - which
+			// fails the fit check, or prompts "Run anyway?", for a model that fits fine a second later. Hold a
+			// disabled "Stopping..." until the runner confirms the memory is back.
+			const spinnerWrap = DOM.append(runSlot, $('.model-server-starting'));
+			const activity = DOM.append(spinnerWrap, $('.model-ollama-activity'));
+			activity.setAttribute('aria-hidden', 'true');
+			for (let i = 0; i < 8; i++) { DOM.append(activity, $('.model-ollama-activity-tick')); }
+			const stoppingLabel = DOM.append(spinnerWrap, $('span.model-server-starting-label'));
+			stoppingLabel.textContent = localize('customLanguageModels.serverStopping', 'Stopping...');
+			spinnerWrap.setAttribute('aria-busy', 'true');
+			spinnerWrap.setAttribute('aria-label', localize('customLanguageModels.serverStoppingAria', 'Server is stopping and freeing memory, please wait'));
+			spinnerWrap.title = localize('customLanguageModels.serverStoppingTooltip', 'Unloading this model and waiting for its memory to be released.');
+		} else if (isLaunching) {
 			// Spinner + disabled label while the server is launching (process spawning OR weights still loading)
 			const spinnerWrap = DOM.append(runSlot, $('.model-server-starting'));
 			const activity = DOM.append(spinnerWrap, $('.model-ollama-activity'));
@@ -1628,7 +1644,7 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 			// so the button below is a convenience to spin up (or shut down) the server ahead of a request.
 			const btn = this._register(new Button(runSlot, { ...defaultButtonStyles, secondary: true, supportIcons: true, title: localize('customLanguageModels.stopServerTooltip', 'Unload this model and stop its server') }));
 			btn.label = '$(stop-circle) ' + localize('customLanguageModels.stopServer', 'Stop server');
-			this._register(btn.onDidClick(() => this.localModelRunner.stopServer(modelId)));
+			this._register(btn.onDidClick(() => void this.localModelRunner.stopServerAndAwaitTeardown(modelId)));
 			const logsButton = this._register(new Button(actionsContainer, { ...defaultButtonStyles, secondary: true, title: localize('customLanguageModels.logs.viewTooltip', 'View server logs') }));
 			logsButton.label = localize('customLanguageModels.logs', 'Logs');
 			this._register(logsButton.onDidClick(() => this._showLogsOverlay(modelId, modelLabel)));

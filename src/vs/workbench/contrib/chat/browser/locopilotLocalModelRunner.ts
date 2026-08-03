@@ -146,7 +146,7 @@ const LAUNCH_FIT_TOLERANCE_MIN_BYTES = 512 * 1024 * 1024;
  *  - 'loading' : process is up but still reading weights into RAM/VRAM (endpoint not 200 yet).
  *  - 'ready'   : the OpenAI endpoint answered 200; safe to send requests.
  */
-export type LocalServerPhase = 'starting' | 'loading' | 'ready';
+export type LocalServerPhase = 'starting' | 'loading' | 'ready' | 'stopping';
 
 /**
  * Cross-window active-server lock file contents. A launch first writes a 'claiming' entry (atomic exclusive
@@ -287,6 +287,20 @@ export interface ILoCoPilotLocalModelRunner {
 	/** True while the server process is being launched (between button click and first state change). */
 	isServerStarting(modelId: string): boolean;
 	/**
+	 * True between a {@link stopServerAndAwaitTeardown} request and the moment the process is really gone and
+	 * its RAM has come back. UI uses this for a disabled "Stopping..." state so the row can't offer Start while
+	 * the weights are still resident - a restart in that window measures pre-teardown memory and needlessly
+	 * fails the fit gate (or pops "Run anyway?") for a model that fits fine seconds later.
+	 */
+	isServerStopping(modelId: string): boolean;
+	/**
+	 * Stop a server and resolve only once its process has exited and the OS has released its memory. Prefer
+	 * this over the fire-and-forget {@link stopServer} for user-facing stop controls: it publishes a
+	 * 'stopping' phase (see {@link isServerStopping}) for the whole teardown, and a launch of the same model
+	 * queued during that window waits for it rather than racing the dying process for RAM.
+	 */
+	stopServerAndAwaitTeardown(modelId: string): Promise<void>;
+	/**
 	 * Read-only mirror of the interactive launch gate for Auto's step-down: would `modelId` fit the RAM a
 	 * launch would ACTUALLY get right now (live available + what this launch's own eviction frees, counting
 	 * only the non-reclaimable working set)? Runs the same math as the real gate but WITHOUT side effects - no
@@ -424,6 +438,12 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 	private readonly _activeLaunchTerminals = new Map<string, ITerminalInstance>();
 	/** Models we are intentionally stopping, so the process-exit handler doesn't report a stop as a crash. */
 	private readonly _intentionalStops = new Set<string>();
+	/**
+	 * In-flight teardowns keyed by model: the promise resolves when the process is gone AND its memory has
+	 * been observed to come back (see _stopServerAndWait). Drives the 'stopping' phase, and a launch of the
+	 * same model started during the window awaits it instead of gating against RAM the dying process still holds.
+	 */
+	private readonly _pendingStops = new Map<string, Promise<void>>();
 	/**
 	 * Models the user chose "Run anyway" for at the fit-check dialog: their next launch bypasses BOTH memory
 	 * gates. Cleared when the model is stopped (manual stop, eviction, or a watchdog trip), so a model the
@@ -1384,11 +1404,43 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 		return this.startingServers.has(modelId);
 	}
 
+	isServerStopping(modelId: string): boolean {
+		return this._pendingStops.has(modelId);
+	}
+
+	stopServerAndAwaitTeardown(modelId: string): Promise<void> {
+		const inFlight = this._pendingStops.get(modelId);
+		if (inFlight) {
+			return inFlight; // already stopping; a second press just joins the same teardown
+		}
+		// Deferred to a microtask so _pendingStops is populated BEFORE _stopServerAndWait runs: it calls
+		// stopServer, which fires onDidServerStateChange synchronously, and that render must already see the
+		// 'stopping' phase - otherwise the row flashes "Start server" for a frame, which is exactly the
+		// window we are trying to close.
+		const teardown = Promise.resolve()
+			.then(() => this._stopServerAndWait(modelId))
+			.catch(e => this._log(`[LoCoPilot Runner] Teardown wait for ${modelId} failed (ignored): ${e}`))
+			.finally(() => {
+				this._pendingStops.delete(modelId);
+				this._log(`[LoCoPilot Runner] Teardown complete for ${modelId}; its memory has been released.`);
+				this._onDidServerStateChange.fire(modelId);
+			});
+		this._pendingStops.set(modelId, teardown);
+		this._onDidServerStateChange.fire(modelId); // paint "Stopping..." immediately
+		return teardown;
+	}
+
 	getServerLogs(modelId: string): string[] {
 		return this.runningServers.get(modelId)?.logs ?? [];
 	}
 
 	getServerPhase(modelId: string): LocalServerPhase | undefined {
+		// A teardown in progress outranks whatever record is still lying around: stopServer deletes the record
+		// up front, but the process keeps its RAM for a moment afterwards, and during that moment the model is
+		// 'stopping' - not stopped, and not startable.
+		if (this._pendingStops.has(modelId)) {
+			return 'stopping';
+		}
 		const running = this.runningServers.get(modelId);
 		if (running) {
 			return running.ready ? 'ready' : 'loading';
@@ -4423,6 +4475,15 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 		if (!model || !model.localPath) {
 			this._log(`[LoCoPilot Runner] Model ${modelId} not found or has no local path.`);
 			return;
+		}
+		// If this model is still tearing down, wait for its process to actually release the RAM before doing
+		// anything else. Gating a restart while the old process is still resident measures memory that is about
+		// to come back, so the launch is refused (or prompts "Run anyway?") for a model that fits fine a second
+		// later. The teardown promise is bounded and never rejects, so this can't stall a launch indefinitely.
+		const pendingStop = this._pendingStops.get(modelId);
+		if (pendingStop) {
+			this._log(`[LoCoPilot Runner] Launch of ${modelId} is waiting for its previous instance to finish stopping.`);
+			await pendingStop;
 		}
 		// A fresh launch attempt supersedes any prior fit-gate block: clear it now so a stale "won't fit" reason
 		// can't outlive a retry. If this attempt bails at a gate again, that gate re-records the current reason.
