@@ -169,8 +169,9 @@ export class OutlineTool implements IToolImpl {
 			}
 
 			const header = `Outline of ${params.path} (${totalLines} lines, ${symbols.length} symbols):\n\n`;
+			const footer = `\n\nNext: readFile("${params.path}", offset, limit) on the symbol you need - the numbers above are its line. This is an outline only; it may omit symbols, so grep if something you expect is missing.\n\nProceed to the next step or goal.`;
 			return {
-				content: [{ kind: 'text', value: header + symbols.join('\n') + '\n\nProceed to the next step or goal.' }]
+				content: [{ kind: 'text', value: header + symbols.join('\n') + footer }]
 			};
 		} catch (error) {
 			const errorMessage = error instanceof Error ? error.message : String(error);

@@ -27,7 +27,14 @@ import { buildFileLinkInvocationMessage, resolveToolFileUri } from './toolHelper
 export const ReadFileToolId = 'readFile';
 
 /** Maximum lines allowed in a single read. Files larger than this require offset and limit. */
-const READ_FILE_MAX_LINES = 1000;
+export const READ_FILE_MAX_LINES = 1000;
+
+/**
+ * How many leading lines to return alongside the "file is too large" notice. A bare error wastes the
+ * whole round-trip; returning the head (imports, class/function headers) usually tells the model where
+ * to aim its next ranged read, so the over-limit call still does useful work.
+ */
+const OVERSIZE_PREVIEW_LINES = 100;
 
 /** Image extensions: readFile returns image as data part so the agent can use vision. */
 const IMAGE_EXTENSIONS = ['png', 'jpg', 'jpeg', 'gif', 'webp', 'bmp', 'tiff'];
@@ -64,7 +71,7 @@ export function createReadFileToolData(): IToolData {
 		icon: ThemeIcon.fromId(Codicon.file.id),
 		displayName: localize('tool.readFile.displayName', 'Read file contents'),
 		userDescription: localize('tool.readFile.userDescription', 'Read the contents of a file (raw text for use with edits)'),
-		modelDescription: 'Read file contents from the workspace. Returns RAW file text (no line number prefixes) so you can copy it exactly for editFile oldString.\n\n**Ways to call:**\n1. **Complete file**: readFile(path) - returns the full file. Use when you need the entire contents (e.g. small config, full module). Files with more than 1000 lines cannot be read in full; the tool returns an error - use (2) for those.\n2. **Specific lines**: readFile(path, offset, limit) - returns only the requested line range. offset = 1-based start line, limit = max lines to return (capped at 1000 per read). Examples: readFile(path, 1, 200) for first 200 lines; readFile(path, 50, 100) for lines 50-149. Use when you need only a section or when the file is large; grep/readLints can give you line numbers.\n\nUse this tool to: examine file contents before edits; copy exact text for editFile oldString; read a specific block when you know the line range. Path can be absolute or relative to workspace root.\n\nHandles: text files (raw content); image files (png, jpg, gif, etc. - returns the image for vision so you can describe or analyze it; max 5MB); binary files (returns "[Binary file]"); missing files (clear error); files >1000 lines without offset/limit (error asking you to use offset and limit).',
+		modelDescription: 'Read file contents from the workspace. Returns RAW file text (no line number prefixes) so you can copy it exactly for editFile oldString.\n\n**Ways to call:**\n1. **Complete file**: readFile(path) - returns the full file. Use when you need the entire contents (e.g. small config, full module). Files with more than 1000 lines cannot be read in full; you get the first 100 lines plus the total line count, then use (2) to read the range you need.\n2. **Specific lines**: readFile(path, offset, limit) - returns only the requested line range. offset = 1-based start line, limit = max lines to return (capped at 1000 per read). Examples: readFile(path, 1, 200) for first 200 lines; readFile(path, 50, 100) for lines 50-149. Use when you need only a section or when the file is large; grep/readLints can give you line numbers.\n\nUse this tool to: examine file contents before edits; copy exact text for editFile oldString; read a specific block when you know the line range. Path can be absolute or relative to workspace root.\n\nHandles: text files (raw content); image files (png, jpg, gif, etc. - returns the image for vision so you can describe or analyze it; max 5MB); binary files (returns "[Binary file]"); missing files (clear error); files >1000 lines without offset/limit (head of the file plus its total line count, so you can pick a range).',
 		source: ToolDataSource.Internal,
 		inputSchema: inputSchema,
 		alwaysDisplayInputOutput: true
@@ -153,15 +160,19 @@ export class ReadFileTool implements IToolImpl {
 			const lines = content.split('\n');
 			const totalLines = lines.length;
 
-			// Files over READ_FILE_MAX_LINES require offset and limit; do not send entire file
+			// Files over READ_FILE_MAX_LINES require offset and limit; do not send entire file. Rather than
+			// spending the round-trip on a bare error, return the head of the file with the notice - the
+			// imports and first declarations are usually enough to aim the next ranged read.
 			const requestedFullFile = params.offset === undefined && params.limit === undefined;
 			if (totalLines > READ_FILE_MAX_LINES && requestedFullFile) {
+				const preview = lines.slice(0, OVERSIZE_PREVIEW_LINES).join('\n');
 				return {
 					content: [{
 						kind: 'text',
-						value: `Error: File "${params.path}" has ${totalLines} lines (max ${READ_FILE_MAX_LINES} lines per read). Next: Use readFile with offset and limit to read specific lines only. Examples: readFile("${params.path}", offset: 1, limit: 200) for the first 200 lines; readFile("${params.path}", offset: 150, limit: 100) for lines 150-249. Use grep or readLints to find relevant line numbers first if needed.`
-					}],
-					toolResultError: 'File exceeds max lines; use offset and limit'
+						value: `File "${params.path}" has ${totalLines} lines - too large to read at once (max ${READ_FILE_MAX_LINES} per read), so only the first ${OVERSIZE_PREVIEW_LINES} lines are shown below.\n\n`
+							+ `Next: read the part you actually need with offset and limit - e.g. readFile("${params.path}", offset: 150, limit: 100) for lines 150-249. To find the right range first, use outline("${params.path}") for its symbol map, or grep for an exact string. Do NOT rewrite this file with createFile; change it with editFile.\n\n`
+							+ `--- lines 1-${OVERSIZE_PREVIEW_LINES} of ${totalLines} ---\n${preview}\n... ${totalLines - OVERSIZE_PREVIEW_LINES} more lines ...`
+					}]
 				};
 			}
 

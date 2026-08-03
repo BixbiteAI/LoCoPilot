@@ -34,13 +34,18 @@ import {
 import { VSBuffer } from '../../../../../../base/common/buffer.js';
 import { buildFileLinkInvocationMessage, resolveToolFileUri } from './toolHelpers.js';
 import { commitEdits, formatDelta, getLintFailureAfterEdit, IEditToolServices, lineCount, readContentForEdit, resolvePathToUri, revealInEditor } from './editToolShared.js';
+import { READ_FILE_MAX_LINES } from './readFileTool.js';
 
 export const CreateFileToolId = 'createFile';
 
 /** An existing file this long ... */
 const SHRINK_GUARD_MIN_LINES = 50;
-/** ...overwritten with content under this fraction of its size is likely accidental truncation. */
-const SHRINK_GUARD_RATIO = 0.4;
+/**
+ * ...overwritten with content under this fraction of its size is likely accidental truncation.
+ * Deliberately strict: real "rewrite the whole file" edits stay close to the original size, while a
+ * model that lost part of the file typically comes back at 50-70% - which a looser ratio waves through.
+ */
+const SHRINK_GUARD_RATIO = 0.75;
 
 /** Extension-less names that are legitimately created without a dot. */
 const KNOWN_EXTENSIONLESS = new Set(['dockerfile', 'makefile', 'license', 'readme', 'changelog', 'procfile', 'gemfile', 'rakefile', 'caddyfile', 'jenkinsfile', 'vagrantfile', 'authors', 'notice', 'codeowners']);
@@ -79,6 +84,7 @@ export function createCreateFileToolData(): IToolData {
 		modelDescription: 'Write a WHOLE file. Params: path, content, overwrite?.\n\n' +
 			'- Create a new file: pass path + content (parent folders are created automatically - no mkdir step).\n' +
 			'- To fully replace an EXISTING file: also pass overwrite: true. Without it, writing over an existing file is rejected. Replacing a large file with much shorter (but COMPLETE) content also needs force: true.\n' +
+			`- Only for files you can read in FULL (under ${READ_FILE_MAX_LINES} lines). Overwriting a file larger than that is refused - you cannot have seen all of it, so the rewrite would drop the parts you did not read. Change those with editFile instead.\n` +
 			'- For SMALL/targeted changes to an existing file, do NOT use this - use editFile (change text) or insertCode (add code). Rewriting a whole file for a small change is wasteful and error-prone.',
 		source: ToolDataSource.Internal,
 		inputSchema,
@@ -172,6 +178,12 @@ export class CreateFileTool implements IToolImpl {
 				return { content: [{ kind: 'text', value: `Error: "${params.path}" already exists. Next: to change part of it use editFile (or insertCode to add code); to replace the WHOLE file, resend createFile with overwrite: true.` }], toolResultError: 'File exists' };
 			}
 			const currentLines = currentContent.split('\n').length;
+			// A file this big cannot have been read in full (readFile caps at READ_FILE_MAX_LINES), so any
+			// whole-file rewrite of it is a reconstruction from partial reads - i.e. silent data loss for
+			// every line the model never saw. There is no safe way to allow this, so it is refused outright.
+			if (currentLines > READ_FILE_MAX_LINES) {
+				return { content: [{ kind: 'text', value: `Error: "${params.path}" has ${currentLines} lines - too large to rewrite in one call (you cannot have read all of it; readFile returns at most ${READ_FILE_MAX_LINES} lines). Rewriting it would silently drop the parts you did not see. Next: use editFile with edits[] to change the specific sections, working through the file in batches - readFile(offset, limit) each section first, or outline "${params.path}" to see its structure.` }], toolResultError: 'File too large to overwrite' };
+			}
 			if (!params.force && currentLines >= SHRINK_GUARD_MIN_LINES && params.content.length < currentContent.length * SHRINK_GUARD_RATIO) {
 				return { content: [{ kind: 'text', value: `Error: Refusing to overwrite "${params.path}" (${currentLines} lines) with much shorter content (${params.content.split('\n').length} lines) - likely incomplete. Next: use editFile for a partial change, or - if the shorter content really is COMPLETE - resend createFile with overwrite: true and force: true.` }], toolResultError: 'Shrink overwrite refused' };
 			}

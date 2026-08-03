@@ -197,7 +197,11 @@ export class GrepTool implements IToolImpl {
 				? `Found matches in ${fileCount} files`
 				: `Found ${totalMatches} matches in ${fileCount} files`;
 			const limitNote = searchResult.limitHit ? `\n\n(Search limit reached at ${params.maxResults || 100} results. Use more specific patterns to narrow results.)` : '';
-			const nextHint = '\n\nProceed to the next step or goal.';
+			// The line numbers above are what makes a large file workable: feed them straight to readFile
+			// as offset/limit instead of trying to read the whole file.
+			const nextHint = outputMode === 'content' && totalMatches > 0
+				? '\n\nUse these line numbers with readFile(path, offset, limit) to read just the regions you need.\n\nProceed to the next step or goal.'
+				: '\n\nProceed to the next step or goal.';
 
 			const output = `${summary}${limitNote}\n${results.join('\n')}${nextHint}`;
 

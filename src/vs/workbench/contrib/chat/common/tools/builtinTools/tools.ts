@@ -16,10 +16,12 @@ import { createListDirectoryToolData, ListDirectoryTool } from './listDirectoryT
 import { createReadLintsToolData, ReadLintsTool } from './readLintsTool.js';
 import { createGrepToolData, GrepTool } from './grepTool.js';
 import { createFindFilesToolData, FindFilesTool } from './findFilesTool.js';
-// outline: commented out - it's a regex-based symbol scraper that the model can reproduce with
-// grep (e.g. pattern "function|class|def|export"). Re-enable the import + registration below if
-// a dedicated outline tool is wanted again.
-// import { createOutlineToolData, OutlineTool } from './outlineTool.js';
+// outline: re-enabled. It was disabled as "a regex scraper the model can reproduce with grep", but that
+// assumes the model knows to build a good multi-language symbol regex - small local models mostly don't,
+// and a one-arg tool is far more reliable for them. Its line numbers come straight from the file, so the
+// failure mode is a missed or noisy symbol, never a misdirected read. Symbol extraction should move to the
+// bundled tree-sitter grammars (@vscode/tree-sitter-wasm) later; that's an internal upgrade, same interface.
+import { createOutlineToolData, OutlineTool } from './outlineTool.js';
 // stringReplace: superseded by the split editFile tool below (kept for reference, not registered).
 // import { createStringReplaceToolData, StringReplaceTool } from './stringReplaceTool.js';
 // modifyFile: the old single mega-tool (create + overwrite + replace + insert + multi-edit in one). It
@@ -59,10 +61,11 @@ export class BuiltinToolsContribution extends Disposable implements IWorkbenchCo
 		const findFilesTool = instantiationService.createInstance(FindFilesTool);
 		this._register(toolsService.registerTool(createFindFilesToolData(), findFilesTool));
 
-		// Outline tool: regex-based symbol map - NOT registered. The model reproduces it with grep
-		// (e.g. "function|class|def|export"). Re-enable here if a dedicated outline tool is wanted:
-		// const outlineTool = instantiationService.createInstance(OutlineTool);
-		// this._register(toolsService.registerTool(createOutlineToolData(), outlineTool));
+		// Outline tool: compact symbol map (symbol + line number) so the model can target its reads on a
+		// large file instead of paging through it blindly. This is the main navigation aid for files over
+		// readFile's 1000-line cap, which can never be read in one call.
+		const outlineTool = instantiationService.createInstance(OutlineTool);
+		this._register(toolsService.registerTool(createOutlineToolData(), outlineTool));
 
 		// Register web search tool (works out of the box via DuckDuckGo; optional Brave API key)
 		const webSearchTool = instantiationService.createInstance(WebSearchTool);
