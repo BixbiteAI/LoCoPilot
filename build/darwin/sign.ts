@@ -22,6 +22,57 @@ function getElectronVersion(): string {
 	return target;
 }
 
+/**
+ * The bundled MLX python environment contributes ~12k files to the app, the vast
+ * majority of which (.pyc, .py, .txt, metadata) are not Mach-O and do not need to
+ * be signed individually - they are covered by the enclosing bundle seal. Signing
+ * them anyway means one `--timestamp` round-trip to Apple per file, which trips
+ * their rate limiter ("The timestamp service is not available.") partway through.
+ * So inside resources/mlx we sign only actual Mach-O images.
+ */
+const MACHO_MAGIC = new Set([
+	0xfeedface, // 32-bit
+	0xfeedfacf, // 64-bit
+	0xcefaedfe, // 32-bit, byte-swapped
+	0xcffaedfe, // 64-bit, byte-swapped
+	0xcafebabe, // fat
+	0xbebafeca, // fat, byte-swapped
+]);
+
+function isMachO(filePath: string): boolean {
+	let fd: number | undefined;
+	try {
+		fd = fs.openSync(filePath, 'r');
+		const buf = Buffer.alloc(4);
+		if (fs.readSync(fd, buf, 0, 4, 0) < 4) {
+			return false;
+		}
+		return MACHO_MAGIC.has(buf.readUInt32BE(0));
+	} catch {
+		// Unreadable/odd file - let codesign decide rather than silently skipping.
+		return true;
+	} finally {
+		if (fd !== undefined) {
+			try { fs.closeSync(fd); } catch { /* ignore */ }
+		}
+	}
+}
+
+function shouldIgnoreForSigning(filePath: string): boolean {
+	if (!filePath.includes(`${path.sep}resources${path.sep}mlx${path.sep}`)) {
+		return false;
+	}
+	try {
+		const stat = fs.lstatSync(filePath);
+		if (!stat.isFile()) {
+			return false;
+		}
+	} catch {
+		return false;
+	}
+	return !isMachO(filePath);
+}
+
 function getEntitlementsForFile(filePath: string): string {
 	if (filePath.includes(gpuHelperAppName)) {
 		return path.join(baseDir, 'azure-pipelines', 'darwin', 'helper-gpu-entitlements.plist');
@@ -45,15 +96,19 @@ async function retrySignOnKeychainError<T>(fn: () => Promise<T>, maxRetries: num
 			// Check if this is the specific keychain error we want to retry
 			const errorMessage = error instanceof Error ? error.message : String(error);
 			const isKeychainError = errorMessage.includes('The specified item could not be found in the keychain.');
+			// Apple's timestamp service rate-limits / drops requests under load. Signing is
+			// idempotent (`--force`), so re-running the whole pass is safe.
+			const isTimestampError = errorMessage.includes('The timestamp service is not available.');
 
-			if (!isKeychainError || attempt === maxRetries) {
+			if ((!isKeychainError && !isTimestampError) || attempt === maxRetries) {
 				throw error;
 			}
 
-			console.log(`Signing attempt ${attempt} failed with keychain error, retrying...`);
+			console.log(`Signing attempt ${attempt} failed with ${isTimestampError ? 'timestamp' : 'keychain'} error, retrying...`);
 			console.log(`Error: ${errorMessage}`);
 
-			const delay = 1000 * Math.pow(2, attempt - 1);
+			// Back off harder for timestamp throttling - a second immediately is pointless.
+			const delay = (isTimestampError ? 30000 : 1000) * Math.pow(2, attempt - 1);
 			console.log(`Waiting ${Math.round(delay)}ms before retry ${attempt}/${maxRetries}...`);
 			await new Promise(resolve => setTimeout(resolve, delay));
 		}
@@ -92,6 +147,7 @@ async function main(buildDir?: string): Promise<void> {
 			entitlements: getEntitlementsForFile(filePath),
 			hardenedRuntime: true,
 		}),
+		ignore: shouldIgnoreForSigning,
 		preAutoEntitlements: false,
 		preEmbedProvisioningProfile: false,
 		...(keychainPath ? { keychain: keychainPath } : {}),
