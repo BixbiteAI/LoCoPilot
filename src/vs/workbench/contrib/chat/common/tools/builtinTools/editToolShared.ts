@@ -18,7 +18,7 @@ import { URI } from '../../../../../../base/common/uri.js';
 import { IRange } from '../../../../../../editor/common/core/range.js';
 import { TextEdit } from '../../../../../../editor/common/languages.js';
 import { IModelService } from '../../../../../../editor/common/services/model.js';
-import { IFileService } from '../../../../../../platform/files/common/files.js';
+import { FileOperationError, FileOperationResult, IFileService } from '../../../../../../platform/files/common/files.js';
 import { IMarkerService, MarkerSeverity } from '../../../../../../platform/markers/common/markers.js';
 import { IWorkspaceContextService } from '../../../../../../platform/workspace/common/workspace.js';
 import { IEditorService } from '../../../../../services/editor/common/editorService.js';
@@ -111,6 +111,46 @@ export function findFlexibleMatches(content: string, oldString: string): IMatchR
 	return ranges;
 }
 
+/** True when two ranges share at least one character. */
+function rangesOverlap(a: IMatchRange, b: IMatchRange): boolean {
+	return a.start < b.start + b.length && b.start < a.start + a.length;
+}
+
+/**
+ * Non-blank line count of a trimmed block. Used as the "is this substantial enough to recognize"
+ * bar for the two idempotency checks (already-inserted, already-applied), which must never fire on
+ * a short/common snippet that happens to appear elsewhere in the file.
+ */
+function nonBlankLineCount(block: string): number {
+	return block.split('\n').filter(l => l.trim().length > 0).length;
+}
+
+/**
+ * Widen delete ranges (newString === '') to swallow the line's own newline.
+ *
+ * Both matchers return the matched TEXT, not the matched LINES: `findFlexibleMatches` stops at the
+ * last line's final character, so replacing that span with '' left the newline behind as a blank
+ * line. Deleting a 200-line block used to leave 200 blank... no - one blank line, but every delete
+ * left one, and a model that then re-read the file saw stray blank lines it had not written.
+ *
+ * Only widens a whole-line match that does not already carry its newline, so a mid-line deletion
+ * and an oldString that deliberately ends in '\n' are both left alone.
+ */
+function expandDeletionRanges(content: string, ranges: IMatchRange[]): IMatchRange[] {
+	return ranges.map(r => {
+		const end = r.start + r.length;
+		const atLineStart = r.start === 0 || content[r.start - 1] === '\n';
+		if (!atLineStart || content.slice(r.start, end).endsWith('\n')) { return r; }
+		if (content[end] === '\n') { return { start: r.start, length: r.length + 1 }; }
+		// Match runs to EOF: there is no trailing newline to take, so take the LEADING one instead -
+		// otherwise the now-last line of the file is followed by a dangling empty line.
+		if (end >= content.length && r.start > 0 && content[r.start - 1] === '\n') {
+			return { start: r.start - 1, length: r.length + 1 };
+		}
+		return r;
+	});
+}
+
 /** Re-base the indentation of `newString` from the model's guessed indent to the file's real indent. */
 function reindentReplacement(newString: string, oldFirstLine: string, matchedFirstLine: string): string {
 	const oldIndent = leadingWhitespace(oldFirstLine);
@@ -154,6 +194,11 @@ export function resolvePatch(content: string, patch: IEditPatch, label: string):
 	const insertAfter = typeof patch.insertAfter === 'string' && patch.insertAfter.length > 0;
 	const insertBefore = typeof patch.insertBefore === 'string' && patch.insertBefore.length > 0;
 	if (insertAfter || insertBefore) {
+		// Both anchors set: the two say opposite things about where the code goes, and quietly letting
+		// insertAfter win put code in a place the model did not ask for, reported as a success.
+		if (insertAfter && insertBefore) {
+			return { error: `${label}both insertAfter and insertBefore were given - they place the code in different spots. Send exactly one.` };
+		}
 		const anchor = (insertAfter ? patch.insertAfter : patch.insertBefore) as string;
 		if (patch.newString.length === 0) {
 			return { error: `${label}newString to insert is empty - provide the code to add.` };
@@ -162,11 +207,14 @@ export function resolvePatch(content: string, patch: IEditPatch, label: string):
 		// insert they already made). Conservative: only >= 2 non-blank lines, and any differing line means
 		// no match so it inserts normally - a short/common single line is never suppressed.
 		const insertBody = patch.newString.trim();
-		const insertBodyLineCount = insertBody.split('\n').filter(l => l.trim().length > 0).length;
-		if (insertBodyLineCount >= 2 && findFlexibleMatches(content, insertBody).length > 0) {
+		if (nonBlankLineCount(insertBody) >= 2 && findFlexibleMatches(content, insertBody).length > 0) {
 			return { skip: true, reason: `${label}the code to insert is already present - skipped to avoid a duplicate.` };
 		}
-		let anchorRanges = findExactRanges(content, anchor, false);
+		// Collect ALL exact hits, not just the first. Passing `false` here made findExactRanges stop at
+		// occurrence 1, so the "Anchor matches N places" guard below was unreachable for exact matches and
+		// an ambiguous anchor silently inserted at whichever one happened to come first - reported as a
+		// success. Only the lenient path ever checked ambiguity.
+		let anchorRanges = findExactRanges(content, anchor, true);
 		let anchorLenient = false;
 		if (anchorRanges.length === 0) {
 			const flexible = findFlexibleMatches(content, anchor);
@@ -201,28 +249,58 @@ export function resolvePatch(content: string, patch: IEditPatch, label: string):
 	if (oldString === patch.newString) {
 		return { error: `${label}oldString and newString are identical - no change.` };
 	}
-	let ranges = findExactRanges(content, oldString, patch.replaceAll ?? false);
+	const replaceAll = patch.replaceAll ?? false;
+	// Always collect ALL exact hits. This used to pass `replaceAll` straight through, so a single-target
+	// edit stopped at occurrence 1 and the "Found N occurrences, make oldString unique" guard below could
+	// never fire - a non-unique oldString silently edited whichever match came first and reported success.
+	// The ambiguity check is the whole point of defaulting replaceAll to false, so it has to see all of them.
+	let ranges = findExactRanges(content, oldString, true);
 	let lenient = false;
 	if (ranges.length === 0) {
 		const flexible = findFlexibleMatches(content, oldString);
 		if (flexible.length === 0) {
-			return { error: `${label}String not found. oldString must match the file (copy it exactly from readFile).` };
+			// oldString missing is most often NOT a bad copy - it is an edit that already landed (a stale
+			// view of the file, or a retry after an interrupted turn). Reporting that as a hard failure sent
+			// models into the classic loop: readFile, see the NEW text, guess a different oldString, fail again.
+			// Recognize the finished state instead. Gated on a substantial newString (>= 2 non-blank lines,
+			// same bar as the idempotent insert) so a short newString that coincidentally appears elsewhere
+			// can never turn a genuinely failed edit into a false success.
+			const applied = patch.newString.trim();
+			if (nonBlankLineCount(applied) >= 2 && findFlexibleMatches(content, applied).length > 0) {
+				return { skip: true, reason: `${label}this change is already applied - the new text is already in the file. Do NOT re-apply it.` };
+			}
+			return { error: `${label}String not found. oldString must match the file (copy it exactly from readFile). If you already made this change, it may have applied - readFile to check before retrying.` };
 		}
-		if (flexible.length > 1 && !patch.replaceAll) {
+		if (flexible.length > 1 && !replaceAll) {
 			return { error: `${label}Found ${flexible.length} places matching oldString (ignoring indentation). Add more surrounding context or set replaceAll=true.` };
 		}
-		ranges = patch.replaceAll ? flexible : [flexible[0]];
+		ranges = replaceAll ? flexible : [flexible[0]];
 		lenient = true;
-	} else if (ranges.length > 1 && !patch.replaceAll) {
+	} else if (ranges.length > 1 && !replaceAll) {
 		return { error: `${label}Found ${ranges.length} occurrences. Make oldString unique (add context) or set replaceAll=true.` };
+	} else if (replaceAll) {
+		// The flexible matcher only ran as a fallback for "no exact match at all", so replaceAll used to
+		// stop at the occurrences that matched character-for-character and silently leave behind any that
+		// differed only in indentation - while reporting success. "All" has to mean all.
+		const extras = findFlexibleMatches(content, oldString).filter(f => !ranges.some(r => rangesOverlap(f, r)));
+		if (extras.length > 0) {
+			ranges = [...ranges, ...extras].sort((a, b) => a.start - b.start);
+			lenient = true;
+		}
 	}
 	const oldFirstLine = oldString.split('\n')[0] ?? '';
+	// Decided per range, not per call: a replaceAll batch can now mix exact and indentation-variant
+	// matches, and only the latter should have their replacement re-indented.
 	const replacementFor = (r: IMatchRange): string => {
-		if (!lenient) { return patch.newString; }
-		const matchedFirstLine = content.slice(r.start).split('\n')[0] ?? '';
-		return reindentReplacement(patch.newString, oldFirstLine, matchedFirstLine);
+		const matched = content.slice(r.start, r.start + r.length);
+		if (matched === oldString) { return patch.newString; }
+		return reindentReplacement(patch.newString, oldFirstLine, matched.split('\n')[0] ?? '');
 	};
-	return { ranges, replacementFor, lenient };
+	return {
+		ranges: patch.newString.length === 0 ? expandDeletionRanges(content, ranges) : ranges,
+		replacementFor,
+		lenient
+	};
 }
 
 /** Result of applying a whole edits[] batch to file content. */
@@ -287,21 +365,42 @@ export interface IEditToolServices {
 }
 
 /**
+ * Outcome of reading a file for editing. `readError` is deliberately distinct from `notFound`: see
+ * {@link readContentForEdit}.
+ */
+export type ReadForEditResult = { content: string } | { notFound: true } | { readError: string };
+
+/**
  * Read the file's CURRENT content for editing. Critically, when a chat editing session has an in-memory
  * text model for this file (because a previous edit THIS turn is applied to the model but not yet flushed
  * to disk), we must read from that live model - not `fileService.readFile`, which returns the stale on-disk
  * bytes. Reading disk while writing through the session makes sequential edits in one turn diverge, so
  * later oldStrings stop matching ("String not found") even though the model shows the expected text.
+ *
+ * A file that cannot be READ is not a file that does not EXIST. This used to catch every failure as
+ * `notFound`, so a locked file, a permission error, or a path that is really a directory all told the
+ * model "it does not exist - create it with createFile" - and createFile REPLACES an existing file
+ * wholesale. A transient read failure could therefore destroy a file the model had never read. Report
+ * the two separately and let callers refuse to write on `readError`.
  */
-export async function readContentForEdit(services: IEditToolServices, fileUri: URI): Promise<{ content: string } | { notFound: true }> {
+export async function readContentForEdit(services: IEditToolServices, fileUri: URI): Promise<ReadForEditResult> {
 	const model = services.modelService.getModel(fileUri);
 	if (model && !model.isDisposed()) {
 		return { content: model.getValue() };
 	}
 	try {
 		return { content: (await services.fileService.readFile(fileUri)).value.toString() };
-	} catch {
-		return { notFound: true };
+	} catch (err) {
+		if (err instanceof FileOperationError && err.fileOperationResult === FileOperationResult.FILE_NOT_FOUND) {
+			return { notFound: true };
+		}
+		// Not a typed not-found: ask directly rather than inferring absence from an unrelated failure.
+		try {
+			if (!(await services.fileService.exists(fileUri))) { return { notFound: true }; }
+		} catch {
+			// exists() itself failed - fall through and report the original error, not absence.
+		}
+		return { readError: err instanceof Error ? err.message : String(err) };
 	}
 }
 

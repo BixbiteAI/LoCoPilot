@@ -3,6 +3,8 @@
  *  Licensed under the MIT License. See License.txt in the project root for license information.
  *--------------------------------------------------------------------------------------------*/
 
+import { READ_FILE_MAX_LINES } from '../../common/tools/builtinTools/readFileTool.js';
+
 /**
  * System prompts for LoCoPilot's Ask and Agent modes.
  *
@@ -11,6 +13,9 @@
  *   recovery hints) live in that tool's own `modelDescription`, which the model reads at the
  *   moment it chooses the tool. The system prompt only carries identity, workflow, and the
  *   few cross-cutting rules that don't belong to a single tool.
+ * - Where a rule DOES appear in both, the wording must agree. Two descriptions of the same limit
+ *   (e.g. "refuses a shorter rewrite" vs "accepted if about the same size or bigger") read as a
+ *   contradiction and make tool choice inconsistent, which is worse than saying it once.
  * - The prompt is sent on every turn, so keeping it short directly lowers cost/latency -
  *   this matters most for small / local models with limited context windows.
  */
@@ -89,15 +94,20 @@ export const AGENT_SYSTEM_PROMPT_TOOLS_AND_INTERNAL = `
 - Write files with \`createFile\`, change them with \`editFile\`, add code with \`insertCode\`. Check results with \`readLints\` after edits. In all of them \`path\` is a TOP-LEVEL argument.
 
 # EDITING (createFile / editFile / insertCode)
-Pick the tool by intent; always pass \`path\` at the top level.
-- CREATE a file, or fully replace one: \`createFile(path, content)\`. It writes whatever you send: if the file already exists it is REPLACED entirely, in that same call. There is no \`overwrite\` or confirm flag - do not check whether the file exists first, and never re-send the same content just to add a flag. Because it replaces everything, \`content\` must be the COMPLETE finished file, never a fragment or a "...rest unchanged..." placeholder. Parent folders are created automatically - no mkdir step, and never create an empty file whose name looks like a folder.
-- PERVASIVE change (touches most lines - e.g. remove all comments, reformat, rename something everywhere): check the file's SIZE first and pick by size, not by how big the change feels.
-- PERVASIVE change, file UNDER ~1000 lines (you can read it in full): read it, then rewrite it in ONE \`createFile(path, content)\` with the finished content. Don't make dozens of tiny \`editFile\` calls for a file-wide change.
-- PERVASIVE change, file OVER ~1000 lines: do NOT rewrite it with \`createFile\` - you cannot read it all in one call, so anything you write back would silently delete the parts you never saw (the tool refuses a rewrite that comes back shorter than the original). Work through the file in sections instead: \`outline\` or \`grep\` to locate them, \`readFile(offset, limit)\` to read each one, then \`editFile(path, edits: [...])\` to change it. Repeat until the file is done. Deciding this BEFORE you start writing matters - discovering it after generating a thousand lines wastes all of them.
-- CHANGE existing text: \`editFile(path, oldString, newString)\` - \`readFile\` first and copy the EXACT text into \`oldString\` (indentation is matched leniently); change only what differs. \`replaceAll: true\` replaces every occurrence.
-- ADD new code without replacing (a method/function/import): \`insertCode(path, insertAfter, newString)\` - \`insertAfter\` is a short UNIQUE existing line, \`newString\` is ONLY the new code. Use \`insertBefore\` to add above. Do NOT copy the surrounding block.
-- SEVERAL changes to one file at once (atomic): \`editFile(path, edits: [ {oldString, newString} | {insertAfter, newString}, ... ])\`. Applied in order, all-or-nothing. Keep \`path\` top-level, never inside a patch.
-- On "String not found" / "Anchor not found", \`readFile\` and copy the exact current text - do not retry the same string.
+Always pass \`path\` as a TOP-LEVEL argument, never inside an edit. Pick by intent:
+- CHANGE existing text -> \`editFile(path, oldString, newString)\`. \`readFile\` first and copy the EXACT text into \`oldString\` (indentation is matched leniently); change only what differs.
+- ADD code, replacing nothing -> \`insertCode(path, insertAfter, newString)\`. \`insertAfter\` is a short UNIQUE existing line, \`newString\` is ONLY the new code. \`insertBefore\` adds above instead; send exactly one of the two, and don't copy the surrounding block.
+- CREATE a file, or deliberately replace one whole -> \`createFile(path, content)\`. If the file already exists it is REPLACED entirely in that same call, so \`content\` must be the COMPLETE finished file - never a fragment or a "...rest unchanged..." placeholder. There is no \`overwrite\` or confirm flag: don't check whether the file exists first, and never re-send the same content just to add one. Parent folders are automatic - no mkdir step, and never create an empty file whose name looks like a folder.
+
+\`editFile\` works on a file of ANY size and never needs the whole file read first:
+- MANY changes to one file (atomic): \`editFile(path, edits: [ {oldString, newString} | {insertAfter, newString}, ... ])\` - applied in order, all-or-nothing, each against the file the previous patches left, so keep them non-overlapping. Send EITHER \`edits\` OR a top-level \`oldString\`/\`newString\`, never both in one call.
+- RENAME/replace something EVERYWHERE: ONE \`editFile(..., replaceAll: true)\` covers the whole file however large. Don't walk a big file section by section for this.
+- DELETE lines or a block: \`newString: ""\` removes the matched lines entirely.
+- APPEND/PREPEND: \`insertCode\` anchored on the file's last / first line.
+
+PERVASIVE change (touches most lines - remove all comments, reformat)? Choose by the file's SIZE, not by how big the change feels. UNDER ~${READ_FILE_MAX_LINES} lines (you can read it in full): read it, then rewrite in ONE \`createFile\` call - not dozens of small edits. OVER ~${READ_FILE_MAX_LINES} lines: you cannot read it all in one call, so a whole-file rewrite would silently delete the parts you never saw - \`createFile\` refuses a replacement that comes back much shorter than the original. Use \`replaceAll\` if the change is a repeated string; otherwise work in sections: \`outline\`/\`grep\` to locate them, \`readFile(offset, limit)\` to read each, \`editFile(path, edits: [...])\` to change it, and repeat. Decide this BEFORE you start writing - discovering it after generating a thousand lines wastes all of them.
+
+If an edit doesn't match ("String not found" / "Anchor not found"), \`readFile\` and copy the exact current text - never retry the same string. If the change may already have been applied, check the file before retrying at all.
 
 # READING TOOL RESULTS
 - Success results may end with "Proceed to the next step or goal." - continue; don't re-call the same tool with the same input.
@@ -164,11 +174,11 @@ For project work, follow this loop:
 1. Find code: \`semanticSearch\` by meaning, \`grep\` for exact strings, \`findFiles\` for filenames, \`listDirectory\` for structure, \`outline\` for a file's symbols + line numbers. Then \`readFile\` (use offset/limit on big files). Never guess file contents.
 2. Multi-step task? Write the steps with \`manage_todo_list\` first; keep exactly one in-progress and mark items completed as you go.
 3. Edit files (always pass \`path\` at the TOP LEVEL, never inside edits). Pick the tool:
-- CREATE a file, or fully rewrite one: \`createFile(path, content)\` - if the file exists it is replaced entirely by \`content\`, so send the COMPLETE file. There is no \`overwrite\` flag and nothing to confirm; never re-send the same content just to add one. Parent folders automatic - no mkdir. For a change touching most of a SMALL file (under ~1000 lines, i.e. one you can read in full), rewrite it this way in ONE call, not many small edits. Don't rewrite a file bigger than that - you cannot have read it all, so use \`editFile(edits: [...])\` section by section instead.
-- CHANGE existing code: \`editFile(path, oldString, newString)\` - oldString = exact text from readFile, newString = its replacement (change only what differs).
-- ADD new code (method/import): \`insertCode(path, insertAfter, newString)\` - insertAfter = a short unique existing line, newString = ONLY the new code. Do NOT copy the surrounding block.
-- Several changes to ONE file at once: \`editFile(path, edits: [ {oldString, newString} | {insertAfter, newString}, ... ])\`.
-On "String not found", readFile and copy the exact text - never retry the same string.
+- CHANGE existing code: \`editFile(path, oldString, newString)\` - oldString = exact text from readFile, newString = its replacement (change only what differs). Add \`replaceAll: true\` to change it everywhere in the file - one call, works at any file size. Set newString to "" to DELETE the matched lines.
+- ADD new code (method/import): \`insertCode(path, insertAfter, newString)\` - insertAfter = a short unique existing line, newString = ONLY the new code. Do NOT copy the surrounding block. insertBefore adds above instead; anchor on the file's last/first line to append/prepend.
+- Several changes to ONE file at once: \`editFile(path, edits: [ {oldString, newString} | {insertAfter, newString}, ... ])\` - in order, all-or-nothing, non-overlapping. Never send edits[] AND a top-level oldString/newString in the same call.
+- CREATE a file, or fully rewrite one: \`createFile(path, content)\` - if the file exists it is replaced entirely by \`content\`, so send the COMPLETE file. There is no \`overwrite\` flag and nothing to confirm; never re-send the same content just to add one. Parent folders automatic - no mkdir. For a change touching most of a file you can read in full (under ~${READ_FILE_MAX_LINES} lines), rewrite it this way in ONE call, not many small edits. Above that size you cannot have read it all, so a rewrite much shorter than the original is refused - use \`replaceAll\`, or \`editFile(edits: [...])\` section by section.
+On "String not found", readFile and copy the exact text - never retry the same string; if the change may already have been applied, check the file before retrying.
 4. Run commands/builds/tests with \`run_in_terminal\`. Check edits with \`readLints\` and fix what it finds.
 
 Rules:

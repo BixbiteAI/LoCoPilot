@@ -164,8 +164,14 @@ export class CreateFileTool implements IToolImpl {
 
 		try {
 			const read = await readContentForEdit(this.services, fileUri);
-			const fileExists = !(hasKey(read, { notFound: true }));
-			const currentContent = hasKey(read, { content: true }) ? read.content : '';
+			// Something is there but unreadable: never fall through to the write. Whether this is a
+			// create or a full replacement depends on the current content, and without it a "create"
+			// would silently become a wholesale overwrite of a file that was never read.
+			if (hasKey(read, { readError: true })) {
+				return { content: [{ kind: 'text', value: `Error: "${params.path}" could not be read (${read.readError}), so it cannot be safely written - if a file is already there, writing now would replace contents you have not seen. Nothing was written. Next: check the path with listDirectory, and that it is not a directory, locked, or lacking permission.` }], toolResultError: read.readError };
+			}
+			const fileExists = hasKey(read, { content: true });
+			const currentContent = fileExists ? read.content : '';
 
 			if (!fileExists) {
 				// Guard the "creating a directory as a file" mistake: empty, extension-less, unknown name.

@@ -68,8 +68,9 @@ export function createInsertCodeToolData(): IToolData {
 		displayName: localize('tool.insertCode.displayName', 'Insert code'),
 		userDescription: localize('tool.insertCode.userDescription', 'Add code to an existing file next to an anchor line'),
 		modelDescription: 'ADD code to an EXISTING file without replacing anything. Params: path, insertAfter (or insertBefore), newString.\n\n' +
-			'Set insertAfter to a short UNIQUE existing line copied from readFile, and put ONLY the new code in newString (the anchor line is kept; newString is inserted next to it). Use this to add a new method/function/import - do NOT copy the surrounding block. Use insertBefore to insert above the anchor instead.\n\n' +
-			'To CHANGE existing text use editFile; to create a file use createFile.',
+			'Set insertAfter to a short UNIQUE existing line copied from readFile, and put ONLY the new code in newString (the anchor line is kept; newString is inserted next to it). Use this to add a new method/function/import - do NOT copy the surrounding block. Use insertBefore to insert above the anchor instead. Send exactly ONE of insertAfter/insertBefore.\n\n' +
+			'- APPEND to the end of a file: insertAfter = its last line. PREPEND: insertBefore = its first line. (readFile that end of the file first to copy the anchor exactly.)\n' +
+			'- To CHANGE existing text use editFile; to create a file use createFile. For several inserts, or inserts mixed with replaces, use editFile edits[] so they apply atomically.',
 		source: ToolDataSource.Internal,
 		inputSchema,
 		canRequestPreApproval: true,
@@ -142,8 +143,12 @@ export class InsertCodeTool implements IToolImpl {
 
 		try {
 			const read = await readContentForEdit(this.services, fileUri);
+			if (hasKey(read, { readError: true })) {
+				return { content: [{ kind: 'text', value: `Error: "${params.path}" exists but could not be read (${read.readError}). Nothing was written. Next: check it is not a directory, locked, or lacking permission - do NOT recreate it with createFile, which would replace contents you have not seen.` }], toolResultError: read.readError };
+			}
 			if (hasKey(read, { notFound: true })) {
-				return { content: [{ kind: 'text', value: `Error: "${params.path}" does not exist. Next: create it with createFile(path, content) first.` }], toolResultError: 'File does not exist' };
+				// Verify the path before suggesting creation - see the matching note in fileEditTool.
+				return { content: [{ kind: 'text', value: `Error: "${params.path}" does not exist. Next: check the path first - findFiles or listDirectory to locate the real file. Only if it genuinely should not exist yet, create it with createFile(path, content).` }], toolResultError: 'File does not exist' };
 			}
 			const currentContent = read.content;
 

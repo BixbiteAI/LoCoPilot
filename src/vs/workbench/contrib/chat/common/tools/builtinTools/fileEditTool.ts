@@ -50,15 +50,15 @@ export function createEditFileToolData(): IToolData {
 			},
 			newString: {
 				type: 'string',
-				description: 'The replacement text for oldString. Change only what differs. Use an empty string ("") to DELETE the matched text.'
+				description: 'The replacement text for oldString. Change only what differs. Use an empty string ("") to DELETE the matched text (whole matched lines are removed, leaving no blank line behind).'
 			},
 			replaceAll: {
 				type: 'boolean',
-				description: 'Optional: replace every occurrence of oldString (default false = exactly one match).'
+				description: 'Optional: replace every occurrence of oldString (default false = exactly one match). Works across the WHOLE file at any size, without reading it all first.'
 			},
 			edits: {
 				type: 'array',
-				description: 'Optional: apply MULTIPLE changes to this file in ONE atomic call (all apply or none). When provided, oldString/newString are ignored. Each item is a REPLACE {oldString, newString, replaceAll?} or an INSERT {insertAfter|insertBefore, newString}. The file "path" stays top-level - do NOT put path in a patch.',
+				description: 'Optional: apply MULTIPLE changes to this file in ONE atomic call (all apply or none). Use EITHER edits[] OR top-level oldString/newString - never both in the same call. Each item is a REPLACE {oldString, newString, replaceAll?} or an INSERT {insertAfter|insertBefore, newString}. Patches apply IN ORDER, each against the file as the previous patches left it, so they must target separate, non-overlapping places. The file "path" stays top-level - do NOT put path in a patch.',
 				items: {
 					type: 'object',
 					properties: {
@@ -82,11 +82,13 @@ export function createEditFileToolData(): IToolData {
 		icon: ThemeIcon.fromId(Codicon.edit.id),
 		displayName: localize('tool.editFile.displayName', 'Edit file'),
 		userDescription: localize('tool.editFile.userDescription', 'Edit an existing file by replacing text (one change or several at once)'),
-		modelDescription: 'Change text in an EXISTING file. Params: path, oldString, newString, replaceAll?, or edits[].\n\n' +
-			'- ONE change: set oldString to the exact text from readFile and newString to its replacement. Change only the lines that differ. replaceAll: true replaces every occurrence.\n' +
-			'- SEVERAL changes at once (atomic): pass edits: [{oldString, newString} | {insertAfter|insertBefore, newString}, ...]. Applied in order; all must apply or none do. Keep path at the TOP LEVEL.\n' +
-			'- To CREATE a file use createFile; to ADD code without replacing use insertCode (or an insert patch in edits[]).\n' +
-			'- On "String not found", copy the exact current text from readFile - do not retry the same oldString.',
+		modelDescription: 'Change text in an EXISTING file. Params: path, oldString, newString, replaceAll?, or edits[]. Works on a file of ANY size - it never has to be read in full first.\n\n' +
+			'- ONE change: set oldString to the exact text from readFile and newString to its replacement. Change only the lines that differ.\n' +
+			'- SEVERAL changes at once (atomic): pass edits: [{oldString, newString} | {insertAfter|insertBefore, newString}, ...]. Applied in order; all must apply or none do. Send EITHER edits[] OR top-level oldString/newString, never both. Keep path at the TOP LEVEL.\n' +
+			'- RENAME/replace something everywhere: one call with replaceAll: true. This covers the whole file however large it is - do NOT walk it section by section for this.\n' +
+			'- DELETE a block or line range: oldString = the text to remove, newString = "". The whole matched lines are removed.\n' +
+			'- To CREATE a file use createFile. To ADD code: a single insert is insertCode; use an insert patch inside edits[] only to mix inserts and replaces in one atomic call.\n' +
+			'- On "String not found": readFile and copy the exact current text - never retry the same oldString. If the change may already have been applied, readFile and check before retrying at all.',
 		source: ToolDataSource.Internal,
 		inputSchema,
 		canRequestPreApproval: true,
@@ -171,8 +173,13 @@ export class EditFileTool implements IToolImpl {
 
 		try {
 			const read = await readContentForEdit(this.services, fileUri);
+			if (hasKey(read, { readError: true })) {
+				return { content: [{ kind: 'text', value: `Error: "${params.path}" exists but could not be read (${read.readError}). Nothing was written. Next: check it is not a directory, locked, or lacking permission - do NOT recreate it with createFile, which would replace contents you have not seen.` }], toolResultError: read.readError };
+			}
 			if (hasKey(read, { notFound: true })) {
-				return { content: [{ kind: 'text', value: `Error: "${params.path}" does not exist, so there is nothing to edit. Next: create it with createFile(path, content), then edit.` }], toolResultError: 'File does not exist' };
+				// The path being wrong is at least as likely as the file being missing, so verify BEFORE
+				// suggesting createFile - a typo'd path sent straight to createFile just leaves a stray file.
+				return { content: [{ kind: 'text', value: `Error: "${params.path}" does not exist, so there is nothing to edit. Next: check the path first - findFiles or listDirectory to locate the real file, then edit that. Only if the file genuinely should not exist yet, create it with createFile(path, content).` }], toolResultError: 'File does not exist' };
 			}
 			const currentContent = read.content;
 
@@ -190,6 +197,17 @@ export class EditFileTool implements IToolImpl {
 				return { content: [{ kind: 'text', value: `Error: You provided edits[] but no patch was valid. Each patch needs "newString" AND either "oldString" (replace) or "insertAfter"/"insertBefore" (add). Next: resend a well-formed edits[].` }], toolResultError: 'No valid edits' };
 			}
 			if (editsArray.length > 0) {
+				// Both call shapes at once. This used to silently drop the top-level pair and then report
+				// "Successfully applied N edit(s)" - a false success for a change that was never made, which
+				// is the worst outcome available here: the model believes it landed and moves on. Absorb it
+				// when it is merely a duplicate of a patch already in the batch (the common, harmless case);
+				// otherwise write nothing and make the model resolve the ambiguity.
+				if (typeof params.oldString === 'string' && params.oldString.length > 0) {
+					const duplicated = editsArray.some(e => e.oldString === params.oldString && e.newString === params.newString);
+					if (!duplicated) {
+						return { content: [{ kind: 'text', value: `Error: You sent BOTH a top-level oldString/newString AND edits[] for "${params.path}". Nothing was written, because it is unclear whether the top-level change is a separate edit or a duplicate of one in edits[]. Next: resend ONE call - either put every change in edits[] (including this one), or send the single oldString/newString with no edits[].` }], toolResultError: 'Both single edit and edits[] provided' };
+					}
+				}
 				const batch = applyPatchBatch(currentContent, editsArray);
 				if (hasKey(batch, { error: true })) {
 					return { content: [{ kind: 'text', value: `Error: ${batch.error} No changes were written (all-or-nothing). Next: readFile "${params.path}" to get the exact current text, fix that patch, and resend the whole edits[] call.` }], toolResultError: 'Multi-edit patch failed' };
