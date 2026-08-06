@@ -83,18 +83,64 @@ function isReleaseArchive(name) {
 	return name.endsWith('.zip') || name.endsWith('.tar.gz');
 }
 
-async function resolveAssetUrl(assetMatch) {
-	const relUrl = LLAMA_BUILD === 'latest'
-		? `https://api.github.com/repos/${REPO}/releases/latest`
-		: `https://api.github.com/repos/${REPO}/releases/tags/${LLAMA_BUILD}`;
-	const release = await fetchJson(relUrl);
-	const assets = release.assets || [];
-	const match = assets.find(a => a.name.includes(assetMatch) && isReleaseArchive(a.name));
-	if (!match) {
-		const names = assets.map(a => a.name).join('\n  ');
-		throw new Error(`No asset matching "${assetMatch}" in release ${release.tag_name}. Available:\n  ${names}`);
+function findAsset(release, assetMatch) {
+	return (release.assets || []).find(a => a.name.includes(assetMatch) && isReleaseArchive(a.name));
+}
+
+// How many recent releases to consider when LLAMA_BUILD is "latest" (see resolveAssetUrl).
+const RELEASE_SCAN_COUNT = 20;
+
+let releaseListCache;  // recent releases, newest first
+let chosenTag;         // tag an earlier target resolved to, so one run ships one llama.cpp build
+
+async function recentReleases() {
+	if (!releaseListCache) {
+		const list = await fetchJson(`https://api.github.com/repos/${REPO}/releases?per_page=${RELEASE_SCAN_COUNT}`);
+		releaseListCache = list.filter(r => !r.draft);
 	}
-	return { url: match.browser_download_url, name: match.name, tag: release.tag_name };
+	return releaseListCache;
+}
+
+// Resolves the download URL for one platform asset.
+//
+// llama.cpp publishes a release tag BEFORE its CI has finished uploading the per-platform
+// archives, and an upload job sometimes fails outright - e.g. b10297 sits at the tip with
+// only cudart-llama-bin-win-cuda-12.4-x64.zip while every neighbouring release has 25
+// assets. Resolving "latest" to a single release therefore fails the build for reasons that
+// have nothing to do with our code. So for "latest" we scan back through recent releases and
+// take the newest one that actually carries the asset this target needs. An explicit
+// LLAMA_BUILD tag is still honoured exactly, with no fallback - a pin should stay pinned.
+async function resolveAssetUrl(assetMatch) {
+	if (LLAMA_BUILD !== 'latest') {
+		const release = await fetchJson(`https://api.github.com/repos/${REPO}/releases/tags/${LLAMA_BUILD}`);
+		const match = findAsset(release, assetMatch);
+		if (!match) {
+			const names = (release.assets || []).map(a => a.name).join('\n  ');
+			throw new Error(`No asset matching "${assetMatch}" in release ${release.tag_name}. Available:\n  ${names}`);
+		}
+		return { url: match.browser_download_url, name: match.name, tag: release.tag_name };
+	}
+
+	const releases = await recentReleases();
+	if (!releases.length) { throw new Error(`No releases found for ${REPO}`); }
+
+	// Prefer the tag an earlier target already settled on, so the CPU and Vulkan engines in one
+	// run come from the same llama.cpp build, then fall back to newest-first.
+	const preferred = chosenTag && releases.find(r => r.tag_name === chosenTag);
+	const ordered = preferred ? [preferred, ...releases.filter(r => r !== preferred)] : releases;
+
+	for (const release of ordered) {
+		const match = findAsset(release, assetMatch);
+		if (!match) { continue; }
+		if (release.tag_name !== releases[0].tag_name) {
+			process.stdout.write(`  note: release ${releases[0].tag_name} has no "${assetMatch}" asset yet, using ${release.tag_name}\n`);
+		}
+		chosenTag = release.tag_name;
+		return { url: match.browser_download_url, name: match.name, tag: release.tag_name };
+	}
+
+	const scanned = releases.map(r => r.tag_name).join(', ');
+	throw new Error(`No asset matching "${assetMatch}" in the last ${releases.length} releases of ${REPO} (${scanned}). Set LLAMA_BUILD to a tag that has it.`);
 }
 
 async function download(url, dest) {
