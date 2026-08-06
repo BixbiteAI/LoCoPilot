@@ -181,14 +181,27 @@ export class CreateFileTool implements IToolImpl {
 				}
 				progress.report({ message: buildFileLinkInvocationMessage(localize('createFile.creating', "Creating file {0}", '{0}'), fileName, fileUri) });
 				const lines = params.content.split('\n').length;
-				// Write a NEW file straight to disk. Routing a not-yet-existing file through the chat editing
-				// session makes it a ModifiedDocumentEntry (in-memory), whose editor-overlay integration throws
-				// "Unexpected type" and wedges the session; the file also never lands on disk for the next turn.
-				// A brand-new file has nothing to diff against, so a direct write is both correct and safe.
+				const createdMessage = `Successfully created file "${params.path}" (${lines} lines). Proceed to the next step or goal.`;
+
+				// A brand-new file goes through the chat editing session like every other edit. It was writing
+				// straight to disk instead, on the grounds that a new file "has nothing to diff against" - but
+				// the session is not only about the diff. Handing it a textEdit for a path that does not exist
+				// makes it create the entry with ChatEditKind.Created, which sets `createdInRequestId`, and THAT
+				// is what makes the file undoable: rejecting or restoring past that request DELETES the file
+				// (chatEditingModifiedDocumentEntry._doReject) instead of leaving an orphan behind. It also
+				// records a FileOperationType.Create in the checkpoint timeline, so the file becomes part of the
+				// request's changed-file set rather than being invisible to review and restore.
+				//
+				// Notebooks stay on the direct write: a not-yet-existing .ipynb has no notebook model yet, so
+				// commitEdits cannot detect it is a notebook and would push plain text edits at it.
+				if (!this.notebookService.hasSupportedNotebooks(fileUri)) {
+					const insertAtStart = [{ range: { startLineNumber: 1, startColumn: 1, endLineNumber: 1, endColumn: 1 }, text: params.content }];
+					return await commitEdits(this.services, invocation, fileUri, params.path, insertAtStart, params.content, createdMessage, true);
+				}
 				await this.fileService.createFile(fileUri, VSBuffer.fromString(params.content), { overwrite: false });
 				revealInEditor(this.editorService, fileUri);
 				const lintFailure = await getLintFailureAfterEdit(this.markerService, fileUri, params.path);
-				return lintFailure ?? { content: [{ kind: 'text', value: `Successfully created file "${params.path}" (${lines} lines). Proceed to the next step or goal.` }] };
+				return lintFailure ?? { content: [{ kind: 'text', value: createdMessage }] };
 			}
 
 			// --- File exists: replace it. There is no confirmation flag by design - "does this file
