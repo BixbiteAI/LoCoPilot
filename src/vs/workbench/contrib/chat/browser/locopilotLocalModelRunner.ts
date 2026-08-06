@@ -5109,9 +5109,10 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 			return;
 		}
 		const model = this.customLanguageModelsService.getCustomModels().find(m => m.id === modelId);
-		// Only pre-warm models we actually launch a managed server for (GGUF/MLX). Ollama/localhost/cloud
-		// manage their own lifecycle, so there is nothing to warm here.
-		if (!model || !model.localPath || (model.provider !== 'huggingface' && model.provider !== 'localhost')) {
+		// Only pre-warm models we actually launch a managed server for (GGUF/MLX). Ollama, custom endpoints
+		// (provider id `localhost`) and cloud manage their own lifecycle, so there is nothing to warm here -
+		// and trying would launch a managed server for a URL we do not own.
+		if (!model || !model.localPath || model.provider !== 'huggingface') {
 			return;
 		}
 		this._log(`[LoCoPilot Runner] Pre-warming model ${modelId} in the background.`);

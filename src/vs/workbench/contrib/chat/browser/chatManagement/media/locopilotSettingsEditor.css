@@ -708,6 +708,35 @@
 	max-width: 80px;
 }
 
+/* Custom endpoint: probe result sits inline, to the right of the context-window input. */
+.locopilot-settings-editor .endpoint-probe-status {
+	font-size: 12px;
+	line-height: 1.4;
+	color: var(--vscode-descriptionForeground);
+	/* Takes the row's remaining width and wraps within it, so a long message never stretches the card. */
+	flex: 1 1 0;
+	min-width: 0;
+	overflow-wrap: anywhere;
+}
+
+/* The context-window row pairs a narrow numeric input with that status text. */
+.locopilot-settings-editor .form-field-tokens .form-input-with-suffix {
+	align-items: center;
+	gap: 10px;
+}
+
+.locopilot-settings-editor .endpoint-probe-status.ok {
+	color: var(--vscode-charts-green, var(--vscode-testing-iconPassed));
+}
+
+.locopilot-settings-editor .endpoint-probe-status.warn {
+	color: var(--vscode-notificationsWarningIcon-foreground, var(--vscode-editorWarning-foreground));
+}
+
+.locopilot-settings-editor .endpoint-probe-status.error {
+	color: var(--vscode-notificationsErrorIcon-foreground, var(--vscode-editorError-foreground));
+}
+
 /* LoCoPilot Settings tab icon: Bixbite logo (black in light theme, white in dark) - same as Welcome */
 .monaco-workbench .part.editor > .content .editor-group-container > .title .tabs-container > .tab .tab-label .monaco-icon-label-iconpath.codicon-locopilot-settings-editor-label-icon {
 	font-size: 0;

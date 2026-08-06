@@ -18,7 +18,7 @@ import { CancellationToken } from '../../../../../base/common/cancellation.js';
 import { AddCustomModelEditorInput } from './addCustomModelEditorInput.js';
 import { Button } from '../../../../../base/browser/ui/button/button.js';
 import { InputBox } from '../../../../../base/browser/ui/inputbox/inputBox.js';
-import { ICustomLanguageModelsService, getCustomModelListLabel } from '../../common/customLanguageModelsService.js';
+import { ICustomLanguageModelsService, getCustomModelListLabel, DEFAULT_CONTEXT_WINDOW_LOCAL } from '../../common/customLanguageModelsService.js';
 import { IDialogService } from '../../../../../platform/dialogs/common/dialogs.js';
 import { Dimension } from '../../../../../base/browser/dom.js';
 import { IContextViewService } from '../../../../../platform/contextview/browser/contextView.js';
@@ -26,6 +26,7 @@ import { SelectBox, ISelectOptionItem, ISelectData } from '../../../../../base/b
 import { defaultButtonStyles, getInputBoxStyle, getSelectBoxStyles } from '../../../../../platform/theme/browser/defaultStyles.js';
 import { settingsSelectBackground, settingsSelectBorder, settingsSelectForeground, settingsSelectListBorder, settingsTextInputBackground, settingsTextInputBorder, settingsTextInputForeground } from '../../../preferences/common/settingsEditorColorRegistry.js';
 import { toErrorMessage } from '../../../../../base/common/errorMessage.js';
+import { ENDPOINT_FALLBACK_CONTEXT_WINDOW } from '../locopilotEndpointProbe.js';
 
 const $ = DOM.$;
 
@@ -49,9 +50,13 @@ const CLOUD_PROVIDERS: ISelectOptionItem[] = [
 	{ text: 'Hugging Face', description: '' },
 ];
 
+/** Display label for the custom-endpoint provider; the id persisted on the model stays `localhost`. */
+const CUSTOM_ENDPOINT_LABEL = 'Custom Endpoint';
+const CUSTOM_ENDPOINT_PROVIDER_ID = 'localhost';
+
 const LOCAL_PROVIDERS: ISelectOptionItem[] = [
 	{ text: 'HuggingFace', description: '' },
-	{ text: 'Localhost', description: '' },
+	{ text: CUSTOM_ENDPOINT_LABEL, description: '' },
 ];
 
 export class AddCustomModelEditor extends EditorPane {
@@ -72,6 +77,8 @@ export class AddCustomModelEditor extends EditorPane {
 	private displayNameInputBox!: InputBox;
 	private localhostModelIdContainer!: HTMLElement;
 	private localhostModelIdInputBox!: InputBox;
+	private contextWindowContainer!: HTMLElement;
+	private contextWindowInputBox!: InputBox;
 	private hfRoutingContainer!: HTMLElement;
 	private hfFastestCheckbox!: HTMLInputElement;
 	private addButton!: Button;
@@ -186,14 +193,26 @@ export class AddCustomModelEditor extends EditorPane {
 		this.localhostModelIdContainer = DOM.append(formContainer, $('.form-field'));
 		this.localhostModelIdContainer.style.display = 'none';
 		const lmLabel = DOM.append(this.localhostModelIdContainer, $('label.form-label'));
-		lmLabel.textContent = localize('addCustomModel.localhostServerModelId', 'Server model id');
-		const lmHelp = DOM.append(this.localhostModelIdContainer, $('span.form-help'));
-		lmHelp.textContent = localize('addCustomModel.localhostServerModelIdHelp', 'The OpenAI `model` field your server expects (see GET /v1/models).');
+		lmLabel.textContent = localize('addCustomModel.localhostServerModelId', 'Server model id (optional)');
 		const lmInputWrap = DOM.append(this.localhostModelIdContainer, $('.form-input-container'));
 		this.localhostModelIdInputBox = this._register(new InputBox(lmInputWrap, this.contextViewService, {
-			placeholder: localize('addCustomModel.localhostServerModelIdPlaceholder', 'e.g. Qwen/Qwen3-4B-MLX-4bit'),
+			placeholder: localize('addCustomModel.localhostServerModelIdPlaceholder', 'Only needed if your server requires a specific id'),
 			inputBoxStyles: settingsStyleInputBox
 		}));
+
+		// Context window: required for a custom endpoint, because LoCoPilot does not run that server and so
+		// cannot read back the window it launched with. Guessing high makes the server silently truncate the
+		// prompt from the left - dropping the instructions first - with no error anywhere.
+		this.contextWindowContainer = DOM.append(formContainer, $('.form-field'));
+		this.contextWindowContainer.style.display = 'none';
+		const cwLabel = DOM.append(this.contextWindowContainer, $('label.form-label'));
+		cwLabel.textContent = localize('addCustomModel.contextWindow', 'Context window');
+		const cwInputWrap = DOM.append(this.contextWindowContainer, $('.form-input-container'));
+		this.contextWindowInputBox = this._register(new InputBox(cwInputWrap, this.contextViewService, {
+			placeholder: String(DEFAULT_CONTEXT_WINDOW_LOCAL),
+			inputBoxStyles: settingsStyleInputBox
+		}));
+		this.contextWindowInputBox.inputElement.setAttribute('inputmode', 'numeric');
 
 		// Routing policy toggle (Hugging Face cloud only): off = cheapest, on = fastest
 		this.hfRoutingContainer = DOM.append(formContainer, $('.form-field'));
@@ -242,7 +261,7 @@ export class AddCustomModelEditor extends EditorPane {
 		const tokenContainer = this.tokenInputBox.element.parentElement?.parentElement;
 		const providers = this.currentModelType === 'cloud' ? CLOUD_PROVIDERS : LOCAL_PROVIDERS;
 		const provider = providers[this.currentProviderIndex];
-		const isLocalhost = this.currentModelType === 'local' && provider.text.toLowerCase() === 'localhost';
+		const isEndpoint = this.currentModelType === 'local' && provider.text === CUSTOM_ENDPOINT_LABEL;
 		const isHfCloud = this.currentModelType === 'cloud' && provider.text === 'Hugging Face';
 
 		if (this.hfRoutingContainer) {
@@ -257,16 +276,21 @@ export class AddCustomModelEditor extends EditorPane {
 				tokenContainer.style.display = 'none';
 			}
 		} else {
+			// A custom endpoint may require a bearer token (llama-server --api-key, vLLM, a reverse proxy);
+			// optional, since a bare loopback server needs none.
 			if (apiKeyContainer) {
-				apiKeyContainer.style.display = 'none';
+				apiKeyContainer.style.display = isEndpoint ? '' : 'none';
 			}
-			// Hide token field for localhost, show for HuggingFace
+			// Hide token field for a custom endpoint, show for HuggingFace
 			if (tokenContainer) {
-				tokenContainer.style.display = isLocalhost ? 'none' : '';
+				tokenContainer.style.display = isEndpoint ? 'none' : '';
 			}
 		}
 		if (this.localhostModelIdContainer) {
-			this.localhostModelIdContainer.style.display = isLocalhost ? '' : 'none';
+			this.localhostModelIdContainer.style.display = isEndpoint ? '' : 'none';
+		}
+		if (this.contextWindowContainer) {
+			this.contextWindowContainer.style.display = isEndpoint ? '' : 'none';
 		}
 
 		// Update model name label when fields change
@@ -280,11 +304,11 @@ export class AddCustomModelEditor extends EditorPane {
 
 		const providers = this.currentModelType === 'cloud' ? CLOUD_PROVIDERS : LOCAL_PROVIDERS;
 		const provider = providers[this.currentProviderIndex];
-		const isLocalhost = this.currentModelType === 'local' && provider.text.toLowerCase() === 'localhost';
+		const isEndpoint = this.currentModelType === 'local' && provider.text === CUSTOM_ENDPOINT_LABEL;
 
-		if (isLocalhost) {
-			this.modelNameLabel.textContent = localize('addCustomModel.localhostUrl', 'Localhost URL');
-			this.modelNameInputBox.setPlaceHolder(localize('addCustomModel.localhostUrlPlaceholder', 'e.g., http://localhost:8080/v1/chat/completions'));
+		if (isEndpoint) {
+			this.modelNameLabel.textContent = localize('addCustomModel.endpointUrl', 'Endpoint URL');
+			this.modelNameInputBox.setPlaceHolder(localize('addCustomModel.endpointUrlPlaceholder', 'e.g., http://192.168.1.50:8080/v1/chat/completions'));
 		} else {
 			this.modelNameLabel.textContent = localize('addCustomModel.modelName', 'Model Name');
 			this.modelNameInputBox.setPlaceHolder(localize('addCustomModel.modelNamePlaceholder', 'e.g., gpt-4, claude-3-opus, llama-2-7b'));
@@ -303,6 +327,7 @@ export class AddCustomModelEditor extends EditorPane {
 		this.modelNameInputBox.value = '';
 		this.displayNameInputBox.value = '';
 		this.localhostModelIdInputBox.value = '';
+		this.contextWindowInputBox.value = '';
 		this.apiKeyInputBox.value = '';
 		this.tokenInputBox.value = '';
 		this.hfFastestCheckbox.checked = false;
@@ -314,25 +339,46 @@ export class AddCustomModelEditor extends EditorPane {
 		const provider = providers[this.currentProviderIndex];
 		const isHfCloud = this.currentModelType === 'cloud' && provider.text === 'Hugging Face';
 		// Cloud "Hugging Face" => HF Inference Providers router. Use a distinct id so it does
-		// not collide with the local `huggingface` (GGUF/MLX) provider.
-		const providerValue = isHfCloud ? 'huggingface-cloud' : provider.text.toLowerCase().replace(/\s+/g, '');
-		const isLocalhost = providerValue === 'localhost';
+		// not collide with the local `huggingface` (GGUF/MLX) provider. The custom-endpoint entry keeps its
+		// legacy `localhost` id so existing user settings continue to resolve.
+		const providerValue = isHfCloud
+			? 'huggingface-cloud'
+			: (provider.text === CUSTOM_ENDPOINT_LABEL ? CUSTOM_ENDPOINT_PROVIDER_ID : provider.text.toLowerCase().replace(/\s+/g, ''));
+		const isEndpoint = providerValue === CUSTOM_ENDPOINT_PROVIDER_ID;
 		const modelName = this.modelNameInputBox.value.trim();
-		const localhostServerModelId = isLocalhost ? this.localhostModelIdInputBox.value.trim() : '';
+		const localhostServerModelId = isEndpoint ? this.localhostModelIdInputBox.value.trim() : '';
 		const displayNameOpt = this.displayNameInputBox.value.trim();
-		const apiKey = this.currentModelType === 'cloud' ? this.apiKeyInputBox.value.trim() : undefined;
-		// Token is only needed for HuggingFace, not for localhost
-		const token = (this.currentModelType === 'local' && !isLocalhost) ? this.tokenInputBox.value.trim() : undefined;
+		// The key field serves cloud providers and custom endpoints (optional for the latter).
+		const apiKeyRaw = this.apiKeyInputBox.value.trim();
+		const apiKey = (this.currentModelType === 'cloud' || isEndpoint) ? (apiKeyRaw || undefined) : undefined;
+		// Token is only needed for HuggingFace, not for a custom endpoint
+		const token = (this.currentModelType === 'local' && !isEndpoint) ? this.tokenInputBox.value.trim() : undefined;
 
 		// Validation
-		if (isLocalhost) {
+		let endpointContextWindow: number | undefined;
+		if (isEndpoint) {
 			if (!modelName) {
-				await this.dialogService.error(localize('addCustomModel.error.localhostUrlRequired', 'Localhost URL is required'));
+				await this.dialogService.error(localize('addCustomModel.error.endpointUrlRequired', 'Endpoint URL is required.'));
 				return;
 			}
-			if (!localhostServerModelId) {
-				await this.dialogService.error(localize('addCustomModel.error.localhostServerModelIdRequired', 'Server model id is required (OpenAI `model` field, e.g. from GET /v1/models).'));
+			if (!/^https?:\/\//i.test(modelName)) {
+				await this.dialogService.error(localize('addCustomModel.error.endpointUrlScheme', 'Enter the full endpoint URL including http:// or https:// (for example http://192.168.1.50:8080/v1/chat/completions).'));
 				return;
+			}
+			// Server model id is optional: with none set the provider sends "local", which llama.cpp ignores.
+			// Only servers that key off it (mlx_lm, vLLM) need a real value.
+			// We do not run this server, so its real context window is unknowable from here. An explicit value
+			// is honoured; otherwise fall back LOW rather than high - guessing high makes the server silently
+			// drop the oldest part of every prompt instead of reporting an error.
+			const cwRaw = this.contextWindowInputBox.value.trim();
+			if (cwRaw) {
+				if (!/^\d+$/.test(cwRaw) || Number(cwRaw) < 512) {
+					await this.dialogService.error(localize('addCustomModel.error.contextWindowNumeric', 'Context window must be a plain number of tokens of at least 512, for example {0}.', DEFAULT_CONTEXT_WINDOW_LOCAL));
+					return;
+				}
+				endpointContextWindow = Number(cwRaw);
+			} else {
+				endpointContextWindow = ENDPOINT_FALLBACK_CONTEXT_WINDOW;
 			}
 		} else if (!modelName) {
 			await this.dialogService.error(localize('addCustomModel.error.modelNameRequired', 'Model name is required'));
@@ -345,7 +391,11 @@ export class AddCustomModelEditor extends EditorPane {
 		}
 
 		try {
-			const nameFallback = isLocalhost ? localhostServerModelId : modelName;
+			// Falls back to host:port when no server model id is given, so the list entry is recognisable.
+			let nameFallback = modelName;
+			if (isEndpoint) {
+				try { nameFallback = localhostServerModelId || new URL(modelName).host; } catch { nameFallback = localhostServerModelId || modelName; }
+			}
 			const added = await this.customLanguageModelsService.addCustomModel({
 				name: nameFallback,
 				displayName: displayNameOpt || undefined,
@@ -354,7 +404,11 @@ export class AddCustomModelEditor extends EditorPane {
 				apiKey,
 				token,
 				modelName: modelName,
-				localhostOpenAiModel: isLocalhost ? localhostServerModelId : undefined,
+				localhostOpenAiModel: isEndpoint ? localhostServerModelId : undefined,
+				contextWindow: endpointContextWindow,
+				// A hand-entered window is a statement about the user's own server, so protect it from later
+				// enrichment. Every other provider derives its own and is left unmarked.
+				userOverrides: isEndpoint && this.contextWindowInputBox.value.trim() ? { contextWindow: true } : undefined,
 				hfFastest: isHfCloud ? this.hfFastestCheckbox.checked : undefined,
 			});
 
@@ -367,6 +421,7 @@ export class AddCustomModelEditor extends EditorPane {
 			this.modelNameInputBox.value = '';
 			this.displayNameInputBox.value = '';
 			this.localhostModelIdInputBox.value = '';
+			this.contextWindowInputBox.value = '';
 			this.apiKeyInputBox.value = '';
 			this.tokenInputBox.value = '';
 			this.hfFastestCheckbox.checked = false;

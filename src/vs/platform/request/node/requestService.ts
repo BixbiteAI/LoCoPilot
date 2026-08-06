@@ -44,6 +44,7 @@ export class RequestService extends AbstractRequestService implements IRequestSe
 	private proxyUrl?: string;
 	private strictSSL: boolean | undefined;
 	private authorization?: string;
+	private noProxy?: string;
 	private shellEnvErrorLogged?: boolean;
 
 	constructor(
@@ -65,10 +66,14 @@ export class RequestService extends AbstractRequestService implements IRequestSe
 		this.proxyUrl = this.getConfigValue<string>('http.proxy');
 		this.strictSSL = !!this.getConfigValue<boolean>('http.proxyStrictSSL');
 		this.authorization = this.getConfigValue<string>('http.proxyAuthorization');
+		// `http.noProxy` is a string[] setting. It was already honoured for Electron's session proxy (see
+		// windowImpl.ts) but never read on this path, so configuring it had no effect on requests made through
+		// the request service. Joined the same way here so one setting governs both.
+		this.noProxy = (this.getConfigValue<string[]>('http.noProxy') || []).map(item => item.trim()).filter(Boolean).join(',') || undefined;
 	}
 
 	async request(options: NodeRequestOptions, token: CancellationToken): Promise<IRequestContext> {
-		const { proxyUrl, strictSSL } = this;
+		const { proxyUrl, strictSSL, noProxy } = this;
 
 		let shellEnv: typeof process.env | undefined = undefined;
 		try {
@@ -84,12 +89,14 @@ export class RequestService extends AbstractRequestService implements IRequestSe
 			...process.env,
 			...shellEnv
 		};
-		const agent = options.agent ? options.agent : await getProxyAgent(options.url || '', env, { proxyUrl, strictSSL });
+		const agent = options.agent ? options.agent : await getProxyAgent(options.url || '', env, { proxyUrl, strictSSL, noProxy });
 
 		options.agent = agent;
 		options.strictSSL = strictSSL;
 
-		if (this.authorization) {
+		// Only when the request actually goes THROUGH the proxy. A bypassed request (loopback, LAN, or a
+		// no_proxy match) would otherwise hand the user's proxy credentials to a server that is not the proxy.
+		if (this.authorization && agent) {
 			options.headers = {
 				...(options.headers || {}),
 				'Proxy-Authorization': this.authorization
@@ -101,7 +108,7 @@ export class RequestService extends AbstractRequestService implements IRequestSe
 
 	async requestToFile(options: NodeRequestOptions, destinationFilePath: string, token: CancellationToken, progressRequestIdOrOnProgress?: string | RequestToFileProgressCallback): Promise<IRequestToFileResult> {
 		const onProgress = typeof progressRequestIdOrOnProgress === 'function' ? progressRequestIdOrOnProgress : undefined;
-		const { proxyUrl, strictSSL } = this;
+		const { proxyUrl, strictSSL, noProxy } = this;
 
 		let shellEnv: typeof process.env | undefined = undefined;
 		try {
@@ -114,11 +121,13 @@ export class RequestService extends AbstractRequestService implements IRequestSe
 		}
 
 		const env = { ...process.env, ...shellEnv };
-		const agent = options.agent ? options.agent : await getProxyAgent(options.url || '', env, { proxyUrl, strictSSL });
+		const agent = options.agent ? options.agent : await getProxyAgent(options.url || '', env, { proxyUrl, strictSSL, noProxy });
 		options.agent = agent;
 		options.strictSSL = strictSSL;
 
-		if (this.authorization) {
+		// Only when the request actually goes THROUGH the proxy. A bypassed request (loopback, LAN, or a
+		// no_proxy match) would otherwise hand the user's proxy credentials to a server that is not the proxy.
+		if (this.authorization && agent) {
 			options.headers = {
 				...(options.headers || {}),
 				'Proxy-Authorization': this.authorization

@@ -55,6 +55,8 @@ import { findCatalogEntryForStoredModel, getCatalogSuitability, getRecommendedRe
 // [engine-ui] Only needed by the commented-out engine dropdown in renderAgentSettings; uncomment to restore.
 // import { isMacintosh } from '../../../../../base/common/platform.js';
 import { IConfigurationService } from '../../../../../platform/configuration/common/configuration.js';
+import { IRequestService } from '../../../../../platform/request/common/request.js';
+import { LoCoPilotEndpointProbe, ENDPOINT_FALLBACK_CONTEXT_WINDOW } from '../locopilotEndpointProbe.js';
 import { ChatConfiguration } from '../../common/constants.js';
 
 const $ = DOM.$;
@@ -84,11 +86,31 @@ const CLOUD_PROVIDERS_ADD: ISelectOptionItem[] = [
 	{ text: 'OpenAI', description: '' },
 ];
 
+/**
+ * The stored provider id for the custom-endpoint entry is still `localhost` (it is persisted in user settings
+ * and matched by string across the provider, runner and model list), so the dropdown text is mapped to it
+ * explicitly rather than derived by lowercasing the label the way the other providers are.
+ */
+const CUSTOM_ENDPOINT_LABEL = 'Custom Endpoint';
+const CUSTOM_ENDPOINT_PROVIDER_ID = 'localhost';
+
 const LOCAL_PROVIDERS_ADD: ISelectOptionItem[] = [
 	{ text: 'HuggingFace', description: '' },
-	{ text: 'Localhost', description: '' },
 	{ text: 'Ollama', description: '' },
+	{ text: CUSTOM_ENDPOINT_LABEL, description: '' },
 ];
+
+/** Maps a provider dropdown label to the id persisted on the model. */
+function providerIdFromLabel(label: string, isHfCloud: boolean): string {
+	if (isHfCloud) {
+		// Distinct id so cloud HF doesn't collide with local `huggingface` (GGUF/MLX).
+		return 'huggingface-cloud';
+	}
+	if (label === CUSTOM_ENDPOINT_LABEL) {
+		return CUSTOM_ENDPOINT_PROVIDER_ID;
+	}
+	return label.toLowerCase().replace(/\s+/g, '');
+}
 
 export const locopilotSettingsSashBorder = registerColor('locopilotSettings.sashBorder', PANEL_BORDER, localize('locopilotSettingsSashBorder', "The color of the LoCoPilot Settings editor splitview sash border."));
 
@@ -221,6 +243,7 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 	private addFormModelTypeSegments: HTMLElement[] = [];
 	private addFormProviderSelectBox!: SelectBox;
 	private addFormApiKeyInputBox!: InputBox;
+	private addFormApiKeyLabel!: HTMLElement;
 	private addFormTokenInputBox!: InputBox;
 	private addFormTokenLabel!: HTMLElement;
 	private addFormModelFormatInputBox!: InputBox;
@@ -232,6 +255,16 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 	private addFormLocalhostModelIdContainer!: HTMLElement;
 	private addFormLocalhostModelIdInputBox!: InputBox;
 	private addFormContextWindowInput!: InputBox;
+	private addFormContextWindowRow!: HTMLElement;
+	/** Inline result of the automatic endpoint probe, shown beside the context-window field. */
+	private addFormEndpointProbeStatus!: HTMLElement;
+	/** Guards against overlapping probes when the URL field is edited repeatedly. */
+	private addFormEndpointProbeSeq = 0;
+	/** Model ids the last successful probe reported, offered as a datalist on the server-model-id field. */
+	private addFormEndpointModelIds: string[] = [];
+	private addFormEndpointModelIdList: HTMLDataListElement | undefined;
+	/** Context window the last successful probe reported, or undefined when the endpoint would not say. */
+	private addFormEndpointProbedContextWindow: number | undefined;
 	private addFormUseNativeToolsToggle!: Toggle;
 	private addFormUseNativeToolsContainer!: HTMLElement;
 	private addFormMtpToggle!: Toggle;
@@ -330,6 +363,7 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 		@IClipboardService private readonly clipboardService: IClipboardService,
 		@ITimerService private readonly timerService: ITimerService,
 		@IConfigurationService private readonly configurationService: IConfigurationService,
+		@IRequestService private readonly requestService: IRequestService,
 	) {
 		super(LoCoPilotSettingsEditor.ID, group, telemetryService, themeService, storageService);
 		this.agentSettingsService = agentSettingsService;
@@ -503,8 +537,8 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 		}));
 
 		const apiKeyContainer = DOM.append(card, $('.form-field'));
-		const apiKeyLabel = DOM.append(apiKeyContainer, $('label.form-label'));
-		apiKeyLabel.textContent = localize('addCustomModel.apiKey', 'API Key');
+		this.addFormApiKeyLabel = DOM.append(apiKeyContainer, $('label.form-label'));
+		this.addFormApiKeyLabel.textContent = localize('addCustomModel.apiKey', 'API Key');
 		const apiKeyInputContainer = DOM.append(apiKeyContainer, $('.form-input-container'));
 		this.addFormApiKeyInputBox = this._register(new InputBox(apiKeyInputContainer, this.contextViewService, {
 			placeholder: localize('addCustomModel.apiKeyPlaceholder', 'Enter your API key'),
@@ -541,15 +575,26 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 			placeholder: localize('addCustomModel.modelNamePlaceholder', 'e.g., gpt-4, claude-3-opus, llama-2-7b'),
 			inputBoxStyles: locopilotSettingsInputBoxStyles
 		}));
+		// For a custom endpoint this field holds the URL, so leaving it is the natural moment to ask the server
+		// what it is running. Doing it on blur rather than per-keystroke means one request for one finished URL.
+		this._register(DOM.addDisposableListener(this.addFormModelNameInputBox.inputElement, DOM.EventType.BLUR, () => {
+			if (this.addFormCurrentProviderIsEndpoint()) {
+				this.probeEndpointFromAddForm();
+			}
+		}));
 
-		// Localhost only: required OpenAI `model` string (e.g. from GET /v1/models)
+		// Custom endpoint only: the OpenAI `model` string. OPTIONAL - the endpoint is asked for its model list
+		// as soon as the URL is entered (see probeEndpointFromAddForm) and the first id is filled in here, and
+		// even with nothing set the provider falls back to sending "local", which llama.cpp ignores. It stays
+		// editable because servers that DO care (mlx_lm, vLLM) stall on a mismatched id, and because the
+		// endpoint may be offline while the user is configuring it.
 		this.addFormLocalhostModelIdContainer = DOM.append(card, $('.form-field'));
 		this.addFormLocalhostModelIdContainer.style.display = 'none';
 		const localhostModelIdLabel = DOM.append(this.addFormLocalhostModelIdContainer, $('label.form-label'));
-		localhostModelIdLabel.textContent = localize('addCustomModel.localhostServerModelId', 'Server model id');
+		localhostModelIdLabel.textContent = localize('addCustomModel.localhostServerModelId', 'Server model id (optional)');
 		const localhostModelIdInputContainer = DOM.append(this.addFormLocalhostModelIdContainer, $('.form-input-container'));
 		this.addFormLocalhostModelIdInputBox = this._register(new InputBox(localhostModelIdInputContainer, this.contextViewService, {
-			placeholder: localize('addCustomModel.localhostServerModelIdPlaceholder', 'e.g. Qwen/Qwen3-4B-MLX-4bit (JSON body "model" field)'),
+			placeholder: localize('addCustomModel.localhostServerModelIdPlaceholder', 'Detected from the endpoint; override if your server needs a specific id'),
 			inputBoxStyles: locopilotSettingsInputBoxStyles
 		}));
 
@@ -562,20 +607,24 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 			inputBoxStyles: locopilotSettingsInputBoxStyles
 		}));
 
-		// Context window is auto-derived from HF/Ollama after download (or service default), and overridden
-		// from the model list - so it is not collected on the Add form. The widget is kept (hidden) to avoid
-		// churn in the form-state helpers that still reference it.
-		const contextWindowRow = DOM.append(card, $('.form-field.form-field-tokens'));
-		contextWindowRow.style.display = 'none';
-		const contextWindowLabel = DOM.append(contextWindowRow, $('label.form-label'));
+		// Context window. Shown for Ollama and custom endpoints (both run servers LoCoPilot does not launch, so
+		// there is no launched-window to read back); hidden for HuggingFace and cloud, which derive their own.
+		// Leaving it blank is meaningful and differs per provider - see handleAddModel.
+		this.addFormContextWindowRow = DOM.append(card, $('.form-field.form-field-tokens'));
+		this.addFormContextWindowRow.style.display = 'none';
+		const contextWindowLabel = DOM.append(this.addFormContextWindowRow, $('label.form-label'));
 		contextWindowLabel.textContent = localize('addCustomModel.contextWindow', 'Context window');
-		const contextWindowWrap = DOM.append(contextWindowRow, $('.form-input-with-suffix'));
+		const contextWindowWrap = DOM.append(this.addFormContextWindowRow, $('.form-input-with-suffix'));
 		const contextWindowInputContainer = DOM.append(contextWindowWrap, $('.form-input-container'));
 		this.addFormContextWindowInput = this._register(new InputBox(contextWindowInputContainer, this.contextViewService, {
-			placeholder: String(LoCoPilotSettingsEditor.DEFAULT_CONTEXT_WINDOW),
+			// Plain token count only - no "32K" shorthand, so what is typed is exactly what is stored.
+			placeholder: String(LoCoPilotSettingsEditor.LOCAL_DEFAULT_CONTEXT_WINDOW),
 			tooltip: '',
 			inputBoxStyles: locopilotSettingsInputBoxStyles
 		}));
+		this.addFormContextWindowInput.inputElement.setAttribute('inputmode', 'numeric');
+		// The probe result reports here, inline beside the field, instead of behind a "Test connection" button.
+		this.addFormEndpointProbeStatus = DOM.append(contextWindowWrap, $('span.endpoint-probe-status'));
 		this.addFormContextWindowInput.element.style.minWidth = `${LoCoPilotSettingsEditor.TOKEN_LIMIT_INPUT_WIDTH_PX}px`;
 		this.addFormContextWindowInput.element.style.width = `${LoCoPilotSettingsEditor.TOKEN_LIMIT_INPUT_WIDTH_PX}px`;
 		this.addFormContextWindowInput.value = String(LoCoPilotSettingsEditor.DEFAULT_CONTEXT_WINDOW);
@@ -608,9 +657,11 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 		}));
 		DOM.append(mtpToggleContainer, this.addFormMtpToggle.domNode);
 
-		// Vision toggle (local models): whether the model can read image attachments. Shown for local providers
-		// so the user can declare a multimodal model up front. Auto-detection (HF/Ollama) and the runtime
-		// auto-disable can still refine this; the My Models toggle lets it be changed later.
+		// Vision toggle - HuggingFace only. Ticking it sets `visionEnabled`, which is what makes the MANAGED
+		// llama.cpp server load an --mmproj projector, so it is meaningful only for models whose server we
+		// launch. Ollama and custom endpoints run their own servers and are therefore excluded: they get vision
+		// optimistically, with the runtime disabling it per-model the first time a server rejects an image
+		// (autoDisableVision), and Ollama additionally derives it from its capabilities after pull.
 		this.addFormVisionContainer = DOM.append(card, $('.form-field'));
 		this.addFormVisionContainer.style.display = 'none';
 		const visionLabel = DOM.append(this.addFormVisionContainer, $('label.form-label'));
@@ -647,6 +698,155 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 		this.addFormUpdateModelNameLabel();
 	}
 
+	/** Clears any result from a previous "Test connection" so stale info never leaks into a different entry. */
+	private resetEndpointProbeState(): void {
+		this.addFormEndpointModelIds = [];
+		this.addFormEndpointProbedContextWindow = undefined;
+		this.syncEndpointModelIdSuggestions();
+		if (this.addFormEndpointProbeStatus) {
+			this.addFormEndpointProbeStatus.textContent = '';
+			this.addFormEndpointProbeStatus.className = 'endpoint-probe-status';
+		}
+	}
+
+	/**
+	 * Offers the model ids the probe discovered as native autocomplete on the "Server model id" field.
+	 *
+	 * A `datalist` rather than a dropdown on purpose: the field must stay free-text, because the endpoint may be
+	 * offline when the user configures it, or may serve an id it does not advertise. Discovery assists, it does
+	 * not constrain.
+	 */
+	private syncEndpointModelIdSuggestions(): void {
+		if (!this.addFormLocalhostModelIdInputBox) {
+			return;
+		}
+		const input = this.addFormLocalhostModelIdInputBox.inputElement;
+		if (this.addFormEndpointModelIds.length === 0) {
+			this.addFormEndpointModelIdList?.remove();
+			this.addFormEndpointModelIdList = undefined;
+			input.removeAttribute('list');
+			return;
+		}
+		if (!this.addFormEndpointModelIdList) {
+			const list = DOM.append(this.addFormLocalhostModelIdContainer, $('datalist')) as HTMLDataListElement;
+			list.id = 'locopilot-endpoint-model-ids';
+			this.addFormEndpointModelIdList = list;
+		}
+		DOM.clearNode(this.addFormEndpointModelIdList);
+		for (const id of this.addFormEndpointModelIds) {
+			const opt = DOM.append(this.addFormEndpointModelIdList, $('option')) as HTMLOptionElement;
+			opt.value = id;
+		}
+		input.setAttribute('list', this.addFormEndpointModelIdList.id);
+	}
+
+	private setEndpointProbeStatus(text: string, kind: 'ok' | 'warn' | 'error' | 'busy'): void {
+		if (!this.addFormEndpointProbeStatus) {
+			return;
+		}
+		this.addFormEndpointProbeStatus.textContent = text;
+		this.addFormEndpointProbeStatus.className = `endpoint-probe-status ${kind}`;
+	}
+
+	/** True when the Add form's current provider selection is the custom endpoint. */
+	private addFormCurrentProviderIsEndpoint(): boolean {
+		if (this.addFormCurrentModelType !== 'local') {
+			return false;
+		}
+		return LOCAL_PROVIDERS_ADD[this.addFormCurrentProviderIndex]?.text === CUSTOM_ENDPOINT_LABEL;
+	}
+
+	/**
+	 * Asks the endpoint what it is running and folds the answers into the form. Triggered automatically when
+	 * the URL field loses focus - there is no button, because the only sensible time to ask is once a URL has
+	 * been entered, and that moment is detectable.
+	 *
+	 * Deliberately non-destructive: anything the user already typed wins over what the server says, since they
+	 * may be configuring an endpoint that is not up yet. Only empty fields get filled in.
+	 */
+	private async probeEndpointFromAddForm(): Promise<void> {
+		const url = this.addFormModelNameInputBox.value.trim();
+		// Nothing typed yet, or obviously not a URL: stay quiet rather than nag mid-typing. handleAddModel is
+		// what actually enforces a well-formed URL.
+		if (!/^https?:\/\/.+/i.test(url)) {
+			this.resetEndpointProbeState();
+			return;
+		}
+		const apiKey = this.addFormApiKeyInputBox.value.trim() || undefined;
+		const seq = ++this.addFormEndpointProbeSeq;
+		this.setEndpointProbeStatus(localize('addCustomModel.endpointProbe.busy', 'Checking endpoint...'), 'busy');
+		try {
+			const probe = new LoCoPilotEndpointProbe(this.requestService);
+			const result = await probe.probe(url, apiKey);
+			// A newer probe (or a provider switch) started while this one was in flight - drop the stale answer.
+			if (seq !== this.addFormEndpointProbeSeq || !this.addFormCurrentProviderIsEndpoint()) {
+				return;
+			}
+			this.addFormEndpointModelIds = result.modelIds;
+			this.addFormEndpointProbedContextWindow = result.contextWindow;
+			this.syncEndpointModelIdSuggestions();
+
+			if (!result.reachable) {
+				this.setEndpointProbeStatus(result.error ?? localize('addCustomModel.endpointProbe.unreachable', 'Could not reach the endpoint.'), 'error');
+				return;
+			}
+			if (result.unauthorized) {
+				this.setEndpointProbeStatus(result.error ?? localize('addCustomModel.endpointProbe.unauthorized', 'The endpoint requires an API key.'), 'error');
+				return;
+			}
+
+			// Fill in what the server told us, without clobbering the user's own entries.
+			if (result.modelIds.length > 0 && !this.addFormLocalhostModelIdInputBox.value.trim()) {
+				this.addFormLocalhostModelIdInputBox.value = result.modelIds[0];
+			}
+			if (result.contextWindow !== undefined && !this.addFormContextWindowInput.value.trim()) {
+				this.addFormContextWindowInput.value = String(result.contextWindow);
+				this.syncAddFormContextWindowTooltip();
+			}
+
+			if (result.contextWindow !== undefined) {
+				this.setEndpointProbeStatus(localize('addCustomModel.endpointProbe.ok', 'Connected - read {0} tokens from the server.', result.contextWindow), 'ok');
+			} else {
+				// Reachable but silent about its window. Common (many servers implement only /chat/completions)
+				// and exactly the case where a wrong value causes silent left-truncation, so say so plainly.
+				this.setEndpointProbeStatus(localize('addCustomModel.endpointProbe.noCtx', "Connected, but it didn't report a context window - enter the value your server runs with."), 'warn');
+			}
+		} catch (e) {
+			if (seq === this.addFormEndpointProbeSeq) {
+				this.setEndpointProbeStatus(toErrorMessage(e), 'error');
+			}
+		}
+	}
+
+	/**
+	 * Add-form context window parser: plain token counts only.
+	 *
+	 * Distinct from {@link parseContextWindow}, which the per-model list editor uses and which also accepts a
+	 * "32K" shorthand. Here the value is a claim about what someone's server was launched with (`-c 8192`,
+	 * `--max-model-len`), so it is entered exactly as that number - no shorthand to mis-expand, and no
+	 * ambiguity about whether K means 1000 or 1024.
+	 */
+	private parseAddFormContextWindow(inputValue: string): { valid: true; value: number } | { valid: false; error: string } {
+		const s = inputValue.trim();
+		if (!/^\d+$/.test(s)) {
+			return { valid: false, error: localize('addCustomModel.error.contextWindowNumeric', 'Context window must be a plain number of tokens, for example {0}.', LoCoPilotSettingsEditor.LOCAL_DEFAULT_CONTEXT_WINDOW) };
+		}
+		const value = Number(s);
+		if (value < LoCoPilotSettingsEditor.MIN_CONTEXT_WINDOW || value > LoCoPilotSettingsEditor.MAX_CONTEXT_WINDOW) {
+			return { valid: false, error: localize('addCustomModel.error.contextWindowRange', 'Context window must be between {0} and {1}.', LoCoPilotSettingsEditor.MIN_CONTEXT_WINDOW, LoCoPilotSettingsEditor.MAX_CONTEXT_WINDOW) };
+		}
+		return { valid: true, value };
+	}
+
+	/** "http://192.168.1.50:8080/v1/chat/completions" -> "192.168.1.50:8080", for use as a list label. */
+	private endpointDisplayName(url: string): string {
+		try {
+			return new URL(url).host;
+		} catch {
+			return url;
+		}
+	}
+
 	private contextWindowTooltip(value: string): string {
 		return localize('customLanguageModels.contextWindowTooltipWithValue', 'Context window: {0} tokens. Input and output budgets are derived from this.', value);
 	}
@@ -665,9 +865,11 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 		this.addFormApiKeyInputBox.value = '';
 		this.addFormTokenInputBox.value = '';
 		this.addFormModelFormatInputBox.value = '';
+		this.addFormContextWindowInput.value = '';
 		this.addFormUseNativeToolsToggle.checked = false;
 		this.addFormMtpToggle.checked = false;
 		this.addFormVisionToggle.checked = false;
+		this.resetEndpointProbeState();
 		this.addFormUpdateInputFields();
 	}
 
@@ -699,13 +901,17 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 		const provider = providers[this.addFormCurrentProviderIndex];
 		const isHuggingFace = this.addFormCurrentModelType === 'local' && provider.text.toLowerCase() === 'huggingface';
 		const isOllama = this.addFormCurrentModelType === 'local' && provider.text.toLowerCase() === 'ollama';
-		const isLocalhost = this.addFormCurrentModelType === 'local' && provider.text.toLowerCase() === 'localhost';
+		const isEndpoint = this.addFormCurrentModelType === 'local' && provider.text === CUSTOM_ENDPOINT_LABEL;
 		const isHfCloud = this.addFormCurrentModelType === 'cloud' && provider.text === 'Hugging Face';
 		if (this.addFormLocalhostModelIdContainer) {
-			this.addFormLocalhostModelIdContainer.style.display = isLocalhost ? '' : 'none';
+			this.addFormLocalhostModelIdContainer.style.display = isEndpoint ? '' : 'none';
+		}
+		if (!isEndpoint) {
+			this.resetEndpointProbeState();
 		}
 		if (this.addFormCurrentModelType === 'cloud') {
 			if (apiKeyContainer) { apiKeyContainer.style.display = ''; }
+			if (this.addFormApiKeyLabel) { this.addFormApiKeyLabel.textContent = localize('addCustomModel.apiKey', 'API Key'); }
 			if (tokenContainer) { tokenContainer.style.display = 'none'; }
 			if (this.addFormModelFormatContainer) { this.addFormModelFormatContainer.style.display = 'none'; }
 			// Tools / MTP / context window are auto-derived or overridden from the model list, never on the Add form.
@@ -716,10 +922,17 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 			if (this.addFormHfFastestContainer) { this.addFormHfFastestContainer.style.display = isHfCloud ? '' : 'none'; }
 			// Reset HF cloud routing toggle to its default (cheapest on) when HF cloud is selected.
 			if (isHfCloud && this.addFormHfFastestToggle) { this.addFormHfFastestToggle.checked = true; }
+			if (this.addFormContextWindowRow) { this.addFormContextWindowRow.style.display = 'none'; }
 			this.addFormContextWindowInput.value = String(LoCoPilotSettingsEditor.DEFAULT_CONTEXT_WINDOW);
 		} else {
 			if (this.addFormHfFastestContainer) { this.addFormHfFastestContainer.style.display = 'none'; }
-			if (apiKeyContainer) { apiKeyContainer.style.display = 'none'; }
+			// A custom endpoint may sit behind auth (llama-server --api-key, vLLM, LiteLLM, a reverse proxy).
+			// Optional, because a bare loopback server needs none - but without the field those endpoints
+			// simply could not be used. HuggingFace/Ollama use the token field below instead.
+			if (apiKeyContainer) { apiKeyContainer.style.display = isEndpoint ? '' : 'none'; }
+			if (isEndpoint && this.addFormApiKeyLabel) {
+				this.addFormApiKeyLabel.textContent = localize('addCustomModel.endpointApiKey', 'API key (optional)');
+			}
 			// For Ollama, we reuse the token field for the Base URL
 			if (tokenContainer) {
 				tokenContainer.style.display = (isHuggingFace || isOllama) ? '' : 'none';
@@ -730,15 +943,22 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 					? 'http://localhost:11434'
 					: localize('addCustomModel.tokenPlaceholder', 'Enter your token (e.g., HuggingFace token)'));
 			}
-			// Format / Tools / MTP / context window are auto-derived (HF/Ollama) or overridden from the model list,
-			// so none are collected on the Add form for local providers either.
+			// Format / Tools / MTP are auto-derived (HF/Ollama) or overridden from the model list.
 			if (this.addFormModelFormatContainer) { this.addFormModelFormatContainer.style.display = 'none'; }
 			if (this.addFormUseNativeToolsContainer) { this.addFormUseNativeToolsContainer.style.display = 'none'; }
 			if (this.addFormMtpContainer) { this.addFormMtpContainer.style.display = 'none'; }
-			// Vision toggle is shown for all local providers so the user can declare a multimodal model up front.
-			if (this.addFormVisionContainer) { this.addFormVisionContainer.style.display = ''; }
-			// All local providers (HuggingFace, Ollama, Localhost) default to the smaller local context window.
-			this.addFormContextWindowInput.value = String(LoCoPilotSettingsEditor.LOCAL_DEFAULT_CONTEXT_WINDOW);
+			// Vision: HuggingFace only. Ticking it sets `visionEnabled`, which is what makes the MANAGED
+			// llama.cpp server load an --mmproj projector, so it only means anything for a server we launch.
+			// Ollama and custom endpoints run their own: they get vision optimistically, with the runtime
+			// disabling it per-model the first time an image is rejected (autoDisableVision), and Ollama also
+			// derives it from its own capabilities after pull.
+			if (this.addFormVisionContainer) { this.addFormVisionContainer.style.display = isHuggingFace ? '' : 'none'; }
+			// Context window: shown for Ollama and custom endpoints, whose servers LoCoPilot does not launch and
+			// whose real window it therefore cannot read back. Blank means different things per provider - see
+			// handleAddModel - so it starts empty rather than pre-filled with a number the user did not choose.
+			const showContextWindow = isEndpoint || isOllama;
+			if (this.addFormContextWindowRow) { this.addFormContextWindowRow.style.display = showContextWindow ? '' : 'none'; }
+			this.addFormContextWindowInput.value = showContextWindow ? '' : String(LoCoPilotSettingsEditor.LOCAL_DEFAULT_CONTEXT_WINDOW);
 		}
 		this.syncAddFormContextWindowTooltip();
 		this.addFormUpdateModelNameLabel();
@@ -748,16 +968,16 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 		if (!this.addFormModelNameLabel) { return; }
 		const providers = this.addFormCurrentModelType === 'cloud' ? CLOUD_PROVIDERS_ADD : LOCAL_PROVIDERS_ADD;
 		const provider = providers[this.addFormCurrentProviderIndex];
-		const isLocalhost = this.addFormCurrentModelType === 'local' && provider.text.toLowerCase() === 'localhost';
+		const isEndpoint = this.addFormCurrentModelType === 'local' && provider.text === CUSTOM_ENDPOINT_LABEL;
 		const isHuggingFace = this.addFormCurrentModelType === 'local' && provider.text.toLowerCase() === 'huggingface';
 		const isOllama = this.addFormCurrentModelType === 'local' && provider.text.toLowerCase() === 'ollama';
 		const isHfCloud = this.addFormCurrentModelType === 'cloud' && provider.text === 'Hugging Face';
 		if (isHfCloud) {
 			this.addFormModelNameLabel.textContent = localize('addCustomModel.modelName', 'Model Name');
 			this.addFormModelNameInputBox.setPlaceHolder(localize('addCustomModel.modelNamePlaceholderHfCloud', 'e.g., meta-llama/Llama-3.3-70B-Instruct'));
-		} else if (isLocalhost) {
-			this.addFormModelNameLabel.textContent = localize('addCustomModel.localhostUrl', 'Localhost URL');
-			this.addFormModelNameInputBox.setPlaceHolder(localize('addCustomModel.localhostUrlPlaceholder', 'e.g., http://localhost:1234/v1/chat/completions'));
+		} else if (isEndpoint) {
+			this.addFormModelNameLabel.textContent = localize('addCustomModel.endpointUrl', 'Endpoint URL');
+			this.addFormModelNameInputBox.setPlaceHolder(localize('addCustomModel.endpointUrlPlaceholder', 'e.g., http://192.168.1.50:8080/v1/chat/completions'));
 		} else if (isOllama) {
 			this.addFormModelNameLabel.textContent = localize('addCustomModel.ollamaModel', 'Ollama Model Name');
 			this.addFormModelNameInputBox.setPlaceHolder(localize('addCustomModel.ollamaModelPlaceholder', 'e.g., llama3, mistral, deepseek-coder'));
@@ -796,26 +1016,81 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 		const providers = this.addFormCurrentModelType === 'cloud' ? CLOUD_PROVIDERS_ADD : LOCAL_PROVIDERS_ADD;
 		const provider = providers[this.addFormCurrentProviderIndex];
 		const isHfCloud = this.addFormCurrentModelType === 'cloud' && provider.text === 'Hugging Face';
-		// Use distinct id for cloud HF so it doesn't collide with local 'huggingface' (GGUF/MLX)
-		const providerValue = isHfCloud ? 'huggingface-cloud' : provider.text.toLowerCase().replace(/\s+/g, '');
-		const isLocalhost = providerValue === 'localhost';
+		const providerValue = providerIdFromLabel(provider.text, isHfCloud);
+		const isEndpoint = providerValue === CUSTOM_ENDPOINT_PROVIDER_ID;
+		// Local (GGUF/MLX) HuggingFace - the only provider whose vision toggle is collected on this form.
+		const isHuggingFaceLocal = this.addFormCurrentModelType === 'local' && providerValue === 'huggingface';
 		const modelName = this.addFormModelNameInputBox.value.trim();
-		const apiKey = this.addFormCurrentModelType === 'cloud' ? this.addFormApiKeyInputBox.value.trim() : undefined;
-		const token = (this.addFormCurrentModelType === 'local' && !isLocalhost) ? this.addFormTokenInputBox.value.trim() : undefined;
+		// The API key field serves cloud providers AND custom endpoints (optional there - a bare loopback
+		// server needs none, but anything on a network should have one).
+		const apiKeyRaw = this.addFormApiKeyInputBox.value.trim();
+		const apiKey = (this.addFormCurrentModelType === 'cloud' || isEndpoint) ? (apiKeyRaw || undefined) : undefined;
+		const token = (this.addFormCurrentModelType === 'local' && !isEndpoint) ? this.addFormTokenInputBox.value.trim() : undefined;
 
 		// For Ollama, token field holds the Base URL
 		const ollamaUrl = (providerValue === 'ollama' && token) ? token : 'http://localhost:11434';
 
 		const displayNameOpt = this.addFormDisplayNameInputBox.value.trim();
-		const localhostServerModelId = isLocalhost ? this.addFormLocalhostModelIdInputBox.value.trim() : '';
-		if (isLocalhost) {
+		const localhostServerModelId = isEndpoint ? this.addFormLocalhostModelIdInputBox.value.trim() : '';
+		// Resolved below for the endpoint provider only; every other provider derives its own window.
+		let endpointContextWindow: number | undefined;
+		let endpointContextWindowIsUserSet = false;
+		if (isEndpoint) {
 			if (!modelName) {
-				await this.dialogService.error(localize('addCustomModel.error.urlRequired', 'URL is required'));
+				await this.dialogService.error(localize('addCustomModel.error.endpointUrlRequired', 'Endpoint URL is required.'));
 				return;
 			}
-			if (!localhostServerModelId) {
-				await this.dialogService.error(localize('addCustomModel.error.localhostServerModelIdRequired', 'Server model id is required (the name your OpenAI-compatible server expects in the request body, e.g. from GET /v1/models).'));
+			if (!/^https?:\/\//i.test(modelName)) {
+				await this.dialogService.error(localize('addCustomModel.error.endpointUrlScheme', 'Enter the full endpoint URL including http:// or https:// (for example http://192.168.1.50:8080/v1/chat/completions).'));
 				return;
+			}
+			// Server model id is intentionally NOT required: the probe fills it from GET /v1/models, and with
+			// nothing set the provider sends "local", which llama.cpp ignores. Only servers that key off it
+			// (mlx_lm, vLLM) need it, and those advertise it - so the probe has it too.
+			// Context window resolution, in the order that keeps us honest:
+			//   1. what the user typed  - an explicit statement about their own server, so it wins outright
+			//   2. what the probe read  - the server's own answer
+			//   3. ask, rather than assume - guessing high is the failure mode that silently drops the system
+			//      prompt, so we do not quietly default here the way the derivable providers can.
+			const typed = this.addFormContextWindowInput.value.trim();
+			if (typed) {
+				const parsed = this.parseAddFormContextWindow(typed);
+				if (!parsed.valid) {
+					await this.dialogService.error(parsed.error);
+					return;
+				}
+				endpointContextWindow = parsed.value;
+				endpointContextWindowIsUserSet = true;
+			} else if (this.addFormEndpointProbedContextWindow !== undefined) {
+				endpointContextWindow = this.addFormEndpointProbedContextWindow;
+			} else {
+				const { confirmed } = await this.dialogService.confirm({
+					message: localize('addCustomModel.endpointNoContextWindow', 'Add this endpoint with a {0}-token context window?', ENDPOINT_FALLBACK_CONTEXT_WINDOW),
+					detail: localize('addCustomModel.endpointNoContextWindowDetail', "LoCoPilot doesn't run this server, so it can't tell how much context the model holds, and the endpoint didn't report one. If the value is set too high the server quietly drops the oldest part of every prompt - including the instructions and tool definitions - and the model behaves oddly with no error. A conservative {0} is used unless you enter the real value.", ENDPOINT_FALLBACK_CONTEXT_WINDOW),
+					primaryButton: localize('addCustomModel.endpointNoContextWindowConfirm', 'Add with {0}', ENDPOINT_FALLBACK_CONTEXT_WINDOW),
+				});
+				if (!confirmed) {
+					return;
+				}
+				endpointContextWindow = ENDPOINT_FALLBACK_CONTEXT_WINDOW;
+			}
+		} else if (providerValue === 'ollama') {
+			if (!modelName) {
+				await this.dialogService.error(localize('addCustomModel.error.modelNameRequired', 'Model name is required'));
+				return;
+			}
+			// Ollama CAN tell us its window (from /api/show after the pull), so blank here means "derive it"
+			// rather than "guess". A typed value is an explicit override and is marked as one below, which is
+			// what stops the post-pull enrichment from replacing it.
+			const typed = this.addFormContextWindowInput.value.trim();
+			if (typed) {
+				const parsed = this.parseAddFormContextWindow(typed);
+				if (!parsed.valid) {
+					await this.dialogService.error(parsed.error);
+					return;
+				}
+				endpointContextWindow = parsed.value;
+				endpointContextWindowIsUserSet = true;
 			}
 		} else if (!modelName) {
 			await this.dialogService.error(localize('addCustomModel.error.modelNameRequired', 'Model name is required'));
@@ -840,7 +1115,9 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 		}
 
 		try {
-			const nameFallback = isLocalhost ? localhostServerModelId : modelName;
+			// With no server model id given, fall back to the host:port so the list entry is still recognisable
+			// (the raw URL as `name` is a legacy shape the provider explicitly guards against sending).
+			const nameFallback = isEndpoint ? (localhostServerModelId || this.endpointDisplayName(modelName)) : modelName;
 			const addedModel = await this.customLanguageModelsService.addCustomModel({
 				name: nameFallback,
 				displayName: displayNameOpt || undefined,
@@ -848,19 +1125,26 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 				provider: providerValue,
 				apiKey,
 				token: providerValue === 'ollama' ? undefined : token, // Don't store URL in token secret for Ollama
-				// format / contextWindow / useNativeTools / mtp are intentionally omitted here: they are
-				// auto-derived from HuggingFace/Ollama after download (see applyDerivedMetadata) and otherwise
-				// fall back to service defaults. The user can override any of them from the model list.
+				// format / useNativeTools / mtp are intentionally omitted here: they are auto-derived from
+				// HuggingFace/Ollama after download (see applyDerivedMetadata) and otherwise fall back to service
+				// defaults. The user can override any of them from the model list. contextWindow is likewise
+				// derived for HuggingFace/cloud; for Ollama and custom endpoints it comes from this form (see the
+				// per-provider resolution above), and is left undefined when Ollama should derive its own.
+				contextWindow: endpointContextWindow,
+				// Mark a hand-entered window as a user override so a later probe (or any other enrichment) never
+				// silently replaces the number the user told us their server actually runs with. A probed value
+				// is left unmarked so it can still be refreshed.
+				userOverrides: endpointContextWindowIsUserSet ? { contextWindow: true } : undefined,
 				modelName: modelName,
-				localhostOpenAiModel: isLocalhost ? localhostServerModelId : undefined,
+				localhostOpenAiModel: isEndpoint ? (localhostServerModelId || undefined) : undefined,
 				localPath: providerValue === 'ollama' ? ollamaUrl : undefined, // Store Base URL in localPath for Ollama
 				hfFastest: isHfCloud ? !this.addFormHfFastestToggle.checked : undefined,
-				// Vision is collected for local models only (cloud relies on provider metadata). A confirmed
-				// HF/Ollama capability can still refine this after download; the My Models toggle can change it.
-				// Ticking it on add is explicit intent to use images, so enable runtime loading too (visionEnabled),
-				// not just the capability - otherwise the projector would download but never load.
-				supportsVision: this.addFormCurrentModelType === 'local' ? this.addFormVisionToggle.checked : undefined,
-				visionEnabled: this.addFormCurrentModelType === 'local' && this.addFormVisionToggle.checked ? true : undefined,
+				// Vision is collected for HuggingFace only - the toggle is shown for no other provider (see
+				// addFormUpdateInputFields), because it drives --mmproj on the server we launch. Ticking it is
+				// explicit intent to use images, so enable runtime loading too, not just the capability -
+				// otherwise the projector would download but never load.
+				supportsVision: isHuggingFaceLocal ? this.addFormVisionToggle.checked : undefined,
+				visionEnabled: isHuggingFaceLocal && this.addFormVisionToggle.checked ? true : undefined,
 			});
 			const listLabel = getCustomModelListLabel(addedModel);
 
@@ -2685,6 +2969,8 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 		// Guard against a localhost URL in modelName ("http://localhost:8080/v1/...") - its first segment is
 		// a scheme, not an org - by only treating the prefix as an org when it isn't a URL.
 		if (slash > 0 && !/^https?:/i.test(repo)) { return repo.slice(0, slash); }
+		// The custom-endpoint provider is stored as `localhost`; show the label users actually see elsewhere.
+		if (model.provider === CUSTOM_ENDPOINT_PROVIDER_ID) { return CUSTOM_ENDPOINT_LABEL; }
 		return model.provider || localize('customLanguageModels.filter.vendorOther', 'Other');
 	}
 

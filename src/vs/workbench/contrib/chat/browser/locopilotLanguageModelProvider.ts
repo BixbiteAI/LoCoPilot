@@ -9,7 +9,7 @@
 import { AsyncIterableSource, timeout } from '../../../../base/common/async.js';
 import { encodeBase64, streamToBuffer } from '../../../../base/common/buffer.js';
 import { createMarkdownCommandLink } from '../../../../base/common/htmlContent.js';
-import { CancellationToken } from '../../../../base/common/cancellation.js';
+import { CancellationToken, CancellationTokenSource } from '../../../../base/common/cancellation.js';
 import { Emitter } from '../../../../base/common/event.js';
 import { generateUuid } from '../../../../base/common/uuid.js';
 import { Disposable } from '../../../../base/common/lifecycle.js';
@@ -46,6 +46,8 @@ interface IOpenAiStreamChunk {
 			thinking?: string;
 			tool_calls?: Array<{ index?: number; id?: string; function?: { name?: string; arguments?: string | object } }>;
 		};
+		/** Why generation stopped ("stop", "length", "tool_calls", ...). Absent on every chunk but the last. */
+		finish_reason?: string | null;
 	}>;
 	/** llama.cpp's non-standard per-response timing block (present on each chunk with `timings_per_token`). */
 	timings?: {
@@ -668,6 +670,19 @@ export class LoCoPilotLanguageModelProvider extends Disposable implements ILangu
 	 */
 	private static readonly _TEXT_TOOLCALL_MARKER = /<\s*tool_call|<\s*function\s*=|<\s*function_call|<\|\s*tool_call|```\s*tool_call|\{\s*"(?:tool_call|tool_calls)"/i;
 
+	/**
+	 * How long a user-configured endpoint may go without sending a single byte before we give up on the turn.
+	 *
+	 * Applies only to the custom-endpoint provider, which is the one that can sit on the far side of a network.
+	 * Managed local servers are deliberately excluded: their slow phase is weight loading, which the readiness
+	 * gate already covers, and a long tool-call prefill can legitimately go quiet.
+	 *
+	 * Generous on purpose - this is a "the other end is gone" backstop, not a latency budget. A large prompt on
+	 * a slow remote GPU can take a while to produce its first token, and the timer resets on every chunk, so a
+	 * response that is merely slow never trips it.
+	 */
+	private static readonly ENDPOINT_IDLE_TIMEOUT_MS = 120_000;
+
 	/** Returns the index of the first textual tool-call marker in `text`, or -1 if none. */
 	private _textToolCallMarkerIndex(text: string): number {
 		const m = LoCoPilotLanguageModelProvider._TEXT_TOOLCALL_MARKER.exec(text);
@@ -1262,7 +1277,19 @@ export class LoCoPilotLanguageModelProvider extends Disposable implements ILangu
 		token: CancellationToken,
 		onJson: (json: unknown) => void,
 		/** When provided, raw response text is accumulated here so the caller can read an error body on a non-200 (SSE responses carry no useful body, but error responses do). */
-		errorSink?: { body: string }
+		errorSink?: { body: string },
+		/**
+		 * Optional stream-health reporting for callers that must distinguish a COMPLETE response from one the
+		 * server cut short. `sawDone` flips true when the `data: [DONE]` sentinel arrives - every mainstream
+		 * OpenAI-compatible server (llama.cpp, mlx_lm, vLLM, LM Studio, Ollama's compat layer) emits it, so its
+		 * absence on an otherwise-200 response means the connection ended early. See {@link _callLocalhostModel}.
+		 *
+		 * `idleTimeoutMs` arms an inactivity watchdog: if no bytes arrive for that long the request is cancelled
+		 * and `timedOut` is set. Only meaningful for endpoints reached over a real network - a local server that
+		 * goes silent is a bug, but a remote one is routine (WiFi drop, sleep, proxy idle-timeout), and without
+		 * this the turn hangs on the spinner until the user cancels by hand.
+		 */
+		streamHealth?: { sawDone: boolean; timedOut: boolean; idleTimeoutMs?: number }
 	): Promise<number> {
 		let buffer = '';
 		const consume = (text: string): void => {
@@ -1274,29 +1301,57 @@ export class LoCoPilotLanguageModelProvider extends Disposable implements ILangu
 				const t = line.trim();
 				if (!t.startsWith('data: ')) { continue; }
 				const d = t.slice(6);
-				if (d === '[DONE]') { continue; }
+				if (d === '[DONE]') {
+					if (streamHealth) { streamHealth.sawDone = true; }
+					continue;
+				}
 				try { onJson(JSON.parse(d)); } catch { /* skip malformed */ }
 			}
 		};
 
 		const reqOptions = { type: 'POST', url, headers, data: bodyJson } as const;
 
-		// Preferred: stream the body chunk-by-chunk via the main process.
-		if (typeof this.requestService.requestStream === 'function') {
-			const result = await this.requestService.requestStream(reqOptions, chunk => consume(chunk.toString()), token);
-			return result.statusCode ?? 0;
-		}
+		// Inactivity watchdog. Cancelling through a linked source means the in-flight request is torn down the
+		// same way a user cancel is, so the main-process socket is released rather than left dangling.
+		const idleMs = streamHealth?.idleTimeoutMs;
+		const idleCts = idleMs ? new CancellationTokenSource(token) : undefined;
+		let idleTimer: Timeout | undefined;
+		const armIdleTimer = (): void => {
+			if (!idleMs || !idleCts) { return; }
+			if (idleTimer) { clearTimeout(idleTimer); }
+			idleTimer = setTimeout(() => {
+				if (streamHealth) { streamHealth.timedOut = true; }
+				idleCts.cancel();
+			}, idleMs);
+		};
+		const onBytes = (text: string): void => {
+			armIdleTimer();
+			consume(text);
+		};
+		const effectiveToken = idleCts ? idleCts.token : token;
+		armIdleTimer();
 
-		// Fallback: buffered request (whole body delivered at once).
-		const response = await this.requestService.request(reqOptions, token);
-		await new Promise<void>((resolve, reject) => {
-			listenStream(response.stream, {
-				onData: chunk => consume(chunk.toString()),
-				onError: err => reject(err),
-				onEnd: () => resolve()
-			}, token);
-		});
-		return response.res.statusCode ?? 0;
+		try {
+			// Preferred: stream the body chunk-by-chunk via the main process.
+			if (typeof this.requestService.requestStream === 'function') {
+				const result = await this.requestService.requestStream(reqOptions, chunk => onBytes(chunk.toString()), effectiveToken);
+				return result.statusCode ?? 0;
+			}
+
+			// Fallback: buffered request (whole body delivered at once).
+			const response = await this.requestService.request(reqOptions, effectiveToken);
+			await new Promise<void>((resolve, reject) => {
+				listenStream(response.stream, {
+					onData: chunk => onBytes(chunk.toString()),
+					onError: err => reject(err),
+					onEnd: () => resolve()
+				}, effectiveToken);
+			});
+			return response.res.statusCode ?? 0;
+		} finally {
+			if (idleTimer) { clearTimeout(idleTimer); }
+			idleCts?.dispose();
+		}
 	}
 
 
@@ -1826,15 +1881,21 @@ export class LoCoPilotLanguageModelProvider extends Disposable implements ILangu
 	}
 
 	/**
-	 * Calls a user-configured localhost URL. `model.modelName` is the full endpoint URL; `model.localhostOpenAiModel`
-	 * (or `model.name` for legacy) is the OpenAI `model` field in the JSON body.
+	 * Calls a user-configured OpenAI-compatible endpoint. `model.modelName` is the full endpoint URL (any host -
+	 * loopback, LAN, or a remote box reachable over the network); `model.localhostOpenAiModel` (or `model.name`
+	 * for legacy) is the OpenAI `model` field in the JSON body. `model.apiKey`, when set, is sent as a bearer
+	 * token - required by every endpoint worth exposing beyond loopback (llama-server --api-key, vLLM, LiteLLM,
+	 * anything behind a reverse proxy).
+	 *
+	 * The stored provider id is still `localhost` for back-compat with existing user settings; only the
+	 * user-facing wording says "endpoint".
 	 */
 	private async _callLocalhostModel(model: ICustomLanguageModel, messages: IChatMessage[], options: { [name: string]: unknown }, stream: AsyncIterableSource<IChatResponsePart | IChatResponsePart[]>, token: CancellationToken): Promise<any> {
 		const url = model.modelName?.trim();
 		if (!url) {
-			throw new Error('Localhost URL is not set. Edit this model in LoCoPilot Settings and enter the complete endpoint URL.');
+			throw new Error('Endpoint URL is not set. Edit this model in LoCoPilot Settings and enter the complete endpoint URL.');
 		}
-		this._log(`[LoCoPilot Provider] Calling localhost model at: ${url}`);
+		this._log(`[LoCoPilot Provider] Calling custom endpoint at: ${url}`);
 		const mappedMessages = this._coalesceSameRoleMessages(messages).flatMap(m => this._mapMessageToOpenAI(m));
 		const isLocalModel = model.provider === 'huggingface' || model.provider === 'localhost' || model.provider === 'ollama';
 		const { maxOutputTokens } = deriveTokenLimits(model.contextWindow ?? defaultContextWindow(isLocalModel), isLocalModel);
@@ -1853,7 +1914,7 @@ export class LoCoPilotLanguageModelProvider extends Disposable implements ILangu
 			// Real token counts + measured rate (ignored by servers that don't support them). See _callLocalModel.
 			timings_per_token: true,
 			stream_options: { include_usage: true },
-			// Reuse the server-side prompt cache across turns (see _callLocalModel). Localhost endpoints are
+			// Reuse the server-side prompt cache across turns (see _callLocalModel). Custom endpoints are
 			// commonly llama.cpp/LM Studio, where older builds default this to false; unknown-field-safe.
 			cache_prompt: true
 		};
@@ -1892,17 +1953,25 @@ export class LoCoPilotLanguageModelProvider extends Disposable implements ILangu
 				if (model.useNativeTools) {
 					body.tools = filteredTools;
 					body.tool_choice = 'auto';
-					this._log(`[LoCoPilot Provider] Localhost model request: ${filteredTools.length} native tools`);
+					this._log(`[LoCoPilot Provider] Custom endpoint request: ${filteredTools.length} native tools`);
 				}
 			} else {
-				this._log(`[LoCoPilot Provider] All ${options.tools.length} tools were excluded for localhost model`);
+				this._log(`[LoCoPilot Provider] All ${options.tools.length} tools were excluded for custom endpoint model`);
 			}
 		}
 
 		const headers: Record<string, string> = { 'Content-Type': 'application/json', 'Accept': 'text/event-stream' };
-		// Same streaming tool-call surfacing as _callLocalModel (localhost servers are commonly
+		// Bearer auth for endpoints that require a key. Optional: a bare loopback llama-server needs none, but
+		// anything reachable over a network should have one, and without this header those endpoints 401.
+		const endpointKey = model.apiKey?.trim();
+		if (endpointKey) {
+			headers['Authorization'] = `Bearer ${endpointKey}`;
+		}
+		// Same streaming tool-call surfacing as _callLocalModel (custom endpoints are commonly
 		// llama.cpp too); gated to the built-in agent's requests.
 		const streamToolCallParts = options.locopilotStreamToolCalls === true;
+		// Declared outside the try so the catch can tell a watchdog cancel from a user cancel.
+		const idleWatchdog = { sawDone: false, timedOut: false, idleTimeoutMs: LoCoPilotLanguageModelProvider.ENDPOINT_IDLE_TIMEOUT_MS };
 		try {
 			const accumulatedToolCalls: Map<number, { id?: string; name?: string; args: string; startEmitted?: boolean }> = new Map();
 			// Full assistant content seen so far. We buffer it so that if a local model emits a tool call as
@@ -1917,6 +1986,9 @@ export class LoCoPilotLanguageModelProvider extends Disposable implements ILangu
 			let thinkingBuffer = '';
 			let emittedThinkLen = 0;
 			let suppressingThinkText = false;
+			// Set once the server tells us WHY it stopped. Together with the `[DONE]` sentinel this is how we
+			// tell a finished response from one the connection cut short - see the cut-off check after the read.
+			let sawFinishReason = false;
 
 			const processChunk = (json: unknown): void => {
 				// Real generation stats from the local server. llama.cpp puts a `timings` block on each chunk
@@ -1924,6 +1996,9 @@ export class LoCoPilotLanguageModelProvider extends Disposable implements ILangu
 				// (with `stream_options.include_usage`). Prefer these exact numbers over the word estimate.
 				this._ingestServerStats(json, reportStats);
 				const choice = (json as IOpenAiStreamChunk).choices?.[0];
+				if (choice?.finish_reason) {
+					sawFinishReason = true;
+				}
 				const localReasoning = this._reasoningTextFromOpenAiDelta(choice?.delta);
 				if (localReasoning) {
 					this._log(`[LoCoPilot Provider] Reasoning delta: ${localReasoning.substring(0, 200)}${localReasoning.length > 200 ? '...' : ''}`);
@@ -1993,16 +2068,26 @@ export class LoCoPilotLanguageModelProvider extends Disposable implements ILangu
 			};
 
 			const errorSink = { body: '' };
-			let status = await this._fetchSSEStream(url, headers, JSON.stringify(body), token, processChunk, errorSink);
+			let status = await this._fetchSSEStream(url, headers, JSON.stringify(body), token, processChunk, errorSink, idleWatchdog);
 
 			// Fallback: If 400 error and tools were provided, retry without tools
 			if (status === 400 && body.tools) {
-				this._log(`[LoCoPilot Provider] Localhost model request failed with 400, retrying without tools as fallback...`);
+				this._log(`[LoCoPilot Provider] Custom endpoint request failed with 400, retrying without tools as fallback...`);
 				accumulatedToolCalls.clear();
 				errorSink.body = '';
+				sawFinishReason = false;
+				idleWatchdog.sawDone = false;
 				const fallbackBody = { ...body };
 				delete fallbackBody.tools;
-				status = await this._fetchSSEStream(url, headers, JSON.stringify(fallbackBody), token, processChunk, errorSink);
+				status = await this._fetchSSEStream(url, headers, JSON.stringify(fallbackBody), token, processChunk, errorSink, idleWatchdog);
+			}
+
+			if (status === 401 || status === 403) {
+				// Distinct from a generic failure: the endpoint is up and reachable, it just refused us. Point
+				// at the fix rather than at "is the server running".
+				throw new Error(endpointKey
+					? `Endpoint at ${url} rejected the API key (${status}). Check the key on this model in LoCoPilot Settings.`
+					: `Endpoint at ${url} requires an API key (${status}). Add one by editing this model in LoCoPilot Settings.`);
 			}
 
 			if (status !== 200) {
@@ -2010,11 +2095,27 @@ export class LoCoPilotLanguageModelProvider extends Disposable implements ILangu
 				// handler can recognize a vision-unsupported error and retry text-only; raw body is not shown.
 				const serverDetail = this._extractServerErrorMessage(errorSink.body);
 				const msg = status === 404 || status === 502 || status === 503
-					? `Localhost server not responding at ${url}. Check that the server is running and the URL is correct.`
+					? `Endpoint not responding at ${url}. Check that the server is running and the URL is correct.`
 					: serverDetail
-						? `Localhost model "${model.name}" request failed (${status}): ${serverDetail}`
-						: `Localhost model "${model.name}" request failed (${status}).`;
+						? `Model "${model.name}" request failed (${status}): ${serverDetail}`
+						: `Model "${model.name}" request failed (${status}).`;
 				throw new Error(msg);
+			}
+
+			// The response ended without the server ever saying it was finished. Over loopback this effectively
+			// never happens; over a network it is routine (server killed, machine slept, WiFi roamed, a proxy
+			// idle-timeout closed the socket) - and because the close is CLEAN, the read above returns a normal
+			// 200 and we would otherwise present a truncated answer as a complete one. Worse, the accumulated
+			// tool call would be emitted with half-written JSON arguments, which is how a partial file gets
+			// written. So bail before emitting anything further and tell the user what happened.
+			//
+			// Both signals must be missing to call it a cut-off: `[DONE]` is what every mainstream
+			// OpenAI-compatible server sends, and `finish_reason` covers the few that omit the sentinel.
+			if (!idleWatchdog.sawDone && !sawFinishReason) {
+				this._log(`[LoCoPilot Provider] Endpoint stream ended without [DONE] or finish_reason - treating as cut off (timedOut=${idleWatchdog.timedOut}).`);
+				throw new Error(idleWatchdog.timedOut
+					? `The endpoint at ${url} stopped sending data for ${Math.round(LoCoPilotLanguageModelProvider.ENDPOINT_IDLE_TIMEOUT_MS / 1000)}s, so the response is incomplete. Check that the server is still running and reachable, then try again.`
+					: `The connection to ${url} closed before the response finished, so the answer is incomplete. Check that the server is still running and reachable, then try again.`);
 			}
 
 			// Emit accumulated tool calls
@@ -2055,13 +2156,33 @@ export class LoCoPilotLanguageModelProvider extends Disposable implements ILangu
 			}
 		} catch (e: unknown) {
 			const errMsg = e && typeof (e as Error).message === 'string' ? (e as Error).message : String(e);
+			// The idle watchdog cancels through a linked token, so its failure arrives here looking exactly like
+			// a user cancel. Check our own flag FIRST or a dead endpoint silently reports as "cancelled by user".
+			if (idleWatchdog.timedOut) {
+				throw new Error(`The endpoint at ${url} stopped responding for ${Math.round(LoCoPilotLanguageModelProvider.ENDPOINT_IDLE_TIMEOUT_MS / 1000)}s. Check that the server is still running and reachable, then try again.`);
+			}
 			if (this._isCanceledError(errMsg)) {
 				throw new Error(this._getCanceledMessage());
 			}
 			const isConnectionRefused = /ECONNREFUSED|fetch failed|Failed to fetch/i.test(errMsg);
-			const msg = isConnectionRefused
-				? `Cannot reach localhost at ${url}. Check that the server is running and the URL in LoCoPilot Settings is correct.`
-				: `Localhost model "${model.name}" error: ${errMsg}`;
+			const isNetworkUnreachable = /EHOSTUNREACH|ENETUNREACH|ETIMEDOUT|EAI_AGAIN|ENOTFOUND/i.test(errMsg);
+			const isTlsFailure = /self[- ]signed|DEPTH_ZERO|CERT_|ERR_TLS|unable to verify/i.test(errMsg);
+			// The connection died PART-WAY through a response rather than failing to open. Verified against a
+			// real llama-server killed mid-generation, which surfaces here as a bare "aborted" - on its own that
+			// reads as an internal fault rather than "the machine serving your model went away".
+			const isMidStreamDrop = /aborted|ECONNRESET|socket hang up|premature close|terminated|ERR_INCOMPLETE_CHUNKED_ENCODING|ERR_EMPTY_RESPONSE|network error/i.test(errMsg);
+			let msg: string;
+			if (isMidStreamDrop) {
+				msg = `The connection to ${url} dropped while the response was still streaming, so the answer is incomplete. Check that the server is still running and reachable, then try again.`;
+			} else if (isConnectionRefused) {
+				msg = `Cannot reach the endpoint at ${url}. Check that the server is running and the URL in LoCoPilot Settings is correct.`;
+			} else if (isNetworkUnreachable) {
+				msg = `Cannot reach the endpoint at ${url} over the network. Check the host is up, the port is open, and the server is bound to a reachable address (e.g. --host 0.0.0.0).`;
+			} else if (isTlsFailure) {
+				msg = `The endpoint at ${url} presented a certificate that could not be verified. Use http:// on a trusted network, or install a certificate the system trusts.`;
+			} else {
+				msg = `Model "${model.name}" error: ${errMsg}`;
+			}
 			throw new Error(msg);
 		}
 	}
