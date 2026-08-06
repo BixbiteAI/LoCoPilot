@@ -38,14 +38,27 @@ import { READ_FILE_MAX_LINES } from './readFileTool.js';
 
 export const CreateFileToolId = 'createFile';
 
-/** An existing file this long ... */
-const SHRINK_GUARD_MIN_LINES = 50;
 /**
- * ...overwritten with content under this fraction of its size is likely accidental truncation.
- * Deliberately strict: real "rewrite the whole file" edits stay close to the original size, while a
- * model that lost part of the file typically comes back at 50-70% - which a looser ratio waves through.
+ * Floor for rewriting a file LARGER than readFile's cap, as a fraction of the current size.
+ *
+ * Such a file cannot have been read in one call, so a rewrite is only safe if the model actually
+ * paged through it. There is no read-tracking to prove that, but the failure mode is size-correlated:
+ * a model that only saw the first READ_FILE_MAX_LINES of a 3000-line file emits roughly that many
+ * lines back, not 2700+. So "came back at nearly the original size" is decent evidence it saw the
+ * whole thing, and refusing a 3000-line generation outright wastes the most expensive output there is.
+ *
+ * One-sided on purpose: truncation only ever makes the file SHORTER, so there is no upper bound - a
+ * rewrite that grows the file is not a partial-read reconstruction.
  */
-const SHRINK_GUARD_RATIO = 0.75;
+const LARGE_FILE_SHRINK_FLOOR = 0.9;
+
+/**
+ * Below this fraction of the original, a replacement is called out in the tool result. Files within
+ * readFile's cap are replaced unconditionally (the model could have read all of it, and the edit
+ * lands in the diff/checkpoint path), but a big drop is worth surfacing so an accidentally truncated
+ * rewrite gets noticed on the next turn instead of never.
+ */
+const NOTABLE_SHRINK_RATIO = 0.75;
 
 /** Extension-less names that are legitimately created without a dot. */
 const KNOWN_EXTENSIONLESS = new Set(['dockerfile', 'makefile', 'license', 'readme', 'changelog', 'procfile', 'gemfile', 'rakefile', 'caddyfile', 'jenkinsfile', 'vagrantfile', 'authors', 'notice', 'codeowners']);
@@ -60,15 +73,7 @@ export function createCreateFileToolData(): IToolData {
 			},
 			content: {
 				type: 'string',
-				description: 'The FULL contents of the file.'
-			},
-			overwrite: {
-				type: 'boolean',
-				description: 'Optional: set true to replace an existing file with the whole new content. If the file exists and this is not set, the call is rejected (use editFile for targeted changes instead).'
-			},
-			force: {
-				type: 'boolean',
-				description: 'Optional: set true ONLY when intentionally overwriting a large file with much shorter (but complete) content. Without it such a shrink is rejected as likely accidental truncation.'
+				description: 'The FULL contents of the file. If the file already exists this REPLACES all of it, so send the complete finished file, never a fragment.'
 			}
 		},
 		required: ['path', 'content']
@@ -81,10 +86,10 @@ export function createCreateFileToolData(): IToolData {
 		icon: ThemeIcon.fromId(Codicon.newFile.id),
 		displayName: localize('tool.createFile.displayName', 'Create file'),
 		userDescription: localize('tool.createFile.userDescription', 'Create a new file (or overwrite one) with the given contents'),
-		modelDescription: 'Write a WHOLE file. Params: path, content, overwrite?.\n\n' +
+		modelDescription: 'Write a WHOLE file. Params: path, content. There is no overwrite/confirm flag.\n\n' +
 			'- Create a new file: pass path + content (parent folders are created automatically - no mkdir step).\n' +
-			'- To fully replace an EXISTING file: also pass overwrite: true. Without it, writing over an existing file is rejected. Replacing a large file with much shorter (but COMPLETE) content also needs force: true.\n' +
-			`- Only for files you can read in FULL (under ${READ_FILE_MAX_LINES} lines). Overwriting a file larger than that is refused - you cannot have seen all of it, so the rewrite would drop the parts you did not read. Change those with editFile instead.\n` +
+			'- If the file ALREADY EXISTS this replaces it entirely, in the same call - do not check first, and do not resend anything to confirm. content must therefore be the COMPLETE finished file, never a fragment or a "..." placeholder.\n' +
+			`- Best for files you can read in FULL (under ${READ_FILE_MAX_LINES} lines). Rewriting a file larger than that is accepted only if your content is about the same size or bigger; content much shorter than the original is refused, because you cannot have read it all and the missing lines would be silently deleted.\n` +
 			'- For SMALL/targeted changes to an existing file, do NOT use this - use editFile (change text) or insertCode (add code). Rewriting a whole file for a small change is wasteful and error-prone.',
 		source: ToolDataSource.Internal,
 		inputSchema,
@@ -96,6 +101,13 @@ export function createCreateFileToolData(): IToolData {
 interface ICreateFileParams {
 	path: string;
 	content: string;
+	/**
+	 * Accepted and ignored. Both used to be gates: overwrite confirmed "yes, really replace it" and
+	 * force waived the shrink guard. Neither told the tool anything it could not work out itself, and
+	 * a model that omitted one paid a whole extra turn re-sending the entire file body to add a
+	 * boolean - the single most expensive round trip in the tool set. Still declared (though no longer
+	 * in the schema) so models that learned to send them are not punished for it.
+	 */
 	overwrite?: boolean;
 	force?: boolean;
 }
@@ -173,27 +185,38 @@ export class CreateFileTool implements IToolImpl {
 				return lintFailure ?? { content: [{ kind: 'text', value: `Successfully created file "${params.path}" (${lines} lines). Proceed to the next step or goal.` }] };
 			}
 
-			// File exists - only allowed with overwrite:true.
-			if (!params.overwrite) {
-				return { content: [{ kind: 'text', value: `Error: "${params.path}" already exists. Next: to change part of it use editFile (or insertCode to add code); to replace the WHOLE file, resend createFile with overwrite: true.` }], toolResultError: 'File exists' };
-			}
+			// --- File exists: replace it. There is no confirmation flag by design - "does this file
+			// exist" is already known here, so a flag saying so carried no information and cost a full
+			// round trip (re-sending the whole file body) whenever the model left it out.
 			const currentLines = currentContent.split('\n').length;
-			// A file this big cannot have been read in full (readFile caps at READ_FILE_MAX_LINES), so any
-			// whole-file rewrite of it is a reconstruction from partial reads - i.e. silent data loss for
-			// every line the model never saw. There is no safe way to allow this, so it is refused outright.
-			if (currentLines > READ_FILE_MAX_LINES) {
-				return { content: [{ kind: 'text', value: `Error: "${params.path}" has ${currentLines} lines - too large to rewrite in one call (you cannot have read all of it; readFile returns at most ${READ_FILE_MAX_LINES} lines). Rewriting it would silently drop the parts you did not see. Next: use editFile with edits[] to change the specific sections, working through the file in batches - readFile(offset, limit) each section first, or outline "${params.path}" to see its structure.` }], toolResultError: 'File too large to overwrite' };
+			const newLines = params.content.split('\n').length;
+
+			// A file over readFile's cap cannot have been read in one call, so a rewrite is either the
+			// result of paging through it properly or a reconstruction from the part that was read. Those
+			// two look very different in size: gate on the shrink only (growth is never truncation).
+			if (currentLines > READ_FILE_MAX_LINES
+				&& (newLines < currentLines * LARGE_FILE_SHRINK_FLOOR || params.content.length < currentContent.length * LARGE_FILE_SHRINK_FLOOR)) {
+				return {
+					content: [{ kind: 'text', value: `Error: "${params.path}" has ${currentLines} lines - more than readFile returns in one call (${READ_FILE_MAX_LINES}) - and your replacement is only ${newLines} lines, well short of it. That means parts of the file you never read would be deleted. Next: do NOT resend this as a whole-file write. Use outline "${params.path}" (or grep) to locate the sections to change, readFile(offset, limit) to read each one, then editFile with edits[] to change them - working through the file in batches.` }],
+					toolResultError: 'Large-file rewrite refused (content much shorter than original)'
+				};
 			}
-			if (!params.force && currentLines >= SHRINK_GUARD_MIN_LINES && params.content.length < currentContent.length * SHRINK_GUARD_RATIO) {
-				return { content: [{ kind: 'text', value: `Error: Refusing to overwrite "${params.path}" (${currentLines} lines) with much shorter content (${params.content.split('\n').length} lines) - likely incomplete. Next: use editFile for a partial change, or - if the shorter content really is COMPLETE - resend createFile with overwrite: true and force: true.` }], toolResultError: 'Shrink overwrite refused' };
-			}
+
 			progress.report({ message: buildFileLinkInvocationMessage(localize('createFile.overwriting', "Replacing entire file {0}", '{0}'), fileName, fileUri) });
-			const lines = currentContent.split('\n');
-			const endLine = lines.length || 1;
-			const lastLine = lines[lines.length - 1] ?? '';
+			const existingLines = currentContent.split('\n');
+			const endLine = existingLines.length || 1;
+			const lastLine = existingLines[existingLines.length - 1] ?? '';
 			const fullRange = { startLineNumber: 1, startColumn: 1, endLineNumber: endLine, endColumn: lastLine.length + 1 };
 			const textEdits = [{ range: fullRange, text: params.content }];
-			return await commitEdits(this.services, invocation, fileUri, params.path, textEdits, params.content, `Successfully replaced entire file "${params.path}". Proceed to the next step or goal.`, false);
+			// Nothing blocks a shrink within readFile's cap (the model could have read the whole file, and
+			// the edit lands in the diff/checkpoint path) - but say it out loud, so a rewrite that came back
+			// accidentally truncated is visible on the next turn rather than silently accepted.
+			const shrank = params.content.length < currentContent.length * NOTABLE_SHRINK_RATIO;
+			const summary = `Successfully replaced the ENTIRE existing file "${params.path}" (was ${currentLines} lines, now ${newLines}).`;
+			const message = shrank
+				? `${summary} This removed most of the previous contents. If that was intended, proceed. If your content was accidentally incomplete, fix it NOW: readFile "${params.path}" and restore the parts that should still be there.`
+				: `${summary} Proceed to the next step or goal.`;
+			return await commitEdits(this.services, invocation, fileUri, params.path, textEdits, params.content, message, false);
 		} catch (error) {
 			const msg = error instanceof Error ? error.message : String(error);
 			if (/exists but is not a directory|not a directory/i.test(msg)) {
