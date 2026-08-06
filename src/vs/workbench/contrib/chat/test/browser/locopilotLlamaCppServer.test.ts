@@ -680,9 +680,23 @@ suite('LoCoPilot llama.cpp server', () => {
 		});
 
 		test('Intel/unknown qualify only with enough dedicated VRAM', () => {
-			assert.strictEqual(shouldUseBundledVulkan([gpu('intel', 0)]), false, 'weak iGPU stays on CPU');
+			assert.strictEqual(shouldUseBundledVulkan([gpu('intel', 0)]), false, 'unnamed iGPU stays on CPU');
 			assert.strictEqual(shouldUseBundledVulkan([gpu('unknown', 2)]), false);
 			assert.strictEqual(shouldUseBundledVulkan([{ vendor: 'intel', totalVramBytes: VULKAN_MIN_DEDICATED_VRAM_BYTES }]), true);
+		});
+
+		test('a modern Intel iGPU qualifies on its NAME despite reporting no dedicated VRAM', () => {
+			// The whole point: an iGPU borrows system memory, so it can never clear the VRAM bar however new it is.
+			assert.strictEqual(shouldUseBundledVulkan([{ vendor: 'intel', totalVramBytes: 0, name: 'Intel(R) Arc(TM) Graphics' }]), true);
+			// Windows splits "Iris Xe" with a trademark marker; Linux reports it contiguously. Both must match.
+			assert.strictEqual(shouldUseBundledVulkan([{ vendor: 'intel', totalVramBytes: 0, name: 'Intel(R) Iris(R) Xe Graphics' }]), true);
+			assert.strictEqual(shouldUseBundledVulkan([{ vendor: 'intel', totalVramBytes: 0, name: 'Intel Corporation Meteor Lake-P [Intel Arc Graphics]' }]), true);
+		});
+
+		test('legacy Intel iGPUs still stay on the CPU build', () => {
+			for (const name of ['Intel(R) UHD Graphics 620', 'Intel(R) HD Graphics 530', 'Intel(R) Iris(R) Plus Graphics 640', 'Intel(R) Graphics']) {
+				assert.strictEqual(shouldUseBundledVulkan([{ vendor: 'intel', totalVramBytes: 0, name }]), false, name);
+			}
 		});
 
 		test('Apple GPUs never pick Vulkan (Metal path), empty list is false', () => {

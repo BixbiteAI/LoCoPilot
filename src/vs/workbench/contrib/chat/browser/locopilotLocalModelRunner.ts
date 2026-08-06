@@ -2384,14 +2384,21 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 		return this._hardwareInfo;
 	}
 
-	/** The adapter the selected backend will actually target (never an unrelated GPU): the one with most VRAM. */
+	/**
+	 * The adapter the selected backend will actually target (never an unrelated GPU): the one with most VRAM,
+	 * counting only adapters that own a SEPARATE memory pool. An integrated GPU is excluded even when it
+	 * reports a nonzero "dedicated VRAM" figure, because that figure is a carve-out of system RAM (typically a
+	 * few hundred MB) rather than a second pool: budgeting a launch against it would clamp a machine with
+	 * 32 GB of usable RAM down to a fraction of a gigabyte. Callers fall back to the system-RAM budget, which
+	 * is the pool an iGPU genuinely draws on.
+	 */
 	private _targetGpu(backend: LlamaBackend, hw: ISystemHardwareInfo | undefined): IGpuInfo | undefined {
 		const candidates = (hw?.gpus ?? []).filter(g => {
 			if (backend === 'cuda') {
 				return g.vendor === 'nvidia';
 			}
 			return backend === 'vulkan' && g.vendor !== 'apple';
-		}).filter(g => g.totalVramBytes > 0);
+		}).filter(g => g.totalVramBytes > 0 && !g.isIntegrated);
 		return candidates.length ? candidates.reduce((a, b) => b.totalVramBytes > a.totalVramBytes ? b : a) : undefined;
 	}
 
@@ -2450,7 +2457,14 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 		if (backend === 'cuda' || backend === 'vulkan') {
 			// Free VRAM less the driver reserve, NOT the card's total: the offload plan and the context clamp both
 			// size against this, so a card already half-committed to other apps no longer gets planned as if empty.
-			return this._discreteVramBudgetBytes(backend, hw);
+			const vram = this._discreteVramBudgetBytes(backend, hw);
+			if (vram !== undefined) {
+				return vram;
+			}
+			// A GPU backend with no dedicated pool to size against - an integrated GPU (which draws on system
+			// RAM, so that is the real ceiling), or a card whose VRAM we could not read. Fall through to the
+			// system-RAM budget rather than returning "unknown": an unknown budget skips the offload plan AND
+			// the context clamp entirely, which is how a long context ends up allocating its KV into swap.
 		}
 		const mem = await this._getSystemMemory();
 		if (!mem?.totalmem) {
@@ -4718,8 +4732,7 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 		// neither MTP nor a paired draft model was available. It is no longer: measured across six real agent
 		// sessions (Qwen3-4B, Qwen3-30B-A3B, Qwen3.6-27B, Gemma-4-26B-A4B, Gemma-4-E4B, Nemotron-30B-A3B) it
 		// generated ZERO drafts in every single one - `#gen drafts = 0, #acc drafts = 0` in all of them - while
-		// still costing a 16 MB mod table per server plus its per-call overhead, and while being one of the
-		// `--spec-type` users that makes llama.cpp disable `cache_reuse` for the whole context. Its default
+		// still costing a 16 MB mod table per server plus its per-call overhead. Its default
 		// `n_match=24` requires a 24-token literal repeat before it will draft anything, which agent chat traffic
 		// essentially never produces. MTP is unaffected and remains the real speculation path (it measured 45-54%
 		// acceptance on Qwen3.5-0.8B and 70-85% on Qwen3.5-9B), as does a downloaded paired draft model. Users who
@@ -5396,9 +5409,11 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 					return;
 				}
 				const appleSilicon = hw.gpus.some(g => g.vendor === 'apple') || isAppleSiliconMac();
-				// Only DISCRETE VRAM is a separate pool; Apple's unified memory reports 0 here.
+				// Only DISCRETE VRAM is a separate pool; Apple's unified memory reports 0 here, and an integrated
+				// GPU's "dedicated VRAM" is a system-RAM carve-out - counting it would size every recommendation
+				// against a few hundred MB instead of the machine's real memory.
 				const target = appleSilicon ? undefined : hw.gpus.reduce<IGpuInfo | undefined>(
-					(best, g) => g.vendor !== 'apple' && g.totalVramBytes > 0 && (!best || g.totalVramBytes > best.totalVramBytes) ? g : best,
+					(best, g) => g.vendor !== 'apple' && !g.isIntegrated && g.totalVramBytes > 0 && (!best || g.totalVramBytes > best.totalVramBytes) ? g : best,
 					undefined);
 				this._hardwareProfile = {
 					totalRamBytes: mem.totalmem,

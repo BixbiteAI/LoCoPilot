@@ -12,17 +12,152 @@ import { IGpuInfo, ISystemHardwareInfo, ILoCoPilotSystemInfoService, GpuVendor, 
 /** Kill any probe command that runs longer than this. */
 const PROBE_TIMEOUT_MS = 4000;
 
+/**
+ * PowerShell needs a longer leash than a plain binary: a cold `powershell.exe` start is ~300-700ms on an idle
+ * machine and can reach several seconds behind on-access antivirus scanning. Timing out here would drop us back
+ * to the same silent fallbacks this probe exists to avoid, and the cost is paid once (the result is cached).
+ */
+const POWERSHELL_PROBE_TIMEOUT_MS = 8000;
+
 /** Runs a command, capturing stdout. Resolves '' on any error (missing binary, non-zero exit, timeout). */
-function tryExec(command: string, args: string[]): Promise<string> {
+function tryExec(command: string, args: string[], timeoutMs: number = PROBE_TIMEOUT_MS): Promise<string> {
 	return new Promise<string>(resolve => {
 		try {
-			execFile(command, args, { timeout: PROBE_TIMEOUT_MS, windowsHide: true, maxBuffer: 4 * 1024 * 1024 }, (err, stdout) => {
+			execFile(command, args, { timeout: timeoutMs, windowsHide: true, maxBuffer: 4 * 1024 * 1024 }, (err, stdout) => {
 				resolve(err ? '' : (stdout ?? '').toString());
 			});
 		} catch {
 			resolve('');
 		}
 	});
+}
+
+/**
+ * Queries Windows management data via CIM, falling back to the legacy `wmic` invocation.
+ *
+ * `wmic` is deprecated and ships DISABLED BY DEFAULT (as a Feature-on-Demand) from Windows 11 24H2 and Server
+ * 2025 onward: the process fails to start, `tryExec` yields '', and every probe built on it silently degrades
+ * to its estimate path on current Windows. `Get-CimInstance` is the supported replacement and is present on
+ * every Windows since 8 (PowerShell 3.0+).
+ *
+ * `wmic` is still tried second for locked-down images that strip PowerShell but keep it. That costs nothing on
+ * machines where the binary is simply absent - the spawn fails immediately rather than waiting out a timeout.
+ *
+ * Both branches are asked to emit the same `Key=Value` line format so callers parse a single shape.
+ */
+async function queryWindowsCim(cimCommand: string, wmicArgs: string[]): Promise<string> {
+	const out = await tryExec('powershell', ['-NoProfile', '-NonInteractive', '-Command', cimCommand], POWERSHELL_PROBE_TIMEOUT_MS);
+	if (out.trim()) {
+		return out;
+	}
+	return tryExec('wmic', wmicArgs);
+}
+
+/** Sums `NumberOfCores=N` lines (one per CPU package) into a physical core count. 0 when none are present. */
+export function parseWindowsPhysicalCores(out: string): number {
+	let total = 0;
+	for (const m of out.matchAll(/NumberOfCores=(\d+)/gi)) {
+		total += parseInt(m[1], 10) || 0;
+	}
+	return total;
+}
+
+/**
+ * Dedicated VRAM (bytes) at/above which an adapter is taken to have a memory pool of its OWN rather than a
+ * carve-out of system RAM. Deliberately the same 4 GiB line the engine picker uses to decide an integrated
+ * GPU is worth offloading to, so an adapter that is budgeted as discrete is exactly one that already was.
+ */
+const DISCRETE_VRAM_HINT_BYTES = 4 * 1024 * 1024 * 1024;
+
+/** Vendor implied by an adapter's product name, or undefined when it names no vendor we know. */
+function gpuVendorFromName(name: string): GpuVendor | undefined {
+	const l = name.toLowerCase();
+	if (l.includes('amd') || l.includes('radeon')) { return 'amd'; }
+	if (l.includes('nvidia') || l.includes('geforce') || l.includes('quadro')) { return 'nvidia'; }
+	if (l.includes('intel')) { return 'intel'; }
+	return undefined;
+}
+
+/**
+ * Whether an adapter shares system memory instead of owning a VRAM pool. Only Intel is classified here (by
+ * the {@link DISCRETE_VRAM_HINT_BYTES} line): AMD APUs are deliberately left reporting `false`, which is what
+ * they do today - reclassifying them would change how every existing AMD machine is budgeted, and that needs
+ * its own hardware verification. Apple is set at its own detection site.
+ */
+function isIntegratedGpu(vendor: GpuVendor, totalVramBytes: number): boolean {
+	return vendor === 'intel' && totalVramBytes < DISCRETE_VRAM_HINT_BYTES;
+}
+
+/**
+ * Resolves the GPU vendor and product name from `lspci | grep -i vga` output. A line reads
+ * `00:02.0 VGA compatible controller: Intel Corporation Meteor Lake-P [Intel Arc Graphics] (rev 08)`, so the
+ * device description is what follows the first colon-space; the PCI address's own colons have no space.
+ * Vendor priority (AMD, then Intel) and the deliberate absence of NVIDIA both match the previous behaviour -
+ * NVIDIA cards are enumerated by `nvidia-smi` before this path is reached.
+ */
+export function parseLspciVga(out: string): { vendor: GpuVendor; name?: string } | undefined {
+	const devices = out.split('\n')
+		.map(line => line.split(/:\s/).slice(1).join(': ').trim())
+		.filter(Boolean);
+	for (const candidate of ['amd', 'intel'] as const) {
+		const match = devices.find(d => gpuVendorFromName(d) === candidate);
+		if (match) {
+			return { vendor: candidate, name: match };
+		}
+	}
+	// Vendor named outside the device description (or an unparseable line): fall back to the whole blob.
+	const l = out.toLowerCase();
+	if (l.includes('amd') || l.includes('radeon')) { return { vendor: 'amd' }; }
+	if (l.includes('intel')) { return { vendor: 'intel' }; }
+	return undefined;
+}
+
+/**
+ * Resolves the GPU vendor, product name and dedicated VRAM from `Name=`/`AdapterRAM=` controller lines, plus
+ * the display driver's registry QWORD. Returns undefined when no known vendor appears, which the caller reads
+ * as "no discrete GPU detected".
+ *
+ * The vendor is resolved per ADAPTER rather than from the whole blob so the name we keep belongs to the
+ * adapter we picked - the engine picker reads that name to tell a modern Arc/Xe iGPU (worth Vulkan) from a
+ * legacy UHD one (not). Vendor priority is unchanged: AMD, then NVIDIA, then Intel.
+ */
+export function parseWindowsVideoController(controllerOut: string, registryOut: string): { vendor: GpuVendor; name?: string; totalVramBytes: number; isIntegrated: boolean } | undefined {
+	const names = [...controllerOut.matchAll(/^\s*Name=(.*)$/gim)].map(m => m[1].trim()).filter(Boolean);
+	let vendor: GpuVendor | undefined;
+	let name: string | undefined;
+	for (const candidate of ['amd', 'nvidia', 'intel'] as const) {
+		const match = names.find(n => gpuVendorFromName(n) === candidate);
+		if (match) {
+			vendor = candidate;
+			name = match;
+			break;
+		}
+	}
+	if (!vendor) {
+		// No adapter NAME identified a vendor: fall back to the whole blob, as before, so drivers that report
+		// the vendor only in another field still resolve (we just have no name to gate on).
+		const lower = controllerOut.toLowerCase();
+		if (lower.includes('amd') || lower.includes('radeon')) { vendor = 'amd'; }
+		else if (lower.includes('nvidia')) { vendor = 'nvidia'; }
+		else if (lower.includes('intel')) { vendor = 'intel'; }
+	}
+	if (!vendor) {
+		return undefined;
+	}
+
+	let vram = 0;
+	for (const m of controllerOut.matchAll(/AdapterRAM=(\d+)/gi)) {
+		vram = Math.max(vram, parseInt(m[1], 10) || 0);
+	}
+	// Win32_VideoController.AdapterRAM is a 32-bit field and wraps/caps around 4 GiB. Prefer the display
+	// driver's QWORD registry value when present so 8/12/16/24 GiB cards are sized correctly.
+	for (const m of registryOut.matchAll(/HardwareInformation\.qwMemorySize\s+REG_QWORD\s+0x([0-9a-f]+)/gi)) {
+		const bytes = Number.parseInt(m[1], 16);
+		if (Number.isSafeInteger(bytes) && bytes > 0) {
+			vram = Math.max(vram, bytes);
+		}
+	}
+	return { vendor, name, totalVramBytes: vram, isIntegrated: isIntegratedGpu(vendor, vram) };
 }
 
 /** Runs a command for its side effect. Resolves true only when it exited 0. */
@@ -302,16 +437,14 @@ export class LoCoPilotSystemInfoService implements ILoCoPilotSystemInfoService {
 					}
 				}
 			} else if (plat === 'win32') {
-				// NumberOfCores sums physical cores across CPU packages.
-				const out = await tryExec('wmic', ['cpu', 'get', 'NumberOfCores', '/value']);
-				if (out) {
-					let total = 0;
-					for (const m of out.matchAll(/NumberOfCores=(\d+)/g)) {
-						total += parseInt(m[1], 10) || 0;
-					}
-					if (total > 0) {
-						return total;
-					}
+				// NumberOfCores sums physical cores across CPU packages. The CIM branch is shaped to emit the
+				// same `NumberOfCores=N` lines that `wmic ... /value` does, so one parser serves both.
+				const out = await queryWindowsCim(
+					`Get-CimInstance -ClassName Win32_Processor | ForEach-Object { 'NumberOfCores=' + $_.NumberOfCores }`,
+					['cpu', 'get', 'NumberOfCores', '/value']);
+				const total = parseWindowsPhysicalCores(out);
+				if (total > 0) {
+					return total;
 				}
 			}
 		} catch {
@@ -342,6 +475,7 @@ export class LoCoPilotSystemInfoService implements ILoCoPilotSystemInfoService {
 							name,
 							totalVramBytes: Math.round(totalMiB * 1024 * 1024),
 							freeVramBytes: Number.isFinite(freeMiB) ? Math.round(freeMiB * 1024 * 1024) : 0,
+							isIntegrated: false, // anything nvidia-smi enumerates owns its VRAM
 						});
 					}
 				}
@@ -351,7 +485,7 @@ export class LoCoPilotSystemInfoService implements ILoCoPilotSystemInfoService {
 		// Apple Silicon: GPU shares system (unified) memory, so there is no separate VRAM figure. We record
 		// presence with totalVramBytes 0; the runner uses the system-RAM budget for Metal offload sizing.
 		if (gpus.length === 0 && platform() === 'darwin' && arch() === 'arm64') {
-			gpus.push({ vendor: 'apple', name: 'Apple Silicon GPU', totalVramBytes: 0, freeVramBytes: 0 });
+			gpus.push({ vendor: 'apple', name: 'Apple Silicon GPU', totalVramBytes: 0, freeVramBytes: 0, isIntegrated: true });
 		}
 
 		// AMD/Intel discrete GPUs: sniff the vendor and, where possible, the dedicated VRAM so the runner can
@@ -359,7 +493,7 @@ export class LoCoPilotSystemInfoService implements ILoCoPilotSystemInfoService {
 		if (gpus.length === 0) {
 			const other = await this._detectOtherGpu();
 			if (other) {
-				gpus.push({ vendor: other.vendor, name: other.name ?? `${other.vendor} GPU`, totalVramBytes: other.totalVramBytes, freeVramBytes: 0 });
+				gpus.push({ vendor: other.vendor, name: other.name ?? `${other.vendor} GPU`, totalVramBytes: other.totalVramBytes, freeVramBytes: 0, isIntegrated: other.isIntegrated });
 			}
 		}
 
@@ -371,40 +505,23 @@ export class LoCoPilotSystemInfoService implements ILoCoPilotSystemInfoService {
 	 * platform exposes it (AMD ROCm `rocm-smi`, Linux DRM sysfs, or Windows WMI `AdapterRAM`). VRAM is `0`
 	 * when it can't be resolved - the runner then treats the GPU as present-but-unsized.
 	 */
-	private async _detectOtherGpu(): Promise<{ vendor: GpuVendor; name?: string; totalVramBytes: number } | undefined> {
+	private async _detectOtherGpu(): Promise<{ vendor: GpuVendor; name?: string; totalVramBytes: number; isIntegrated: boolean } | undefined> {
 		const plat = platform();
 		try {
 			if (plat === 'linux') {
 				const out = await tryExec('sh', ['-c', 'lspci 2>/dev/null | grep -i vga']);
-				const l = out.toLowerCase();
-				let vendor: GpuVendor | undefined;
-				if (l.includes('amd') || l.includes('radeon')) { vendor = 'amd'; }
-				else if (l.includes('intel')) { vendor = 'intel'; }
-				if (!vendor) { return undefined; }
-				return { vendor, totalVramBytes: await this._detectLinuxGpuVram(vendor) };
+				const parsed = parseLspciVga(out);
+				if (!parsed) { return undefined; }
+				const totalVramBytes = await this._detectLinuxGpuVram(parsed.vendor);
+				return { ...parsed, totalVramBytes, isIntegrated: isIntegratedGpu(parsed.vendor, totalVramBytes) };
 			} else if (plat === 'win32') {
-				// Query both Name and AdapterRAM (bytes, 32-bit so capped at ~4GB) per controller.
-				const out = await tryExec('wmic', ['path', 'win32_VideoController', 'get', 'Name,AdapterRAM', '/format:list']);
-				const lower = out.toLowerCase();
-				let vendor: GpuVendor | undefined;
-				if (lower.includes('amd') || lower.includes('radeon')) { vendor = 'amd'; }
-				else if (lower.includes('nvidia')) { vendor = 'nvidia'; }
-				else if (lower.includes('intel')) { vendor = 'intel'; }
-				if (!vendor) { return undefined; }
-				let vram = 0;
-				for (const m of out.matchAll(/AdapterRAM=(\d+)/gi)) {
-					vram = Math.max(vram, parseInt(m[1], 10) || 0);
-				}
-				// Win32_VideoController.AdapterRAM is a 32-bit field and wraps/caps around 4 GiB. Prefer the
-				// display driver's QWORD registry value when present so 8/12/16/24 GiB cards are sized correctly.
+				// Query both Name and AdapterRAM (bytes, 32-bit so capped at ~4GB) per controller. The CIM branch
+				// is shaped to emit the same `Name=`/`AdapterRAM=` lines that `wmic ... /format:list` does.
+				const out = await queryWindowsCim(
+					`Get-CimInstance -ClassName Win32_VideoController | ForEach-Object { 'Name=' + $_.Name; 'AdapterRAM=' + $_.AdapterRAM }`,
+					['path', 'win32_VideoController', 'get', 'Name,AdapterRAM', '/format:list']);
 				const registry = await tryExec('reg', ['query', 'HKLM\\SYSTEM\\CurrentControlSet\\Control\\Video', '/s', '/v', 'HardwareInformation.qwMemorySize']);
-				for (const m of registry.matchAll(/HardwareInformation\.qwMemorySize\s+REG_QWORD\s+0x([0-9a-f]+)/gi)) {
-					const bytes = Number.parseInt(m[1], 16);
-					if (Number.isSafeInteger(bytes) && bytes > 0) {
-						vram = Math.max(vram, bytes);
-					}
-				}
-				return { vendor, totalVramBytes: vram };
+				return parseWindowsVideoController(out, registry);
 			}
 		} catch {
 			// ignore

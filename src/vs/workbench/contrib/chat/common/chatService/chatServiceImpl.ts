@@ -1109,9 +1109,11 @@ export class ChatService extends Disposable implements IChatService {
 		/* ---------------------------------------------------------------------------------
 		 * LLM-BASED TITLE GENERATION - COMMENTED OUT.
 		 *
-		 * Measured on llama.cpp (Qwen3.5-2B MTP, n_slots = 1, cache_reuse disabled by the MTP
-		 * draft context): this 53-token title prompt lands between conversation turns, and because
-		 * it shares no prefix with what is in the slot it logs "forcing full prompt re-processing"
+		 * Measured on llama.cpp (Qwen3.5-2B MTP, n_slots = 1, and with cache_reuse unavailable - Qwen3.5
+		 * is an M-RoPE arch, so llama.cpp zeroes n_cache_reuse at load regardless of MTP; see the
+		 * --cache-reuse comment in locopilotLlamaCppServer.ts): this 53-token title prompt lands between
+		 * conversation turns, and because it shares no prefix with what is in the slot it logs
+		 * "forcing full prompt re-processing"
 		 * and ERASES every context checkpoint of the ~7.7K conversation. With it commented out the
 		 * next turn instead hits "restored context checkpoint" at sim_best = 0.999. The warm-up
 		 * ping in locopilotLocalModelRunner.ts is commented out for the same reason.

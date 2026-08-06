@@ -16,6 +16,13 @@ export interface IGpuInfo {
 	readonly totalVramBytes: number;
 	/** Free VRAM in bytes at probe time, or 0 when unknown. */
 	readonly freeVramBytes: number;
+	/**
+	 * True when this adapter has no memory pool of its own and draws on system RAM (Intel/AMD integrated
+	 * graphics, Apple unified memory). Whatever such an adapter reports as "dedicated VRAM" is a carve-out of
+	 * system RAM, not a second pool that can be budgeted on top of it - so callers sizing an inference budget
+	 * must fall back to the system-RAM budget instead of treating the reported figure as a VRAM ceiling.
+	 */
+	readonly isIntegrated: boolean;
 }
 
 export interface ISystemHardwareInfo {

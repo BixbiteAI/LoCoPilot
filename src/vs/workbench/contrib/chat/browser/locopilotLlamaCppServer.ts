@@ -127,6 +127,29 @@ export const VULKAN_MIN_DEDICATED_VRAM_BYTES = 4 * 1024 * 1024 * 1024; // 4 GB
 export interface GpuLike {
 	vendor: 'nvidia' | 'amd' | 'intel' | 'apple' | 'unknown';
 	totalVramBytes: number;
+	/** Adapter product name, when the probe could read it. Absent shapes simply skip the name-based gate. */
+	name?: string;
+}
+
+/**
+ * Intel graphics generations where Vulkan offload is worth taking over the CPU build: the Xe line (Tiger Lake
+ * "Iris Xe" and later) and everything branded Arc, which covers both the discrete A/B-series cards and the
+ * integrated Arc GPU in Core Ultra parts. Deliberately does NOT match the older HD/UHD/Iris Plus iGPUs, whose
+ * execution-unit counts are low enough that Vulkan can be slower than running on the CPU.
+ */
+const INTEL_VULKAN_CAPABLE_NAME = /\barc\b|\biris xe\b|\bxe graphics\b/;
+
+/**
+ * Whether an adapter name identifies an Intel GPU worth using Vulkan on. Trademark markers are stripped first
+ * because Windows reports names like `Intel(R) Iris(R) Xe Graphics`, where the `(R)` splits the "Iris Xe"
+ * that Linux's `lspci` reports contiguously.
+ */
+export function isVulkanCapableIntelGpuName(name: string | undefined): boolean {
+	if (!name) {
+		return false;
+	}
+	const normalized = name.toLowerCase().replace(/\((?:r|tm)\)|[\u00AE\u2122]/g, ' ').replace(/\s+/g, ' ');
+	return INTEL_VULKAN_CAPABLE_NAME.test(normalized);
 }
 
 /**
@@ -135,9 +158,13 @@ export interface GpuLike {
  *
  * The intent is "discrete/decent GPU -> Vulkan, weak integrated GPU -> CPU":
  *  - NVIDIA or AMD -> yes. These are discrete cards (or capable AMD APUs); Vulkan offload clearly wins.
- *  - Intel/unknown -> only when we measured a meaningful dedicated VRAM pool
- *    ({@link VULKAN_MIN_DEDICATED_VRAM_BYTES}+), which weak integrated GPUs don't have. This keeps slow
- *    iGPUs (where Vulkan can be *slower* than CPU) on the CPU build.
+ *  - Intel/unknown -> when we measured a meaningful dedicated VRAM pool
+ *    ({@link VULKAN_MIN_DEDICATED_VRAM_BYTES}+), OR when the adapter NAME identifies a modern Intel GPU
+ *    ({@link isVulkanCapableIntelGpuName}). The VRAM test alone permanently excluded every Intel integrated
+ *    GPU however capable, because an iGPU borrows system memory and so reports no dedicated pool at all - a
+ *    brand-new Core Ultra laptop was pinned to the CPU build for the same reason a 2016 UHD one was. The name
+ *    check is purely additive: anything that qualified on VRAM still qualifies, and an Intel GPU we cannot
+ *    name still falls back to the VRAM rule (i.e. stays on CPU), so this can only widen, never narrow.
  *  - Apple GPUs are ignored here (handled by the Metal path).
  */
 export function shouldUseBundledVulkan(gpus: readonly GpuLike[]): boolean {
@@ -146,7 +173,7 @@ export function shouldUseBundledVulkan(gpus: readonly GpuLike[]): boolean {
 			return true;
 		}
 		if (g.vendor === 'intel' || g.vendor === 'unknown') {
-			return g.totalVramBytes >= VULKAN_MIN_DEDICATED_VRAM_BYTES;
+			return g.totalVramBytes >= VULKAN_MIN_DEDICATED_VRAM_BYTES || isVulkanCapableIntelGpuName(g.name);
 		}
 		return false; // apple -> Metal path, not Vulkan
 	});
@@ -1490,6 +1517,19 @@ export function getLlamaCppServerCommand(modelPath: string, backend: LlamaBacken
 
 	// Reuse cached KV for matching prompt prefixes (via KV shifting). Big win for agent loops that
 	// resend the same system prompt every turn. Default 256; set to 0 to disable.
+	//
+	// The server may ignore this. Verified against llama.cpp b9789 (tools/server/server-context.cpp, the two
+	// load-time gates at ~L1275/L1287 plus the per-slot re-check at ~L3159): `n_cache_reuse` is zeroed - with a
+	// `cache_reuse is not supported ...` warning - when EITHER a multimodal projector is loaded (`--mmproj`) OR
+	// `llama_memory_can_shift(ctx_tgt)` is false. That second one is false for:
+	//   - M-RoPE / interleaved-M-RoPE architectures (`hparams.n_pos_per_embd() > 1`), which covers the whole
+	//     natively-multimodal Qwen3.5/3.6 family - those models can NEVER use cache reuse, vision on or off;
+	//   - sliding-window models whose base and SWA caches differ in size, i.e. SWA WITHOUT `--swa-full`
+	//     (measured: gemma-4-E4B loses cache reuse by default and keeps it with `--swa-full`).
+	// Speculative decoding does NOT gate it: `--spec-type draft-mtp`, `draft-simple` and `ngram-mod` all keep
+	// cache reuse (measured on StarCoder2-3B), and the gates read the TARGET context only, never the draft one.
+	// So the flag is emitted unconditionally: it is a harmless no-op on models that can't use it, and passing it
+	// costs nothing beyond one warning line at load.
 	const cacheReuse = tuning.cacheReuse !== undefined ? tuning.cacheReuse : 256;
 	if (cacheReuse > 0) {
 		args.push('--cache-reuse', String(Math.floor(cacheReuse)));
