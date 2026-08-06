@@ -5,9 +5,9 @@
 
 import { execFile } from 'child_process';
 import { cpus, arch, platform, totalmem, freemem } from 'os';
-import { readFile } from 'fs/promises';
+import { readdir, readFile } from 'fs/promises';
 import { ILogService } from '../../log/common/log.js';
-import { IGpuInfo, ISystemHardwareInfo, ILoCoPilotSystemInfoService, GpuVendor, IMemoryStatus, MemoryPressureLevel, ThermalPressureLevel } from '../common/locopilotSystemInfo.js';
+import { IGpuInfo, ISystemHardwareInfo, ILoCoPilotSystemInfoService, GpuVendor, IMemoryStatus, MemoryPressureLevel, PowerSource, ThermalPressureLevel } from '../common/locopilotSystemInfo.js';
 
 /** Kill any probe command that runs longer than this. */
 const PROBE_TIMEOUT_MS = 4000;
@@ -18,6 +18,14 @@ const PROBE_TIMEOUT_MS = 4000;
  * to the same silent fallbacks this probe exists to avoid, and the cost is paid once (the result is cached).
  */
 const POWERSHELL_PROBE_TIMEOUT_MS = 8000;
+
+/**
+ * How long a power-source answer stays fresh. Short enough that unplugging is picked up before the next
+ * model launch (the only consumer), long enough that the several calls a single launch makes cost one
+ * subprocess rather than several. Deliberately NOT session-cached like the hardware probe: the whole point
+ * is that this value changes while the app runs.
+ */
+const POWER_SOURCE_TTL_MS = 15_000;
 
 /** Runs a command, capturing stdout. Resolves '' on any error (missing binary, non-zero exit, timeout). */
 function tryExec(command: string, args: string[], timeoutMs: number = PROBE_TIMEOUT_MS): Promise<string> {
@@ -51,6 +59,38 @@ async function queryWindowsCim(cimCommand: string, wmicArgs: string[]): Promise<
 		return out;
 	}
 	return tryExec('wmic', wmicArgs);
+}
+
+/**
+ * Reads the power source out of `pmset -g batt`, whose first line is one of:
+ *   `Now drawing from 'AC Power'` / `Now drawing from 'Battery Power'`
+ * A Mac with no battery (Studio, Mini, Pro) prints the AC line too, which is the answer we want anyway.
+ * Empty/unrecognised output means the probe failed, and 'unknown' keeps the caller on its current behaviour
+ * rather than throttling a workstation on a bad parse.
+ */
+export function parseDarwinPowerSource(pmsetOut: string): PowerSource {
+	const l = pmsetOut.toLowerCase();
+	if (l.includes('ac power')) { return 'ac'; }
+	if (l.includes('battery power')) { return 'battery'; }
+	return 'unknown';
+}
+
+/**
+ * Resolves the power source from Win32_Battery `BatteryStatus` values, where 1 means "discharging" (i.e. the
+ * machine is running off the battery) and 2 means "on AC". Any other code (3-11: charging, fully charged and
+ * on mains, etc.) still implies mains power.
+ *
+ * A desktop has NO Win32_Battery instance at all, so empty output is the normal, correct 'ac' answer - not a
+ * failure. That is why this parser takes the exit-shaped `queried` flag separately: only a probe that failed
+ * to RUN yields 'unknown'.
+ */
+export function parseWindowsPowerSource(out: string, queried: boolean): PowerSource {
+	if (!queried) { return 'unknown'; }
+	const codes = [...out.matchAll(/BatteryStatus=(\d+)/gi)].map(m => parseInt(m[1], 10));
+	if (codes.length === 0) {
+		return 'ac'; // no battery device -> desktop/VM -> mains
+	}
+	return codes.some(c => c === 1) ? 'battery' : 'ac';
 }
 
 /** Sums `NumberOfCores=N` lines (one per CPU package) into a physical core count. 0 when none are present. */
@@ -209,6 +249,11 @@ export class LoCoPilotSystemInfoService implements ILoCoPilotSystemInfoService {
 
 	/** Cached probe result; hardware doesn't change during a session. */
 	private _cached: Promise<ISystemHardwareInfo> | undefined;
+
+	/** Last power-source answer and when it was taken, for the {@link POWER_SOURCE_TTL_MS} cache. */
+	private _powerSource: { value: PowerSource; at: number } | undefined;
+	/** In-flight power probe, so concurrent callers share one subprocess instead of racing several. */
+	private _powerSourceInFlight: Promise<PowerSource> | undefined;
 
 	constructor(
 		@ILogService private readonly logService: ILogService
@@ -394,6 +439,94 @@ export class LoCoPilotSystemInfoService implements ILoCoPilotSystemInfoService {
 			// fall through
 		}
 		return false;
+	}
+
+	async getPowerSource(): Promise<PowerSource> {
+		const now = Date.now();
+		if (this._powerSource && now - this._powerSource.at < POWER_SOURCE_TTL_MS) {
+			return this._powerSource.value;
+		}
+		if (!this._powerSourceInFlight) {
+			this._powerSourceInFlight = this._probePowerSource()
+				.catch(err => {
+					this.logService.warn(`[LoCoPilotSystemInfo] power-source probe failed: ${err}`);
+					return 'unknown' as PowerSource;
+				})
+				.then(value => {
+					// Only remember an answer we actually got. Caching 'unknown' would pin a transient probe
+					// failure for the whole TTL, and 'unknown' is the one value callers act on by doing nothing.
+					if (value !== 'unknown') {
+						this._powerSource = { value, at: Date.now() };
+					}
+					this._powerSourceInFlight = undefined;
+					return value;
+				});
+		}
+		return this._powerSourceInFlight;
+	}
+
+	private async _probePowerSource(): Promise<PowerSource> {
+		const plat = platform();
+		if (plat === 'darwin') {
+			return parseDarwinPowerSource(await tryExec('pmset', ['-g', 'batt']));
+		}
+		if (plat === 'win32') {
+			// The sentinel line matters: on a desktop Win32_Battery legitimately returns NOTHING, which is
+			// indistinguishable from "PowerShell never ran" unless the query prints something unconditionally.
+			// `BatteryCount=` proves the probe executed, so an empty battery list can be read as 'ac' (desktop)
+			// instead of being lumped in with a failed probe.
+			const out = await queryWindowsCim(
+				'$b = @(Get-CimInstance Win32_Battery); "BatteryCount=" + $b.Count; $b | ForEach-Object { "BatteryStatus=" + $_.BatteryStatus }',
+				['path', 'Win32_Battery', 'get', 'BatteryStatus', '/format:value']);
+			return parseWindowsPowerSource(out, /^BatteryCount=/mi.test(out) || /BatteryStatus=/i.test(out));
+		}
+		if (plat === 'linux') {
+			return this._linuxPowerSource();
+		}
+		return 'unknown';
+	}
+
+	/**
+	 * Linux: /sys/class/power_supply holds one directory per supply. A `Mains` supply's `online` file is the
+	 * authoritative answer (1 = plugged in); only when no mains device is exposed do we fall back to reading a
+	 * battery's own `status`. A machine with neither (most desktops, containers, VMs) exposes an empty or
+	 * missing directory, which is 'ac' - there is no battery to run down.
+	 */
+	private async _linuxPowerSource(): Promise<PowerSource> {
+		const root = '/sys/class/power_supply';
+		let entries: string[];
+		try {
+			entries = await readdir(root);
+		} catch {
+			return 'ac'; // no power-supply class at all -> nothing that can run on battery
+		}
+		const read = async (p: string): Promise<string> => {
+			try {
+				return (await readFile(p, 'utf8')).trim();
+			} catch {
+				return '';
+			}
+		};
+		let sawMains = false;
+		let batteryStatus = '';
+		for (const name of entries) {
+			const type = await read(`${root}/${name}/type`);
+			if (type === 'Mains') {
+				sawMains = true;
+				if (await read(`${root}/${name}/online`) === '1') {
+					return 'ac';
+				}
+			} else if (type === 'Battery' && !batteryStatus) {
+				batteryStatus = await read(`${root}/${name}/status`);
+			}
+		}
+		if (sawMains) {
+			return 'battery'; // mains present and every one of them offline
+		}
+		if (batteryStatus) {
+			return batteryStatus === 'Discharging' ? 'battery' : 'ac';
+		}
+		return 'ac';
 	}
 
 	/** Direct child PIDs of `pid` (darwin/linux, via pgrep). Empty on error or when there are none. */

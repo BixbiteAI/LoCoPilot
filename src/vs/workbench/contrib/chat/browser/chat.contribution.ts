@@ -860,14 +860,15 @@ configurationRegistry.registerConfiguration({
 		},
 		[ChatConfiguration.LocopilotLocalPerformanceProfile]: {
 			type: 'string',
-			enum: ['performance', 'balanced', 'quiet'],
+			enum: ['auto', 'performance', 'balanced', 'quiet'],
 			enumDescriptions: [
+				nls.localize('locopilot.local.performanceProfile.auto', "Pick the profile when a model starts: `performance` on mains power, `balanced` on battery, `quiet` when the machine is already running hot. Desktops always resolve to `performance`."),
 				nls.localize('locopilot.local.performanceProfile.performance', "Maximum throughput using all detected performance cores and the largest safe prefill batches."),
 				nls.localize('locopilot.local.performanceProfile.balanced', "Use about 75% of CPU cores and moderate prefill batches for lower sustained heat with a small speed trade-off."),
 				nls.localize('locopilot.local.performanceProfile.quiet', "Use about half the CPU cores and small prefill batches for the lowest heat and power consumption."),
 			],
-			markdownDescription: nls.localize('locopilot.local.performanceProfile.description', "Power and thermal profile for sustained local inference. `performance` preserves maximum speed. Choose `balanced` or `quiet` on laptops or passively cooled systems to reduce heat and throttling during long sessions."),
-			default: 'performance',
+			markdownDescription: nls.localize('locopilot.local.performanceProfile.description', "Power and thermal profile for sustained local inference. `auto` (the default) reads the power source and thermal state each time a model server starts and picks for you; a desktop or a plugged-in laptop is unaffected. The profile is fixed for the life of a server, so unplugging mid-session does not restart or re-tune a model that is already running - the new profile applies the next time one starts. Set `performance`, `balanced` or `quiet` explicitly to override."),
+			default: 'auto',
 		},
 		[ChatConfiguration.LocopilotShowToolDetails]: {
 			type: 'boolean',

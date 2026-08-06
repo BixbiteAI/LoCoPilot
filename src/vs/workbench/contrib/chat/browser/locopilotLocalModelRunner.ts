@@ -67,6 +67,8 @@ import {
 	kvCacheTiersFor,
 	detectRejectedKvQuantHalf,
 	KV_QUANT_FULLY_SUPPORTED,
+	resolveAutoPerformanceProfile,
+	type ResolvedPerformanceProfile,
 	type LlamaServerTuning,
 	type FlashAttentionMode,
 	type KvCacheType,
@@ -75,7 +77,7 @@ import {
 } from './locopilotLlamaCppServer.js';
 import { readGgufModelInfo, isMoeModelInfo, isSwaModelInfo, kvBytesPerTokenPerLayer, kvLayerCount, recurrentStateBytes, type IGgufModelInfo } from './locopilotGgufMetadata.js';
 import { readMlxModelInfo } from './locopilotMlxMetadata.js';
-import { ILoCoPilotSystemInfoService, type IGpuInfo, type IMemoryStatus, type ISystemHardwareInfo, type MemoryPressureLevel } from '../../../../platform/locopilotSystemInfo/common/locopilotSystemInfo.js';
+import { ILoCoPilotSystemInfoService, type IGpuInfo, type IMemoryStatus, type ISystemHardwareInfo, type MemoryPressureLevel, type PowerSource } from '../../../../platform/locopilotSystemInfo/common/locopilotSystemInfo.js';
 import { dirname } from '../../../../base/common/path.js';
 import { isWindows, isMacintosh } from '../../../../base/common/platform.js';
 import {
@@ -628,7 +630,11 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 		this._register(this.configurationService.onDidChangeConfiguration(e => {
 			if (e.affectsConfiguration(ChatConfiguration.LocopilotLlamaCppContextSize)
 				|| e.affectsConfiguration(ChatConfiguration.LocopilotLlamaCppKvCacheType)
-				|| e.affectsConfiguration(ChatConfiguration.LocopilotLlamaCppSwaFull)) {
+				|| e.affectsConfiguration(ChatConfiguration.LocopilotLlamaCppSwaFull)
+				// The profile sizes -b/-ub, which feed runtimeOverheadBytesForTuning and therefore the KV budget
+				// the context clamp works from - so a cached plan computed under the old profile is stale in the
+				// context it planned, not just in the batch flags.
+				|| e.affectsConfiguration(ChatConfiguration.LocopilotLocalPerformanceProfile)) {
 				this._invalidateAutoPlans();
 			}
 		}));
@@ -2385,6 +2391,42 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 	}
 
 	/**
+	 * Resolves `locopilot.local.performanceProfile` to a CONCRETE profile for a launch that is about to happen.
+	 *
+	 * Everything the profile controls (`--threads`, `-b`/`-ub`, MLX's prefill step and prompt-cache count) is a
+	 * command-line argument to a server process, and neither llama-server nor mlx_lm.server can change any of
+	 * them on a live process. So 'auto' is deliberately a LAUNCH-TIME decision, not a running control loop:
+	 * reacting to a mid-session unplug would mean restarting the server, paying a full weight reload and
+	 * throwing away the KV/prompt cache, at exactly the moment the user is mid-conversation. That trade is
+	 * worse than the heat it would save, so a running server keeps the profile it started with.
+	 *
+	 * The precedence itself lives in {@link resolveAutoPerformanceProfile}; this method is the plumbing that
+	 * feeds it live signals and logs what it decided.
+	 */
+	private async _resolvePerformanceProfile(): Promise<ResolvedPerformanceProfile> {
+		const configured = this.configurationService.getValue<'auto' | ResolvedPerformanceProfile>(ChatConfiguration.LocopilotLocalPerformanceProfile) ?? 'auto';
+		if (configured !== 'auto') {
+			return configured;
+		}
+		const [power, mem] = await Promise.all([
+			this.instantiationService.invokeFunction(async (accessor) => {
+				try {
+					return await accessor.get(ILoCoPilotSystemInfoService).getPowerSource();
+				} catch {
+					return 'unknown' as PowerSource; // service not registered (web) or probe failed
+				}
+			}),
+			// Reuse the launch path's existing sample rather than re-probing: on macOS a memory status costs
+			// five subprocesses, and the fit gate has just taken one a moment earlier.
+			this._getMemoryStatus(LoCoPilotLocalModelRunner.WATCHDOG_INTERVAL_MS),
+		]);
+		const thermal = mem?.thermalPressure ?? 'unknown';
+		const resolved = resolveAutoPerformanceProfile(power, thermal);
+		this._log(`[LoCoPilot Runner] Performance profile auto -> ${resolved} (power=${power}, thermal=${thermal}).`);
+		return resolved;
+	}
+
+	/**
 	 * The adapter the selected backend will actually target (never an unrelated GPU): the one with most VRAM,
 	 * counting only adapters that own a SEPARATE memory pool. An integrated GPU is excluded even when it
 	 * reports a nonzero "dedicated VRAM" figure, because that figure is a carve-out of system RAM (typically a
@@ -2493,7 +2535,7 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 			return base;
 		}
 		const tuning: LlamaServerTuning = { ...base };
-		const performanceProfile = this.configurationService.getValue<'performance' | 'balanced' | 'quiet'>(ChatConfiguration.LocopilotLocalPerformanceProfile) ?? 'performance';
+		const performanceProfile = await this._resolvePerformanceProfile();
 
 		// Thread auto-tuning: only when the user left it on auto (0/unset).
 		if ((!tuning.threads || tuning.threads <= 0) && hw.physicalCoreCount > 0) {
@@ -5863,7 +5905,7 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 		// the resident cache) is what blew the command buffer.
 		const oomDegraded = this._oomStripExtras.has(modelId) || (oomLadderCap !== undefined && oomLadderCap > 0);
 		const tightFit = oomDegraded || (weightBytes > 0 && leftoverAfterWeights < MLX_TIGHT_FIT_HEADROOM_BYTES);
-		const performanceProfile = this.configurationService.getValue<'performance' | 'balanced' | 'quiet'>(ChatConfiguration.LocopilotLocalPerformanceProfile) ?? 'performance';
+		const performanceProfile = await this._resolvePerformanceProfile();
 		if (tightFit) {
 			tuning.prefillStepSize = 512;
 			tuning.promptCacheCount = 2;

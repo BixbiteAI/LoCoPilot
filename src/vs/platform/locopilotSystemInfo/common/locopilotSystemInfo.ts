@@ -57,6 +57,15 @@ export type MemoryPressureLevel = 'normal' | 'warn' | 'critical' | 'unknown';
 export type ThermalPressureLevel = 'nominal' | 'fair' | 'serious' | 'critical' | 'unknown';
 
 /**
+ * Where the machine is currently drawing power. 'ac' covers desktops and anything with no battery at all
+ * (a machine that cannot run down is, for our purposes, always plugged in), so callers can treat 'ac' as
+ * "spend freely". 'unknown' means the probe failed or the platform gave no answer - callers must then keep
+ * their existing behaviour rather than guessing, because guessing 'battery' on a workstation would silently
+ * throttle it.
+ */
+export type PowerSource = 'ac' | 'battery' | 'unknown';
+
+/**
  * A LIVE snapshot of system memory, taken at call time (never cached - unlike the hardware probe).
  *
  * `availableBytes` is the memory the OS could actually give an allocating process WITHOUT swapping:
@@ -100,4 +109,11 @@ export interface ILoCoPilotSystemInfoService {
 	 * the platform tools are missing or the call fails; never throws.
 	 */
 	deprioritizeProcess(pid: number): Promise<boolean>;
+	/**
+	 * Whether the machine is on AC or battery right now (see {@link PowerSource}). Briefly cached: the
+	 * launch path asks more than once per start, and the answer cannot meaningfully change between those
+	 * calls, but it MUST change within a session - unplugging is the whole point. Best-effort: resolves
+	 * 'unknown' when the platform tools are missing or the probe fails; never throws.
+	 */
+	getPowerSource(): Promise<PowerSource>;
 }

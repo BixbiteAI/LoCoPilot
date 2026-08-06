@@ -18,6 +18,7 @@ import {
 	getBundledLlamaServerPath,
 	getLlamaCppServerCommand,
 	resolveKvCacheType,
+	resolveAutoPerformanceProfile,
 	resolveKvCachePlan,
 	selectAutomaticKvCache,
 	kvCacheBytesPerElem,
@@ -965,6 +966,35 @@ suite('LoCoPilot llama.cpp server', () => {
 			assert.strictEqual(args.indexOf('--decode-concurrency'), -1);
 			assert.strictEqual(args.indexOf('--prefill-step-size'), -1);
 			assert.strictEqual(args.indexOf('--prompt-cache-size'), -1);
+		});
+	});
+
+	suite('auto performance profile', () => {
+		test('battery selects balanced, mains selects performance', () => {
+			assert.strictEqual(resolveAutoPerformanceProfile('battery', 'nominal'), 'balanced');
+			assert.strictEqual(resolveAutoPerformanceProfile('ac', 'nominal'), 'performance');
+			// A desktop reports 'ac' and must be completely unaffected by the feature.
+			assert.strictEqual(resolveAutoPerformanceProfile('ac', 'fair'), 'performance');
+		});
+
+		test('thermal pressure outranks the power source', () => {
+			// Plugged in but already throttling: being on mains does not make the heat go away, and starting
+			// another full-tilt load here is what ends with the watchdog stopping a server.
+			assert.strictEqual(resolveAutoPerformanceProfile('ac', 'serious'), 'quiet');
+			assert.strictEqual(resolveAutoPerformanceProfile('ac', 'critical'), 'quiet');
+			assert.strictEqual(resolveAutoPerformanceProfile('battery', 'critical'), 'quiet');
+			// 'fair' is normal warm operation, not throttling - it must NOT trigger a backoff.
+			assert.strictEqual(resolveAutoPerformanceProfile('battery', 'fair'), 'balanced');
+		});
+
+		test('an unknown probe never throttles - it keeps the previous default', () => {
+			assert.strictEqual(resolveAutoPerformanceProfile('unknown', 'unknown'), 'performance');
+			assert.strictEqual(resolveAutoPerformanceProfile('unknown', 'nominal'), 'performance');
+			// Thermal is macOS-only, so an unknown thermal reading on Windows/Linux must still let the
+			// power source decide rather than voiding the whole feature.
+			assert.strictEqual(resolveAutoPerformanceProfile('battery', 'unknown'), 'balanced');
+			// ...and an unknown power source must not be guessed as battery.
+			assert.strictEqual(resolveAutoPerformanceProfile('unknown', 'serious'), 'quiet');
 		});
 	});
 });

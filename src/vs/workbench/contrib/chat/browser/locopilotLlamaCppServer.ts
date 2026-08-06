@@ -5,6 +5,7 @@
 
 import { isMacintosh, isWindows } from '../../../../base/common/platform.js';
 import { join as pathJoin } from '../../../../base/common/path.js';
+import type { PowerSource, ThermalPressureLevel } from '../../../../platform/locopilotSystemInfo/common/locopilotSystemInfo.js';
 
 export type LlamaBackend = 'cuda' | 'metal' | 'vulkan' | 'cpu';
 
@@ -544,6 +545,26 @@ export function usableSystemMemoryBytes(totalmemBytes: number): number {
  * answer "does it fit?" with the same arithmetic.
  */
 export const RUNTIME_OVERHEAD_BYTES = Math.round(1.5 * 1024 * 1024 * 1024);
+
+/** The concrete profiles a launch can run under, once `auto` has been resolved. */
+export type ResolvedPerformanceProfile = 'performance' | 'balanced' | 'quiet';
+
+/**
+ * Resolves the `auto` performance profile from the machine's live power and thermal state. Engine-agnostic:
+ * both the llama.cpp and the MLX launch planners run their tuning through it.
+ *
+ * Precedence is deliberate. Thermal outranks power because a machine that is ALREADY throttling has a problem
+ * that being plugged in does not fix - and adding a full-tilt inference load there is what ends with the
+ * memory/thermal watchdog stopping a server outright. Everything else, including every 'unknown', resolves to
+ * `performance`: a probe that failed must leave behaviour exactly as it was rather than quietly throttling a
+ * workstation on missing data.
+ */
+export function resolveAutoPerformanceProfile(power: PowerSource, thermal: ThermalPressureLevel): ResolvedPerformanceProfile {
+	if (thermal === 'serious' || thermal === 'critical') {
+		return 'quiet';
+	}
+	return power === 'battery' ? 'balanced' : 'performance';
+}
 
 /**
  * Estimates transient runtime/compute allocations that grow beyond the flat base allowance. This is

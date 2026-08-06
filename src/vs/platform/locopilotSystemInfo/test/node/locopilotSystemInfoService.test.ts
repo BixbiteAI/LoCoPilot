@@ -5,7 +5,7 @@
 
 import assert from 'assert';
 import { ensureNoDisposablesAreLeakedInTestSuite } from '../../../../base/test/common/utils.js';
-import { parseDarwinAvailableBytes, parseLspciVga, parseWindowsPhysicalCores, parseWindowsVideoController } from '../../node/locopilotSystemInfoService.js';
+import { parseDarwinAvailableBytes, parseDarwinPowerSource, parseLspciVga, parseWindowsPhysicalCores, parseWindowsPowerSource, parseWindowsVideoController } from '../../node/locopilotSystemInfoService.js';
 
 suite('LoCoPilot system info service', () => {
 	ensureNoDisposablesAreLeakedInTestSuite();
@@ -137,5 +137,36 @@ suite('LoCoPilot system info service', () => {
 			{ vendor: 'amd', name: 'Advanced Micro Devices, Inc. [AMD/ATI] Navi 33 [Radeon RX 7600]' }
 		);
 		assert.strictEqual(parseLspciVga(''), undefined);
+	});
+
+	test('macOS power source reads the pmset drawing-from line', () => {
+		// Real `pmset -g batt` output: the battery detail line follows the verdict line, and on a charged
+		// laptop it mentions the battery even though the machine is on mains - so the verdict must win.
+		assert.strictEqual(parseDarwinPowerSource([
+			`Now drawing from 'AC Power'`,
+			' -InternalBattery-0 (id=22806627)\t100%; charged; 0:00 remaining present: true',
+		].join('\n')), 'ac');
+		assert.strictEqual(parseDarwinPowerSource([
+			`Now drawing from 'Battery Power'`,
+			' -InternalBattery-0 (id=22806627)\t83%; discharging; 4:12 remaining present: true',
+		].join('\n')), 'battery');
+		// A Mac with no battery at all still prints the AC verdict.
+		assert.strictEqual(parseDarwinPowerSource(`Now drawing from 'AC Power'`), 'ac');
+		// A failed probe must not be read as either state.
+		assert.strictEqual(parseDarwinPowerSource(''), 'unknown');
+	});
+
+	test('Windows power source distinguishes a desktop from a failed probe', () => {
+		// BatteryStatus 1 = discharging; 2 = on AC.
+		assert.strictEqual(parseWindowsPowerSource('BatteryCount=1\nBatteryStatus=1', true), 'battery');
+		assert.strictEqual(parseWindowsPowerSource('BatteryCount=1\nBatteryStatus=2', true), 'ac');
+		// Charging/fully-charged codes still mean mains power.
+		assert.strictEqual(parseWindowsPowerSource('BatteryCount=1\nBatteryStatus=6', true), 'ac');
+		// Any discharging battery wins on a multi-battery machine.
+		assert.strictEqual(parseWindowsPowerSource('BatteryCount=2\nBatteryStatus=2\nBatteryStatus=1', true), 'battery');
+		// A desktop has no Win32_Battery instance: the query ran and found nothing, which is 'ac'.
+		assert.strictEqual(parseWindowsPowerSource('BatteryCount=0', true), 'ac');
+		// The same empty output when the query never ran must NOT be read as 'ac'.
+		assert.strictEqual(parseWindowsPowerSource('', false), 'unknown');
 	});
 });
