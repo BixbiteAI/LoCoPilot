@@ -133,12 +133,21 @@ export interface GpuLike {
 }
 
 /**
- * Intel graphics generations where Vulkan offload is worth taking over the CPU build: the Xe line (Tiger Lake
- * "Iris Xe" and later) and everything branded Arc, which covers both the discrete A/B-series cards and the
- * integrated Arc GPU in Core Ultra parts. Deliberately does NOT match the older HD/UHD/Iris Plus iGPUs, whose
- * execution-unit counts are low enough that Vulkan can be slower than running on the CPU.
+ * Intel graphics generations where Vulkan offload is worth taking over the CPU build: everything branded Arc,
+ * which covers both the discrete A/B-series cards and the integrated Arc GPU in Core Ultra parts.
+ *
+ * "Iris Xe" / "Xe Graphics" USED to match here and no longer does. That is the 11th-13th gen laptop class
+ * (e.g. an i7-1355U's 96-EU Iris Xe), where the iGPU shares a 15 W package budget with the CPU cores it is
+ * supposed to be beating - so Vulkan there routinely LOSES to two performance cores on prompt processing,
+ * and on Windows the Intel driver exposes only a small device-local heap, which makes a full offload either
+ * fail or spill into uncached shared memory. Since `auto` has no fallback once a backend is chosen (a launch
+ * that is merely slow, not crashing, never trips the OOM ladder), the wrong guess here is unrecoverable for
+ * the user, so the gate stays narrow. Anyone on a beefier Xe part (the 28 W P-series) can still opt in with
+ * `locopilot.llamaCpp.engine: "gpu"`, which bypasses this check entirely.
+ *
+ * Also deliberately does NOT match the older HD/UHD/Iris Plus iGPUs, for the same reason as before.
  */
-const INTEL_VULKAN_CAPABLE_NAME = /\barc\b|\biris xe\b|\bxe graphics\b/;
+const INTEL_VULKAN_CAPABLE_NAME = /\barc\b/;
 
 /**
  * Whether an adapter name identifies an Intel GPU worth using Vulkan on. Trademark markers are stripped first

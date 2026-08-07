@@ -93,6 +93,35 @@ export function parseWindowsPowerSource(out: string, queried: boolean): PowerSou
 	return codes.some(c => c === 1) ? 'battery' : 'ac';
 }
 
+/**
+ * Performance-core count derived from the physical and logical (hardware-thread) counts, for the platforms
+ * whose OS probe reports only "all physical cores" (Windows `Win32_Processor.NumberOfCores`, Linux
+ * `lscpu -p=Core,Socket`). Both COUNT EFFICIENCY CORES, so on an Intel hybrid part they answer 10 for a
+ * 2P+8E chip - and handing llama.cpp `--threads 10` there is actively slower than `--threads 2`: it shards
+ * work evenly and barriers at every op, so each matmul runs at E-core pace while the P-cores idle at the
+ * barrier, and on a 15 W laptop ten busy cores also blow the power budget so the P-cores clock down too.
+ *
+ * On x86 the split is recoverable without native code, because P-cores carry SMT and E-cores do not:
+ *   logical = 2*P + E, physical = P + E  =>  logical - physical = P.
+ * Verified against the shapes that matter: i7-1355U (2P+8E) 12-10=2; i9-13900K (8P+16E) 32-24=8;
+ * a conventional 8c/16t part 16-8=8 (all cores are performance cores, which is the right answer);
+ * an AMD 8c/16t 16-8=8 likewise.
+ *
+ * When SMT is absent or disabled the counts are equal and there is nothing to recover, so we return the
+ * physical count unchanged - today's behaviour. That also covers Intel parts that dropped HyperThreading
+ * entirely (Core Ultra 200S / Arrow Lake): they are not improved by this, but they are not made worse.
+ * The result is clamped to the physical count so an exotic 4-way-SMT machine cannot over-report.
+ */
+export function performanceCoreCount(physicalCores: number, logicalCores: number): number {
+	if (physicalCores <= 0) {
+		return 0;
+	}
+	if (logicalCores > physicalCores) {
+		return Math.max(1, Math.min(physicalCores, logicalCores - physicalCores));
+	}
+	return physicalCores;
+}
+
 /** Sums `NumberOfCores=N` lines (one per CPU package) into a physical core count. 0 when none are present. */
 export function parseWindowsPhysicalCores(out: string): number {
 	let total = 0;
@@ -557,6 +586,8 @@ export class LoCoPilotSystemInfoService implements ILoCoPilotSystemInfoService {
 				}
 			} else if (plat === 'linux') {
 				// Count distinct physical core ids across sockets from /proc/cpuinfo via lscpu's machine output.
+				// This counts EVERY physical core, efficiency cores included, so the hybrid split is recovered
+				// from the logical count by {@link performanceCoreCount} (see there for why E-cores must go).
 				const out = await tryExec('lscpu', ['-p=Core,Socket']);
 				if (out) {
 					const pairs = new Set<string>();
@@ -566,18 +597,19 @@ export class LoCoPilotSystemInfoService implements ILoCoPilotSystemInfoService {
 						pairs.add(l);
 					}
 					if (pairs.size > 0) {
-						return pairs.size;
+						return performanceCoreCount(pairs.size, logical);
 					}
 				}
 			} else if (plat === 'win32') {
 				// NumberOfCores sums physical cores across CPU packages. The CIM branch is shaped to emit the
 				// same `NumberOfCores=N` lines that `wmic ... /value` does, so one parser serves both.
+				// Like the Linux probe it counts efficiency cores too, hence the same hybrid correction.
 				const out = await queryWindowsCim(
 					`Get-CimInstance -ClassName Win32_Processor | ForEach-Object { 'NumberOfCores=' + $_.NumberOfCores }`,
 					['cpu', 'get', 'NumberOfCores', '/value']);
 				const total = parseWindowsPhysicalCores(out);
 				if (total > 0) {
-					return total;
+					return performanceCoreCount(total, logical);
 				}
 			}
 		} catch {

@@ -708,7 +708,7 @@ configurationRegistry.registerConfiguration({
 		[ChatConfiguration.LocopilotLlamaCppThreads]: {
 			type: 'number',
 			minimum: 0,
-			markdownDescription: nls.localize('locopilot.llamaCpp.threads.description', "CPU threads (`--threads`) for the local llama.cpp server. `0` lets llama.cpp auto-detect. Set to your physical (performance) core count if auto-detection is suboptimal on a hybrid CPU."),
+			markdownDescription: nls.localize('locopilot.llamaCpp.threads.description', "CPU threads (`--threads`) for the local llama.cpp server. `0` (default) lets LoCoPilot pick, using your CPU's **performance**-core count - on a hybrid Intel chip that deliberately excludes the efficiency cores, which slow generation down rather than speeding it up. Set a specific number only to override that choice."),
 			default: 0,
 		},
 		[ChatConfiguration.LocopilotLlamaCppBatchSize]: {

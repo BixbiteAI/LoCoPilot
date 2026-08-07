@@ -4740,7 +4740,14 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 			// only when even this small extra fits; otherwise drop it here and let the zero-memory n-gram drafting
 			// below take over. Runs BEFORE the paired-draft / n-gram blocks, so clearing the flag lets one of them
 			// pick up the slack.
-			const mtpHeadBytes = Math.min(Math.max(weightBytesForBudget * 0.08, 512 * 1e6), 2 * 1e9);
+			// The 512 MB floor is sized for multi-billion-parameter models and must not outgrow the model it is
+			// drafting for: on a sub-1B GGUF (~0.9 GB of weights) a flat 512 MB reserved more than half the
+			// model's own weight size for a single embedded head, which inflated the launch estimate to ~4 GB,
+			// shrank the context (the budget at #1 above is charged this reserve) and dropped MTP entirely on
+			// tight machines. Cap the floor at a quarter of the weights so it degrades with model size; the
+			// 8% term still governs everything above ~6.4 GB, where the floor never applied anyway.
+			const mtpHeadFloorBytes = Math.min(512 * 1e6, weightBytesForBudget * 0.25);
+			const mtpHeadBytes = Math.min(Math.max(weightBytesForBudget * 0.08, mtpHeadFloorBytes), 2 * 1e9);
 			if (await this._extrasFitBudget(modelPath, backend, discreteVramBytes, mmprojBytes + mtpHeadBytes)) {
 				extraResidentBytes += mtpHeadBytes;
 			} else {

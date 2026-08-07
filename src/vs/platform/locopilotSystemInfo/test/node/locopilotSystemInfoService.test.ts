@@ -5,7 +5,7 @@
 
 import assert from 'assert';
 import { ensureNoDisposablesAreLeakedInTestSuite } from '../../../../base/test/common/utils.js';
-import { parseDarwinAvailableBytes, parseDarwinPowerSource, parseLspciVga, parseWindowsPhysicalCores, parseWindowsPowerSource, parseWindowsVideoController } from '../../node/locopilotSystemInfoService.js';
+import { parseDarwinAvailableBytes, parseDarwinPowerSource, parseLspciVga, parseWindowsPhysicalCores, parseWindowsPowerSource, parseWindowsVideoController, performanceCoreCount } from '../../node/locopilotSystemInfoService.js';
 
 suite('LoCoPilot system info service', () => {
 	ensureNoDisposablesAreLeakedInTestSuite();
@@ -65,6 +65,34 @@ suite('LoCoPilot system info service', () => {
 		// Both an empty result and a header-only one must fall through to the caller's estimate, not to NaN.
 		assert.strictEqual(parseWindowsPhysicalCores(''), 0);
 		assert.strictEqual(parseWindowsPhysicalCores('NumberOfCores\r\n'), 0);
+	});
+
+	test('performance cores exclude efficiency cores on Intel hybrid CPUs', () => {
+		// The whole point of the correction: Win32_Processor/lscpu report P+E, and --threads must get P only.
+		// i7-1355U: 2 P-cores (SMT) + 8 E-cores -> 12 logical, 10 physical.
+		assert.strictEqual(performanceCoreCount(10, 12), 2);
+		// i9-13900K: 8 P-cores (SMT) + 16 E-cores -> 32 logical, 24 physical.
+		assert.strictEqual(performanceCoreCount(24, 32), 8);
+	});
+
+	test('performance cores are unchanged on conventional SMT CPUs', () => {
+		// No efficiency cores: every physical core IS a performance core, so nothing may be subtracted.
+		assert.strictEqual(performanceCoreCount(8, 16), 8);   // 8c/16t Intel or AMD
+		assert.strictEqual(performanceCoreCount(16, 32), 16); // 16c/32t
+	});
+
+	test('performance cores fall back to the physical count without SMT', () => {
+		// SMT absent or disabled (incl. Arrow Lake, which dropped HyperThreading): counts are equal and there
+		// is nothing to recover. Must return the physical count, never 0 or a subtraction artefact.
+		assert.strictEqual(performanceCoreCount(4, 4), 4);
+		assert.strictEqual(performanceCoreCount(24, 24), 24);
+	});
+
+	test('performance cores never exceed the physical count or report zero', () => {
+		// A 4-way-SMT machine would make logical-physical overshoot; the clamp keeps it honest.
+		assert.strictEqual(performanceCoreCount(8, 32), 8);
+		// A failed probe (0 physical) must stay 0 so the caller falls through to its own estimate.
+		assert.strictEqual(performanceCoreCount(0, 8), 0);
 	});
 
 	test('GPU vendor and VRAM parse identically from CIM and wmic output', () => {

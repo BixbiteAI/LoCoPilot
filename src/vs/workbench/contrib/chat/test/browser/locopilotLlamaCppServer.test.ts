@@ -686,12 +686,20 @@ suite('LoCoPilot llama.cpp server', () => {
 			assert.strictEqual(shouldUseBundledVulkan([{ vendor: 'intel', totalVramBytes: VULKAN_MIN_DEDICATED_VRAM_BYTES }]), true);
 		});
 
-		test('a modern Intel iGPU qualifies on its NAME despite reporting no dedicated VRAM', () => {
+		test('an integrated Arc iGPU qualifies on its NAME despite reporting no dedicated VRAM', () => {
 			// The whole point: an iGPU borrows system memory, so it can never clear the VRAM bar however new it is.
 			assert.strictEqual(shouldUseBundledVulkan([{ vendor: 'intel', totalVramBytes: 0, name: 'Intel(R) Arc(TM) Graphics' }]), true);
-			// Windows splits "Iris Xe" with a trademark marker; Linux reports it contiguously. Both must match.
-			assert.strictEqual(shouldUseBundledVulkan([{ vendor: 'intel', totalVramBytes: 0, name: 'Intel(R) Iris(R) Xe Graphics' }]), true);
+			// Trademark markers must not break the match: Windows splits the name, Linux reports it contiguously.
 			assert.strictEqual(shouldUseBundledVulkan([{ vendor: 'intel', totalVramBytes: 0, name: 'Intel Corporation Meteor Lake-P [Intel Arc Graphics]' }]), true);
+		});
+
+		test('15 W Iris Xe parts stay on the CPU build', () => {
+			// Regression guard for the i7-1355U class: 96 EUs sharing a 15 W package budget with the cores they
+			// would be replacing, so Vulkan loses on prompt processing - and `auto` has no way back once chosen.
+			// `engine: "gpu"` remains the opt-in for the beefier 28 W P-series parts.
+			for (const name of ['Intel(R) Iris(R) Xe Graphics', 'Intel(R) Xe Graphics', 'Intel Iris Xe Graphics']) {
+				assert.strictEqual(shouldUseBundledVulkan([{ vendor: 'intel', totalVramBytes: 0, name }]), false, name);
+			}
 		});
 
 		test('legacy Intel iGPUs still stay on the CPU build', () => {
