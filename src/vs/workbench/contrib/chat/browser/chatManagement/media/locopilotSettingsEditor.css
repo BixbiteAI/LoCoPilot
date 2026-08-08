@@ -708,7 +708,7 @@
 	max-width: 80px;
 }
 
-/* Custom endpoint: probe result sits inline, to the right of the context-window input. */
+/* Custom endpoint: the probe result is the whole row now (the context-window input it used to sit beside is gone - every provider derives or defaults its window). */
 .locopilot-settings-editor .endpoint-probe-status {
 	font-size: 12px;
 	line-height: 1.4;
@@ -719,7 +719,7 @@
 	overflow-wrap: anywhere;
 }
 
-/* The context-window row pairs a narrow numeric input with that status text. */
+/* The connection row holds only that status text. */
 .locopilot-settings-editor .form-field-tokens .form-input-with-suffix {
 	align-items: center;
 	gap: 10px;

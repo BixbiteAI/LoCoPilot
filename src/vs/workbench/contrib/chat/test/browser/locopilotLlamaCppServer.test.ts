@@ -321,6 +321,8 @@ suite('LoCoPilot llama.cpp server', () => {
 				ssmInnerSize: 8192,
 				ssmStateSize: 128,
 				ssmGroupCount: 8,
+				nextnPredictLayers: undefined,
+				hasNextnTensors: undefined,
 				...overrides,
 			};
 		}
@@ -332,6 +334,7 @@ suite('LoCoPilot llama.cpp server', () => {
 				kvHeadCount: 8, headCount: 40, embeddingLength: 5120, keyLength: 128, valueLength: 128,
 				slidingWindow: undefined, ssmConvKernel: undefined, ssmInnerSize: undefined,
 				ssmStateSize: undefined, ssmGroupCount: undefined,
+				nextnPredictLayers: undefined, hasNextnTensors: undefined,
 			};
 		}
 

@@ -383,6 +383,21 @@ export interface IGgufModelInfo {
 	 */
 	readonly slidingWindow: number | undefined;
 	/**
+	 * `<arch>.nextn_predict_layers` - how many trailing blocks are Multi-Token-Prediction (NextN) heads.
+	 * This is the AUTHORITATIVE MTP signal: llama.cpp reads this exact key to decide whether the model can
+	 * run `--spec-type draft-mtp`, and asserts on it when the arch claims MTP without it ("QWEN35_MTP requires
+	 * nextn_predict_layers > 0"). Detection must key off this, NOT off {@link hasNextnTensors} - see
+	 * {@link isMtpModelInfo} for why a tensors-only model must stay dense.
+	 */
+	readonly nextnPredictLayers: number | undefined;
+	/**
+	 * True when the tensor section carries NextN/MTP head tensors (`blk.N.nextn.*`, `nextn.pre_projection`,
+	 * `nextn.post_projection`). Corroborating evidence ONLY. A GGUF with these tensors but no
+	 * {@link nextnPredictLayers} key is a mis-converted MTP build that crashes llama.cpp on load, so this
+	 * field exists to DIAGNOSE that case (we log it), never to enable MTP on its own.
+	 */
+	readonly hasNextnTensors: boolean | undefined;
+	/**
 	 * Weight bytes of each transformer block, indexed by block number (from the GGUF tensor-info section).
 	 * Undefined when the tensor section couldn't be parsed (older reader path, unknown quant type, scan cap).
 	 * This is the "per-layer memory accounting" that lets the offload logic size a partial split from each
@@ -502,6 +517,29 @@ export function isSwaModelInfo(info: IGgufModelInfo): boolean {
 }
 
 /**
+ * True when this GGUF can actually be launched with `--spec-type draft-mtp`.
+ *
+ * Deliberately keyed on the `<arch>.nextn_predict_layers` METADATA KEY alone, never on the presence of
+ * `blk.N.nextn.*` tensors. The two can disagree, and when they do the tensors are the liar: Unsloth's
+ * Qwen3.6-27B-MTP-GGUF shipped every NextN tensor but omitted the key, and llama.cpp aborted the load with
+ * "QWEN35_MTP requires nextn_predict_layers > 0" until the upload was fixed. Since the key is precisely what
+ * the engine reads, a tensors-present/key-absent model is a mis-converted build that would crash on every
+ * launch - it must run dense. See {@link IGgufModelInfo.hasNextnTensors}.
+ */
+export function isMtpModelInfo(info: IGgufModelInfo): boolean {
+	return (info.nextnPredictLayers ?? 0) > 0;
+}
+
+/**
+ * True for the mis-converted shape described in {@link isMtpModelInfo}: NextN head tensors are present but the
+ * key the engine needs is missing. Not actionable for the user (only a re-upload fixes it), but worth logging
+ * so "why didn't MTP turn on for my -MTP- model?" is answerable from the log.
+ */
+export function hasBrokenMtpMetadata(info: IGgufModelInfo): boolean {
+	return info.hasNextnTensors === true && !((info.nextnPredictLayers ?? 0) > 0);
+}
+
+/**
  * Reduces a per-block attention-head array to the two numbers KV sizing needs: the largest head count on any
  * block (the most expensive attention block - sizing to the max is the memory-safe direction) and how many
  * blocks are attention blocks at all. Returns undefined for a missing/empty array or one that is entirely
@@ -542,6 +580,8 @@ export async function readGgufModelInfo(fileService: IFileService, filePath: str
 	let keyLength: number | undefined;
 	let valueLength: number | undefined;
 	let slidingWindow: number | undefined;
+	let nextnPredictLayers: number | undefined;
+	let hasNextnTensors: boolean | undefined;
 	let perLayerWeightBytes: number[] | undefined;
 	let perLayerExpertBytes: number[] | undefined;
 	let nonLayerWeightBytes: number | undefined;
@@ -549,7 +589,8 @@ export async function readGgufModelInfo(fileService: IFileService, filePath: str
 	const base = () => ({
 		layerCount, expertCount, contextLength, kvHeadCount, headCount, attentionLayerCount,
 		ssmConvKernel, ssmInnerSize, ssmStateSize, ssmGroupCount,
-		embeddingLength, keyLength, valueLength, slidingWindow,
+		embeddingLength, keyLength, valueLength, slidingWindow, nextnPredictLayers,
+		hasNextnTensors,
 	});
 	try {
 		const uri = URI.file(filePath);
@@ -628,6 +669,10 @@ export async function readGgufModelInfo(fileService: IFileService, filePath: str
 			} else if (isScalar && key.endsWith('.attention.sliding_window')) {
 				const n = await cursor.scalar(valueType);
 				slidingWindow = Number.isFinite(n) && n > 0 ? Math.floor(n) : undefined;
+			} else if (isScalar && key.endsWith('.nextn_predict_layers')) {
+				// The one key llama.cpp reads to decide MTP eligibility; see isMtpModelInfo.
+				const n = await cursor.scalar(valueType);
+				nextnPredictLayers = Number.isFinite(n) && n > 0 ? Math.floor(n) : undefined;
 			} else {
 				await cursor.skipValue(valueType);
 			}
@@ -659,6 +704,11 @@ export async function readGgufModelInfo(fileService: IFileService, filePath: str
 					}
 					const type = await cursor.u32();
 					await cursor.u64(); // tensor data offset (unused for sizing)
+					// NextN/MTP head tensors (`blk.N.nextn.*`, `nextn.pre_projection`, `nextn.post_projection`).
+					// Diagnostic only - MTP is enabled off the metadata key, never off this. See isMtpModelInfo.
+					if (!hasNextnTensors && name.includes('nextn.')) {
+						hasNextnTensors = true;
+					}
 					const block = ggmlTypeBlock(type);
 					if (!block) { usable = false; break; } // unknown quant -> can't size reliably
 					const [blockSize, typeSize] = block;

@@ -37,6 +37,10 @@ const HYBRID_FIELDS_NOT_DERIVED = {
 	ssmInnerSize: undefined,
 	ssmStateSize: undefined,
 	ssmGroupCount: undefined,
+	// MTP (`--spec-type draft-mtp`) is a llama.cpp GGUF feature; mlx_lm has no equivalent, so these stay
+	// undefined for an MLX weights directory rather than being derived from config.json.
+	nextnPredictLayers: undefined,
+	hasNextnTensors: undefined,
 } as const;
 
 export async function readMlxModelInfo(fileService: IFileService, modelDirPath: string, onError?: (e: unknown) => void): Promise<IGgufModelInfo> {

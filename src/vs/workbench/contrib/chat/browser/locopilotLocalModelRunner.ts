@@ -578,6 +578,21 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 	private readonly _kvQuantCapability = new Map<string, KvQuantCapability>();
 	/** Resolves once the persisted {@link _kvQuantCapability} map has been read from disk (or found absent). */
 	private _kvQuantCapabilityLoaded: Promise<void> | undefined;
+	/**
+	 * Model ids whose launch died with MTP (`--spec-type draft-mtp`) enabled, so they must run DENSE from now on.
+	 *
+	 * Per-model and persisted, for the same reason as {@link _kvQuantCapability}: whether the embedded MTP head
+	 * loads is a property of the MODEL's conversion, not of the binary. The session-wide
+	 * {@link _specFlagsUnsupported} switch is the wrong tool here - one mis-converted MTP GGUF would otherwise
+	 * disable speculative decoding for every OTHER model this session, including catalog models whose MTP works
+	 * and the unrelated n-gram fallback. Persisting it means an affected model costs one failed launch EVER,
+	 * rather than one on every app start.
+	 */
+	private readonly _mtpUnsupported = new Set<string>();
+	/** Resolves once the persisted {@link _mtpUnsupported} set has been read from disk (or found absent). */
+	private _mtpUnsupportedLoaded: Promise<void> | undefined;
+	/** Model ids whose LAST llama-server launch emitted the MTP flags; consulted by the crash fallback. */
+	private readonly _launchedWithMtp = new Set<string>();
 	/** Model ids whose LAST launch emitted a quantized `--cache-type-k`; consulted by the crash fallback. */
 	private readonly _launchedWithQuantizedK = new Set<string>();
 	/** Model ids whose LAST launch emitted a quantized `--cache-type-v`; consulted by the crash fallback. */
@@ -937,6 +952,47 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 			})();
 		}
 		return this._kvQuantCapabilityLoaded;
+	}
+
+	/** File the learned {@link _mtpUnsupported} set is persisted to. See that field for why it survives restarts. */
+	private _mtpUnsupportedUri(): URI {
+		return joinPath(this.environmentService.cacheHome, 'locopilot-mtp-support.json');
+	}
+
+	/**
+	 * Loads the persisted per-model MTP failures once per session. Best-effort in every failure mode: a missing,
+	 * unreadable or malformed file leaves the set empty, i.e. "assume MTP works where the GGUF says it does" -
+	 * the fresh-install state, which self-heals again on the first failed launch.
+	 */
+	private _ensureMtpUnsupportedLoaded(): Promise<void> {
+		if (!this._mtpUnsupportedLoaded) {
+			this._mtpUnsupportedLoaded = (async () => {
+				try {
+					const buf = await this.fileService.readFile(this._mtpUnsupportedUri());
+					const parsed = JSON.parse(buf.value.toString()) as string[];
+					for (const modelId of Array.isArray(parsed) ? parsed : []) {
+						if (typeof modelId === 'string' && modelId) {
+							this._mtpUnsupported.add(modelId);
+						}
+					}
+					if (this._mtpUnsupported.size > 0) {
+						this._log(`[LoCoPilot Runner] ${this._mtpUnsupported.size} model(s) are known to fail with MTP from a previous session; they will run dense.`);
+					}
+				} catch {
+					// No file yet (the common case) or unreadable - both mean "nothing learned", which is the default.
+				}
+			})();
+		}
+		return this._mtpUnsupportedLoaded;
+	}
+
+	/** Writes the learned MTP failures back out. Best-effort: losing them only costs one self-heal next start. */
+	private async _persistMtpUnsupported(): Promise<void> {
+		try {
+			await this.fileService.writeFile(this._mtpUnsupportedUri(), VSBuffer.fromString(JSON.stringify([...this._mtpUnsupported], undefined, 2)));
+		} catch (e) {
+			this._log(`[LoCoPilot Runner] Could not persist MTP support (it will be re-learned next session): ${e}`);
+		}
 	}
 
 	/** Writes the learned capabilities back out. Best-effort: losing them only costs one self-heal next start. */
@@ -2156,6 +2212,34 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 			}
 		}
 
+		// MTP -> dense fallback. Checked BEFORE the session-wide speculation switch below, because these
+		// failures are a property of this MODEL's conversion, not of the binary: demoting the whole session
+		// would strip speculation from every other model (including the n-gram path, which is unrelated).
+		//
+		// The engine fails an unusable MTP head in several distinct ways, all seen in the wild:
+		//   - the arch declares MTP but the GGUF omits the key ("QWEN35_MTP requires nextn_predict_layers > 0")
+		//   - the draft head loads into a bad graph (GGML_ASSERT "missing result_norm/result_embd tensor")
+		//   - the head tensors are malformed ("invalid vector subscript" during llama_model_load)
+		// None of these are user-actionable and all of them run fine dense, so we record the demotion (persisted,
+		// so it costs one failed launch EVER) and relaunch once without MTP.
+		const mtpRejected = /nextn_predict_layers|nextn|result_norm\/result_embd|missing result_norm|invalid vector subscript|mtp/i.test(tail);
+		if (this._launchedWithMtp.has(modelId) && !this._mtpUnsupported.has(modelId) && mtpRejected) {
+			this._mtpUnsupported.add(modelId);
+			this._launchedWithMtp.delete(modelId);
+			this._launchedWithSpecFlags.delete(modelId);
+			void this._persistMtpUnsupported();
+			this._log(`[LoCoPilot Runner] "${modelName}" could not load its Multi-Token Prediction head; running it as a dense model from now on and relaunching. Last output:\n${tail}`);
+			this._endStarting(modelId);
+			// Wait out the original launch's in-flight window so the retry is a genuinely fresh launch rather
+			// than being coalesced into the crashed one (same reasoning as the speculation fallback below).
+			timeout(6000).then(() => {
+				if (!this.runningServers.has(modelId) && !this.startingServers.has(modelId)) {
+					this.startServerInTerminal(modelId).catch(e => this._log(`[LoCoPilot Runner] Dense relaunch without MTP failed: ${e}`));
+				}
+			});
+			return;
+		}
+
 		// Self-healing for speculative decoding: when THIS launch carried spec flags and the output shows the
 		// build rejected them (old build without --spec-type) or the draft/target pair is incompatible
 		// (tokenizer mismatch), disable speculation for the session and retry once WITHOUT the flags instead
@@ -2336,7 +2420,11 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 			// Anything this model's engine has already refused to quantize (learned from a failed launch, see
 			// _kvQuantCapability). Undefined for every model that has never failed, i.e. almost all of them.
 			kvQuantCapability: model ? this._kvQuantCapability.get(model.id) : undefined,
-			multiTokenPrediction: perModelMtp !== undefined ? perModelMtp : globalMtp,
+			// A model that already crashed with the embedded MTP head runs dense forever after, whatever its
+			// flag says - the flag records what the GGUF CLAIMS, this records what the engine actually managed.
+			multiTokenPrediction: (model && this._mtpUnsupported.has(model.id))
+				? false
+				: (perModelMtp !== undefined ? perModelMtp : globalMtp),
 			mtpArgs: cfg.getValue<string>(ChatConfiguration.LocopilotLlamaCppMtpArgs),
 			cacheReuse: cfg.getValue<number>(ChatConfiguration.LocopilotLlamaCppCacheReuse),
 			draftModelPath: cfg.getValue<string>(ChatConfiguration.LocopilotLlamaCppDraftModelPath),
@@ -4533,6 +4621,12 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 			this._log(`[LoCoPilot Runner] Model ${modelId} not found or has no local path.`);
 			return;
 		}
+		// A fresh server is a fresh chance at native tool calling. The runtime demotes a model after two
+		// tool-shaped failures, which is the right call in the moment but was permanent - and with the model
+		// list's tools switch gone there is no manual way back, so two transient errors would strand a
+		// perfectly capable model on prompt-injected tools forever. Re-arming here costs at most two failed
+		// turns to re-learn, and leaves an explicit user override untouched.
+		void this.customLanguageModelsService.retryAutoDisabledTools(modelId);
 		// If this model is still tearing down, wait for its process to actually release the RAM before doing
 		// anything else. Gating a restart while the old process is still resident measures memory that is about
 		// to come back, so the launch is refused (or prompts "Run anyway?") for a model that fits fine a second
@@ -4677,6 +4771,9 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 		// Load what previous sessions learned about this engine's KV support BEFORE building the tuning, so a model
 		// that already failed on a quantized V cache launches with f16 straight away instead of failing once more.
 		await this._ensureKvQuantCapabilityLoaded();
+		// Same for MTP: a model whose embedded draft head already failed to load launches dense straight away
+		// rather than repeating the crash-and-relaunch once per app start.
+		await this._ensureMtpUnsupportedLoaded();
 		const baseTuning = this._getLlamaTuning(model);
 		// Requested context CEILING: aim for the model's full window and let the memory clamp be the real limiter,
 		// instead of the legacy 16384 default silently capping every model. An EXPLICIT per-model context (set by
@@ -4878,6 +4975,13 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 			this._launchedWithDraftContext.add(modelId);
 		} else {
 			this._launchedWithDraftContext.delete(modelId);
+		}
+		// Track MTP separately from speculation as a whole: an MTP-shaped crash must demote THIS MODEL to dense
+		// (persisted, see _mtpUnsupported) rather than switch off speculative decoding session-wide.
+		if (specTypeVal === 'draft-mtp' && !args.includes('--model-draft')) {
+			this._launchedWithMtp.add(modelId);
+		} else {
+			this._launchedWithMtp.delete(modelId);
 		}
 		// Same bookkeeping for --cache-ram, so an old build's rejection of it can be told apart and self-healed.
 		if (args.includes('--cache-ram')) {

@@ -18,7 +18,7 @@ import { CancellationToken } from '../../../../../base/common/cancellation.js';
 import { AddCustomModelEditorInput } from './addCustomModelEditorInput.js';
 import { Button } from '../../../../../base/browser/ui/button/button.js';
 import { InputBox } from '../../../../../base/browser/ui/inputbox/inputBox.js';
-import { ICustomLanguageModelsService, getCustomModelListLabel, DEFAULT_CONTEXT_WINDOW_LOCAL } from '../../common/customLanguageModelsService.js';
+import { ICustomLanguageModelsService, getCustomModelListLabel } from '../../common/customLanguageModelsService.js';
 import { IDialogService } from '../../../../../platform/dialogs/common/dialogs.js';
 import { Dimension } from '../../../../../base/browser/dom.js';
 import { IContextViewService } from '../../../../../platform/contextview/browser/contextView.js';
@@ -77,8 +77,6 @@ export class AddCustomModelEditor extends EditorPane {
 	private displayNameInputBox!: InputBox;
 	private localhostModelIdContainer!: HTMLElement;
 	private localhostModelIdInputBox!: InputBox;
-	private contextWindowContainer!: HTMLElement;
-	private contextWindowInputBox!: InputBox;
 	private hfRoutingContainer!: HTMLElement;
 	private hfFastestCheckbox!: HTMLInputElement;
 	private addButton!: Button;
@@ -200,19 +198,9 @@ export class AddCustomModelEditor extends EditorPane {
 			inputBoxStyles: settingsStyleInputBox
 		}));
 
-		// Context window: required for a custom endpoint, because LoCoPilot does not run that server and so
-		// cannot read back the window it launched with. Guessing high makes the server silently truncate the
-		// prompt from the left - dropping the instructions first - with no error anywhere.
-		this.contextWindowContainer = DOM.append(formContainer, $('.form-field'));
-		this.contextWindowContainer.style.display = 'none';
-		const cwLabel = DOM.append(this.contextWindowContainer, $('label.form-label'));
-		cwLabel.textContent = localize('addCustomModel.contextWindow', 'Context window');
-		const cwInputWrap = DOM.append(this.contextWindowContainer, $('.form-input-container'));
-		this.contextWindowInputBox = this._register(new InputBox(cwInputWrap, this.contextViewService, {
-			placeholder: String(DEFAULT_CONTEXT_WINDOW_LOCAL),
-			inputBoxStyles: settingsStyleInputBox
-		}));
-		this.contextWindowInputBox.inputElement.setAttribute('inputmode', 'numeric');
+		// The context window is no longer asked for on either Add surface: every provider resolves its own
+		// (GGUF header / Ollama /api/show / the endpoint's /props probe) and otherwise takes the shared
+		// ENDPOINT_FALLBACK_CONTEXT_WINDOW default. Kept in sync with the settings-editor Add form.
 
 		// Routing policy toggle (Hugging Face cloud only): off = cheapest, on = fastest
 		this.hfRoutingContainer = DOM.append(formContainer, $('.form-field'));
@@ -289,9 +277,6 @@ export class AddCustomModelEditor extends EditorPane {
 		if (this.localhostModelIdContainer) {
 			this.localhostModelIdContainer.style.display = isEndpoint ? '' : 'none';
 		}
-		if (this.contextWindowContainer) {
-			this.contextWindowContainer.style.display = isEndpoint ? '' : 'none';
-		}
 
 		// Update model name label when fields change
 		this.updateModelNameLabel();
@@ -327,7 +312,6 @@ export class AddCustomModelEditor extends EditorPane {
 		this.modelNameInputBox.value = '';
 		this.displayNameInputBox.value = '';
 		this.localhostModelIdInputBox.value = '';
-		this.contextWindowInputBox.value = '';
 		this.apiKeyInputBox.value = '';
 		this.tokenInputBox.value = '';
 		this.hfFastestCheckbox.checked = false;
@@ -367,19 +351,10 @@ export class AddCustomModelEditor extends EditorPane {
 			}
 			// Server model id is optional: with none set the provider sends "local", which llama.cpp ignores.
 			// Only servers that key off it (mlx_lm, vLLM) need a real value.
-			// We do not run this server, so its real context window is unknowable from here. An explicit value
-			// is honoured; otherwise fall back LOW rather than high - guessing high makes the server silently
-			// drop the oldest part of every prompt instead of reporting an error.
-			const cwRaw = this.contextWindowInputBox.value.trim();
-			if (cwRaw) {
-				if (!/^\d+$/.test(cwRaw) || Number(cwRaw) < 512) {
-					await this.dialogService.error(localize('addCustomModel.error.contextWindowNumeric', 'Context window must be a plain number of tokens of at least 512, for example {0}.', DEFAULT_CONTEXT_WINDOW_LOCAL));
-					return;
-				}
-				endpointContextWindow = Number(cwRaw);
-			} else {
-				endpointContextWindow = ENDPOINT_FALLBACK_CONTEXT_WINDOW;
-			}
+			// The context window is not asked for here (this editor has no probe, unlike the settings-editor
+			// Add form), so it always starts on the shared default and any longer conversation is handled by
+			// context summarisation rather than by a number entered up front.
+			endpointContextWindow = ENDPOINT_FALLBACK_CONTEXT_WINDOW;
 		} else if (!modelName) {
 			await this.dialogService.error(localize('addCustomModel.error.modelNameRequired', 'Model name is required'));
 			return;
@@ -405,10 +380,9 @@ export class AddCustomModelEditor extends EditorPane {
 				token,
 				modelName: modelName,
 				localhostOpenAiModel: isEndpoint ? localhostServerModelId : undefined,
+				// Endpoint only, and always the default now - never marked as a user override, so a later
+				// probe or enrichment pass is free to replace it with something the server actually reported.
 				contextWindow: endpointContextWindow,
-				// A hand-entered window is a statement about the user's own server, so protect it from later
-				// enrichment. Every other provider derives its own and is left unmarked.
-				userOverrides: isEndpoint && this.contextWindowInputBox.value.trim() ? { contextWindow: true } : undefined,
 				hfFastest: isHfCloud ? this.hfFastestCheckbox.checked : undefined,
 			});
 
@@ -421,7 +395,6 @@ export class AddCustomModelEditor extends EditorPane {
 			this.modelNameInputBox.value = '';
 			this.displayNameInputBox.value = '';
 			this.localhostModelIdInputBox.value = '';
-			this.contextWindowInputBox.value = '';
 			this.apiKeyInputBox.value = '';
 			this.tokenInputBox.value = '';
 			this.hfFastestCheckbox.checked = false;

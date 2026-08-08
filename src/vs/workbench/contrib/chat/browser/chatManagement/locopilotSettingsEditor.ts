@@ -36,7 +36,7 @@ import { defaultButtonStyles, getInputBoxStyle, getSelectBoxStyles, defaultToggl
 import { settingsSelectBackground, settingsSelectBorder, settingsSelectForeground, settingsSelectListBorder, settingsTextInputBackground, settingsTextInputBorder, settingsTextInputForeground } from '../../../preferences/common/settingsEditorColorRegistry.js';
 import { Toggle } from '../../../../../base/browser/ui/toggle/toggle.js';
 import { SelectBox, ISelectOptionItem, ISelectData } from '../../../../../base/browser/ui/selectBox/selectBox.js';
-import { ICustomLanguageModelsService, ICustomLanguageModel, getCustomModelListLabel, customModelSupportsVision, customModelVisionEnabled, needsDownloadOrPullRetry, hasRemovableLocalDownload, formatDownloadRateAndEta, DEFAULT_CONTEXT_WINDOW_CLOUD, DEFAULT_CONTEXT_WINDOW_LOCAL, MIN_CONTEXT_WINDOW, MAX_CONTEXT_WINDOW } from '../../common/customLanguageModelsService.js';
+import { ICustomLanguageModelsService, ICustomLanguageModel, getCustomModelListLabel, customModelSupportsVision, customModelVisionEnabled, needsDownloadOrPullRetry, hasRemovableLocalDownload, formatDownloadRateAndEta } from '../../common/customLanguageModelsService.js';
 import { IDialogService } from '../../../../../platform/dialogs/common/dialogs.js';
 import Severity from '../../../../../base/common/severity.js';
 import { IClipboardService } from '../../../../../platform/clipboard/common/clipboardService.js';
@@ -254,9 +254,9 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 	private addFormDisplayNameInputBox!: InputBox;
 	private addFormLocalhostModelIdContainer!: HTMLElement;
 	private addFormLocalhostModelIdInputBox!: InputBox;
-	private addFormContextWindowInput!: InputBox;
+	/** The endpoint "Connection" row; holds only {@link addFormEndpointProbeStatus} now. */
 	private addFormContextWindowRow!: HTMLElement;
-	/** Inline result of the automatic endpoint probe, shown beside the context-window field. */
+	/** Inline result of the automatic endpoint probe. */
 	private addFormEndpointProbeStatus!: HTMLElement;
 	/** Guards against overlapping probes when the URL field is edited repeatedly. */
 	private addFormEndpointProbeSeq = 0;
@@ -278,12 +278,6 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 	private addFormCurrentModelType: 'cloud' | 'local' = 'local';
 	private addFormCurrentProviderIndex: number = 0;
 
-	private static readonly DEFAULT_CONTEXT_WINDOW = DEFAULT_CONTEXT_WINDOW_CLOUD;
-	private static readonly LOCAL_DEFAULT_CONTEXT_WINDOW = DEFAULT_CONTEXT_WINDOW_LOCAL;
-	private static readonly MIN_CONTEXT_WINDOW = MIN_CONTEXT_WINDOW;
-	private static readonly MAX_CONTEXT_WINDOW = MAX_CONTEXT_WINDOW;
-	/** Compact width for token fields (hover shows full value). */
-	private static readonly TOKEN_LIMIT_INPUT_WIDTH_PX = 80;
 
 	private askPromptTextarea!: HTMLTextAreaElement;
 	private agentPromptTextarea!: HTMLTextAreaElement;
@@ -607,29 +601,14 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 			inputBoxStyles: locopilotSettingsInputBoxStyles
 		}));
 
-		// Context window. Shown for Ollama and custom endpoints (both run servers LoCoPilot does not launch, so
-		// there is no launched-window to read back); hidden for HuggingFace and cloud, which derive their own.
-		// Leaving it blank is meaningful and differs per provider - see handleAddModel.
+		// Connection status row. The context window is no longer asked for anywhere - every provider resolves
+		// its own (GGUF header / Ollama /api/show / the endpoint's own /props probe, else the 128K default) -
+		// so what remains of this row is the inline probe result for a custom endpoint: the only feedback that
+		// tells the user their URL, port and API key are actually right before they hit Add.
 		this.addFormContextWindowRow = DOM.append(card, $('.form-field.form-field-tokens'));
 		this.addFormContextWindowRow.style.display = 'none';
-		const contextWindowLabel = DOM.append(this.addFormContextWindowRow, $('label.form-label'));
-		contextWindowLabel.textContent = localize('addCustomModel.contextWindow', 'Context window');
-		const contextWindowWrap = DOM.append(this.addFormContextWindowRow, $('.form-input-with-suffix'));
-		const contextWindowInputContainer = DOM.append(contextWindowWrap, $('.form-input-container'));
-		this.addFormContextWindowInput = this._register(new InputBox(contextWindowInputContainer, this.contextViewService, {
-			// Plain token count only - no "32K" shorthand, so what is typed is exactly what is stored.
-			placeholder: String(LoCoPilotSettingsEditor.LOCAL_DEFAULT_CONTEXT_WINDOW),
-			tooltip: '',
-			inputBoxStyles: locopilotSettingsInputBoxStyles
-		}));
-		this.addFormContextWindowInput.inputElement.setAttribute('inputmode', 'numeric');
-		// The probe result reports here, inline beside the field, instead of behind a "Test connection" button.
-		this.addFormEndpointProbeStatus = DOM.append(contextWindowWrap, $('span.endpoint-probe-status'));
-		this.addFormContextWindowInput.element.style.minWidth = `${LoCoPilotSettingsEditor.TOKEN_LIMIT_INPUT_WIDTH_PX}px`;
-		this.addFormContextWindowInput.element.style.width = `${LoCoPilotSettingsEditor.TOKEN_LIMIT_INPUT_WIDTH_PX}px`;
-		this.addFormContextWindowInput.value = String(LoCoPilotSettingsEditor.DEFAULT_CONTEXT_WINDOW);
-		this.syncAddFormContextWindowTooltip();
-		this._register(this.addFormContextWindowInput.onDidChange(() => this.syncAddFormContextWindowTooltip()));
+		const connectionWrap = DOM.append(this.addFormContextWindowRow, $('.form-input-with-suffix'));
+		this.addFormEndpointProbeStatus = DOM.append(connectionWrap, $('span.endpoint-probe-status'));
 
 		// Use Native Tools toggle (for local models)
 		this.addFormUseNativeToolsContainer = DOM.append(card, $('.form-field'));
@@ -799,43 +778,18 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 			if (result.modelIds.length > 0 && !this.addFormLocalhostModelIdInputBox.value.trim()) {
 				this.addFormLocalhostModelIdInputBox.value = result.modelIds[0];
 			}
-			if (result.contextWindow !== undefined && !this.addFormContextWindowInput.value.trim()) {
-				this.addFormContextWindowInput.value = String(result.contextWindow);
-				this.syncAddFormContextWindowTooltip();
-			}
-
 			if (result.contextWindow !== undefined) {
 				this.setEndpointProbeStatus(localize('addCustomModel.endpointProbe.ok', 'Connected - read {0} tokens from the server.', result.contextWindow), 'ok');
 			} else {
-				// Reachable but silent about its window. Common (many servers implement only /chat/completions)
-				// and exactly the case where a wrong value causes silent left-truncation, so say so plainly.
-				this.setEndpointProbeStatus(localize('addCustomModel.endpointProbe.noCtx', "Connected, but it didn't report a context window - enter the value your server runs with."), 'warn');
+				// Reachable but silent about its window (common - many servers implement only /chat/completions).
+				// The model is added with the standard default; say which, so a smaller server isn't a surprise.
+				this.setEndpointProbeStatus(localize('addCustomModel.endpointProbe.noCtx', "Connected, but it didn't report a context window - {0} tokens will be assumed.", ENDPOINT_FALLBACK_CONTEXT_WINDOW), 'warn');
 			}
 		} catch (e) {
 			if (seq === this.addFormEndpointProbeSeq) {
 				this.setEndpointProbeStatus(toErrorMessage(e), 'error');
 			}
 		}
-	}
-
-	/**
-	 * Add-form context window parser: plain token counts only.
-	 *
-	 * Distinct from {@link parseContextWindow}, which the per-model list editor uses and which also accepts a
-	 * "32K" shorthand. Here the value is a claim about what someone's server was launched with (`-c 8192`,
-	 * `--max-model-len`), so it is entered exactly as that number - no shorthand to mis-expand, and no
-	 * ambiguity about whether K means 1000 or 1024.
-	 */
-	private parseAddFormContextWindow(inputValue: string): { valid: true; value: number } | { valid: false; error: string } {
-		const s = inputValue.trim();
-		if (!/^\d+$/.test(s)) {
-			return { valid: false, error: localize('addCustomModel.error.contextWindowNumeric', 'Context window must be a plain number of tokens, for example {0}.', LoCoPilotSettingsEditor.LOCAL_DEFAULT_CONTEXT_WINDOW) };
-		}
-		const value = Number(s);
-		if (value < LoCoPilotSettingsEditor.MIN_CONTEXT_WINDOW || value > LoCoPilotSettingsEditor.MAX_CONTEXT_WINDOW) {
-			return { valid: false, error: localize('addCustomModel.error.contextWindowRange', 'Context window must be between {0} and {1}.', LoCoPilotSettingsEditor.MIN_CONTEXT_WINDOW, LoCoPilotSettingsEditor.MAX_CONTEXT_WINDOW) };
-		}
-		return { valid: true, value };
 	}
 
 	/** "http://192.168.1.50:8080/v1/chat/completions" -> "192.168.1.50:8080", for use as a list label. */
@@ -845,14 +799,6 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 		} catch {
 			return url;
 		}
-	}
-
-	private contextWindowTooltip(value: string): string {
-		return localize('customLanguageModels.contextWindowTooltipWithValue', 'Context window: {0} tokens. Input and output budgets are derived from this.', value);
-	}
-
-	private syncAddFormContextWindowTooltip(): void {
-		this.addFormContextWindowInput.setTooltip(this.contextWindowTooltip(this.addFormContextWindowInput.value));
 	}
 
 	/** Cloud + first provider, cleared fields, default token limits - use when (re)entering the Add Language Model section. */
@@ -865,7 +811,6 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 		this.addFormApiKeyInputBox.value = '';
 		this.addFormTokenInputBox.value = '';
 		this.addFormModelFormatInputBox.value = '';
-		this.addFormContextWindowInput.value = '';
 		this.addFormUseNativeToolsToggle.checked = false;
 		this.addFormMtpToggle.checked = false;
 		this.addFormVisionToggle.checked = false;
@@ -923,7 +868,6 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 			// Reset HF cloud routing toggle to its default (cheapest on) when HF cloud is selected.
 			if (isHfCloud && this.addFormHfFastestToggle) { this.addFormHfFastestToggle.checked = true; }
 			if (this.addFormContextWindowRow) { this.addFormContextWindowRow.style.display = 'none'; }
-			this.addFormContextWindowInput.value = String(LoCoPilotSettingsEditor.DEFAULT_CONTEXT_WINDOW);
 		} else {
 			if (this.addFormHfFastestContainer) { this.addFormHfFastestContainer.style.display = 'none'; }
 			// A custom endpoint may sit behind auth (llama-server --api-key, vLLM, LiteLLM, a reverse proxy).
@@ -947,20 +891,15 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 			if (this.addFormModelFormatContainer) { this.addFormModelFormatContainer.style.display = 'none'; }
 			if (this.addFormUseNativeToolsContainer) { this.addFormUseNativeToolsContainer.style.display = 'none'; }
 			if (this.addFormMtpContainer) { this.addFormMtpContainer.style.display = 'none'; }
-			// Vision: HuggingFace only. Ticking it sets `visionEnabled`, which is what makes the MANAGED
-			// llama.cpp server load an --mmproj projector, so it only means anything for a server we launch.
-			// Ollama and custom endpoints run their own: they get vision optimistically, with the runtime
-			// disabling it per-model the first time an image is rejected (autoDisableVision), and Ollama also
-			// derives it from its own capabilities after pull.
-			if (this.addFormVisionContainer) { this.addFormVisionContainer.style.display = isHuggingFace ? '' : 'none'; }
-			// Context window: shown for Ollama and custom endpoints, whose servers LoCoPilot does not launch and
-			// whose real window it therefore cannot read back. Blank means different things per provider - see
-			// handleAddModel - so it starts empty rather than pre-filled with a number the user did not choose.
-			const showContextWindow = isEndpoint || isOllama;
-			if (this.addFormContextWindowRow) { this.addFormContextWindowRow.style.display = showContextWindow ? '' : 'none'; }
-			this.addFormContextWindowInput.value = showContextWindow ? '' : String(LoCoPilotSettingsEditor.LOCAL_DEFAULT_CONTEXT_WINDOW);
+			// Vision is no longer asked for at add time: the capability is DETECTED (an mmproj projector landing
+			// on disk during the download, or HF pipeline_tag/tags), and the switch that actually costs memory -
+			// loading the projector - stays off until the user turns it on from the model list. Asking up front
+			// only got in the way, since nobody knows at add time whether a repo ships a projector.
+			if (this.addFormVisionContainer) { this.addFormVisionContainer.style.display = 'none'; }
+			// The connection row is now just the endpoint probe's status line - no context window is asked for
+			// anywhere (see the row's construction). Ollama and HuggingFace derive their own after the pull.
+			if (this.addFormContextWindowRow) { this.addFormContextWindowRow.style.display = isEndpoint ? '' : 'none'; }
 		}
-		this.syncAddFormContextWindowTooltip();
 		this.addFormUpdateModelNameLabel();
 	}
 
@@ -990,36 +929,12 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 		}
 	}
 
-	/** Validate and parse the context window (raw number, or with K suffix e.g. 128K). Rejects empty, non-numeric, negative, non-integer, out of range. */
-	private parseContextWindow(inputValue: string): { valid: true; value: number } | { valid: false; error: string } {
-		const s = inputValue.trim();
-		if (s === '') {
-			return { valid: false, error: localize('addCustomModel.error.contextWindowRequired', 'Context window is required.') };
-		}
-		const hasK = /k$/i.test(s);
-		const numStr = s.replace(/[kK]/g, '').trim();
-		const n = Number(numStr);
-		if (Number.isNaN(n)) {
-			return { valid: false, error: localize('addCustomModel.error.contextWindowInvalid', 'Context window must be a valid number (e.g. 128000 or 128K).') };
-		}
-		if (!Number.isInteger(n) || n < 0) {
-			return { valid: false, error: localize('addCustomModel.error.contextWindowPositiveInteger', 'Context window must be a positive integer.') };
-		}
-		const value = hasK ? n * 1000 : n;
-		if (value < LoCoPilotSettingsEditor.MIN_CONTEXT_WINDOW || value > LoCoPilotSettingsEditor.MAX_CONTEXT_WINDOW) {
-			return { valid: false, error: localize('addCustomModel.error.contextWindowRange', 'Context window must be between {0} and {1}.', LoCoPilotSettingsEditor.MIN_CONTEXT_WINDOW, LoCoPilotSettingsEditor.MAX_CONTEXT_WINDOW) };
-		}
-		return { valid: true, value };
-	}
-
 	private async handleAddModel(): Promise<void> {
 		const providers = this.addFormCurrentModelType === 'cloud' ? CLOUD_PROVIDERS_ADD : LOCAL_PROVIDERS_ADD;
 		const provider = providers[this.addFormCurrentProviderIndex];
 		const isHfCloud = this.addFormCurrentModelType === 'cloud' && provider.text === 'Hugging Face';
 		const providerValue = providerIdFromLabel(provider.text, isHfCloud);
 		const isEndpoint = providerValue === CUSTOM_ENDPOINT_PROVIDER_ID;
-		// Local (GGUF/MLX) HuggingFace - the only provider whose vision toggle is collected on this form.
-		const isHuggingFaceLocal = this.addFormCurrentModelType === 'local' && providerValue === 'huggingface';
 		const modelName = this.addFormModelNameInputBox.value.trim();
 		// The API key field serves cloud providers AND custom endpoints (optional there - a bare loopback
 		// server needs none, but anything on a network should have one).
@@ -1032,9 +947,9 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 
 		const displayNameOpt = this.addFormDisplayNameInputBox.value.trim();
 		const localhostServerModelId = isEndpoint ? this.addFormLocalhostModelIdInputBox.value.trim() : '';
-		// Resolved below for the endpoint provider only; every other provider derives its own window.
+		// Only the custom endpoint resolves a window here, and only from its own probe - every other provider
+		// derives one after the model lands (GGUF header / Ollama /api/show) or falls back to the default.
 		let endpointContextWindow: number | undefined;
-		let endpointContextWindowIsUserSet = false;
 		if (isEndpoint) {
 			if (!modelName) {
 				await this.dialogService.error(localize('addCustomModel.error.endpointUrlRequired', 'Endpoint URL is required.'));
@@ -1047,51 +962,12 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 			// Server model id is intentionally NOT required: the probe fills it from GET /v1/models, and with
 			// nothing set the provider sends "local", which llama.cpp ignores. Only servers that key off it
 			// (mlx_lm, vLLM) need it, and those advertise it - so the probe has it too.
-			// Context window resolution, in the order that keeps us honest:
-			//   1. what the user typed  - an explicit statement about their own server, so it wins outright
-			//   2. what the probe read  - the server's own answer
-			//   3. ask, rather than assume - guessing high is the failure mode that silently drops the system
-			//      prompt, so we do not quietly default here the way the derivable providers can.
-			const typed = this.addFormContextWindowInput.value.trim();
-			if (typed) {
-				const parsed = this.parseAddFormContextWindow(typed);
-				if (!parsed.valid) {
-					await this.dialogService.error(parsed.error);
-					return;
-				}
-				endpointContextWindow = parsed.value;
-				endpointContextWindowIsUserSet = true;
-			} else if (this.addFormEndpointProbedContextWindow !== undefined) {
-				endpointContextWindow = this.addFormEndpointProbedContextWindow;
-			} else {
-				const { confirmed } = await this.dialogService.confirm({
-					message: localize('addCustomModel.endpointNoContextWindow', 'Add this endpoint with a {0}-token context window?', ENDPOINT_FALLBACK_CONTEXT_WINDOW),
-					detail: localize('addCustomModel.endpointNoContextWindowDetail', "LoCoPilot doesn't run this server, so it can't tell how much context the model holds, and the endpoint didn't report one. If the value is set too high the server quietly drops the oldest part of every prompt - including the instructions and tool definitions - and the model behaves oddly with no error. A conservative {0} is used unless you enter the real value.", ENDPOINT_FALLBACK_CONTEXT_WINDOW),
-					primaryButton: localize('addCustomModel.endpointNoContextWindowConfirm', 'Add with {0}', ENDPOINT_FALLBACK_CONTEXT_WINDOW),
-				});
-				if (!confirmed) {
-					return;
-				}
-				endpointContextWindow = ENDPOINT_FALLBACK_CONTEXT_WINDOW;
-			}
-		} else if (providerValue === 'ollama') {
-			if (!modelName) {
-				await this.dialogService.error(localize('addCustomModel.error.modelNameRequired', 'Model name is required'));
-				return;
-			}
-			// Ollama CAN tell us its window (from /api/show after the pull), so blank here means "derive it"
-			// rather than "guess". A typed value is an explicit override and is marked as one below, which is
-			// what stops the post-pull enrichment from replacing it.
-			const typed = this.addFormContextWindowInput.value.trim();
-			if (typed) {
-				const parsed = this.parseAddFormContextWindow(typed);
-				if (!parsed.valid) {
-					await this.dialogService.error(parsed.error);
-					return;
-				}
-				endpointContextWindow = parsed.value;
-				endpointContextWindowIsUserSet = true;
-			}
+			//
+			// Context window: the server's own answer if /props gave one, otherwise the standard default. We no
+			// longer ask the user - the probe covers the servers that can answer, and for the rest a window
+			// larger than the server's is handled by context summarisation rather than by a number nobody
+			// reliably knows at add time. The probe status line says which of the two happened.
+			endpointContextWindow = this.addFormEndpointProbedContextWindow ?? ENDPOINT_FALLBACK_CONTEXT_WINDOW;
 		} else if (!modelName) {
 			await this.dialogService.error(localize('addCustomModel.error.modelNameRequired', 'Model name is required'));
 			return;
@@ -1130,21 +1006,22 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 				// defaults. The user can override any of them from the model list. contextWindow is likewise
 				// derived for HuggingFace/cloud; for Ollama and custom endpoints it comes from this form (see the
 				// per-provider resolution above), and is left undefined when Ollama should derive its own.
+				// Set only for a custom endpoint (probe result, else the default); every other provider leaves
+				// this undefined and derives its own after the model lands. Never marked as a user override -
+				// nothing here is hand-entered any more, so a later probe or enrichment may freely refresh it.
 				contextWindow: endpointContextWindow,
-				// Mark a hand-entered window as a user override so a later probe (or any other enrichment) never
-				// silently replaces the number the user told us their server actually runs with. A probed value
-				// is left unmarked so it can still be refreshed.
-				userOverrides: endpointContextWindowIsUserSet ? { contextWindow: true } : undefined,
 				modelName: modelName,
 				localhostOpenAiModel: isEndpoint ? (localhostServerModelId || undefined) : undefined,
 				localPath: providerValue === 'ollama' ? ollamaUrl : undefined, // Store Base URL in localPath for Ollama
 				hfFastest: isHfCloud ? !this.addFormHfFastestToggle.checked : undefined,
-				// Vision is collected for HuggingFace only - the toggle is shown for no other provider (see
-				// addFormUpdateInputFields), because it drives --mmproj on the server we launch. Ticking it is
-				// explicit intent to use images, so enable runtime loading too, not just the capability -
-				// otherwise the projector would download but never load.
-				supportsVision: isHuggingFaceLocal ? this.addFormVisionToggle.checked : undefined,
-				visionEnabled: isHuggingFaceLocal && this.addFormVisionToggle.checked ? true : undefined,
+				// Vision is DETECTED, never declared at add time (see addFormUpdateInputFields): a projector found
+				// on disk during the download, or HF pipeline_tag/tags, sets the capability. Both fields must stay
+				// undefined here - writing `false` would mark the model text-only before anything had looked, which
+				// then hides the model list's vision switch (it only renders for supportsVision === true) and makes
+				// the capability unrecoverable. Runtime loading (visionEnabled, the ~1GB projector) stays off until
+				// the user turns it on from the list.
+				supportsVision: undefined,
+				visionEnabled: undefined,
 			});
 			const listLabel = getCustomModelListLabel(addedModel);
 
@@ -1569,10 +1446,8 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 		if (model.provider === 'localhost' && model.localhostOpenAiModel) {
 			addChip(localize('customLanguageModels.localhostModelId', 'API model: {0}', model.localhostOpenAiModel), 'muted', 'mono');
 		}
-		if (model.type === 'local' && model.useNativeTools) {
-			addChip(localize('customLanguageModels.nativeTools', 'Native Tools'), 'muted');
-		}
-		if (model.format) { addChip(model.format, 'muted'); }
+		// "Native Tools" and format chips removed: both are now derived for every model and true/known for
+		// essentially all of them, so they cost a row of visual noise and told the user nothing actionable.
 		// Status badge: only show the in-progress download/pull state. Steady-state
 		// (Downloaded / Download not finished / Ready) chips are intentionally omitted.
 		if (model.isDownloading) {
@@ -1582,74 +1457,35 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 				'status', 'pending');
 		}
 
-		// Context window input sits on the right of row 2, inline with the details text
-		const contextWindowContainer = DOM.append(row2, $('.model-max-input-container'));
-		const contextWindowIcon = DOM.append(contextWindowContainer, $('span.model-max-input-icon'));
-		contextWindowIcon.appendChild(renderIcon(Codicon.window));
-		const isLocalModel = model.type === 'local';
-		const contextWindowDefault = isLocalModel ? LoCoPilotSettingsEditor.LOCAL_DEFAULT_CONTEXT_WINDOW : LoCoPilotSettingsEditor.DEFAULT_CONTEXT_WINDOW;
-		const contextWindowInput = this._register(new InputBox(contextWindowContainer, this.contextViewService, {
-			placeholder: String(contextWindowDefault),
-			tooltip: '',
-			inputBoxStyles: locopilotSettingsInputBoxStyles
-		}));
-		contextWindowInput.element.style.minWidth = `${LoCoPilotSettingsEditor.TOKEN_LIMIT_INPUT_WIDTH_PX}px`;
-		contextWindowInput.element.style.width = `${LoCoPilotSettingsEditor.TOKEN_LIMIT_INPUT_WIDTH_PX}px`;
-		contextWindowInput.value = String(model.contextWindow ?? model.maxInputTokens ?? contextWindowDefault);
-		const syncContextWindowTooltip = () => {
-			contextWindowInput.setTooltip(this.contextWindowTooltip(contextWindowInput.value));
-		};
-		syncContextWindowTooltip();
-		this._register(contextWindowInput.onDidChange(async () => {
-			syncContextWindowTooltip();
-			const result = this.parseContextWindow(contextWindowInput.value);
-			if (result.valid) {
-				await this.customLanguageModelsService.updateCustomModel(model.id, { contextWindow: result.value });
-			}
-		}));
+		// The context-window input is gone from the list entirely - every provider now resolves its own:
+		// HuggingFace from the GGUF header, Ollama from /api/show, cloud and custom endpoints from the
+		// 128K default (or the endpoint's own /props probe). The number here was never what a local server
+		// actually ran with anyway, since the launch-time fit planner clamps context to the memory available
+		// and the provider reports that clamped window back (getLaunchedContextWindow) - so the box looked
+		// authoritative and was overridden a second later. Anything longer than the window is handled by
+		// context summarisation rather than by asking the user to predict a number.
 
-		// Settings row: toggles only (right-aligned)
-		const settingsRow = DOM.append(itemContainer, $('.model-item-row.model-item-row-settings'));
-		const secondarySettingsContainer = DOM.append(settingsRow, $('.model-secondary-settings'));
-		if (model.type === 'local' || model.provider === 'huggingface-cloud') {
-			const toolsContainer = DOM.append(secondarySettingsContainer, $('.model-action-tools-container'));
-			toolsContainer.title = localize('customLanguageModels.toolsDescription', 'Enable native tool calling for this model');
-			const toolsIcon = DOM.append(toolsContainer, $('span.model-action-tools-icon'));
-			toolsIcon.appendChild(renderIcon(Codicon.tools));
-			const toolsWrap = DOM.append(toolsContainer, $('.model-action-tools.agent-setting-switch-wrap'));
-			const toolsToggle = this._register(new Toggle({
-				title: localize('customLanguageModels.toolsDescription', 'Enable native tool calling for this model'),
-				isChecked: !!model.useNativeTools,
-				...defaultToggleStyles
-			}));
-			DOM.append(toolsWrap, toolsToggle.domNode);
-			this._register(toolsToggle.onChange(async () => {
-				await this.customLanguageModelsService.updateCustomModel(model.id, { useNativeTools: toolsToggle.checked });
-			}));
-		}
-		// Multi-Token Prediction toggle: llama.cpp GGUF feature, so HuggingFace local models only.
-		if (model.provider === 'huggingface') {
-			const mtpDesc = localize('customLanguageModels.mtpDescription', 'Run with Multi-Token Prediction (faster). Only for MTP-trained models on a recent llama.cpp build; other models will fail to start.');
-			const mtpContainer = DOM.append(secondarySettingsContainer, $('.model-action-tools-container'));
-			mtpContainer.title = mtpDesc;
-			const mtpIcon = DOM.append(mtpContainer, $('span.model-action-tools-icon'));
-			mtpIcon.appendChild(renderIcon(Codicon.rocket));
-			const mtpWrap = DOM.append(mtpContainer, $('.model-action-tools.agent-setting-switch-wrap'));
-			const mtpToggle = this._register(new Toggle({
-				title: mtpDesc,
-				isChecked: !!model.mtp,
-				...defaultToggleStyles
-			}));
-			DOM.append(mtpWrap, mtpToggle.domNode);
-			this._register(mtpToggle.onChange(async () => {
-				await this.customLanguageModelsService.updateCustomModel(model.id, { mtp: mtpToggle.checked });
-			}));
-		}
+		// Remaining per-model switches, right-aligned on row 2 where the context input used to sit (the
+		// details chips take flex:1 beside them). They previously had a row to themselves, which was a lot of
+		// vertical space for what is now at most one switch per model.
+		const secondarySettingsContainer = DOM.append(row2, $('.model-secondary-settings'));
+		// Tools and Multi-Token Prediction switches removed - both are decided without the user now:
+		//
+		// Tools default on for every model and the runtime demotes a model to prompt-injected tools after two
+		// tool-shaped failures (autoDisableTools), re-arming on the next server start (retryAutoDisabledTools).
+		// The switch only ever let someone turn off something that already turns itself off.
+		//
+		// MTP comes from the catalog for curated models and from the downloaded GGUF's own
+		// `nextn_predict_layers` key for everything else - the same key llama.cpp reads, so we agree with the
+		// engine by construction. If the head still fails to load, the runner records it per-model and relaunches
+		// dense (_mtpUnsupported). The switch was the most dangerous control here: turning it on for a model
+		// without MTP heads is a guaranteed failed launch, and nothing in the UI could tell you which was which.
 		// Vision toggle: only shown for models that actually SUPPORT images, so text-only models stay clean.
 		// A local model is vision-capable once that's confirmed - catalog entries, HF/Ollama enrichment, or a
-		// projector found on disk at download all set supportsVision=true; the user can also declare it via the
-		// add-model form's vision toggle. The switch itself then controls runtime loading (visionEnabled),
-		// which is off until the user turns it on. HF-cloud multimodal models keep their provider-driven flag.
+		// projector found on disk at download all set supportsVision=true. This is now the ONLY vision control
+		// (the add-model form no longer asks), and it deliberately stays: it drives runtime loading
+		// (visionEnabled), which is off by default because the projector costs ~1GB of working set, so turning
+		// it on is a real memory decision the user should make. HF-cloud models keep their provider-driven flag.
 		const showVisionToggle = model.type === 'local'
 			? model.supportsVision === true
 			: model.provider === 'huggingface-cloud' && customModelSupportsVision(model);

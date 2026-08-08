@@ -421,7 +421,7 @@
 	min-width: 0;
 }
 
-/* Row 2: local/cloud | provider | model (left) | context window (right) */
+/* Row 2: local/cloud | provider | model (left) | per-model switches (right). The switches used to have a row to themselves; they moved here when the context-window input was removed, since at most one shows per model and a whole row for one toggle was mostly empty space. */
 .model-item-row.model-item-row2 {
 	display: flex;
 	align-items: center;
@@ -430,16 +430,9 @@
 	min-width: 0;
 }
 
-.model-item-row2 .model-max-input-container {
+.model-item-row2 .model-max-input-container,
+.model-item-row2 .model-secondary-settings {
 	flex-shrink: 0;
-}
-
-/* Settings row: toggles + token inputs, right-aligned on their own line */
-.model-item-row.model-item-row-settings {
-	display: flex;
-	align-items: center;
-	justify-content: flex-end;
-	min-width: 0;
 }
 
 /* Row 3: local path or progress (full width) */

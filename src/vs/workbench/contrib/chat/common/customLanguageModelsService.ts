@@ -111,11 +111,26 @@ export function hasRemovableLocalDownload(model: ICustomLanguageModel): boolean 
 	return false;
 }
 
-/** Default context window for newly added cloud models (modern safe floor: GPT-4o, Llama 3.1, Mistral). */
+/**
+ * The single fallback context window, used for BOTH cloud and local models when nothing better is known.
+ *
+ * 128K is the value essentially every current model and hosted API supports, and it is deliberately the same
+ * number for both: since the context window is no longer editable anywhere in the UI, this is the only figure
+ * a model can land on when its own metadata is unavailable, so it has to be the one that is right most often.
+ *
+ * The two directions fail very differently, and that asymmetry is why 128K rather than something smaller:
+ *  - Declared LOWER than the model's real window: pure waste, every time. The agent summarises earlier than it
+ *    needed to and the user simply never gets the context length they paid for, with nothing to indicate why.
+ *  - Declared HIGHER than the real window: for a local model, nothing - the launch-time fit planner clamps to
+ *    what memory holds and the provider reports the clamped figure back (getLaunchedContextWindow). For a
+ *    cloud model or a custom endpoint there is no clamp, so an over-long prompt is a visible API error or a
+ *    server-side truncation. Context summarisation keeps prompts well under this ceiling in normal use, so
+ *    that is the rarer and louder failure - and a model smaller than 128K is expected to fail plainly rather
+ *    than have every other model quietly under-serve to protect it.
+ */
 export const DEFAULT_CONTEXT_WINDOW_CLOUD = 128000;
-/** Default context window for newly added local models. Newer local models (Llama 3.x, Qwen) handle this;
- *  the user must still ensure their llama.cpp/Ollama server is launched with a matching context. */
-export const DEFAULT_CONTEXT_WINDOW_LOCAL = 32000;
+/** @see DEFAULT_CONTEXT_WINDOW_CLOUD - one shared fallback; kept as a separate name for existing call sites. */
+export const DEFAULT_CONTEXT_WINDOW_LOCAL = 128000;
 /**
  * Upper bound for a model's output reservation.
  * - Cloud: 16k is a provider-safety cap, not a guess - e.g. OpenAI gpt-4o rejects max_tokens > 16384
@@ -315,7 +330,7 @@ export interface ICustomLanguageModelsService {
 	 * Apply metadata derived from HuggingFace/Ollama. Only writes fields the user has NOT overridden
 	 * (and never re-enables tools that the runtime auto-disabled). Marks the model as enriched.
 	 */
-	applyDerivedMetadata(id: string, derived: Partial<Pick<ICustomLanguageModel, 'contextWindow' | 'format' | 'useNativeTools' | 'supportsVision'>>): Promise<void>;
+	applyDerivedMetadata(id: string, derived: Partial<Pick<ICustomLanguageModel, 'contextWindow' | 'format' | 'useNativeTools' | 'mtp' | 'supportsVision'>>): Promise<void>;
 	/**
 	 * Stamp {@link ICustomLanguageModel.lastUsedAt} for a model that just served a request. Throttled
 	 * internally (see {@link USAGE_STAMP_THROTTLE_MS}) so a burst of turns costs one storage write, and
@@ -329,6 +344,16 @@ export interface ICustomLanguageModelsService {
 	resetToolFailureStreak(id: string): Promise<void>;
 	/** Auto-disable native tool calling after repeated failures (sets toolsAutoDisabled + useNativeTools=false, without marking a user override). */
 	autoDisableTools(id: string): Promise<void>;
+	/**
+	 * Give a runtime-demoted model one more chance at native tool calling, clearing {@link ICustomLanguageModel.toolsAutoDisabled}
+	 * and its failure streak. Called when the model's server (re)starts.
+	 *
+	 * This is what makes the auto-disable safe to run WITHOUT a UI toggle: the demotion is cheap to redo (two
+	 * failed turns) but was otherwise permanent, so a model demoted by two transient errors stayed on
+	 * prompt-injected tools forever with no way back once the switch was gone. Deliberately does NOT touch a
+	 * model the USER turned tools off on - that override is theirs to keep.
+	 */
+	retryAutoDisabledTools(id: string): Promise<void>;
 	/** Auto-disable vision after the local server rejected an image (sets supportsVision=false + visionAutoDisabled=true), so image attach is gated next turn. Returns true if it flipped a previously-vision model. */
 	autoDisableVision(id: string): Promise<boolean>;
 }
@@ -626,7 +651,7 @@ export class CustomLanguageModelsService extends Disposable implements ICustomLa
 		}
 	}
 
-	async applyDerivedMetadata(id: string, derived: Partial<Pick<ICustomLanguageModel, 'contextWindow' | 'format' | 'useNativeTools' | 'supportsVision'>>): Promise<void> {
+	async applyDerivedMetadata(id: string, derived: Partial<Pick<ICustomLanguageModel, 'contextWindow' | 'format' | 'useNativeTools' | 'mtp' | 'supportsVision'>>): Promise<void> {
 		const index = this.models.findIndex(m => m.id === id);
 		if (index < 0) {
 			return;
@@ -649,6 +674,12 @@ export class CustomLanguageModelsService extends Disposable implements ICustomLa
 		// never override a manual setting or a runtime auto-disable; a confirmed source may turn it OFF or ON.
 		if (derived.supportsVision !== undefined && !ov.supportsVision && !model.visionAutoDisabled) {
 			updates.supportsVision = derived.supportsVision;
+		}
+		// MTP read from the downloaded GGUF's own header - the same key llama.cpp reads, so it may set the flag
+		// either way. The runtime's dense demotion for a model whose head failed to load lives in the runner
+		// (_mtpUnsupported), not here: this records what the FILE claims, that records what the ENGINE managed.
+		if (derived.mtp !== undefined && !ov.mtp) {
+			updates.mtp = derived.mtp;
 		}
 		this.models[index] = { ...model, ...updates, metadataEnriched: true };
 		await this.saveModels();
@@ -696,6 +727,22 @@ export class CustomLanguageModelsService extends Disposable implements ICustomLa
 			return;
 		}
 		this.models[index] = { ...this.models[index], useNativeTools: false, toolsAutoDisabled: true, toolFailureStreak: 0 };
+		await this.saveModels();
+		this._onDidChangeCustomModels.fire();
+	}
+
+	async retryAutoDisabledTools(id: string): Promise<void> {
+		const index = this.models.findIndex(m => m.id === id);
+		if (index < 0) {
+			return;
+		}
+		const model = this.models[index];
+		// Only undo the RUNTIME's demotion. A user who explicitly turned tools off is recorded in
+		// userOverrides.useNativeTools, and that decision must survive every restart.
+		if (!model.toolsAutoDisabled || model.userOverrides?.useNativeTools) {
+			return;
+		}
+		this.models[index] = { ...model, useNativeTools: true, toolsAutoDisabled: false, toolFailureStreak: 0 };
 		await this.saveModels();
 		this._onDidChangeCustomModels.fire();
 	}

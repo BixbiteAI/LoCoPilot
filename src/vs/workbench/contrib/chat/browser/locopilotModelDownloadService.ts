@@ -35,7 +35,8 @@ import { LOCOPILOT_SETTINGS_SECTION_LIST_MODELS } from './chatManagement/locopil
 import { usableSystemMemoryBytes, metalOffloadBudgetBytes, kvCacheBytesPerElem, kvPlanBytesPerElem, DEFAULT_KV_BYTES_PER_TOKEN_PER_LAYER_F16, RUNTIME_OVERHEAD_BYTES, TARGET_MIN_CONTEXT, MIN_CLAMPED_CONTEXT } from './locopilotLlamaCppServer.js';
 import { IConfigurationService } from '../../../../platform/configuration/common/configuration.js';
 import { ChatConfiguration } from '../common/constants.js';
-import { findDraftPairing, estimateLayerCountFromModelName, modelParamsBillionsFromName, rankRecommendations, type IHardwareProfile } from './locopilotModelCatalog.js';
+import { findDraftPairing, estimateLayerCountFromModelName, modelParamsBillionsFromName, rankRecommendations, findCatalogEntryForStoredModel, type IHardwareProfile } from './locopilotModelCatalog.js';
+import { readGgufModelInfo, isMtpModelInfo, hasBrokenMtpMetadata } from './locopilotGgufMetadata.js';
 import { IDialogService } from '../../../../platform/dialogs/common/dialogs.js';
 import { ITerminalService, ITerminalInstance } from '../../terminal/browser/terminal.js';
 import { getBundledMlxPython } from './locopilotMlxServer.js';
@@ -1570,8 +1571,8 @@ export class LoCoPilotModelDownloadService extends Disposable implements IWorkbe
 			});
 			this._log(`[LoCoPilot Download] ${repoId} downloaded to ${localPath}.`);
 
-			// Enrich format/context window from HF now that the files are on disk (best-effort, never blocks completion).
-			await this._enrichHuggingFaceMetadata(model, toDownload, cancel);
+			// Enrich format/context window/MTP now that the files are on disk (best-effort, never blocks completion).
+			await this._enrichHuggingFaceMetadata(model, toDownload, cancel, mainModelFileUri?.fsPath);
 
 			// Fetch the paired speculative-decoding draft model in the background (small, few hundred MB).
 			// Fire-and-forget: the main model is fully usable without it; the runner simply enables the
@@ -1848,11 +1849,11 @@ export class LoCoPilotModelDownloadService extends Disposable implements IWorkbe
 	}
 
 	/**
-	 * Derive `format` and `contextWindow` from HuggingFace and write them via applyDerivedMetadata
-	 * (which skips any field the user has overridden). Best-effort: failures are logged and ignored,
-	 * leaving the model on its defaults.
+	 * Derive `format`, `contextWindow`, `supportsVision` and `mtp` from HuggingFace + the downloaded GGUF, and
+	 * write them via applyDerivedMetadata (which skips any field the user has overridden). Best-effort:
+	 * failures are logged and ignored, leaving the model on its defaults.
 	 */
-	private async _enrichHuggingFaceMetadata(model: ICustomLanguageModel, downloadedPaths: string[], cancel: CancellationToken): Promise<void> {
+	private async _enrichHuggingFaceMetadata(model: ICustomLanguageModel, downloadedPaths: string[], cancel: CancellationToken, mainGgufPath?: string): Promise<void> {
 		try {
 			const repoId = model.modelName.trim();
 			const repoPath = repoId.split('/').map(encodeURIComponent).join('/');
@@ -1877,13 +1878,52 @@ export class LoCoPilotModelDownloadService extends Disposable implements IWorkbe
 				contextWindow = contextWindowFromConfig(cfg);
 			}
 
-			if (format === undefined && contextWindow === undefined && supportsVision === undefined) {
+			// 3) MTP, read from the GGUF we just downloaded. Only for models the CATALOG doesn't already describe:
+			// a catalog entry's `mtp` flag is curated and authoritative, so re-deriving it would only risk
+			// overwriting a known-good true with a false from a header we mis-read.
+			const mtp = findCatalogEntryForStoredModel(repoId, format)
+				? undefined
+				: await this._detectMtpFromGguf(mainGgufPath, repoId);
+
+			if (format === undefined && contextWindow === undefined && supportsVision === undefined && mtp === undefined) {
 				return;
 			}
-			await this.customLanguageModelsService.applyDerivedMetadata(model.id, { format, contextWindow, supportsVision });
-			this._log(`[LoCoPilot Download] Enriched ${repoId} metadata (format=${format ?? 'n/a'}, contextWindow=${contextWindow ?? 'n/a'}, vision=${supportsVision ?? 'n/a'}).`);
+			await this.customLanguageModelsService.applyDerivedMetadata(model.id, { format, contextWindow, supportsVision, mtp });
+			this._log(`[LoCoPilot Download] Enriched ${repoId} metadata (format=${format ?? 'n/a'}, contextWindow=${contextWindow ?? 'n/a'}, vision=${supportsVision ?? 'n/a'}, mtp=${mtp ?? 'n/a'}).`);
 		} catch (e) {
 			this._log(`[LoCoPilot Download] Metadata enrichment failed for ${model.modelName} (non-fatal): ${e}`);
+		}
+	}
+
+	/**
+	 * Whether this downloaded GGUF can run llama.cpp's Multi-Token-Prediction speculative decoding, read from
+	 * the file's own header. Cheap: {@link readGgufModelInfo} only reads the header, never the weight data.
+	 *
+	 * Returns `false` rather than `undefined` when the file parses and simply has no MTP head - that is a real
+	 * answer ("this is a dense model"), and returning undefined would leave the flag on whatever default the
+	 * model was added with. Only an unreadable/unparseable file yields undefined, leaving the default in place.
+	 *
+	 * NOTE the deliberate asymmetry with a `-MTP-` repo NAME: the name is not evidence. Unsloth's
+	 * Qwen3.6-27B-MTP-GGUF shipped without the `nextn_predict_layers` key and llama.cpp refused to load it with
+	 * MTP, so the header - which is exactly what the engine reads - is the only signal we trust here.
+	 */
+	private async _detectMtpFromGguf(mainGgufPath: string | undefined, repoId: string): Promise<boolean | undefined> {
+		if (!mainGgufPath || !mainGgufPath.toLowerCase().endsWith('.gguf')) {
+			return undefined; // MLX / transformers / folder-loaded repo: MTP is a llama.cpp GGUF feature only.
+		}
+		try {
+			const info = await readGgufModelInfo(this.fileService, mainGgufPath);
+			if (info.layerCount === undefined && info.contextLength === undefined) {
+				return undefined; // header didn't parse at all - don't assert anything about MTP.
+			}
+			if (hasBrokenMtpMetadata(info)) {
+				this._log(`[LoCoPilot Download] ${repoId} carries NextN/MTP tensors but no nextn_predict_layers key - this build cannot run MTP (llama.cpp rejects it), so it will run dense.`);
+				return false;
+			}
+			return isMtpModelInfo(info);
+		} catch (e) {
+			this._log(`[LoCoPilot Download] Could not read MTP support from ${mainGgufPath} (non-fatal): ${e}`);
+			return undefined;
 		}
 	}
 
