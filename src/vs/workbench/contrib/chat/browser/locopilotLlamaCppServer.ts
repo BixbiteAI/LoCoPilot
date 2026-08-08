@@ -851,6 +851,39 @@ export const DEFAULT_KV_BYTES_PER_TOKEN_PER_LAYER_F16 = 4096;
 export const MTP_DRAFT_KV_LAYER_EQUIV = 2;
 
 /**
+ * The FIXED (context-independent) resident cost of the embedded MTP draft head, as a fraction of the model
+ * weights, with a floor and a ceiling.
+ *
+ * MTP's memory has two halves and they are budgeted in different places. The draft context's KV cache scales
+ * with `n_ctx` and is charged by the context clamp via {@link MTP_DRAFT_KV_LAYER_EQUIV}; this covers only the
+ * other half - the single-layer head's own tensors. Keeping them separate is the point: the previous model
+ * charged a flat ~8% of the weights (1.4 GB on a 27B) as if the whole thing were fixed, which both
+ * double-counted the KV the clamp had already reserved AND scaled with entirely the wrong variable. Measured
+ * reference: llama.cpp reported a 764.82 MiB total MTP context for a ~1.4 GB 2B model at a 183K window - i.e.
+ * almost all of that figure was context-scaling KV, not head tensors.
+ */
+export const MTP_HEAD_WEIGHT_FRACTION = 0.02;
+export const MTP_HEAD_MIN_BYTES = Math.round(128 * 1e6);
+export const MTP_HEAD_MAX_BYTES = Math.round(512 * 1e6);
+
+/** Fixed resident bytes for the embedded MTP draft head. See {@link MTP_HEAD_WEIGHT_FRACTION}. */
+export function mtpHeadResidentBytes(weightBytes: number): number {
+	if (!(weightBytes > 0)) {
+		return MTP_HEAD_MIN_BYTES;
+	}
+	return Math.round(Math.min(Math.max(weightBytes * MTP_HEAD_WEIGHT_FRACTION, MTP_HEAD_MIN_BYTES), MTP_HEAD_MAX_BYTES));
+}
+
+/**
+ * Max context checkpoints per slot (`--ctx-checkpoints`). llama.cpp defaults to 32, and each checkpoint is a
+ * HOST-RAM copy of the sliding-window / recurrent state - measured at 149.6 MiB on a 27B with a 46K window, so
+ * the default quietly reserves up to ~4.8 GB that none of our memory accounting books. The restore path only
+ * looks for the most recent usable checkpoint, so a handful still covers the case that matters (the next agent
+ * turn continuing the same prefix) at a fraction of the RAM.
+ */
+export const LLAMA_CTX_CHECKPOINTS = 4;
+
+/**
  * Clamps the requested context window to (a) the model's trained maximum and (b) what the KV-cache memory
  * budget can hold, rounded down to a multiple of 1024 and floored at {@link MIN_CLAMPED_CONTEXT}. Returns
  * the requested size unchanged when no constraint applies or inputs are missing. This stops a long-context
@@ -1474,6 +1507,19 @@ export function getLlamaCppServerCommand(modelPath: string, backend: LlamaBacken
 	if (tuning.multiTokenPrediction) {
 		const mtpArgs = (tuning.mtpArgs && tuning.mtpArgs.trim()) ? tuning.mtpArgs.trim() : '--spec-type draft-mtp';
 		args.push(...mtpArgs.split(/\s+/));
+		// The draft context allocates its OWN KV at the same n_ctx as the target and does NOT inherit
+		// `--cache-type-k/v` - llama.cpp logs `cache_k=f16, cache_v=f16` for the draft even when the target runs
+		// q8_0. There is no flag to give the draft a smaller window (checked against b9789's option list), so
+		// precision is the only lever on it. q8_0 roughly halves the cost; a marginally worse draft token is
+		// rejected by the target's verification rather than emitted, so this trades a little acceptance for
+		// memory, never correctness. Skipped when the target itself runs f16 (small window, or a model whose
+		// engine refused quantized KV - the draft would refuse it too), and when the user pinned their own flags.
+		if (kvCachePlan.k !== 'f16' && !mtpArgs.includes('--spec-draft-type-k')) {
+			args.push('--spec-draft-type-k', 'q8_0');
+		}
+		if (kvCachePlan.v !== 'f16' && !mtpArgs.includes('--spec-draft-type-v')) {
+			args.push('--spec-draft-type-v', 'q8_0');
+		}
 	} else if (tuning.draftModelPath && tuning.draftModelPath.trim()) {
 		// Speculative decoding with a SEPARATE small draft model: the small model proposes tokens and the
 		// big model verifies them in one batch, so when they agree we generate several tokens per big-model
@@ -1555,6 +1601,11 @@ export function getLlamaCppServerCommand(modelPath: string, backend: LlamaBacken
 	if (cacheReuse > 0) {
 		args.push('--cache-reuse', String(Math.floor(cacheReuse)));
 	}
+
+	// Cap the per-slot context checkpoints so their host-RAM cost is bounded and matches what the memory
+	// accounting assumes. See LLAMA_CTX_CHECKPOINTS - the build default of 32 is worth multiple GB on a
+	// large-context model and is invisible to every budget we compute.
+	args.push('--ctx-checkpoints', String(LLAMA_CTX_CHECKPOINTS));
 
 	// Cap the host-RAM prompt cache so its real size matches what the memory accounting books for it
 	// (the build default is 8192 MiB). 0 is meaningful (disable); undefined leaves the build default.

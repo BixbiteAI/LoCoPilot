@@ -37,6 +37,10 @@ import {
 	METAL_LARGE_RAM_THRESHOLD_BYTES,
 	MAX_CLAMPED_CONTEXT,
 	TARGET_MIN_CONTEXT,
+	mtpHeadResidentBytes,
+	MTP_HEAD_MAX_BYTES,
+	MTP_HEAD_MIN_BYTES,
+	LLAMA_CTX_CHECKPOINTS,
 	SWA_GLOBAL_LAYER_FRACTION,
 	USABLE_SYSTEM_MEMORY_FRACTION,
 	KV_AUTO_QUANT_CONTEXT_THRESHOLD,
@@ -997,4 +1001,87 @@ suite('LoCoPilot llama.cpp server', () => {
 			assert.strictEqual(resolveAutoPerformanceProfile('unknown', 'serious'), 'quiet');
 		});
 	});
+
+	suite('MTP budgeting', () => {
+		const GB = 1e9;
+		// Attention geometry back-solved from a real Qwen3.6-27B launch log: a ~5.2 GB q8 KV budget granted
+		// 46080 tokens, which lands on 64 layers x ~3350 B/token/layer at f16. Reproducing that number is what
+		// makes the "after" figures below trustworthy.
+		const L27 = 64, F16_27 = 3350, W27 = 17.2 * GB;
+		const metal32 = metalOffloadBudgetBytes(34359738368);
+
+		// Mirrors the launch path: the MTP head is subtracted from the budget BEFORE context is sized, and the
+		// draft context's own KV is charged by inflating the layer count.
+		function plan(requested: number, weights: number, layers: number, f16: number, budget: number, mtp: boolean) {
+			const head = mtp ? mtpHeadResidentBytes(weights) : 0;
+			return selectAutomaticKvCache({
+				requestedContext: requested,
+				modelContextLength: 262144,
+				kvBudgetBytes: computeKvBudgetBytes(budget - head, weights, RUNTIME_OVERHEAD_BYTES),
+				layerCount: mtp ? layers + MTP_DRAFT_KV_LAYER_EQUIV : layers,
+				kvBytesPerTokenPerLayerF16: f16,
+			});
+		}
+
+		test('reproduces the observed 27B launch (~46K at q8) with MTP off', () => {
+			const old = plan(262144, W27, L27, F16_27, metal32, false);
+			assert.strictEqual(kvPlanId(old.kvCachePlan), 'q8_0');
+			assert.ok(old.contextSize >= 44000 && old.contextSize <= 47000, `got ${old.contextSize}`);
+		});
+
+		test('a 27B keeps q8 and clears the comfort floor once MTP is budgeted in', () => {
+			// The reserve, NOT any context cap, is what makes room - the request stays at the full window.
+			const now = plan(262144, W27, L27, F16_27, metal32, true);
+			assert.strictEqual(kvPlanId(now.kvCachePlan), 'q8_0', 'precision is not traded away');
+			assert.ok(now.contextSize >= TARGET_MIN_CONTEXT, `got ${now.contextSize}`);
+			assert.ok(now.contextSize < plan(262144, W27, L27, F16_27, metal32, false).contextSize,
+				'MTP is paid for out of context length, not by disabling MTP');
+		});
+
+		test('a roomy machine keeps its full window - the reserve costs it nothing', () => {
+			// The regression a fixed planner target WOULD have caused, and the reason there is no such constant:
+			// a 27B that fits comfortably must not be held to the window of one squeezed onto 32 GB.
+			for (const totalRam of [68719476736, 137438953472]) {
+				const roomy = plan(262144, W27, L27, F16_27, metalOffloadBudgetBytes(totalRam), true);
+				assert.ok(roomy.contextSize > 200000, `${totalRam / GB}GB gave only ${roomy.contextSize}`);
+			}
+		});
+
+		test('the reserve only shortens the window on machines that are actually tight', () => {
+			const tight = metal32;
+			const roomy = metalOffloadBudgetBytes(137438953472);
+			assert.ok(plan(262144, W27, L27, F16_27, tight, true).contextSize < plan(262144, W27, L27, F16_27, tight, false).contextSize);
+			assert.strictEqual(plan(262144, W27, L27, F16_27, roomy, true).contextSize, plan(262144, W27, L27, F16_27, roomy, false).contextSize);
+		});
+
+		test('the head reserve tracks head tensors, not the old 8%-of-weights charge', () => {
+			// Must cover more than one transformer block of a 64-layer 27B, and stay far under the 1.37 GB the
+			// old formula charged - that gap is exactly what used to push MTP over the budget.
+			assert.ok(mtpHeadResidentBytes(W27) > W27 / L27);
+			assert.ok(mtpHeadResidentBytes(W27) < 0.08 * W27 / 3);
+			assert.strictEqual(mtpHeadResidentBytes(400 * GB), MTP_HEAD_MAX_BYTES);
+			assert.strictEqual(mtpHeadResidentBytes(0), MTP_HEAD_MIN_BYTES);
+		});
+
+		test('MTP quantizes the draft KV to match the target, and only then', () => {
+			const q8 = getLlamaCppServerCommand('/m.gguf', 'metal', undefined, 1234, { multiTokenPrediction: true, kvCachePlan: symmetricKvPlan('q8_0') }).args;
+			assert.strictEqual(argValue(q8, '--spec-draft-type-k'), 'q8_0');
+			assert.strictEqual(argValue(q8, '--spec-draft-type-v'), 'q8_0');
+			// An f16 target means either a small window or an engine that refused quantized KV; the draft
+			// context would refuse it too, so it is left at the build default.
+			const f16 = getLlamaCppServerCommand('/m.gguf', 'metal', undefined, 1234, { multiTokenPrediction: true, kvCachePlan: symmetricKvPlan('f16') }).args;
+			assert.ok(!f16.includes('--spec-draft-type-k'));
+			const pinned = getLlamaCppServerCommand('/m.gguf', 'metal', undefined, 1234, { multiTokenPrediction: true, mtpArgs: '--spec-type draft-mtp --spec-draft-type-k f16', kvCachePlan: symmetricKvPlan('q8_0') }).args;
+			assert.strictEqual(argValue(pinned, '--spec-draft-type-k'), 'f16');
+			const plain = getLlamaCppServerCommand('/m.gguf', 'metal', undefined, 1234, { kvCachePlan: symmetricKvPlan('q8_0') }).args;
+			assert.ok(!plain.includes('--spec-draft-type-k'));
+		});
+
+		test('context checkpoints are capped on every launch', () => {
+			const args = getLlamaCppServerCommand('/m.gguf', 'metal', undefined, 1234, {}).args;
+			assert.strictEqual(argValue(args, '--ctx-checkpoints'), String(LLAMA_CTX_CHECKPOINTS));
+			assert.ok(LLAMA_CTX_CHECKPOINTS < 32, 'must be below the llama.cpp default');
+		});
+	});
+
 });

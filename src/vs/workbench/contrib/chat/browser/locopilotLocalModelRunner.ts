@@ -58,6 +58,7 @@ import {
 	DEFAULT_KV_BYTES_PER_TOKEN_PER_LAYER_F16,
 	DEFAULT_CLAMP_LAYER_COUNT,
 	MTP_DRAFT_KV_LAYER_EQUIV,
+	mtpHeadResidentBytes,
 	swaFullKvHeadroomBytes,
 	maxContextForFullSwa,
 	MIN_FULL_SWA_CONTEXT,
@@ -4685,8 +4686,15 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 		// context and a tight one is trimmed to fit - never OOM-ed by requesting more than the device holds.
 		try {
 			const ceilingInfo = await this._getModelInfo(modelPath);
-			const explicitPerModel = model.contextWindow && model.contextWindow > 0 ? model.contextWindow : undefined;
 			const trainedWindow = ceilingInfo.contextLength && ceilingInfo.contextLength > 0 ? ceilingInfo.contextLength : undefined;
+			const explicitPerModel = model.contextWindow && model.contextWindow > 0 ? model.contextWindow : undefined;
+			// Ask for the model's FULL window and let the memory clamp be the only limiter. There is deliberately no
+			// constant ceiling here: a fixed target would hand a 128 GB machine the same window as a 32 GB one, and it
+			// is not what makes room for speculative decoding either - the MTP head is subtracted from the budget
+			// BEFORE context is sized (see the reserve below and _augmentTuningWithHardware), so a tight machine gives
+			// back exactly the length MTP needs and a roomy one gives back nothing. Measured on a 32 GB M1 Max: a 27B
+			// lands on q8_0/40960 with MTP on whether this asks for 65536 or the full 262144 - the reserve does the
+			// work, a cap would only have cost the 64 GB+ machines their context.
 			const requestedCeiling = explicitPerModel ?? trainedWindow ?? baseTuning.contextSize ?? DEFAULT_LLAMA_CONTEXT_SIZE;
 			// Never request beyond the trained window (rope stays un-scaled) or the absolute backstop.
 			baseTuning.contextSize = Math.max(
@@ -4731,22 +4739,19 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 		let extraResidentBytes = mmprojBytes;
 		const userDraftPath = baseTuning.draftModelPath?.trim();
 		if (baseTuning.multiTokenPrediction) {
-			// MTP self-drafts from the SAME GGUF using `--spec-type draft-mtp` alone (no `--model-draft`), which
-			// loads only the embedded single-layer MTP head + its small draft context - the server logs
-			// `[spec] estimated memory usage of MTP context is <N> MiB` (~100-300 MB, not a second weight copy).
-			// We therefore reserve a bounded head cost rather than a full weights-worth: ~8% of the model weights
-			// with a 512 MB floor and 2 GB ceiling comfortably covers the head tensors plus the draft KV cache,
-			// while keeping big MTP models (e.g. 27B) fitting on machines that hold a single weight copy. Keep MTP
-			// only when even this small extra fits; otherwise drop it here and let the zero-memory n-gram drafting
-			// below take over. Runs BEFORE the paired-draft / n-gram blocks, so clearing the flag lets one of them
-			// pick up the slack.
-			const mtpHeadBytes = Math.min(Math.max(weightBytesForBudget * 0.08, 512 * 1e6), 2 * 1e9);
-			if (await this._extrasFitBudget(modelPath, backend, discreteVramBytes, mmprojBytes + mtpHeadBytes)) {
-				extraResidentBytes += mtpHeadBytes;
-			} else {
-				this._log(`[LoCoPilot Runner] MTP disabled for ${modelId}: even the lightweight embedded draft head (~${Math.round(mtpHeadBytes / 1e6)}MB) exceeds this machine's memory budget; falling back to n-gram drafting.`);
-				baseTuning.multiTokenPrediction = false;
-			}
+			// MTP's memory has two halves, budgeted in two different places, and conflating them is what used to
+			// disable it on the machines it was meant for:
+			//   - the DRAFT CONTEXT's KV scales with n_ctx and is charged by the context clamp, via
+			//     MTP_DRAFT_KV_LAYER_EQUIV (see _augmentTuningWithHardware). It must not be double-charged here.
+			//   - the HEAD TENSORS are a small fixed cost, and are what this reserve covers.
+			// The old code reserved ~8% of the WEIGHTS for both halves at once (~1.4 GB on a 27B) and then GATED MTP
+			// on that figure BEFORE the clamp had sized anything, pricing the cache at a fabricated 16K/f16 window
+			// that no launch ever used. On a 32 GB Mac that arithmetic missed by a few hundred MB, so speculative
+			// decoding was silently dropped on a model chosen specifically for it - and the clamp then handed the very
+			// same memory to context anyway. MTP is now carried through the planner as a first-class cost and is only
+			// ever dropped AFTER a real plan exists: see the post-clamp verification below, which is the sole place
+			// that can turn it off and which prices it with the context and KV precision that will really launch.
+			extraResidentBytes += mtpHeadResidentBytes(weightBytesForBudget);
 		} else if (userDraftPath) {
 			extraResidentBytes += (await this._fileBytes(userDraftPath)) || weightBytesForBudget;
 		}
@@ -4795,9 +4800,26 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 		// An active OOM-ladder cap is the one case allowed below the usability floor, so the clamp must be told
 		// not to raise it back up (otherwise the degraded relaunch requests the same window that just OOM-ed).
 		const oomLadderCap = this._oomContextCap.get(modelId);
-		const tuning = await this._augmentTuningWithHardware(
+		let tuning = await this._augmentTuningWithHardware(
 			modelPath, backend, baseTuning, extraResidentBytes,
 			oomLadderCap && oomLadderCap > 0 ? oomLadderCap : undefined);
+		// MTP post-clamp verification - the ONLY place MTP is dropped for memory reasons.
+		// Everything above carried it as a first-class cost, so `tuning` already describes a context sized to hold
+		// BOTH the main and the draft KV cache. Only now, with the real context and the real KV precision decided,
+		// is there anything worth checking - and unlike the old pre-clamp gate this prices the launch that will
+		// actually happen. When it does fail we replan without MTP, which gives the context back the draft cache
+		// was holding, so dropping speculation is never also a context penalty.
+		if (tuning.multiTokenPrediction) {
+			const mtpFit = await this._computeFit(modelPath, backend, discreteVramBytes, extraResidentBytes, tuning);
+			if (mtpFit && mtpFit.requiredBytes > mtpFit.usableBytes) {
+				this._log(`[LoCoPilot Runner] MTP disabled for ${modelId}: the planned ${tuning.contextSize}-token context plus the draft head needs ~${Math.round(mtpFit.requiredBytes / 1e9)}GB against a ~${Math.round(mtpFit.usableBytes / 1e9)}GB budget. Replanning without it.`);
+				baseTuning.multiTokenPrediction = false;
+				extraResidentBytes = Math.max(0, extraResidentBytes - mtpHeadResidentBytes(weightBytesForBudget));
+				tuning = await this._augmentTuningWithHardware(
+					modelPath, backend, baseTuning, extraResidentBytes,
+					oomLadderCap && oomLadderCap > 0 ? oomLadderCap : undefined);
+			}
+		}
 		// Tight-fit notice: the clamp granted the largest context that fits, but it landed below the comfort floor
 		// (TARGET_MIN) on a model whose own window is larger - i.e. the DEVICE, not the model, is the limit. The
 		// model still runs (at best fit; the watchdog auto-stops it if memory later runs out), so this is a plain-
