@@ -1070,7 +1070,14 @@ export class ChatInputPart extends Disposable implements IHistoryNavigationWidge
 		const cachedModels = this.storageService.getObject<ILanguageModelChatMetadataAndIdentifier[]>(CachedLanguageModelsKey, StorageScope.APPLICATION, []);
 		let models = this.languageModelsService.getLanguageModelIds()
 			.map(modelId => ({ identifier: modelId, metadata: this.languageModelsService.lookupLanguageModel(modelId)! }));
-		if (models.length === 0 || models.some(m => m.metadata.isDefaultForLocation[this.location]) === false) {
+		// Fall back to the persisted snapshot ONLY when the service has nothing live yet (first paint, before
+		// the provider has resolved). The upstream condition also fell back whenever no model claimed
+		// `isDefaultForLocation`, which is the normal state for LoCoPilot - only the single RAM-matched picker
+		// default sets it, and it is absent whenever the user hides or filters that model out. That made every
+		// caller read a snapshot written once before any server launched, so post-launch metadata never
+		// surfaced: the context gauge (and the summariser budgeting off the same maxInputTokens) kept showing
+		// the catalog's nominal window, e.g. 262144 for a server actually running 40960.
+		if (models.length === 0) {
 			models = cachedModels;
 		} else {
 			this.storageService.store(CachedLanguageModelsKey, models, StorageScope.APPLICATION, StorageTarget.MACHINE);

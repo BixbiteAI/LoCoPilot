@@ -557,6 +557,21 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 	/** Context size (-c) each model's LAST llama launch actually used, so the OOM ladder can halve it. */
 	private readonly _lastLaunchContext = new Map<string, number>();
 	/**
+	 * Context size the SERVER reports it is really running with, scraped from its own startup log
+	 * ("new slot ... n_ctx = N" / "n_ctx_seq (N) < n_ctx_train").
+	 *
+	 * This is not always the `-c` we asked for: llama.cpp runs its own `-fit` pass ("fitting params to device
+	 * memory") and will silently shrink the context to fit VRAM - e.g. a 12B Q8_0 with a full-size SWA cache
+	 * came back at 17408 for a request on a round tier boundary. Reporting the REQUESTED figure then overstates
+	 * the window to the context gauge and, worse, to the agent's summariser, which would not compact until far
+	 * past the point the server starts truncating.
+	 *
+	 * Deliberately kept SEPARATE from {@link _lastLaunchContext}: the OOM ladder halves from what we asked for,
+	 * and folding the server's own reduction into that would change relaunch sizing. This map is read-only
+	 * reporting - {@link getLaunchedContextWindow} prefers it, nothing else does.
+	 */
+	private readonly _actualContextWindow = new Map<string, number>();
+	/**
 	 * Resolved KV-cache tensor type (f16 / q8_0 / q4_0) each model's current llama server launched with. A saved
 	 * slot-cache blob is only byte-compatible with a server using the SAME type, so this is folded into the slot
 	 * filename: a later launch that resolves a different type (context size shifted the 'auto' choice, or the OOM
@@ -1516,7 +1531,47 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 	}
 
 	getLaunchedContextWindow(modelId: string): number | undefined {
-		return this._lastLaunchContext.get(modelId);
+		// Prefer what the server SAYS it is running (scraped from its log) over what we requested: llama.cpp's
+		// own -fit pass can shrink the context below our -c, and the gauge/summariser must budget against the
+		// real window. Falls back to the requested figure until the server has printed its slot line.
+		return this._actualContextWindow.get(modelId) ?? this._lastLaunchContext.get(modelId);
+	}
+
+	/**
+	 * Scrape the real context size out of a llama-server startup line. Two forms carry it:
+	 *
+	 *   slot   load_model: id  0 | task -1 | new slot, n_ctx = 40960
+	 *   llama_context: n_ctx_seq (17408) < n_ctx_train (262144) -- the full capacity ...
+	 *
+	 * The slot line is printed last and is authoritative, so plain last-write-wins is correct; the n_ctx_seq
+	 * warning just gets the right number in place a little earlier (and repeats harmlessly for the MTP draft
+	 * context, which shares the target's window).
+	 */
+	private _parseServerContextWindow(line: string): number | undefined {
+		const slot = /new slot[^\n]*\bn_ctx\s*=\s*(\d+)/.exec(line);
+		const seq = slot ? undefined : /n_ctx_seq\s*\((\d+)\)/.exec(line);
+		const raw = slot?.[1] ?? seq?.[1];
+		if (!raw) {
+			return undefined;
+		}
+		const parsed = Number(raw);
+		return Number.isFinite(parsed) && parsed > 0 ? parsed : undefined;
+	}
+
+	/** Record the server-reported context window and refresh consumers when it differs from what we had. */
+	private _recordActualContextWindow(modelId: string, line: string): void {
+		const actual = this._parseServerContextWindow(line);
+		if (actual === undefined || this._actualContextWindow.get(modelId) === actual) {
+			return;
+		}
+		const requested = this._lastLaunchContext.get(modelId);
+		this._actualContextWindow.set(modelId, actual);
+		if (requested !== undefined && requested !== actual) {
+			this._log(`[LoCoPilot Runner] Server for ${modelId} is running n_ctx=${actual}, not the requested -c ${requested} (llama.cpp re-fitted it). Reporting ${actual} to the context gauge and summariser.`);
+		}
+		// Re-derives maxInputTokens in the LM provider, which feeds both the input-box gauge and the agent's
+		// context manager.
+		this._onDidServerStateChange.fire(modelId);
 	}
 
 	stopServer(modelId: string): void {
@@ -4955,6 +5010,9 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 		// Remember the context this launch runs with, so an OOM crash can halve it on the retry.
 		const launchContext = tuning.contextSize ?? DEFAULT_LLAMA_CONTEXT_SIZE;
 		this._lastLaunchContext.set(modelId, launchContext);
+		// Drop the previous server's scraped window so we report the request until THIS launch prints its own
+		// n_ctx - otherwise a relaunch at a different size would briefly show the old server's figure.
+		this._actualContextWindow.delete(modelId);
 		// Remember the resolved KV cache type this server uses, so slot save/restore only reuses a byte-compatible
 		// blob (see _lastLaunchKvType / _slotCacheFileName). Mirrors getLlamaCppServerCommand's own resolution.
 		this._lastLaunchKvType.set(modelId, kvPlanId(tuning.kvCachePlan ?? resolveKvCachePlan(tuning.kvCacheType ?? 'auto', launchContext)));
@@ -5069,6 +5127,10 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 				if (/backend is in error state|ggml_backend_sched_graph_compute_async failed|failed to compute graph|failed to decode, ret = -3/i.test(line)) {
 					void this._handleWedgedBackend(modelId, model.modelName, logs);
 				}
+				// Capture the context window the server actually came up with (may be smaller than our -c).
+				// Done before the `rec` lookup below: these lines print while the model is still loading, so
+				// the figure is already correct by the time the model flips to ready.
+				this._recordActualContextWindow(modelId, line);
 				const rec = this.runningServers.get(modelId);
 				if (rec) {
 					const progress = this._parseLoadProgress(line);
@@ -6083,6 +6145,9 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 		const mlxPlan = plan ?? await this._computeMlxPlan(modelId, modelDir);
 		const mlxTuning = mlxPlan.tuning;
 		this._lastLaunchContext.set(modelId, mlxPlan.contextSize);
+		// mlx_lm honours the requested context verbatim (no -fit equivalent), so there is nothing to scrape
+		// back; clear any figure left by a previous llama launch of the same model.
+		this._actualContextWindow.delete(modelId);
 		// The catalog-paired draft is resolved here rather than in the planner: it depends on a background
 		// download completing and is a pure add-on that either fits alongside the planned footprint or is dropped.
 		// A draft model is a second set of weights held resident - exactly the kind of extra the OOM ladder exists
