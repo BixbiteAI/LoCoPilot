@@ -34,7 +34,13 @@ import { IWorkbenchContribution } from '../../../common/contributions.js';
 import { LOCOPILOT_SETTINGS_SECTION_LIST_MODELS } from './chatManagement/locopilotSettingsEditorInput.js';
 
 import { ILoCoPilotLocalModelRunner } from './locopilotLocalModelRunner.js';
+import { ILoCoPilotOllamaService } from './locopilotOllamaService.js';
 import { ILoCoPilotLiveStatsService } from './locopilotLiveStatsService.js';
+
+/** An Error whose message is already written for the user and must not be wrapped or re-worded. */
+interface IUserFacingError extends Error {
+	locopilotUserFacing?: boolean;
+}
 
 /** Shape of a single SSE chunk from an OpenAI-compatible `/chat/completions` stream. */
 interface IOpenAiStreamChunk {
@@ -81,6 +87,7 @@ export class LoCoPilotLanguageModelProvider extends Disposable implements ILangu
 		@IStorageService private readonly storageService: IStorageService,
 		@ITimerService private readonly timerService: ITimerService,
 		@ILoCoPilotLiveStatsService private readonly liveStatsService: ILoCoPilotLiveStatsService,
+		@ILoCoPilotOllamaService private readonly ollamaService: ILoCoPilotOllamaService,
 	) {
 		super();
 		this._log('[LoCoPilot] Initializing Language Model Provider');
@@ -177,22 +184,79 @@ export class LoCoPilotLanguageModelProvider extends Disposable implements ILangu
 			case 403:
 				return `Access denied for ${provider}. Your API key may not have permission to use this model.`;
 			case 404:
-				if (provider === 'Ollama') {
-					return `Model not found in Ollama. Please make sure you have pulled the model (e.g., 'ollama pull llama3') or added it in LoCoPilot Settings.`;
-				}
 				return `Resource not found for ${provider}.`;
 			case 429:
 				return `Rate limit exceeded for ${provider}. Please try again in a few moments.`;
 			case 500:
 			case 502:
 			case 503:
-				if (provider === 'Ollama') {
-					return `Ollama server is not responding. Please make sure Ollama is installed and running (http://localhost:11434). You can download it from ollama.com.`;
-				}
 				return `${provider} service is temporarily unavailable. Please try again later.`;
 			default:
 				return `Something went wrong while calling ${provider} (error ${statusCode}). Please try again.`;
 		}
+	}
+
+	/**
+	 * Ollama-specific status-code wording for the chat panel. Ollama is a local daemon, so its failures map to
+	 * different user actions than a cloud provider's: 404 means the model was never pulled, 500 means the daemon
+	 * answered but could not load/run the model (almost always memory), and only 502/503 mean the daemon itself
+	 * is not serving. `serverDetail` is Ollama's own error text when it sent one - it is the most accurate thing
+	 * we can show (e.g. "model requires more system memory than is available"), so it leads when present.
+	 */
+	private _getOllamaStatusMessage(model: ICustomLanguageModel, baseUrl: string, statusCode: number, serverDetail: string | undefined): string {
+		const name = model.modelName;
+		const detail = serverDetail ? ` Ollama said: "${serverDetail}"` : '';
+		switch (statusCode) {
+			case 400:
+				// The common 400 from Ollama's compat layer is a model that doesn't accept `tools`.
+				return `Ollama rejected the request for "${name}" (400).${detail || ' If this model does not support tool calling, turn off Native Tools for it in LoCoPilot Settings, or pick a tool-capable model.'}`;
+			case 404:
+				return `Model "${name}" is not available in Ollama. Pull it first with \`ollama pull ${name}\`, or check the model name in LoCoPilot Settings.${detail}`;
+			case 413:
+				return `The request was too large for "${name}" in Ollama. Start a new chat or reduce the attached context, then try again.${detail}`;
+			case 500:
+				return `Ollama could not run "${name}" (500). This usually means the model ran out of memory or failed to load - close other apps, or try a smaller model.${detail}`;
+			case 502:
+			case 503:
+				return `Ollama is running at ${baseUrl} but is not serving requests right now. Wait a moment and try again, or restart Ollama.${detail}`;
+			default:
+				return `Ollama returned an error (${statusCode}) for "${name}".${detail || ' Check the Ollama terminal output for details.'}`;
+		}
+	}
+
+	/**
+	 * True for a transport-level failure (nothing reached the server). Electron's `net` module reports these as
+	 * Chromium error codes (`net::ERR_CONNECTION_REFUSED`), NOT as Node's `ECONNREFUSED` - matching only the
+	 * Node spelling is why a stopped Ollama used to surface the raw error code in chat.
+	 */
+	private _isConnectionError(errMsg: string): boolean {
+		return /ECONNREFUSED|ECONNRESET|ENOTFOUND|EHOSTUNREACH|ETIMEDOUT|ERR_CONNECTION_REFUSED|ERR_CONNECTION_RESET|ERR_CONNECTION_CLOSED|ERR_CONNECTION_TIMED_OUT|ERR_CONNECTION_FAILED|ERR_NAME_NOT_RESOLVED|ERR_ADDRESS_UNREACHABLE|ERR_EMPTY_RESPONSE|ERR_NETWORK_CHANGED|ERR_INTERNET_DISCONNECTED|fetch failed|Failed to fetch|socket hang up|network error/i.test(errMsg);
+	}
+
+	/**
+	 * Wording for "we could not reach Ollama at all". We re-probe `/api/version` before writing the message so
+	 * the panel can distinguish a daemon that is down from one that is up but dropped this particular request -
+	 * those need different actions from the user, and guessing wrong sends them to fix the wrong thing.
+	 */
+	/**
+	 * Tags an already user-facing Ollama message so the surrounding catch re-throws it untouched instead of
+	 * wrapping it in a second "could not complete the request" sentence.
+	 */
+	private _ollamaError(message: string): Error {
+		const err: IUserFacingError = new Error(message);
+		err.locopilotUserFacing = true;
+		return err;
+	}
+
+	private async _getOllamaUnreachableMessage(model: ICustomLanguageModel, baseUrl: string): Promise<string> {
+		const reachable = await this.ollamaService.isReachable(baseUrl).catch(() => false);
+		if (reachable) {
+			return `Ollama is running at ${baseUrl}, but the request for "${model.modelName}" was dropped before it completed. It may have run out of memory loading the model - try again, or pick a smaller model.`;
+		}
+		const isLocal = /^https?:\/\/(localhost|127\.0\.0\.1|\[?::1\]?)(:|\/|$)/i.test(baseUrl);
+		return isLocal
+			? `Ollama is not running at ${baseUrl}. Start it (run \`ollama serve\`, or open the Ollama app) and send your message again. If Ollama is not installed yet, get it from https://ollama.com/download.`
+			: `Could not reach Ollama at ${baseUrl}. Check that the server is running, that the URL is correct in LoCoPilot Settings, and that this machine can reach it.`;
 	}
 
 	/**
@@ -1756,6 +1820,12 @@ export class LoCoPilotLanguageModelProvider extends Disposable implements ILangu
 		}
 
 		const headers: Record<string, string> = { 'Content-Type': 'application/json', 'Accept': 'text/event-stream' };
+		// Ollama's error responses carry the only accurate diagnosis we get (missing model, out of memory,
+		// tools unsupported), so capture the body and quote it instead of printing a generic sentence.
+		const errorSink = { body: '' };
+		// Declared outside the try so the catch can tell a watchdog cancel from a user cancel. A local daemon
+		// that goes silent is wedged or thrashing on a model load; without this the turn spins forever.
+		const idleWatchdog = { sawDone: false, timedOut: false, idleTimeoutMs: LoCoPilotLanguageModelProvider.ENDPOINT_IDLE_TIMEOUT_MS };
 		try {
 			const accumulatedToolCalls: Map<number, { id?: string; name?: string; args: string }> = new Map();
 			let hasEmittedAnything = false;
@@ -1769,8 +1839,10 @@ export class LoCoPilotLanguageModelProvider extends Disposable implements ILangu
 			let emittedThinkLen = 0;
 			let suppressingThinkText = false;
 
+			let sawFinishReason = false;
 			const status = await this._fetchSSEStream(url, headers, JSON.stringify(body), token, json => {
 				const choice = (json as IOpenAiStreamChunk).choices?.[0];
+				if (choice?.finish_reason) { sawFinishReason = true; }
 				const delta = choice?.delta;
 				if (delta?.content) {
 					contentBuffer += delta.content;
@@ -1820,10 +1892,26 @@ export class LoCoPilotLanguageModelProvider extends Disposable implements ILangu
 						}
 					}
 				}
-			});
+			}, errorSink, idleWatchdog);
 
 			if (status !== 200) {
-				throw new Error(this._getApiErrorMessage('Ollama', status));
+				// Status 0 means the request layer never got a response line at all - that is a transport
+				// failure, not something Ollama answered, so diagnose it the same way as a thrown one.
+				if (!status) {
+					throw this._ollamaError(await this._getOllamaUnreachableMessage(model, baseUrl));
+				}
+				throw this._ollamaError(this._getOllamaStatusMessage(model, baseUrl, status, this._extractServerErrorMessage(errorSink.body)));
+			}
+
+			// A 200 that never reaches [DONE] or a finish_reason means the daemon died (or was stopped, or hit
+			// the OOM killer) partway through. Without this the turn just stops - silently truncated if some
+			// text had streamed, or blamed on the model ("did not return a response") if none had.
+			if (!idleWatchdog.sawDone && !sawFinishReason) {
+				this._log(`[LoCoPilot Provider] Ollama stream ended without [DONE] or finish_reason (timedOut=${idleWatchdog.timedOut}).`);
+				const idleSeconds = Math.round(LoCoPilotLanguageModelProvider.ENDPOINT_IDLE_TIMEOUT_MS / 1000);
+				throw this._ollamaError(idleWatchdog.timedOut
+					? `Ollama stopped sending data for ${idleSeconds}s while answering with "${model.modelName}", so the response is incomplete. Check that Ollama is still running (it may be stuck loading the model), then try again.`
+					: `Ollama closed the connection before the response for "${model.modelName}" finished, so the answer is incomplete. The Ollama server may have stopped or run out of memory - check it is still running and try again.`);
 			}
 
 			if (!hasEmittedAnything && accumulatedToolCalls.size === 0 && !options.tools) {
@@ -1869,14 +1957,23 @@ export class LoCoPilotLanguageModelProvider extends Disposable implements ILangu
 			}
 		} catch (e: unknown) {
 			const errMsg = e && typeof (e as Error).message === 'string' ? (e as Error).message : String(e);
+			// The watchdog cancels through a linked token, so its cancel looks exactly like a user cancel here -
+			// check the flag first or a wedged Ollama gets reported as "you canceled".
+			if (idleWatchdog.timedOut) {
+				const idleSeconds = Math.round(LoCoPilotLanguageModelProvider.ENDPOINT_IDLE_TIMEOUT_MS / 1000);
+				throw new Error(`Ollama did not send anything for ${idleSeconds}s while answering with "${model.modelName}", so the request was stopped. It may be stuck loading the model, or the server may have hung - check that Ollama is running and try again.`);
+			}
 			if (this._isCanceledError(errMsg)) {
 				throw new Error(this._getCanceledMessage());
 			}
-			const isConnectionRefused = /ECONNREFUSED|fetch failed|Failed to fetch/i.test(errMsg);
-			const msg = isConnectionRefused
-				? `Ollama server is not running at ${baseUrl}. Please start Ollama and try again.`
-				: `Ollama model "${model.modelName}" error: ${errMsg}`;
-			throw new Error(msg);
+			if (this._isConnectionError(errMsg)) {
+				throw new Error(await this._getOllamaUnreachableMessage(model, baseUrl));
+			}
+			// An error we raised ourselves above is already user-facing; don't wrap it again.
+			if (e && (e as IUserFacingError).locopilotUserFacing === true) {
+				throw e;
+			}
+			throw new Error(`Ollama could not complete the request for "${model.modelName}": ${errMsg}`);
 		}
 	}
 
