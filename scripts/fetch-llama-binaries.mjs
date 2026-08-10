@@ -20,7 +20,7 @@
 // (ggml-org/llama.cpp). Re-run after bumping LLAMA_BUILD to update the bundled engine.
 
 import { createWriteStream } from 'node:fs';
-import { mkdir, stat, lstat, rm, readdir, copyFile, chmod, mkdtemp, readlink, symlink, unlink } from 'node:fs/promises';
+import { mkdir, stat, lstat, rm, readdir, copyFile, chmod, mkdtemp, readlink, symlink, unlink, readFile, writeFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
@@ -30,8 +30,36 @@ import { spawnSync } from 'node:child_process';
 
 // Pin the llama.cpp release build. Bump this (and re-run) to update the bundled engine.
 // Use a real tag from https://github.com/ggml-org/llama.cpp/releases (e.g. "b6651"), or "latest".
-const LLAMA_BUILD = process.env.LLAMA_BUILD || 'latest';
+/**
+ * SINGLE SOURCE OF TRUTH for the bundled engine version. Bump this one constant to move every platform at
+ * once, then rebuild.
+ *
+ * Why a constant rather than a pin repeated in each caller: the six release workflows and the two mac build
+ * scripts each invoke this script SEPARATELY, and `chosenTag` only unifies targets within one invocation. So
+ * with `'latest'`, jobs that run hours apart resolve different tags and one release ships mismatched engines
+ * across platforms - darwin-arm64 on one build, win32-x64 on another. A pinned tag makes a release state a
+ * verifiable fact ("1.4.6 ships llama.cpp b10350") instead of "whatever was newest when CI happened to run".
+ *
+ * `'latest'` is fine for local experimentation. Pin a real tag for anything you ship.
+ * Verify a candidate tag contains the commit you need before pinning it, e.g. for muse-glimmer support:
+ *   curl -sS "https://api.github.com/repos/ggml-org/llama.cpp/compare/62bf73d...<tag>" | grep '"status"'
+ * A `status` of "ahead" or "identical" means the tag contains it; "behind" means it does not.
+ */
+const DEFAULT_LLAMA_BUILD = 'latest';
+
+// Env override wins, so CI can pass a tag (or a repo variable) without editing this file.
+const LLAMA_BUILD = process.env.LLAMA_BUILD?.trim() || DEFAULT_LLAMA_BUILD;
 const REPO = 'ggml-org/llama.cpp';
+
+/** Set LLAMA_FORCE=1 to re-fetch even when the stamped tag already matches (e.g. a corrupt install). */
+const LLAMA_FORCE = /^(1|true|yes)$/i.test(process.env.LLAMA_FORCE || '');
+
+/**
+ * Records the release tag installed in resources/bin/<target>/, so a later run can tell "already correct"
+ * apart from "already something". Without it, existence alone gated the fetch and a persistent working tree
+ * could never be upgraded to a newer engine.
+ */
+const STAMP_FILE = '.llama-build';
 
 // Asset selection per <platform>-<arch>. `asset` is matched as a substring against the release's
 // asset names so it survives the embedded build number (e.g. "llama-b9624-bin-macos-x64.tar.gz").
@@ -65,6 +93,16 @@ function currentTarget() {
 }
 
 async function exists(p) { try { await stat(p); return true; } catch { return false; } }
+
+/** Reads the installed tag, or undefined when the stamp is missing (a pre-stamp install) or unreadable. */
+async function readStamp(p) {
+	try {
+		const tag = (await readFile(p, 'utf8')).trim();
+		return tag.length > 0 ? tag : undefined;
+	} catch {
+		return undefined;
+	}
+}
 
 async function fetchJson(url) {
 	const headers = { 'Accept': 'application/vnd.github+json', 'User-Agent': 'locopilot-build' };
@@ -230,10 +268,34 @@ async function fetchTarget(target) {
 
 	const outDir = join(root, 'resources', 'bin', target);
 	const existingBin = join(outDir, spec.bin);
+	const stampPath = join(outDir, STAMP_FILE);
+
+	// A present binary is only reusable when it is the build we were ASKED for. The previous check tested
+	// existence alone, which made "skip" mean "already something" rather than "already correct": on a
+	// persistent working tree (the local mac build scripts - CI runners start clean, so they never saw this)
+	// the first fetch pinned the engine forever, and no later tag could ever ship. That is how a build can
+	// keep bundling an engine that predates a model's architecture support no matter how often you rebuild.
 	if (await exists(existingBin)) {
-		process.stdout.write(`llama-server already present for ${target} (${existingBin}), skipping.\n`);
-		process.stdout.write(`Delete resources/bin/${target}/ to re-fetch.\n`);
-		return;
+		const stamped = await readStamp(stampPath);
+		if (LLAMA_FORCE) {
+			process.stdout.write(`llama-server present for ${target} (tag ${stamped ?? 'unknown'}) but LLAMA_FORCE is set; re-fetching.\n`);
+		} else if (LLAMA_BUILD === 'latest') {
+			// "latest" is a moving target, so an existing build can never be proven current without asking
+			// the API. Resolve it and compare; identical tag means genuinely nothing to do.
+			const { tag: latestTag } = await resolveAssetUrl(spec.asset);
+			if (stamped === latestTag) {
+				process.stdout.write(`llama-server for ${target} is already the latest release (${latestTag}), skipping.\n`);
+				return;
+			}
+			process.stdout.write(`llama-server for ${target} is ${stamped ?? 'an unstamped older build'}; latest is ${latestTag}, re-fetching.\n`);
+		} else if (stamped === LLAMA_BUILD) {
+			process.stdout.write(`llama-server for ${target} is already ${LLAMA_BUILD}, skipping.\n`);
+			return;
+		} else {
+			process.stdout.write(`llama-server for ${target} is ${stamped ?? 'unstamped'}, want ${LLAMA_BUILD}; re-fetching.\n`);
+		}
+		// Clear the old install so a shrinking asset can't leave stale libs behind next to the new binary.
+		await rm(outDir, { recursive: true, force: true });
 	}
 
 	process.stdout.write(`Fetching llama.cpp ${LLAMA_BUILD} for ${target} ...\n`);
@@ -257,6 +319,9 @@ async function fetchTarget(target) {
 		if (!(await exists(existingBin))) {
 			throw new Error(`Copy did not produce ${existingBin}`);
 		}
+		// Record WHICH build this is. Written only after the copy is verified, so a failed fetch never leaves
+		// a stamp claiming a build that isn't there - an unstamped dir re-fetches, which is the safe default.
+		await writeFile(stampPath, `${tag}\n`, 'utf8');
 		process.stdout.write(`\nllama.cpp ready for ${target} in resources/bin/${target}/ (tag ${tag})\n`);
 	} finally {
 		await rm(work, { recursive: true, force: true });

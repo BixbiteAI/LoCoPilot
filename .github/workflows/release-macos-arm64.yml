@@ -8,6 +8,14 @@ name: Build macOS arm64
 on:
   workflow_dispatch:
 
+# Pins the bundled llama.cpp engine for EVERY job in this workflow. Each release workflow invokes
+# scripts/fetch-llama-binaries.mjs separately, so without one shared value the platforms can resolve
+# different 'latest' tags and a single release ships mismatched engines. Set the LLAMA_BUILD repository
+# variable (Settings -> Actions -> Variables) to a tag like b10350 to pin all platforms at once; leave it
+# unset and the script falls back to its DEFAULT_LLAMA_BUILD constant.
+env:
+  LLAMA_BUILD: ${{ vars.LLAMA_BUILD }}
+
 jobs:
   build-macos-arm64:
     name: Build macOS arm64 (unsigned .app zip)
