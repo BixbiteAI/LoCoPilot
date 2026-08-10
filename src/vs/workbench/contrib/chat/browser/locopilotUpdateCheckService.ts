@@ -151,8 +151,19 @@ export class LoCoPilotUpdateCheckContribution extends Disposable implements IWor
 		const cts = new CancellationTokenSource();
 		const timer = setTimeout(() => cts.cancel(), FETCH_TIMEOUT_MS);
 		try {
-			const res = await this.requestService.request({ type: 'GET', url, headers: { Accept: 'application/json' } }, cts.token);
+			// `Cache-Control: no-cache` for the same reason as the model catalog's fetch: this feed is served as a
+			// plain S3/CloudFront object with an ETag but no Cache-Control, so the network stack falls back to a
+			// HEURISTIC freshness lifetime of ~10% of the object's age - days for a feed that changes per release.
+			// Without this the app can sit on a cached feed and never see a shipped update, and because a stale
+			// feed is still perfectly valid JSON the failure is invisible. The 6h recheck does not rescue it: every
+			// recheck reads the same cached body. Revalidation costs one conditional request per check.
+			const res = await this.requestService.request({
+				type: 'GET',
+				url,
+				headers: { Accept: 'application/json', 'Cache-Control': 'no-cache' },
+			}, cts.token);
 			if (res.res.statusCode !== 200) {
+				this.logService.warn(`[LoCoPilot Update] Update feed returned HTTP ${res.res.statusCode}: ${url}`);
 				return undefined;
 			}
 			const raw = await streamToBuffer(res.stream).then(b => b.toString());
@@ -169,6 +180,7 @@ export class LoCoPilotUpdateCheckContribution extends Disposable implements IWor
 						}
 					}
 				}
+				this.logService.info(`[LoCoPilot Update] Update feed reports ${o.version} (running ${this.productService.version}).`);
 				return {
 					version: o.version,
 					url: o.url,
@@ -177,6 +189,9 @@ export class LoCoPilotUpdateCheckContribution extends Disposable implements IWor
 					mandatory: o.mandatory === true,
 				};
 			}
+			// Malformed rather than merely older - worth a warning, since a feed that fails this shape check
+			// silently disables update notifications entirely with no other symptom.
+			this.logService.warn(`[LoCoPilot Update] Update feed is missing a valid "version"/"url" pair; ignoring: ${url}`);
 			return undefined;
 		} catch (e) {
 			this.logService.info(`[LoCoPilot Update] Update feed unavailable: ${e}`);

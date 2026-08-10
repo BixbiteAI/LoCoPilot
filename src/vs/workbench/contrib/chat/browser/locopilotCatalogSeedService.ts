@@ -3,6 +3,7 @@
  *  Licensed under the MIT License. See License.txt in the project root for license information.
  *--------------------------------------------------------------------------------------------*/
 
+import { IntervalTimer } from '../../../../base/common/async.js';
 import { CancellationTokenSource } from '../../../../base/common/cancellation.js';
 import { streamToBuffer } from '../../../../base/common/buffer.js';
 import { Disposable } from '../../../../base/common/lifecycle.js';
@@ -33,6 +34,13 @@ const REMOTE_CATALOG_URL = '';
 const REMOTE_FETCH_TIMEOUT_MS = 5000;
 
 /**
+ * How often to re-run the seed after the initial one, so a catalog published while the app is OPEN is picked
+ * up without a restart. Matches the update-feed check's cadence. Re-seeding is idempotent - `seededIds` makes
+ * a tick with nothing new a pure no-op, and the "new models" toast only fires for entries that actually seeded.
+ */
+const RESEED_INTERVAL_MS = 6 * 60 * 60 * 1000; // 6h
+
+/**
  * Seeds the built-in model catalog into the install so the model list and chat picker are never empty.
  *
  * Behaviour:
@@ -53,6 +61,16 @@ export class LoCoPilotCatalogSeedContribution extends Disposable implements IWor
 	/** One-time flag: re-apply default hidden/visible state to already-seeded catalog models. */
 	private static readonly VISIBILITY_MIGRATION_KEY = 'locopilot.catalog.visibilityMigration.v2';
 
+	/**
+	 * Set once the first seed pass completes, so periodic re-seeds can never be mistaken for a fresh install.
+	 * Without it, an install whose first pass seeded nothing (empty bundled catalog + failed remote fetch) would
+	 * still read `seededIds.size === 0` on the next tick and re-apply the first-run picker default.
+	 */
+	private _firstRunHandled = false;
+
+	/** Guards against a slow pass overlapping the next interval tick and double-seeding the same entry. */
+	private _seeding = false;
+
 	constructor(
 		@ICustomLanguageModelsService private readonly customLanguageModelsService: ICustomLanguageModelsService,
 		@IStorageService private readonly storageService: IStorageService,
@@ -63,7 +81,11 @@ export class LoCoPilotCatalogSeedContribution extends Disposable implements IWor
 		@IProductService private readonly productService: IProductService,
 	) {
 		super();
+		// Seed immediately - a fresh install must not show an empty model list while a timer counts down.
 		void this._seed();
+		// Then keep checking, so a catalog uploaded while this window is open arrives without a restart.
+		const reseed = this._register(new IntervalTimer());
+		reseed.cancelAndSet(() => void this._seed(), RESEED_INTERVAL_MS);
 	}
 
 	/** Resolved remote catalog URL: product.json field overrides the in-code constant. */
@@ -86,6 +108,18 @@ export class LoCoPilotCatalogSeedContribution extends Disposable implements IWor
 	}
 
 	private async _seed(): Promise<void> {
+		if (this._seeding) {
+			return; // a pass is still in flight (slow network); let it finish rather than racing it.
+		}
+		this._seeding = true;
+		try {
+			await this._seedOnce();
+		} finally {
+			this._seeding = false;
+		}
+	}
+
+	private async _seedOnce(): Promise<void> {
 		const seededIds = this._getSeededIds();
 		const appleSilicon = isAppleSiliconMac();
 
@@ -104,7 +138,9 @@ export class LoCoPilotCatalogSeedContribution extends Disposable implements IWor
 		// First-ever run seeds the whole bundled catalog at once - that is install setup, not "news", so we
 		// suppress the toast then. After that, any newly seeded entry that came from the REMOTE catalog is a
 		// genuine "new model added over the air" event worth surfacing.
-		const isFirstRun = seededIds.size === 0;
+		// Only the FIRST pass of this window can be a first run; later ticks are always incremental updates.
+		const isFirstRun = !this._firstRunHandled && seededIds.size === 0;
+		this._firstRunHandled = true;
 		const newlyFromRemote: string[] = [];
 
 		const existing = this.customLanguageModelsService.getCustomModels();
@@ -140,9 +176,10 @@ export class LoCoPilotCatalogSeedContribution extends Disposable implements IWor
 		}
 
 		this._storeSeededIds(seededIds);
-		if (seeded > 0) {
-			this.logService.info(`[LoCoPilot Catalog] Seeded ${seeded} model(s) (Apple Silicon: ${appleSilicon}, remote entries: ${remote.length}).`);
-		}
+		// Unconditional, including `seeded === 0`. Gating this on `seeded > 0` meant a launch that fetched a stale
+		// catalog logged NOTHING, which is exactly the state that is impossible to tell apart from the seeder not
+		// running at all - the counts below are what make "the upload didn't reach this machine" greppable.
+		this.logService.info(`[LoCoPilot Catalog] Seeded ${seeded} new model(s); ${byId.size} candidate(s) considered, ${remote.length} from remote, ${seededIds.size} recorded (Apple Silicon: ${appleSilicon}).`);
 
 		// Fresh installs default the chat picker to "Auto" (which resolves to the best downloaded model, or
 		// shows the starter download card when nothing is downloaded yet). Strictly first-run only - existing
@@ -217,21 +254,47 @@ export class LoCoPilotCatalogSeedContribution extends Disposable implements IWor
 	private async _fetchRemoteCatalog(): Promise<ICatalogModel[]> {
 		const url = this._remoteCatalogUrl;
 		if (!url) {
+			this.logService.info('[LoCoPilot Catalog] No remote catalog URL configured; using bundled catalog only.');
 			return [];
 		}
 		const cts = new CancellationTokenSource();
 		const timer = setTimeout(() => cts.cancel(), REMOTE_FETCH_TIMEOUT_MS);
 		try {
-			const res = await this.requestService.request({ type: 'GET', url, headers: { Accept: 'application/json' } }, cts.token);
+			// `Cache-Control: no-cache` forces the network stack to REVALIDATE instead of trusting its disk cache.
+			// This is not belt-and-braces: an origin that serves the catalog with an ETag/Last-Modified but no
+			// Cache-Control (the default for a plain S3/CloudFront object) leaves Chromium - and so Electron, and
+			// so this request - to invent a *heuristic* freshness lifetime of ~10% of the object's age. A catalog
+			// file untouched for two months therefore reads as fresh for ~5 days, and the app serves the STALE
+			// body from disk without ever hitting the network. That failure is completely silent: the old JSON is
+			// still a valid array, every id in it is already seeded, so nothing is added and nothing is logged,
+			// and it survives restarts because the disk cache does. Revalidation is cheap - a 304 is resolved
+			// inside the net stack and handed back as a 200 with the cached body, so this costs one conditional
+			// request per launch and removes the dependency on the origin's headers being right.
+			const res = await this.requestService.request({
+				type: 'GET',
+				url,
+				headers: { Accept: 'application/json', 'Cache-Control': 'no-cache' },
+			}, cts.token);
 			if (res.res.statusCode !== 200) {
+				// Logged rather than silent: a non-200 here (403 from a bad bucket policy, 404 from a moved
+				// object) is indistinguishable from "no new models" to the user, so leave a trace to grep for.
+				this.logService.warn(`[LoCoPilot Catalog] Remote catalog fetch returned HTTP ${res.res.statusCode} (using bundled): ${url}`);
 				return [];
 			}
 			const raw = await streamToBuffer(res.stream).then(b => b.toString());
 			const parsed = JSON.parse(raw);
 			if (!Array.isArray(parsed)) {
+				this.logService.warn(`[LoCoPilot Catalog] Remote catalog is not a JSON array (using bundled): ${url}`);
 				return [];
 			}
-			return parsed.filter((e): e is ICatalogModel => this._isValidCatalogEntry(e));
+			const entries = parsed.filter((e): e is ICatalogModel => this._isValidCatalogEntry(e));
+			// Always log the outcome, including the all-zero case. A successful fetch that adds nothing used to
+			// look identical to no fetch at all, which is the single hardest state to diagnose from a user's logs.
+			this.logService.info(`[LoCoPilot Catalog] Remote catalog fetched: ${entries.length} valid entr${entries.length === 1 ? 'y' : 'ies'} of ${parsed.length} received.`);
+			if (entries.length !== parsed.length) {
+				this.logService.warn(`[LoCoPilot Catalog] ${parsed.length - entries.length} remote entr${parsed.length - entries.length === 1 ? 'y was' : 'ies were'} rejected as malformed.`);
+			}
+			return entries;
 		} catch (e) {
 			this.logService.info(`[LoCoPilot Catalog] Remote catalog unavailable (using bundled): ${e}`);
 			return [];
