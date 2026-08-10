@@ -237,6 +237,38 @@ export const LOCOPILOT_DEFAULT_CATALOG: readonly ICatalogModel[] = [
 	// RESOLVED 2026-07: Qwen3.6 35B-A3B now HAS an MLX twin (`qwen36-35b-a3b-mlx`, bottom of this file).
 	// Same correction as the 27B above: `model_type: qwen3_5_moe` is supported by the bundled mlx-lm.
 
+	// ---- Muse Glimmer (Meta), Aug 2026 - Apache 2.0, dense 30B, multimodal + tool calling ----
+	// Deliberately points at UNSLOTH, not Meta's own `meta-models/Muse-Glimmer-30B-GGUF`: the official repo
+	// publishes exactly two weight files, `muse-glimmer-30B-kquant-dynamic.gguf` (19.65 GB) and
+	// `-kquant-17gb.gguf` (16.76 GB). Neither basename carries a quant token, so filterPathsByFormat cannot
+	// discriminate between them and planGgufDownload's quality bands cannot rank them - a `gguf` format there
+	// falls through to the unranked branch and returns BOTH files. Unsloth's UD-* ladder (IQ2_XXS 10.75 GB
+	// through Q8_K_XL 32.30 GB) is the same naming the Gemma 4 QAT entries rely on, so the hardware-aware
+	// two-way quant sizing works and tight machines can be stepped down within the quality band.
+	//
+	// NO draft pairing on purpose. The model's drafter (`dflash-kquant.gguf`) ships INSIDE the weights repo
+	// rather than as a standalone one, and draftRepoId resolves a SEPARATE repo download - pointing it back at
+	// the same repo would re-fetch the weights. The runner falls back to n-gram speculation, which is the
+	// documented "pairing absent" path, not a failure. (The drafter itself is excluded from weight selection
+	// by isDflashGgufPath in the download service.)
+	{
+		catalogId: 'muse-glimmer-30b-gguf',
+		displayName: 'Muse Glimmer 30B',
+		vendor: 'Meta',
+		blurb: 'Meta\'s open agentic model: vision + tool calling, Apache 2.0. 32 GB+ recommended.',
+		repoId: 'unsloth/Muse-Glimmer-30B-GGUF',
+		supportsVision: true,
+		format: 'Q4_K_XL',
+		engine: 'gguf',
+		approxSizeBytes: 15878222368,
+		minRamGB: 32,
+		tier: '32 GB+',
+		// 131072 from the checkpoint's text_config.max_position_embeddings. The architecture is unusually cheap
+		// to run long: 2 KV heads (GQA) over 52 layers, plus `sliding_window: 2048`, so the windowed-KV clamp
+		// should reach the full window on far less RAM than a 30B normally implies.
+		contextWindow: 131072,
+	},
+
 	// ---- Qwen 3.5 MTP (Alibaba) - GGUF builds with Multi-Token Prediction heads (llama.cpp --spec-type mtp) ----
 	// NOTE on minRamGB/tier for MTP entries: these are sized for the BASE model (single weight copy), NOT the
 	// doubled footprint MTP briefly needs. The current llama.cpp MTP path loads a second full weight copy for the
@@ -1042,6 +1074,24 @@ export const LOCOPILOT_DEFAULT_CATALOG: readonly ICatalogModel[] = [
 		contextWindow: 202752,
 		defaultHidden: true,
 	},
+	{
+		catalogId: 'muse-glimmer-30b-mlx',
+		displayName: 'Muse Glimmer 30B (MLX)',
+		vendor: 'Meta',
+		blurb: 'Meta\'s open agentic model tuned for Apple Silicon via MLX.',
+		repoId: 'mlx-community/Muse-Glimmer-30B-4bit',
+		// Same call as the Qwen3.6 27B MLX twin: mlx-lm dispatches on `model_type` and loads the TEXT tower of
+		// a multimodal checkpoint, so the GGUF entry carries vision and this one does not.
+		supportsVision: false,
+		format: 'mlx',
+		engine: 'mlx',
+		approxSizeBytes: 21376443276,
+		minRamGB: 32,
+		tier: '32 GB+',
+		requiresAppleSilicon: true,
+		contextWindow: 131072,
+		defaultHidden: true,
+	},
 ];
 
 /** Build the stored-model record to seed from a catalog entry (a HuggingFace/local model with no localPath yet). */
@@ -1088,6 +1138,10 @@ const DEFAULT_VISIBLE_CATALOG_IDS: ReadonlySet<string> = new Set([
 	// The catalog's most-downloaded repo (~1.42M): Qwen3.6 27B with MTP speculative decoding. Also the curated
 	// 32 GB+ "Best for you" pick (see CURATED_RECOMMENDATION_LADDER), so it must stay visible to show badged.
 	'qwen36-27b-mtp-gguf',
+	// Meta's first open-weight release in this generation (Aug 2026). Visible rather than hidden because a
+	// brand-new flagship nobody can find behind Show is a wasted catalog entry; the MLX twin stays hidden so
+	// the 32 GB+ picker row does not gain two Muse Glimmer lines on Apple Silicon.
+	'muse-glimmer-30b-gguf',
 	// Apple Silicon: one MLX pick per tier so an M-series machine always sees a native-engine option
 	// in the picker (the rest of the MLX set is seeded hidden and surfaced via Show).
 	'qwen35-4b-mlx',

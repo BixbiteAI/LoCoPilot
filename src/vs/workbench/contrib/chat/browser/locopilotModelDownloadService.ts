@@ -266,12 +266,35 @@ export function isDsparkGgufPath(path: string): boolean {
 	return /[-_.]dspark[-_.][^/]*\.gguf$/i.test(path);
 }
 
-/** Weight GGUFs only (excludes mmproj / CLIP projectors, standalone MTP heads and DSpark drafters). */
+/**
+ * True for Meta DFlash speculative-drafter files (`dflash-*.gguf`). Same class of hazard as the DSpark
+ * drafters above: Muse Glimmer 30B ships `dflash-kquant.gguf` (1.63 GB) beside the real weights in BOTH the
+ * official `meta-models/Muse-Glimmer-30B-GGUF` repo and Unsloth's, and it is only ever usable via
+ * `--model-draft`, never as `-m`.
+ *
+ * It is a weaker trap than DSpark - `kquant` is not in {@link GGUF_QUANT_QUALITY}, so the drafter scores
+ * LOWEST rather than highest and the quality floor normally rejects it - but "normally" is doing real work
+ * there: an empty/`gguf` format falls through to the unranked `paths.filter(isWeightGgufPath)` branch in
+ * {@link filterPathsByFormat}, which would hand back the drafter alongside the weights. Excluding it at the
+ * source removes the case entirely.
+ *
+ * NOTE the leading `(^|\/|[-_.])` rather than DSpark's `[-_.]`: this file is named `dflash-kquant.gguf` with
+ * the marker at the START of the basename, so a separator-anchored pattern would miss it - exactly the bug
+ * {@link isMmprojGgufPath} was widened to fix.
+ */
+export function isDflashGgufPath(path: string): boolean {
+	return /(^|\/|[-_.])dflash[-_.][^/]*\.gguf$/i.test(path);
+}
+
+/**
+ * Weight GGUFs only (excludes mmproj / CLIP projectors, standalone MTP heads, DSpark and DFlash drafters).
+ */
 function isWeightGgufPath(path: string): boolean {
 	return path.toLowerCase().endsWith('.gguf')
 		&& !isMmprojGgufPath(path)
 		&& !isMtpGgufPath(path)
-		&& !isDsparkGgufPath(path);
+		&& !isDsparkGgufPath(path)
+		&& !isDflashGgufPath(path);
 }
 
 /**
