@@ -1074,25 +1074,15 @@ export const LOCOPILOT_DEFAULT_CATALOG: readonly ICatalogModel[] = [
 		contextWindow: 202752,
 		defaultHidden: true,
 	},
-	{
-		catalogId: 'muse-glimmer-30b-mlx',
-		displayName: 'Muse Glimmer 30B (MLX)',
-		vendor: 'Meta',
-		blurb: 'Meta\'s open agentic model tuned for Apple Silicon via MLX.',
-		repoId: 'mlx-community/Muse-Glimmer-30B-4bit',
-		// Same call as the Qwen3.6 27B MLX twin: mlx-lm dispatches on `model_type` and loads the TEXT tower of
-		// a multimodal checkpoint, so the GGUF entry carries vision and this one does not.
-		supportsVision: false,
-		format: 'mlx',
-		engine: 'mlx',
-		approxSizeBytes: 21376443276,
-		minRamGB: 32,
-		tier: '32 GB+',
-		requiresAppleSilicon: true,
-		contextWindow: 131072,
-		defaultHidden: true,
-	},
 ];
+
+// REMOVED 2026-08-11: `muse-glimmer-30b-mlx` (mlx-community/Muse-Glimmer-30B-4bit). Unlike the Qwen3.6 MLX
+// twin, mlx-lm cannot load this one AT ALL - there is no `mlx_lm/models/muse_glimmer.py` on PyPI *or* on
+// main, and mlx-lm's newest release (0.31.3, Apr 2026) predates the model by months, so no version bump
+// helps. Support lives in mlx-vlm (`mlx_vlm/models/muse_glimmer/`, shipped in 0.6.12), which is how
+// mlx-community produced those 4/5/6/8-bit builds - and our runner drives `mlx_lm.server`, not
+// `mlx_vlm.server`. Re-add this entry only once the runner can launch mlx-vlm for multimodal checkpoints;
+// until then the entry could only ever fail at start.
 
 /** Build the stored-model record to seed from a catalog entry (a HuggingFace/local model with no localPath yet). */
 export function catalogModelToSeed(entry: ICatalogModel): Omit<ICustomLanguageModel, 'id' | 'createdAt'> {
