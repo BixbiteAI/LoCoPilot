@@ -6,9 +6,16 @@
 import {
 	MLX_PROMPT_CACHE_DIR_ENV,
 	MLX_PROMPT_CACHE_EXT,
+	MLX_PROMPT_CACHE_PREFILL_PATH,
 	MLX_PROMPT_CACHE_RESTORE_PATH,
 	MLX_PROMPT_CACHE_SAVE_PATH,
 } from './locopilotMlxServer.js';
+import {
+	MIN_PREFILL_PREFIX_TOKENS,
+	MLX_PREFILL_CHUNK_TOKENS,
+	PREFIX_PROBE_A,
+	PREFIX_PROBE_B,
+} from './locopilotPrefixWarmConstants.js';
 
 // This file exists ONLY to hold the embedded Python module below. It is space-indented (Python's
 // indentation IS its syntax, so it cannot be retabbed) and is therefore listed in build/filters.ts'
@@ -144,6 +151,67 @@ def _save(response_generator, path):
     return {'saved': True, 'tokens': len(tokens), 'segment': segment, 'bytes': os.path.getsize(path)}
 
 
+def _prefill(response_generator, path, body):
+    """Build a cache holding ONLY the static system+tools span, and register it as the 'system' entry.
+
+    mlx_lm segments a chat prompt itself, but it only does so for requests it generates from - and the
+    segment it keeps is not guaranteed to exist (observed live: 'system: 0 sequences' while the warm's
+    full prompt sat under 'assistant'). Persisting that full prompt is useless: it carries the warm's own
+    user turn, so it is neither an exact match nor a prefix of the next turn, and fetch_nearest_cache
+    falls through to a complete re-prefill.
+
+    So we build the prefix ourselves. Rendering the SAME request twice with different user text and
+    keeping the shared token span gives exactly the part that does not depend on what the user types -
+    the model's own chat template decides where that boundary is, and we never parse the template.
+    """
+    from mlx_lm.models.cache import make_prompt_cache
+    import mlx.core as mx
+
+    provider = response_generator.model_provider
+    model_key = provider.model_key
+    if model_key is None:
+        raise RuntimeError('model is not loaded yet')
+    model, tokenizer = provider.model, provider.tokenizer
+    system = body.get('system') or ''
+    if not system:
+        raise RuntimeError('no system prompt supplied')
+    tools = body.get('tools') or None
+
+    def render(user_content):
+        kwargs = {'add_generation_prompt': True, 'tokenize': True}
+        if tools:
+            kwargs['tools'] = tools
+        return tokenizer.apply_chat_template(
+            [{'role': 'system', 'content': system}, {'role': 'user', 'content': user_content}],
+            **kwargs)
+
+    rendered_a, rendered_b = render('${PREFIX_PROBE_A}'), render('${PREFIX_PROBE_B}')
+    shared = 0
+    while (shared < len(rendered_a) and shared < len(rendered_b)
+           and rendered_a[shared] == rendered_b[shared]):
+        shared += 1
+    if shared < ${MIN_PREFILL_PREFIX_TOKENS}:
+        raise RuntimeError('only {0} stable tokens found'.format(shared))
+
+    tokens = [int(t) for t in rendered_a[:shared]]
+    prompt_cache = make_prompt_cache(model)
+    y = mx.array(tokens)
+    offset = 0
+    # Chunked so a long prefix does not build one enormous graph. Every token IS processed (mlx_lm's own
+    # prefill loop stops one short because it needs a token to sample from; we are not generating).
+    while offset < y.size:
+        model(y[offset:offset + ${MLX_PREFILL_CHUNK_TOKENS}][None], cache=prompt_cache)
+        mx.eval([c.state for c in prompt_cache])
+        offset += ${MLX_PREFILL_CHUNK_TOKENS}
+        mx.clear_cache()
+
+    # 'system' is both the LRU tier evicted last and what /save prefers.
+    response_generator.prompt_cache.insert_cache(
+        model_key, tokens, prompt_cache, cache_type='system'
+    )
+    return {'prefilled': shared, 'rendered': len(rendered_a)}
+
+
 def _restore(response_generator, path):
     from mlx_lm.models.cache import load_prompt_cache
     model_key = response_generator.model_provider.model_key
@@ -208,14 +276,20 @@ def _install():
     def do_POST(self):
         path = (self.path or '').split('?')[0]
         handler = routes.get(path)
-        if handler is None:
+        is_prefill = path == '${MLX_PROMPT_CACHE_PREFILL_PATH}'
+        if handler is None and not is_prefill:
             return _orig_do_post(self)
         try:
             length = int(self.headers.get('Content-Length') or 0)
             body = json.loads(self.rfile.read(length) or b'{}')
-            target = _resolve(body.get('filename'))
             generator = self.response_generator
-            payload = _submit(lambda: handler(generator, target))
+            if is_prefill:
+                # Prefill takes the prompt to warm, not a file: it only populates the in-memory cache.
+                # Persisting it stays with /save, which now finds it as the newest 'system' entry.
+                payload = _submit(lambda: _prefill(generator, None, body))
+            else:
+                target = _resolve(body.get('filename'))
+                payload = _submit(lambda: handler(generator, target))
             status = 200
         except Exception as e:
             status = 400

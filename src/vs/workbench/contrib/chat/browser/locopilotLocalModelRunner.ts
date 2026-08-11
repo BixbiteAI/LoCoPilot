@@ -78,6 +78,7 @@ import {
 	type KvQuantCapability
 } from './locopilotLlamaCppServer.js';
 import { readGgufModelInfo, isMoeModelInfo, isSwaModelInfo, kvBytesPerTokenPerLayer, kvLayerCount, recurrentStateBytes, type IGgufModelInfo } from './locopilotGgufMetadata.js';
+import { MIN_PREFILL_PREFIX_TOKENS, PREFIX_PROBE_A, PREFIX_PROBE_B } from './locopilotPrefixWarmConstants.js';
 import { readMlxModelInfo } from './locopilotMlxMetadata.js';
 import { ILoCoPilotSystemInfoService, type IGpuInfo, type IMemoryStatus, type ISystemHardwareInfo, type MemoryPressureLevel, type PowerSource } from '../../../../platform/locopilotSystemInfo/common/locopilotSystemInfo.js';
 import { dirname } from '../../../../base/common/path.js';
@@ -95,6 +96,7 @@ import {
 	MLX_PROMPT_CACHE_DIR_ENV,
 	MLX_PROMPT_CACHE_EXT,
 	MLX_PROMPT_CACHE_HELPER_FILENAME,
+	MLX_PROMPT_CACHE_PREFILL_PATH,
 	MLX_PROMPT_CACHE_RESTORE_PATH,
 	MLX_PROMPT_CACHE_SAVE_PATH,
 	type MlxServerTuning,
@@ -148,18 +150,6 @@ const LAUNCH_BLOCK_TTL_MS = 300_000;
  */
 const PREFIX_WARM_GATE_TIMEOUT_MS = 240_000;
 
-/**
- * Two throwaway user messages used to locate the stable/volatile boundary of a rendered chat prompt (see
- * {@link LoCoPilotLocalModelRunner.prefillStablePrefix}). They must differ from their FIRST character, so the
- * renderings diverge exactly where user content begins and the shared span can't accidentally extend into it.
- */
-const PREFIX_PROBE_A = 'a';
-const PREFIX_PROBE_B = 'b';
-/**
- * Below this many stable tokens a prefill isn't worth a slot save - and, more importantly, a tiny shared span
- * means the probe didn't find the real boundary, so the safe move is the ordinary chat warm.
- */
-const MIN_PREFILL_PREFIX_TOKENS = 32;
 /**
  * The pre-launch footprint is necessarily an estimate: mmap residency, driver scratch and reclaimable file
  * cache vary by engine/OS. Treat a shortfall within 10% (at least 512 MiB) as estimator noise rather than
@@ -1500,6 +1490,36 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 		}
 	}
 
+	/**
+	 * MLX counterpart of the llama.cpp prefill. The rendering and boundary search happen INSIDE the server
+	 * (the bootstrap helper owns the tokenizer and the one thread allowed to touch MLX arrays), so this just
+	 * hands over the system prompt and tool set. On success the helper has registered the static span as the
+	 * newest 'system' cache entry, which is what {@link _saveMlxPromptCache} then persists.
+	 */
+	private async _prefillMlxStablePrefix(modelId: string, systemPrompt: string, tools: unknown[] | undefined, port: number, token: CancellationToken): Promise<boolean> {
+		try {
+			const res = await this.requestService.request({
+				type: 'POST',
+				url: `http://127.0.0.1:${port}${MLX_PROMPT_CACHE_PREFILL_PATH}`,
+				headers: { 'Content-Type': 'application/json' },
+				data: JSON.stringify({ system: systemPrompt, ...(tools && tools.length > 0 ? { tools } : {}) }),
+			}, token);
+			const status = res.res.statusCode ?? 0;
+			const body = await streamToBuffer(res.stream).then(b => b.toString()).catch(() => '');
+			if (status !== 200) {
+				// 404 = a server started before this helper existed; anything else is a real rejection. Either
+				// way the caller falls back to the chat warm, which is what used to happen unconditionally.
+				this._log(`[LoCoPilot Runner] MLX prefix prefill for ${modelId} returned ${status}; falling back to the chat warm: ${body.slice(0, 300)}`);
+				return false;
+			}
+			this._log(`[LoCoPilot Runner] MLX prefix prefill for ${modelId}: ${body.slice(0, 200)}`);
+			return true;
+		} catch (e) {
+			this._log(`[LoCoPilot Runner] MLX prefix prefill failed for ${modelId} (falling back to the chat warm): ${e}`);
+			return false;
+		}
+	}
+
 	/** POSTs JSON to one of the llama.cpp server's own (non-OpenAI) endpoints; resolves the raw body plus status. */
 	private async _llamaPost(rootUrl: string, path: string, body: unknown, token: CancellationToken): Promise<{ status: number; body: string }> {
 		const res = await this.requestService.request({
@@ -1514,8 +1534,14 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 
 	async prefillStablePrefix(modelId: string, systemPrompt: string, tools: unknown[] | undefined, token: CancellationToken = CancellationToken.None): Promise<boolean> {
 		const running = this.runningServers.get(modelId);
-		if (!running || running.kind !== 'llama' || !running.ready) {
-			return false; // MLX has its own segmenting (see the prompt-cache helper); nothing to do for the rest.
+		if (!running || !running.ready) {
+			return false;
+		}
+		if (running.kind === 'mlx') {
+			return this._prefillMlxStablePrefix(modelId, systemPrompt, tools, running.port, token);
+		}
+		if (running.kind !== 'llama') {
+			return false; // Unmanaged endpoints (localhost/ollama) expose neither a prefill nor a slot cache.
 		}
 		const root = getLlamaServerRootUrl(running.port);
 		try {

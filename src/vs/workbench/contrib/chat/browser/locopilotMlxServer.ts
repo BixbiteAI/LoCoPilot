@@ -145,6 +145,12 @@ export const MLX_PROMPT_CACHE_DIR_ENV = 'LOCOPILOT_MLX_CACHE_DIR';
 export const MLX_PROMPT_CACHE_SAVE_PATH = '/locopilot/prompt-cache/save';
 export const MLX_PROMPT_CACHE_RESTORE_PATH = '/locopilot/prompt-cache/restore';
 /**
+ * Builds a cache covering only the static system+tools span and registers it as the 'system' entry, so a
+ * later /save persists a blob that is a strict PREFIX of every real turn. Unlike save/restore this takes
+ * the prompt rather than a filename - it touches memory only.
+ */
+export const MLX_PROMPT_CACHE_PREFILL_PATH = '/locopilot/prompt-cache/prefill';
+/**
  * mx.load() sniffs the container format from the FILE EXTENSION, so a persisted prompt cache must end
  * in `.safetensors` - a `.bin` (what the llama.cpp slot files use) fails to load with
  * "Unknown file format". Verified against the bundled mlx 0.31.2.
