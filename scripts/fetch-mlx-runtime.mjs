@@ -20,7 +20,7 @@
 // PSF/BSD-licensed; mlx-lm is MIT (Apple).
 
 import { createWriteStream } from 'node:fs';
-import { mkdir, stat, rm, mkdtemp, readdir, rename } from 'node:fs/promises';
+import { mkdir, stat, rm, mkdtemp, readdir, rename, readFile, writeFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
@@ -39,12 +39,88 @@ const PBS_URL = `https://github.com/astral-sh/python-build-standalone/releases/d
 // Package(s) to pre-install into the bundled runtime.
 const PIP_PACKAGES = ['mlx-lm'];
 
+/** Set MLX_FORCE=1 to rebuild the runtime even when the stamp says it is current. */
+const MLX_FORCE = /^(1|true|yes)$/i.test(process.env.MLX_FORCE || '');
+
+/**
+ * Records WHAT was built: CPython/python-build-standalone versions plus the resolved version of every pip
+ * package. Without it the only gate was "does python3 exist", so the runtime was built once and then frozen
+ * forever - a new mlx-lm release (or adding a package to PIP_PACKAGES) could never reach a build. Same class
+ * of trap as the llama.cpp engine stamp; it just hides longer here because mlx-lm publishes rarely.
+ */
+const STAMP_FILE = '.mlx-runtime';
+
 const root = join(dirname(fileURLToPath(import.meta.url)), '..');
 const outDir = join(root, 'resources', 'mlx', 'darwin-arm64');
 const pythonDir = join(outDir, 'python');
 const pythonBin = join(pythonDir, 'bin', 'python3');
 
 async function exists(p) { try { await stat(p); return true; } catch { return false; } }
+
+const stampPath = join(outDir, STAMP_FILE);
+
+/** Reads the build stamp, or undefined when absent/corrupt (either way: rebuild). */
+async function readStamp() {
+	try {
+		return JSON.parse(await readFile(stampPath, 'utf8'));
+	} catch {
+		return undefined;
+	}
+}
+
+/** Newest version of a package on PyPI, or undefined when the lookup fails. */
+async function latestOnPyPI(pkg) {
+	try {
+		const res = await fetch(`https://pypi.org/pypi/${encodeURIComponent(pkg)}/json`, {
+			headers: { 'Accept': 'application/json', 'User-Agent': 'locopilot-build' },
+		});
+		if (!res.ok) { return undefined; }
+		const body = await res.json();
+		return body?.info?.version;
+	} catch {
+		return undefined;
+	}
+}
+
+/**
+ * Decides whether the existing runtime can be reused. Returns a reason string to rebuild, or undefined to keep.
+ *
+ * Deliberately CONSERVATIVE about the network: an unreachable PyPI returns undefined from latestOnPyPI and we
+ * keep what we have. Rebuilding on a lookup failure would mean an offline build destroys a perfectly good
+ * runtime and then cannot pip-install a replacement - trading a possibly-stale runtime for no runtime at all.
+ */
+async function rebuildReason() {
+	if (MLX_FORCE) { return 'MLX_FORCE is set'; }
+	const stamp = await readStamp();
+	if (!stamp) { return 'no build stamp (runtime predates version tracking)'; }
+	if (stamp.python !== PY_VERSION) { return `CPython ${stamp.python} -> ${PY_VERSION}`; }
+	if (stamp.pbs !== PBS_TAG) { return `python-build-standalone ${stamp.pbs} -> ${PBS_TAG}`; }
+
+	const installed = stamp.packages || {};
+	// A package added to PIP_PACKAGES (e.g. mlx-vlm) must trigger a rebuild even if everything else matches.
+	const missing = PIP_PACKAGES.filter(p => !installed[p]);
+	if (missing.length) { return `package(s) not in the bundled runtime: ${missing.join(', ')}`; }
+
+	for (const pkg of PIP_PACKAGES) {
+		const latest = await latestOnPyPI(pkg);
+		if (!latest) {
+			process.stdout.write(`  note: could not reach PyPI for ${pkg}; keeping the installed ${installed[pkg]}.\n`);
+			continue;
+		}
+		if (latest !== installed[pkg]) { return `${pkg} ${installed[pkg]} -> ${latest}`; }
+	}
+	return undefined;
+}
+
+/** Asks the built interpreter what it actually installed - the resolved versions, not what we hoped for. */
+function resolveInstalledVersions() {
+	const versions = {};
+	for (const pkg of PIP_PACKAGES) {
+		const r = spawnSync(pythonBin, ['-c', `import importlib.metadata as m; print(m.version(${JSON.stringify(pkg)}))`], { encoding: 'utf8' });
+		versions[pkg] = r.status === 0 ? (r.stdout || '').trim() : 'unknown';
+	}
+	return versions;
+}
 
 async function download(url, dest) {
 	process.stdout.write(`  download: ${url}\n`);
@@ -66,9 +142,14 @@ async function main() {
 	}
 
 	if (await exists(pythonBin)) {
-		process.stdout.write(`MLX runtime already present (${pythonBin}), skipping.\n`);
-		process.stdout.write(`Delete resources/mlx/darwin-arm64/ to rebuild.\n`);
-		return;
+		const reason = await rebuildReason();
+		if (!reason) {
+			const stamp = await readStamp();
+			const summary = Object.entries(stamp?.packages || {}).map(([k, v]) => `${k} ${v}`).join(', ');
+			process.stdout.write(`MLX runtime is current (CPython ${stamp?.python}, ${summary}), skipping.\n`);
+			return;
+		}
+		process.stdout.write(`Rebuilding MLX runtime: ${reason}.\n`);
 	}
 
 	process.stdout.write(`Building MLX runtime (CPython ${PY_VERSION}, python-build-standalone ${PBS_TAG}) ...\n`);
@@ -100,7 +181,13 @@ async function main() {
 		// Sanity check: import mlx_lm so a broken install fails the build, not the user's first run.
 		run(pythonBin, ['-c', 'import mlx_lm; print("mlx-lm", getattr(mlx_lm, "__version__", "ok"))']);
 
-		process.stdout.write(`\nMLX runtime ready in resources/mlx/darwin-arm64/python/ (CPython ${PY_VERSION} + ${PIP_PACKAGES.join(', ')})\n`);
+		// Stamp AFTER the import check, so a runtime that fails to import is never recorded as good - an
+		// unstamped dir rebuilds, which is the safe direction.
+		const packages = resolveInstalledVersions();
+		await writeFile(stampPath, JSON.stringify({ python: PY_VERSION, pbs: PBS_TAG, packages }, null, 2) + '\n', 'utf8');
+
+		const summary = Object.entries(packages).map(([k, v]) => `${k} ${v}`).join(', ');
+		process.stdout.write(`\nMLX runtime ready in resources/mlx/darwin-arm64/python/ (CPython ${PY_VERSION} + ${summary})\n`);
 		process.stdout.write(`NOTE: sign + notarize this runtime with the app on macOS (hardened runtime) or Gatekeeper will block it.\n`);
 	} finally {
 		await rm(work, { recursive: true, force: true });
