@@ -84,3 +84,20 @@ export const LOCAL_MODEL_EXCLUDED_TOOL_IDS: ReadonlySet<string> = new Set([
 export function isToolExcluded(toolName: string, excluded: ReadonlySet<string>): boolean {
 	return excluded.has(bareName(toolName));
 }
+
+/**
+ * The exact tool list a LOCAL model receives on the wire: the caller's set minus the always-excluded
+ * ids and the local-only extras. Accepts the OpenAI-shaped entries the provider builds (`{function:
+ * {name}}`) as well as bare `{name}` ones.
+ *
+ * Shared rather than inlined because the prefix warm has to render the SAME tools the real turn sends.
+ * When the two drifted apart - the warm rendering all 18 tools while the provider put 15 on the wire -
+ * the warmed prefix was several hundred tokens longer than the real prompt, so it was not a prefix of
+ * it at all and every persisted KV blob was silently unusable.
+ */
+export function filterToolsForLocalModel<T extends { name?: string; function?: { name?: string } }>(tools: readonly T[]): T[] {
+	return tools.filter(t => {
+		const name = t.function?.name || t.name;
+		return !!name && !isToolExcluded(name, LOCAL_MODEL_EXCLUDED_TOOL_IDS) && !isToolExcluded(name, AGENT_LOOP_EXCLUDED_TOOL_IDS);
+	});
+}

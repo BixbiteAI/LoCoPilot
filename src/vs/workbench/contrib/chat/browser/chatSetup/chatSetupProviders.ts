@@ -1417,6 +1417,16 @@ export class LoCoPilotBuiltInAgent extends Disposable implements IChatAgentImple
 				// and still leaves a blob on disk for the NEXT session to restore.
 				releaseWarmGateOnce();
 
+				// ...and wait for the model to go quiet before spending a full prefill on it. The cold warm's
+				// only product is a blob for the NEXT session; the turn happening now gains nothing from it.
+				// Since llama.cpp serves a single slot, going first doesn't just fail to help - the user's
+				// message queues behind it inside the server and the machine pays two full prefills instead
+				// of one. Waiting costs nothing: the blob is just as useful written a minute later.
+				if (!await this.localModelRunner.whenModelIdle(modelId, CancellationToken.None)) {
+					this._log(`[LoCoPilot] Prefix warm for ${modelId} abandoned: the model never went idle.`);
+					return;
+				}
+
 				// Prefer prefilling ONLY the stable span: it leaves the slot holding a pure prefix, which is the
 				// difference between a blob every model can reuse and one that models with a non-shiftable KV
 				// cache throw away wholesale (they re-process the entire prompt instead). Falls back to the

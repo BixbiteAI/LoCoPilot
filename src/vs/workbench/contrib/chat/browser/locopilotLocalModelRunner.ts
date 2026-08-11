@@ -151,6 +151,20 @@ const LAUNCH_BLOCK_TTL_MS = 300_000;
 const PREFIX_WARM_GATE_TIMEOUT_MS = 240_000;
 
 /**
+ * Pacing for {@link LoCoPilotLocalModelRunner.whenModelIdle}, which the COLD prefix warm waits on.
+ *
+ * A cold warm exists only to leave a blob on disk for the next session - it does nothing for the turn
+ * happening right now. Running it first is actively harmful: llama.cpp serves one slot, so the user's
+ * message simply queues behind it in the server and the machine pays two full prefills instead of one
+ * (measured at 105s + 104s on a 30B). So it waits for the model to go quiet first.
+ */
+const MODEL_IDLE_POLL_MS = 1_000;
+/** A tool loop releases and re-acquires between iterations; don't mistake that gap for idle. */
+const MODEL_IDLE_SETTLE_MS = 3_000;
+/** Give up waiting after this long - a permanently busy model simply never gets a persisted prefix. */
+const MODEL_IDLE_WAIT_TIMEOUT_MS = 600_000;
+
+/**
  * The pre-launch footprint is necessarily an estimate: mmap residency, driver scratch and reclaimable file
  * cache vary by engine/OS. Treat a shortfall within 10% (at least 512 MiB) as estimator noise rather than
  * interrupting the user. The hard total-capability gate and runtime watchdog still bound unsafe launches.
@@ -290,6 +304,13 @@ export interface ILoCoPilotLocalModelRunner {
 	 * the time `fire()` returns for the waiting caller to observe it.
 	 */
 	beginPrefixWarmGate(modelId: string): () => void;
+	/**
+	 * Resolves true once the model has no in-flight requests (and stays quiet for a short settle window),
+	 * false if it never goes quiet, is cancelled, or the server disappears. Used by the COLD prefix warm,
+	 * whose only product is a blob for the NEXT session: running it while the user's turn is queued behind
+	 * it on a single-slot server costs two full prefills instead of one.
+	 */
+	whenModelIdle(modelId: string, token?: CancellationToken): Promise<boolean>;
 	/**
 	 * True when the model's server was launched with a draft/MTP speculative context, which makes prefix
 	 * warming pointless: `/slots` save+restore only covers the MAIN KV, so the blob is neither persisted nor
@@ -5633,6 +5654,31 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 	 */
 	usesDraftContext(modelId: string): boolean {
 		return this._launchedWithDraftContext.has(modelId);
+	}
+
+	async whenModelIdle(modelId: string, token: CancellationToken = CancellationToken.None): Promise<boolean> {
+		const deadline = Date.now() + MODEL_IDLE_WAIT_TIMEOUT_MS;
+		while (Date.now() < deadline && !token.isCancellationRequested) {
+			const running = this.runningServers.get(modelId);
+			if (!running) {
+				return false; // server went away - nothing to prefill into
+			}
+			if ((running.activeRequests ?? 0) === 0) {
+				// Settle before claiming idle: a turn's tool loop releases and re-acquires between
+				// iterations, and prefilling into that gap would put us right back to competing with it.
+				await timeout(MODEL_IDLE_SETTLE_MS, token).catch(() => undefined);
+				const still = this.runningServers.get(modelId);
+				if (!still) {
+					return false;
+				}
+				if ((still.activeRequests ?? 0) === 0) {
+					return true;
+				}
+				continue;
+			}
+			await timeout(MODEL_IDLE_POLL_MS, token).catch(() => undefined);
+		}
+		return false;
 	}
 
 	beginPrefixWarmGate(modelId: string): () => void {

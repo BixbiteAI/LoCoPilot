@@ -21,7 +21,7 @@ import { ChatImageMimeType, ChatMessageRole, IChatMessage, IChatMessageImagePart
 import { ILanguageModelToolsService, IToolData, toolMatchesModel } from '../../common/tools/languageModelToolsService.js';
 import { IChatTodo, IChatTodoListService } from '../../common/tools/chatTodoListService.js';
 import { ManageTodoListToolToolId } from '../../common/tools/builtinTools/manageTodoListTool.js';
-import { AGENT_LOOP_EXCLUDED_TOOL_IDS, EDIT_TOOL_IDS, isToolExcluded } from '../../common/tools/builtinTools/agentToolPolicy.js';
+import { AGENT_LOOP_EXCLUDED_TOOL_IDS, EDIT_TOOL_IDS, filterToolsForLocalModel, isToolExcluded } from '../../common/tools/builtinTools/agentToolPolicy.js';
 import { parsePartialJsonObject } from '../../common/tools/partialJsonInput.js';
 import { ContextManager } from './contextManager.js';
 /**
@@ -797,7 +797,11 @@ export class UnifiedAgent {
 		// real Ask/Plan turn strips them renders a different (larger) prompt, and the prefix is then useless.
 		const allTools = await this.getAvailableTools(modelMetadata, {}, allowEdits);
 		const { llmNameById } = this.buildToolNameMap(allTools);
-		const tools = this.formatToolsForLLM(allTools, llmNameById);
+		// Exactly what the provider will put on the wire for a local model, not what the agent loop holds:
+		// the provider drops a few more ids for local models, and a warm rendered from the wider set is
+		// several hundred tokens longer than the real prompt - so it is not a prefix of it, and the KV blob
+		// it produces can never be reused. The signature below hashes this same filtered set.
+		const tools = filterToolsForLocalModel(this.formatToolsForLLM(allTools, llmNameById));
 
 		const messages: IChatMessage[] = [
 			{ role: ChatMessageRole.System, content: [{ type: 'text', value: systemPrompt }] },

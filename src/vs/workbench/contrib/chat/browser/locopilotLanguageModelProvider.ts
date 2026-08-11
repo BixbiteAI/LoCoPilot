@@ -27,7 +27,7 @@ import { showTransientNotification } from './locopilotNotify.js';
 import { IStorageService } from '../../../../platform/storage/common/storage.js';
 import { getReasoningEffort, reasoningBudgetTokens, ReasoningEffort } from '../common/locopilotReasoningEffort.js';
 import { ICustomLanguageModelsService, ICustomLanguageModel, getCustomModelListLabel, deriveTokenLimits, defaultContextWindow, TOOL_FAILURE_DISABLE_THRESHOLD, customModelSupportsVision, LOCOPILOT_AUTO_MODEL_ID } from '../common/customLanguageModelsService.js';
-import { AGENT_LOOP_EXCLUDED_TOOL_IDS, LOCAL_MODEL_EXCLUDED_TOOL_IDS, isToolExcluded } from '../common/tools/builtinTools/agentToolPolicy.js';
+import { AGENT_LOOP_EXCLUDED_TOOL_IDS, LOCAL_MODEL_EXCLUDED_TOOL_IDS, filterToolsForLocalModel, isToolExcluded } from '../common/tools/builtinTools/agentToolPolicy.js';
 import { parseToolCallArguments } from '../common/tools/partialJsonInput.js';
 import { IChatMessage, ILanguageModelChatInfoOptions, ILanguageModelChatMetadataAndIdentifier, ILanguageModelChatProvider, ILanguageModelChatResponse, ILanguageModelsService, IChatResponsePart, ChatMessageRole } from '../common/languageModels.js';
 import { IWorkbenchContribution } from '../../../common/contributions.js';
@@ -1505,10 +1505,8 @@ export class LoCoPilotLanguageModelProvider extends Disposable implements ILangu
 			// Shared local-model exclusion policy (agentToolPolicy.ts). Prefix-insensitive matching:
 			// the old inline list missed `vscode_`-prefixed names, so e.g. vscode_searchExtensions_internal
 			// leaked into every local request.
-			const filteredTools = options.tools.filter((t: any) => {
-				const name = t.function?.name || t.name;
-				return name && !isToolExcluded(name, LOCAL_MODEL_EXCLUDED_TOOL_IDS) && !isToolExcluded(name, AGENT_LOOP_EXCLUDED_TOOL_IDS);
-			});
+			// Shared with the prefix warm - see filterToolsForLocalModel for why this must not be inlined.
+			const filteredTools = filterToolsForLocalModel(options.tools as any[]);
 
 			if (filteredTools.length > 0) {
 				// Check if we should use manual tool injection as fallback or primary for local
@@ -2027,10 +2025,8 @@ export class LoCoPilotLanguageModelProvider extends Disposable implements ILangu
 		// Add tools if provided
 		if (options.tools && Array.isArray(options.tools) && options.tools.length > 0) {
 			// Shared local-model exclusion policy (agentToolPolicy.ts), prefix-insensitive.
-			const filteredTools = options.tools.filter((t: any) => {
-				const name = t.function?.name || t.name;
-				return name && !isToolExcluded(name, LOCAL_MODEL_EXCLUDED_TOOL_IDS) && !isToolExcluded(name, AGENT_LOOP_EXCLUDED_TOOL_IDS);
-			});
+			// Shared with the prefix warm - see filterToolsForLocalModel for why this must not be inlined.
+			const filteredTools = filterToolsForLocalModel(options.tools as any[]);
 
 			if (filteredTools.length > 0) {
 				// const useManualTools = !model.useNativeTools;
