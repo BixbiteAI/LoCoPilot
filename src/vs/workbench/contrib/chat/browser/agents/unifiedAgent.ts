@@ -790,10 +790,12 @@ export class UnifiedAgent {
 	 * re-prefill). Kept separate from {@link warmUpWithPrefix} so the caller can compute the signature,
 	 * look for a matching cache, and only pay the tool build once.
 	 */
-	async buildWarmPrefix(modelId: string, systemPrompt: string): Promise<IWarmPrefix> {
+	async buildWarmPrefix(modelId: string, systemPrompt: string, allowEdits: boolean = true): Promise<IWarmPrefix> {
 		const modelMetadata = this.languageModelsService.lookupLanguageModel(modelId);
-		// Same tool set a real turn sends with the default (no explicit) tool selection.
-		const allTools = await this.getAvailableTools(modelMetadata, {});
+		// Same tool set a real turn sends with the default (no explicit) tool selection. `allowEdits` MUST
+		// match what the run() call for this mode will pass - a warm that includes the edit tools while the
+		// real Ask/Plan turn strips them renders a different (larger) prompt, and the prefix is then useless.
+		const allTools = await this.getAvailableTools(modelMetadata, {}, allowEdits);
 		const { llmNameById } = this.buildToolNameMap(allTools);
 		const tools = this.formatToolsForLLM(allTools, llmNameById);
 

@@ -1325,6 +1325,14 @@ export class LoCoPilotBuiltInAgent extends Disposable implements IChatAgentImple
 		// warmed prefix matches what the user's first message will actually send. Defaults to Agent when no
 		// widget is focused yet (startup).
 		const modeKind = this.chatWidgetService.lastFocusedWidget?.input.currentModeKind ?? ChatModeKind.Agent;
+		// Mirror the REAL turn's tool-set decision exactly (see the allowEdits line in the request handler):
+		// Ask and Plan get the edit tools hard-removed from the payload. Warming with a different tool set
+		// renders a different prompt - and because chat templates put tools near the TOP of the system block,
+		// the divergence lands within the first few hundred tokens, so the server shares almost no prefix with
+		// the real turn and re-processes the whole thing. That is a warm that costs a full prefill and buys
+		// nothing, which is exactly what happened in Ask/Plan before this line existed.
+		const modeId = this.chatWidgetService.lastFocusedWidget?.input.currentModeInfo?.modeId;
+		const warmAllowEdits = modeKind === ChatModeKind.Agent && modeId !== 'plan';
 		const warmKey = LoCoPilotBuiltInAgent._warmKey(modelId, modeKind);
 		if (LoCoPilotBuiltInAgent._warmedPrefixKeys.has(warmKey)) {
 			return;
@@ -1341,6 +1349,14 @@ export class LoCoPilotBuiltInAgent extends Disposable implements IChatAgentImple
 		if (this.localModelRunner.getServerPhase(modelId) !== 'ready') {
 			return;
 		}
+		// Draft/MTP models are excluded outright. Their slot blob can be neither saved nor restored (the
+		// speculative context makes /slots cover only the main KV), so a warm here can never pay off across a
+		// restart - and every restart triggered another full prefill of the same thousands of tokens, competing
+		// with the user for the machine. In-session the user's own first turn fills the slot just as well.
+		if (this.localModelRunner.usesDraftContext(modelId)) {
+			this._log(`[LoCoPilot] Prefix warm skipped for ${modelId}: draft/MTP context cannot persist or restore a prefix cache.`);
+			return;
+		}
 		// Claim SYNCHRONOUSLY (before the async work) so concurrent callers - the other five agent instances,
 		// or the selection trigger racing the server-ready hook - see it taken and skip.
 		LoCoPilotBuiltInAgent._warmedPrefixKeys.add(warmKey);
@@ -1349,6 +1365,13 @@ export class LoCoPilotBuiltInAgent extends Disposable implements IChatAgentImple
 		// gate must exist by the time fire() returns for the user's first turn to wait on it instead of racing
 		// the restore into an empty slot (the reason a persisted cache only ever helped the session that wrote it).
 		const releaseWarmGate = this.localModelRunner.beginPrefixWarmGate(modelId);
+		let warmGateReleased = false;
+		const releaseWarmGateOnce = () => {
+			if (!warmGateReleased) {
+				warmGateReleased = true;
+				releaseWarmGate();
+			}
+		};
 		(async () => {
 			try {
 				// Build the EXACT stable prefix a real turn uses for this mode FIRST, so the disk cache can be
@@ -1376,7 +1399,7 @@ export class LoCoPilotBuiltInAgent extends Disposable implements IChatAgentImple
 				// prefix is simply not found and we re-warm below - instead of restoring a stale blob that
 				// llama.cpp accepts (HTTP 200) but whose tokens don't match the real turn, forcing a full
 				// turn-1 re-prefill. This is what makes the fast turn-1 path self-heal with no manual wipe.
-				const prefix = await this.unifiedAgent.buildWarmPrefix(modelId, systemPrompt);
+				const prefix = await this.unifiedAgent.buildWarmPrefix(modelId, systemPrompt, warmAllowEdits);
 				const diskKey = `${warmKey}::${prefix.signature}`;
 
 				// Server is already ready (gated above). Try the matching persisted slot cache first: on a hit
@@ -1386,7 +1409,23 @@ export class LoCoPilotBuiltInAgent extends Disposable implements IChatAgentImple
 					return; // finally below releases the gate; the waiting turn proceeds against a hot prefix
 				}
 
-				await this.unifiedAgent.warmUpWithPrefix(modelId, prefix, CancellationToken.None);
+				// COLD path: there was nothing to restore, so warming means paying a full prefill. Stop holding
+				// the user's turn for it. Waiting is only ever worth it for a restore, which is a fast disk read
+				// that can only save time; making a turn queue behind a cold prefill risks paying for TWO - the
+				// warm's and its own - whenever the warmed prefix doesn't match what that turn actually sends.
+				// Released here rather than in the finally so the turn goes now, while the warm continues below
+				// and still leaves a blob on disk for the NEXT session to restore.
+				releaseWarmGateOnce();
+
+				// Prefer prefilling ONLY the stable span: it leaves the slot holding a pure prefix, which is the
+				// difference between a blob every model can reuse and one that models with a non-shiftable KV
+				// cache throw away wholesale (they re-process the entire prompt instead). Falls back to the
+				// chat-shaped warm whenever the boundary could not be established safely.
+				const tools = Array.isArray(prefix.options?.tools) ? prefix.options.tools as unknown[] : undefined;
+				const prefilled = await this.localModelRunner.prefillStablePrefix(modelId, systemPrompt, tools, CancellationToken.None);
+				if (!prefilled) {
+					await this.unifiedAgent.warmUpWithPrefix(modelId, prefix, CancellationToken.None);
+				}
 				// Persist the freshly-warmed prefix KV so a future session can restore it without re-prefilling.
 				await this.localModelRunner.saveSlotCache(modelId, diskKey, CancellationToken.None);
 			} catch (e) {
@@ -1397,7 +1436,7 @@ export class LoCoPilotBuiltInAgent extends Disposable implements IChatAgentImple
 			} finally {
 				// Always release, on every path: a turn blocked on this gate must never outlive the warm it
 				// is waiting for (the runner's timeout is a backstop, not the normal exit).
-				releaseWarmGate();
+				releaseWarmGateOnce();
 			}
 		})();
 	}

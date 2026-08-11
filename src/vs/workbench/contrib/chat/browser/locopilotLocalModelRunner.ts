@@ -147,6 +147,19 @@ const LAUNCH_BLOCK_TTL_MS = 300_000;
  * from a hit. The cap exists only so a wedged warm can never strand the user's message forever.
  */
 const PREFIX_WARM_GATE_TIMEOUT_MS = 240_000;
+
+/**
+ * Two throwaway user messages used to locate the stable/volatile boundary of a rendered chat prompt (see
+ * {@link LoCoPilotLocalModelRunner.prefillStablePrefix}). They must differ from their FIRST character, so the
+ * renderings diverge exactly where user content begins and the shared span can't accidentally extend into it.
+ */
+const PREFIX_PROBE_A = 'a';
+const PREFIX_PROBE_B = 'b';
+/**
+ * Below this many stable tokens a prefill isn't worth a slot save - and, more importantly, a tiny shared span
+ * means the probe didn't find the real boundary, so the safe move is the ordinary chat warm.
+ */
+const MIN_PREFILL_PREFIX_TOKENS = 32;
 /**
  * The pre-launch footprint is necessarily an estimate: mmap residency, driver scratch and reclaimable file
  * cache vary by engine/OS. Treat a shortfall within 10% (at least 512 MiB) as estimator noise rather than
@@ -288,6 +301,13 @@ export interface ILoCoPilotLocalModelRunner {
 	 */
 	beginPrefixWarmGate(modelId: string): () => void;
 	/**
+	 * True when the model's server was launched with a draft/MTP speculative context, which makes prefix
+	 * warming pointless: `/slots` save+restore only covers the MAIN KV, so the blob is neither persisted nor
+	 * restorable, and the warm therefore cannot survive a restart. In-session it buys nothing either - the
+	 * user's own first turn fills the slot just as well - so a warm here is pure competition for the machine.
+	 */
+	usesDraftContext(modelId: string): boolean;
+	/**
 	 * Marks a foreground request as active so idle-unload cannot stop its server mid-stream. Calls must be
 	 * balanced with {@link endModelRequest}, normally from a `finally` block.
 	 */
@@ -306,6 +326,18 @@ export interface ILoCoPilotLocalModelRunner {
 	 * future session can restore it. No-op for MLX/non-llama servers or when slot persistence is disabled.
 	 */
 	saveSlotCache(modelId: string, key: string, token?: CancellationToken): Promise<void>;
+	/**
+	 * Prefills ONLY the stable system+tools span of a turn into the llama.cpp server's slot 0, leaving a KV
+	 * cache that is a pure prefix of every later turn. Returns true when the slot was prefilled (so the caller
+	 * can persist it and skip the chat-shaped warm), false whenever anything made that unsafe - including a
+	 * non-llama server, in which case the caller should warm the ordinary way.
+	 *
+	 * Why not just warm with a chat request: that necessarily appends a user turn and a generation prompt, so
+	 * the saved blob carries a trailing span the next turn does not have. Dropping it requires llama.cpp to
+	 * shift KV cells, which some contexts cannot do - they announce it as "cache_reuse is not supported by
+	 * this context" - and there the whole restored cache is discarded and the prompt fully re-processed.
+	 */
+	prefillStablePrefix(modelId: string, systemPrompt: string, tools: unknown[] | undefined, token?: CancellationToken): Promise<boolean>;
 	stopServer(modelId: string): void;
 	/**
 	 * Stops every running llama.cpp/MLX server we manage, except an optional one to keep.
@@ -1464,6 +1496,105 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 			return false;
 		} catch (e) {
 			this._log(`[LoCoPilot Runner] KV slot restore failed (ignored) for ${modelId}: ${e}`);
+			return false;
+		}
+	}
+
+	/** POSTs JSON to one of the llama.cpp server's own (non-OpenAI) endpoints; resolves the raw body plus status. */
+	private async _llamaPost(rootUrl: string, path: string, body: unknown, token: CancellationToken): Promise<{ status: number; body: string }> {
+		const res = await this.requestService.request({
+			type: 'POST',
+			url: `${rootUrl}${path}`,
+			headers: { 'Content-Type': 'application/json' },
+			data: JSON.stringify(body),
+		}, token);
+		const text = await streamToBuffer(res.stream).then(b => b.toString()).catch(() => '');
+		return { status: res.res.statusCode ?? 0, body: text };
+	}
+
+	async prefillStablePrefix(modelId: string, systemPrompt: string, tools: unknown[] | undefined, token: CancellationToken = CancellationToken.None): Promise<boolean> {
+		const running = this.runningServers.get(modelId);
+		if (!running || running.kind !== 'llama' || !running.ready) {
+			return false; // MLX has its own segmenting (see the prompt-cache helper); nothing to do for the rest.
+		}
+		const root = getLlamaServerRootUrl(running.port);
+		try {
+			// Render the SAME request twice with different user text. Everything the two renderings share is,
+			// by construction, independent of what the user types - i.e. exactly the span every later turn
+			// with this system prompt and tool set begins with. Asking the server to do the rendering means
+			// the model's own chat template decides where that boundary is; we never parse the template.
+			const render = async (userContent: string): Promise<string> => {
+				const res = await this._llamaPost(root, '/apply-template', {
+					messages: [
+						{ role: 'system', content: systemPrompt },
+						{ role: 'user', content: userContent },
+					],
+					...(tools && tools.length > 0 ? { tools } : {}),
+				}, token);
+				if (res.status !== 200) {
+					throw new Error(`/apply-template returned ${res.status}: ${res.body.slice(0, 200)}`);
+				}
+				const prompt = JSON.parse(res.body)?.prompt;
+				if (typeof prompt !== 'string' || !prompt) {
+					throw new Error('/apply-template returned no prompt');
+				}
+				return prompt;
+			};
+			const tokenize = async (content: string): Promise<number[]> => {
+				const res = await this._llamaPost(root, '/tokenize', { content }, token);
+				if (res.status !== 200) {
+					throw new Error(`/tokenize returned ${res.status}: ${res.body.slice(0, 200)}`);
+				}
+				const parsed = JSON.parse(res.body)?.tokens;
+				if (!Array.isArray(parsed) || parsed.length === 0) {
+					throw new Error('/tokenize returned no tokens');
+				}
+				return parsed as number[];
+			};
+
+			const [renderedA, renderedB] = await Promise.all([
+				render(PREFIX_PROBE_A),
+				render(PREFIX_PROBE_B),
+			]);
+			if (renderedA === renderedB) {
+				// The template ignored the user turn entirely; we cannot locate a boundary, so fall back to the
+				// chat warm rather than prefill something that might not be a prefix.
+				this._log(`[LoCoPilot Runner] Prefix prefill skipped for ${modelId}: the chat template renders both probes identically.`);
+				return false;
+			}
+			// Compare TOKENS, not characters. A character-level cut can split a token, and a prefill that ends
+			// one token short of - or past - a real boundary is exactly the divergent tail this whole path
+			// exists to avoid. Slicing a tokenization of the full string at a position where two different
+			// continuations still agree is safe by construction.
+			const [tokensA, tokensB] = await Promise.all([tokenize(renderedA), tokenize(renderedB)]);
+			let shared = 0;
+			while (shared < tokensA.length && shared < tokensB.length && tokensA[shared] === tokensB[shared]) {
+				shared++;
+			}
+			if (shared < MIN_PREFILL_PREFIX_TOKENS) {
+				this._log(`[LoCoPilot Runner] Prefix prefill skipped for ${modelId}: only ${shared} stable tokens found (< ${MIN_PREFILL_PREFIX_TOKENS}).`);
+				return false;
+			}
+			const prefix = tokensA.slice(0, shared);
+			// n_predict 0 = prefill only. The KV stays in the slot (cache_prompt), which is what the caller
+			// then persists - and because those tokens carry no user turn, the blob is a PURE prefix of every
+			// later turn. That is what keeps f_keep at 1.000, so llama.cpp never has to shift cells to reuse
+			// it - the operation that models reporting "cache_reuse is not supported by this context" cannot
+			// do, and where a chat-shaped warm's trailing tokens cost the entire cache.
+			const res = await this._llamaPost(root, '/completion', {
+				prompt: prefix,
+				n_predict: 0,
+				cache_prompt: true,
+			}, token);
+			if (res.status !== 200) {
+				this._log(`[LoCoPilot Runner] Prefix prefill for ${modelId} returned ${res.status}; falling back to the chat warm: ${res.body.slice(0, 300)}`);
+				return false;
+			}
+			this._log(`[LoCoPilot Runner] Prefilled ${shared} stable prefix tokens for ${modelId} (of ${tokensA.length} rendered); slot now holds a pure prefix.`);
+			return true;
+		} catch (e) {
+			// Any failure just means we warm the old way - never a hard error on a best-effort optimization.
+			this._log(`[LoCoPilot Runner] Prefix prefill failed for ${modelId} (falling back to the chat warm): ${e}`);
 			return false;
 		}
 	}
@@ -5474,6 +5605,10 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 	 * but first frees memory by evicting the least-recently-used server when the resident-model budget is
 	 * reached, then waits until the server's OpenAI endpoint actually responds so the caller can send immediately.
 	 */
+	usesDraftContext(modelId: string): boolean {
+		return this._launchedWithDraftContext.has(modelId);
+	}
+
 	beginPrefixWarmGate(modelId: string): () => void {
 		// An already-open gate is left alone and its release handed back: two warms for the same model should
 		// never leave the gate closed by the first one to finish while the second is still prefilling.
