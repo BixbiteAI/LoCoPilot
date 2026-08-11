@@ -1431,16 +1431,20 @@ export class LoCoPilotLanguageModelProvider extends Disposable implements ILangu
 		// are still loading. Sending now would hit the server mid-load and come back 503 "still loading", so we
 		// must treat not-ready exactly like not-started - wait for readiness rather than fire the request.
 		const isReady = this.localModelRunner.getServerPhase(model.id) === 'ready';
+		// Only a real user turn waits for an in-flight prefix warm / KV restore. The warm request itself is
+		// what holds that gate, so it must never wait on it (that would deadlock until the timeout), and the
+		// other background callers (title generation, summarization) have no cached prefix to gain from it.
+		const isForegroundTurn = options.locopilotForegroundTurn === true;
 		if (!isReady && autoStart) {
 			// Auto-start-on-use (Ollama-like): launch (or wait for) this model's server until it is ready, so the
 			// user can just pick the model and send without a manual step. The wait happens under the chat's normal
 			// "Working…" spinner (no separate loading indicator) - the request simply takes a bit longer while the
 			// weights load into memory.
 			this._log(`[LoCoPilot Provider] Ensuring local server is ready for ${model.modelName}.`);
-			baseUrl = await this.localModelRunner.ensureServerForModel(model.id, token);
+			baseUrl = await this.localModelRunner.ensureServerForModel(model.id, token, true, isForegroundTurn);
 		} else if (isReady && autoStart) {
 			// Already running and ready: route through ensure to refresh the keep-alive idle timer (cheap no-op).
-			baseUrl = await this.localModelRunner.ensureServerForModel(model.id, token) ?? baseUrl;
+			baseUrl = await this.localModelRunner.ensureServerForModel(model.id, token, true, isForegroundTurn) ?? baseUrl;
 		}
 		if (!baseUrl) {
 			throw new Error(this._getLocalServerUnavailableMessage(model));

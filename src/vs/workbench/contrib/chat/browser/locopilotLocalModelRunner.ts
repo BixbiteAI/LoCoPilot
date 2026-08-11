@@ -74,6 +74,7 @@ import {
 	type FlashAttentionMode,
 	type KvCacheType,
 	type KvCachePlan,
+	type KvCacheElemType,
 	type KvQuantCapability
 } from './locopilotLlamaCppServer.js';
 import { readGgufModelInfo, isMoeModelInfo, isSwaModelInfo, kvBytesPerTokenPerLayer, kvLayerCount, recurrentStateBytes, type IGgufModelInfo } from './locopilotGgufMetadata.js';
@@ -135,6 +136,17 @@ const MAX_SLOT_CACHE_ENTRIES = 10;
  * successful ready still clears it immediately.
  */
 const LAUNCH_BLOCK_TTL_MS = 300_000;
+
+/**
+ * Upper bound on how long a foreground turn waits for an in-flight prefix warm / KV restore before giving
+ * up and sending anyway (see {@link ILoCoPilotLocalModelRunner.beginPrefixWarmGate}).
+ *
+ * Waiting is what makes the persisted cache useful at all - a turn dispatched into an empty slot re-prefills
+ * the whole prefix and the restore that lands a moment later is wasted - so the bound is generous rather than
+ * snappy: a cold warm on a large model legitimately takes ~90s, and the turn that waits for it then starts
+ * from a hit. The cap exists only so a wedged warm can never strand the user's message forever.
+ */
+const PREFIX_WARM_GATE_TIMEOUT_MS = 240_000;
 /**
  * The pre-launch footprint is necessarily an estimate: mmap residency, driver scratch and reclaimable file
  * cache vary by engine/OS. Treat a shortfall within 10% (at least 512 MiB) as estimator noise rather than
@@ -257,8 +269,24 @@ export interface ILoCoPilotLocalModelRunner {
 	 * `interactive` (default true) mirrors startServerInTerminal's flag: true for a user action (send/Start),
 	 * where a non-fitting model may show the "Run anyway?" dialog; false for background pre-warm, where a
 	 * non-fitting model is skipped silently instead of interrupting the user with a modal.
+	 *
+	 * `waitForPrefixWarm` (default false) makes the call also wait for an in-flight prefix warm/KV restore
+	 * (see {@link beginPrefixWarmGate}) before returning. Foreground turns pass true so the user's first
+	 * message lands AFTER the cached prefix is resident instead of racing it into an empty slot; the warm
+	 * request itself - and every other background call - must pass false, or it would wait on itself.
 	 */
-	ensureServerForModel(modelId: string, token?: CancellationToken, interactive?: boolean): Promise<string | undefined>;
+	ensureServerForModel(modelId: string, token?: CancellationToken, interactive?: boolean, waitForPrefixWarm?: boolean): Promise<string | undefined>;
+	/**
+	 * Opens the "a prefix warm / KV restore is in flight for this model" gate and returns the release
+	 * callback (idempotent; the caller must invoke it from a `finally`). While the gate is open, an
+	 * {@link ensureServerForModel} call made with `waitForPrefixWarm` waits for it, so the restored or
+	 * freshly-warmed prefix is resident before the first real request is dispatched.
+	 *
+	 * Must be called SYNCHRONOUSLY from the server-ready handler, before the warm's first `await`: the ready
+	 * event is fired synchronously from inside `ensureServerForModel`, and the gate has to be registered by
+	 * the time `fire()` returns for the waiting caller to observe it.
+	 */
+	beginPrefixWarmGate(modelId: string): () => void;
 	/**
 	 * Marks a foreground request as active so idle-unload cannot stop its server mid-stream. Calls must be
 	 * balanced with {@link endModelRequest}, normally from a `finally` block.
@@ -579,6 +607,31 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 	 * server-side "mismatched key type" restore error on an incompatible blob saved under the same name.
 	 */
 	private readonly _lastLaunchKvType = new Map<string, string>();
+	/** The same launch decision as {@link _lastLaunchKvType}, kept as the plan object. See its set site. */
+	private readonly _lastLaunchPlan = new Map<string, KvCachePlan>();
+	/** Last-RESTORED time per cache filename, so the prune evicts by use rather than by write. See {@link _touchSlotCache}. */
+	private readonly _slotCacheUsage = new Map<string, number>();
+	/** Resolves once {@link _slotCacheUsage} has been read from disk (or found absent). */
+	private _slotCacheUsageLoaded: Promise<void> | undefined;
+	/**
+	 * Per-model gate held while a prefix warm / KV restore is in flight, so a foreground turn can wait for the
+	 * cached prefix to be resident instead of racing it (see {@link beginPrefixWarmGate}). Absent = no warm
+	 * pending, which is the overwhelmingly common state - nothing waits.
+	 */
+	private readonly _prefixWarmGates = new Map<string, { promise: Promise<void>; release: () => void }>();
+	/**
+	 * KV plan each model's persisted prefix cache on disk was saved under, remembered across sessions.
+	 *
+	 * The slot filename is tagged with the KV plan (see {@link _slotCacheFileName}) because a blob is only
+	 * byte-compatible with a server using the same one - but the automatic plan is derived from the LIVE free-RAM
+	 * budget, so an ordinary fluctuation in free memory flips q8_0 <-> f16, changes the filename, and the restore
+	 * misses a perfectly good cache. This makes the choice sticky: when last session's plan still fits at no cost
+	 * in context, the launch reuses it and the filename lines up. When it no longer fits, the memory-safe choice
+	 * wins and we simply re-warm - correctness is never traded for a cache hit.
+	 */
+	private readonly _preferredKvPlan = new Map<string, KvCachePlan>();
+	/** Resolves once {@link _preferredKvPlan} has been read from disk (or found absent). */
+	private _preferredKvPlanLoaded: Promise<void> | undefined;
 	/**
 	 * Per-model record of which KV halves this engine could actually quantize. llama.cpp implements a quantized
 	 * V cache only in the Flash Attention kernel, so when `-fa auto` resolves to OFF for a model (its FA tensor
@@ -969,6 +1022,69 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 		return this._kvQuantCapabilityLoaded;
 	}
 
+	/**
+	 * Records the KV plan the model's server is currently running (i.e. the one a just-saved blob was written
+	 * under) as the plan future launches should prefer. No-op when this window doesn't know the type - a
+	 * foreign server's plan was chosen elsewhere and pinning it here would be a guess.
+	 */
+	private async _rememberKvPlanForSavedCache(modelId: string): Promise<void> {
+		const plan = this._lastLaunchPlan.get(modelId);
+		if (!plan) {
+			return;
+		}
+		const existing = this._preferredKvPlan.get(modelId);
+		if (existing && kvPlanId(existing) === kvPlanId(plan)) {
+			return; // unchanged - don't rewrite the file on every save
+		}
+		this._preferredKvPlan.set(modelId, plan);
+		await this._persistPreferredKvPlan();
+	}
+
+	/** File the {@link _preferredKvPlan} map is persisted to. See that field for what it buys. */
+	private _preferredKvPlanUri(): URI {
+		return joinPath(this.environmentService.cacheHome, 'locopilot-kv-plan-preference.json');
+	}
+
+	/**
+	 * Loads the KV plan each model's persisted slot cache was written under. Best-effort: a missing or malformed
+	 * file just means "no preference", i.e. the automatic choice stands and the first cache hit is deferred by a
+	 * session - the same state a fresh install is in.
+	 */
+	private _ensurePreferredKvPlanLoaded(): Promise<void> {
+		if (!this._preferredKvPlanLoaded) {
+			this._preferredKvPlanLoaded = (async () => {
+				try {
+					const buf = await this.fileService.readFile(this._preferredKvPlanUri());
+					const parsed = JSON.parse(buf.value.toString()) as Record<string, { k?: string; v?: string }>;
+					for (const [modelId, plan] of Object.entries(parsed ?? {})) {
+						if (plan && typeof plan.k === 'string' && typeof plan.v === 'string') {
+							this._preferredKvPlan.set(modelId, { k: plan.k as KvCacheElemType, v: plan.v as KvCacheElemType });
+						}
+					}
+					if (this._preferredKvPlan.size > 0) {
+						this._log(`[LoCoPilot Runner] Loaded the KV plan ${this._preferredKvPlan.size} model(s) have a persisted prefix cache under.`);
+					}
+				} catch {
+					// No file yet (the common case) or unreadable - both mean "no preference".
+				}
+			})();
+		}
+		return this._preferredKvPlanLoaded;
+	}
+
+	/** Writes the KV-plan preferences back out. Best-effort: losing them costs one missed cache hit. */
+	private async _persistPreferredKvPlan(): Promise<void> {
+		try {
+			const payload: Record<string, KvCachePlan> = {};
+			for (const [modelId, plan] of this._preferredKvPlan) {
+				payload[modelId] = plan;
+			}
+			await this.fileService.writeFile(this._preferredKvPlanUri(), VSBuffer.fromString(JSON.stringify(payload, undefined, 2)));
+		} catch (e) {
+			this._log(`[LoCoPilot Runner] Could not persist the KV plan preference (it will be re-learned): ${e}`);
+		}
+	}
+
 	/** File the learned {@link _mtpUnsupported} set is persisted to. See that field for why it survives restarts. */
 	private _mtpUnsupportedUri(): URI {
 		return joinPath(this.environmentService.cacheHome, 'locopilot-mtp-support.json');
@@ -1339,6 +1455,7 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 			const body = await streamToBuffer(res.stream).then(b => b.toString()).catch(() => '');
 			if (status === 200) {
 				this._log(`[LoCoPilot Runner] Restored KV slot cache "${filename}" for ${modelId}.`);
+				await this._touchSlotCache(filename);
 				return true;
 			}
 			// A non-200 (e.g. 400 when the saved prefix is incompatible with the current weights/context) just
@@ -1387,7 +1504,11 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 				return;
 			}
 			this._log(`[LoCoPilot Runner] Saved KV slot cache "${filename}" for ${modelId} (status ${status}).`);
-			// Keep the KV-cache dir bounded: retain only the most-recently-saved caches, evict the rest (LRU).
+			// Remember the plan this blob was written under so the next launch can prefer it and actually find
+			// the file (see _preferredKvPlan). Recorded only on a real save - a blob that was never written
+			// must not pin the KV plan of every future launch.
+			await this._rememberKvPlanForSavedCache(modelId);
+			// Keep the KV-cache dir bounded: retain only the most-recently-USED caches, evict the rest (LRU).
 			await this._pruneSlotCaches();
 		} catch (e) {
 			this._log(`[LoCoPilot Runner] KV slot save failed (ignored) for ${modelId}: ${e}`);
@@ -1414,6 +1535,7 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 			const { status, body } = await this._mlxPromptCacheRequest(port, MLX_PROMPT_CACHE_RESTORE_PATH, filename, token);
 			if (status === 200) {
 				this._log(`[LoCoPilot Runner] Restored MLX prompt cache "${filename}" for ${modelId}: ${body.slice(0, 200)}`);
+				await this._touchSlotCache(filename);
 				return true;
 			}
 			// 404 means this server predates the helper (or it failed to install); anything else is a real
@@ -1446,22 +1568,75 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 	}
 
 	/**
-	 * LRU eviction for the persisted KV-cache dir: keep the {@link MAX_SLOT_CACHE_ENTRIES} most-recently
-	 * modified cache blobs (freshly-saved caches touch their mtime), delete the older ones. Best-effort.
+	 * Marks a cache blob as just-used so {@link _pruneSlotCaches} treats it as recent.
+	 *
+	 * The prune ranks by mtime, but a restore only READS the file - so without this the eviction order was
+	 * "oldest write" rather than "least recently used", and the blob that gets restored every single session
+	 * was precisely the one the next model's save deleted.
+	 *
+	 * Recorded in a small sidecar rather than by touching the file: IFileService has no utimes, and the only
+	 * way to move a blob's mtime through it is to rewrite the (hundreds-of-MB) payload - or, worse, truncate it.
+	 */
+	private async _touchSlotCache(filename: string): Promise<void> {
+		try {
+			await this._ensureSlotCacheUsageLoaded();
+			this._slotCacheUsage.set(filename, Date.now());
+			await this.fileService.writeFile(
+				this._slotCacheUsageUri(),
+				VSBuffer.fromString(JSON.stringify(Object.fromEntries(this._slotCacheUsage), undefined, 2)));
+		} catch (e) {
+			// Purely an eviction-order hint; a failure costs at most one prematurely-evicted cache.
+			this._log(`[LoCoPilot Runner] Could not record KV slot cache use for "${filename}" (ignored): ${e}`);
+		}
+	}
+
+	/** File {@link _slotCacheUsage} is persisted to. Deliberately outside the cache dir, which the prune scans. */
+	private _slotCacheUsageUri(): URI {
+		return joinPath(this.environmentService.cacheHome, 'locopilot-kv-cache-usage.json');
+	}
+
+	/** Loads the last-used timestamps once per session. Missing/corrupt = "never used", i.e. fall back to mtime. */
+	private _ensureSlotCacheUsageLoaded(): Promise<void> {
+		if (!this._slotCacheUsageLoaded) {
+			this._slotCacheUsageLoaded = (async () => {
+				try {
+					const buf = await this.fileService.readFile(this._slotCacheUsageUri());
+					const parsed = JSON.parse(buf.value.toString()) as Record<string, number>;
+					for (const [name, at] of Object.entries(parsed ?? {})) {
+						if (typeof at === 'number' && isFinite(at)) {
+							this._slotCacheUsage.set(name, at);
+						}
+					}
+				} catch {
+					// No file yet or unreadable - every blob then ranks by its own mtime, the old behaviour.
+				}
+			})();
+		}
+		return this._slotCacheUsageLoaded;
+	}
+
+	/**
+	 * LRU eviction for the persisted KV-cache dir: keep the {@link MAX_SLOT_CACHE_ENTRIES} most-recently USED
+	 * cache blobs, delete the older ones. Best-effort.
 	 *
 	 * Matches by extension rather than by "everything in the dir": the same directory also holds the MLX
 	 * bootstrap helper (a `.py`), which must survive - deleting it would silently turn persistence off.
 	 */
 	private async _pruneSlotCaches(): Promise<void> {
 		try {
+			await this._ensureSlotCacheUsageLoaded();
 			const dir = this._kvCacheDir();
 			const stat = await this.fileService.resolve(dir, { resolveMetadata: true });
+			// Rank by last USE, falling back to mtime for a blob that has never been restored (just saved, or
+			// written before the usage sidecar existed). Ranking by mtime alone evicted the most-reused cache.
+			const rank = (name: string, mtime: number) => Math.max(mtime, this._slotCacheUsage.get(name) ?? 0);
 			const caches = (stat.children ?? [])
 				.filter(c => !c.isDirectory && (c.name.endsWith('.bin') || c.name.endsWith(MLX_PROMPT_CACHE_EXT)))
-				.sort((a, b) => b.mtime - a.mtime); // newest first
+				.sort((a, b) => rank(b.name, b.mtime) - rank(a.name, a.mtime)); // most-recently-used first
 			for (const stale of caches.slice(MAX_SLOT_CACHE_ENTRIES)) {
 				try {
 					await this.fileService.del(stale.resource);
+					this._slotCacheUsage.delete(stale.name); // don't let the sidecar grow with dead entries
 					this._log(`[LoCoPilot Runner] Evicted stale KV slot cache "${stale.name}" (LRU).`);
 				} catch { /* ignore individual delete failures */ }
 			}
@@ -2673,7 +2848,7 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 	 *
 	 * All steps are best-effort: any missing data leaves the base tuning untouched.
 	 */
-	private async _augmentTuningWithHardware(modelPath: string, backend: LlamaBackend, base: LlamaServerTuning, extraResidentBytes: number = 0, minContext?: number): Promise<LlamaServerTuning> {
+	private async _augmentTuningWithHardware(modelPath: string, backend: LlamaBackend, base: LlamaServerTuning, extraResidentBytes: number = 0, minContext?: number, modelId?: string): Promise<LlamaServerTuning> {
 		const hw = await this._getHardwareInfo();
 		if (!hw) {
 			return base;
@@ -2829,6 +3004,34 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 				resolvedKvPlan = selection.kvCachePlan;
 				clamped = selection.contextSize;
 				this._log(`[LoCoPilot Runner] Dynamic KV selected ${kvPlanId(resolvedKvPlan)} (K ${resolvedKvPlan.k} / V ${resolvedKvPlan.v}) for ${clamped}/${tuning.contextSize} requested tokens from the model-specific memory budget${tuning.multiTokenPrediction ? ' (incl. MTP draft-context KV reserve)' : ''}.`);
+
+				// Sticky KV plan: this budget is derived from LIVE free memory, so an ordinary fluctuation between
+				// sessions flips the automatic choice one rung and renames the slot-cache file - which is why a
+				// persisted prefix cache could be written one session and never found the next. When the plan the
+				// model's cache was saved under still buys AT LEAST the same context under today's budget, take it
+				// instead: same memory math, same context, and the filename lines up so the restore hits. A plan
+				// that would cost context is refused - the cache is an optimization, the context is not.
+				const preferred = modelId ? this._preferredKvPlan.get(modelId) : undefined;
+				if (preferred && kvPlanId(preferred) !== kvPlanId(resolvedKvPlan)) {
+					const preferredPlan = applyKvQuantCapability(preferred, tuning.kvQuantCapability);
+					const preferredContext = clampContextSize({
+						requestedContext: tuning.contextSize,
+						modelContextLength: info.contextLength,
+						kvBudgetBytes,
+						layerCount: clampLayerCount,
+						kvBytesPerTokenPerLayer: f16PerTokenPerLayer * kvPlanBytesPerElem(preferredPlan) / kvCacheBytesPerElem('f16'),
+						slidingWindow: info.slidingWindow,
+						swaFullOnAllLayers: tuning.swaFull === true,
+						minContext,
+					});
+					if (preferredContext >= clamped) {
+						this._log(`[LoCoPilot Runner] Keeping the KV plan this model's persisted prefix cache was saved under (${kvPlanId(preferredPlan)} over ${kvPlanId(resolvedKvPlan)}): it holds ${preferredContext} tokens vs ${clamped}, so the cache stays findable at no cost in context.`);
+						resolvedKvPlan = preferredPlan;
+						clamped = preferredContext;
+					} else {
+						this._log(`[LoCoPilot Runner] Persisted prefix cache was saved under KV ${kvPlanId(preferredPlan)}, but today's budget only holds ${preferredContext} tokens with it (vs ${clamped} at ${kvPlanId(resolvedKvPlan)}); keeping the larger context and re-warming.`);
+					}
+				}
 			} else {
 				// A user-pinned type applies to both halves - the asymmetric rung is an automatic choice only. A
 				// half the engine has rejected still falls back to f16: honouring the pin literally would just
@@ -4829,6 +5032,9 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 		// Same for MTP: a model whose embedded draft head already failed to load launches dense straight away
 		// rather than repeating the crash-and-relaunch once per app start.
 		await this._ensureMtpUnsupportedLoaded();
+		// And the KV plan this model's persisted prefix cache was written under, so the automatic choice can
+		// stay sticky (and the cache stay findable) when it costs nothing.
+		await this._ensurePreferredKvPlanLoaded();
 		const baseTuning = this._getLlamaTuning(model);
 		// Requested context CEILING: aim for the model's full window and let the memory clamp be the real limiter,
 		// instead of the legacy 16384 default silently capping every model. An EXPLICIT per-model context (set by
@@ -4954,7 +5160,7 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 		const oomLadderCap = this._oomContextCap.get(modelId);
 		let tuning = await this._augmentTuningWithHardware(
 			modelPath, backend, baseTuning, extraResidentBytes,
-			oomLadderCap && oomLadderCap > 0 ? oomLadderCap : undefined);
+			oomLadderCap && oomLadderCap > 0 ? oomLadderCap : undefined, modelId);
 		// MTP post-clamp verification - the ONLY place MTP is dropped for memory reasons.
 		// Everything above carried it as a first-class cost, so `tuning` already describes a context sized to hold
 		// BOTH the main and the draft KV cache. Only now, with the real context and the real KV precision decided,
@@ -4969,7 +5175,7 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 				extraResidentBytes = Math.max(0, extraResidentBytes - mtpHeadResidentBytes(weightBytesForBudget));
 				tuning = await this._augmentTuningWithHardware(
 					modelPath, backend, baseTuning, extraResidentBytes,
-					oomLadderCap && oomLadderCap > 0 ? oomLadderCap : undefined);
+					oomLadderCap && oomLadderCap > 0 ? oomLadderCap : undefined, modelId);
 			}
 		}
 		// Tight-fit notice: the clamp granted the largest context that fits, but it landed below the comfort floor
@@ -5015,7 +5221,11 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 		this._actualContextWindow.delete(modelId);
 		// Remember the resolved KV cache type this server uses, so slot save/restore only reuses a byte-compatible
 		// blob (see _lastLaunchKvType / _slotCacheFileName). Mirrors getLlamaCppServerCommand's own resolution.
-		this._lastLaunchKvType.set(modelId, kvPlanId(tuning.kvCachePlan ?? resolveKvCachePlan(tuning.kvCacheType ?? 'auto', launchContext)));
+		const launchedKvPlan = tuning.kvCachePlan ?? resolveKvCachePlan(tuning.kvCacheType ?? 'auto', launchContext);
+		this._lastLaunchKvType.set(modelId, kvPlanId(launchedKvPlan));
+		// Kept as the plan (not just its id) so a successful slot save can record it as the preference for the
+		// next launch without re-parsing the tag - see _rememberKvPlanForSavedCache.
+		this._lastLaunchPlan.set(modelId, launchedKvPlan);
 		const { command, args } = getLlamaCppServerCommand(modelPath, backend, serverPath, port, tuning);
 		// Remember whether this launch carries speculative flags, so a crash caused by an old build rejecting
 		// them can be told apart from a real failure and self-healed (relaunch without speculation).
@@ -5264,7 +5474,54 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 	 * but first frees memory by evicting the least-recently-used server when the resident-model budget is
 	 * reached, then waits until the server's OpenAI endpoint actually responds so the caller can send immediately.
 	 */
-	async ensureServerForModel(modelId: string, token: CancellationToken = CancellationToken.None, interactive: boolean = true): Promise<string | undefined> {
+	beginPrefixWarmGate(modelId: string): () => void {
+		// An already-open gate is left alone and its release handed back: two warms for the same model should
+		// never leave the gate closed by the first one to finish while the second is still prefilling.
+		const existing = this._prefixWarmGates.get(modelId);
+		if (existing) {
+			return existing.release;
+		}
+		let release!: () => void;
+		const promise = new Promise<void>(resolve => {
+			release = () => {
+				// Idempotent: only the entry we own is removed, so a late release from a superseded warm cannot
+				// clear a newer gate.
+				if (this._prefixWarmGates.get(modelId)?.release === release) {
+					this._prefixWarmGates.delete(modelId);
+				}
+				resolve();
+			};
+		});
+		this._prefixWarmGates.set(modelId, { promise, release });
+		return release;
+	}
+
+	/**
+	 * Waits for an open prefix-warm gate, bounded by {@link PREFIX_WARM_GATE_TIMEOUT_MS} and by `token`.
+	 * Returns immediately when no warm is in flight (the common case).
+	 */
+	private async _awaitPrefixWarmGate(modelId: string, token: CancellationToken): Promise<void> {
+		const gate = this._prefixWarmGates.get(modelId);
+		if (!gate) {
+			return;
+		}
+		this._log(`[LoCoPilot Runner] Holding the first request for ${modelId} until its prefix warm/KV restore completes.`);
+		const started = Date.now();
+		const cap = new CancellationTokenSource();
+		try {
+			await Promise.race([
+				gate.promise,
+				// Cancelled in the finally so a warm that finishes first doesn't leave the timer pending.
+				timeout(PREFIX_WARM_GATE_TIMEOUT_MS, cap.token).catch(() => undefined),
+				new Promise<void>(resolve => token.onCancellationRequested(() => resolve())),
+			]);
+		} finally {
+			cap.dispose(true);
+		}
+		this._log(`[LoCoPilot Runner] Prefix warm gate for ${modelId} cleared after ${Date.now() - started}ms; dispatching the request.`);
+	}
+
+	async ensureServerForModel(modelId: string, token: CancellationToken = CancellationToken.None, interactive: boolean = true, waitForPrefixWarm: boolean = false): Promise<string | undefined> {
 		// Already running AND ready - reuse as-is, and refresh its LRU/idle state so it isn't evicted while
 		// in use. A record that exists but is not yet ready (weights still loading, e.g. a pre-warm that just
 		// launched) must NOT be returned here: doing so would let the caller fire a request the server rejects
@@ -5281,6 +5538,12 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 				this._log(`[LoCoPilot Runner] Foreign server for ${modelId} is no longer reachable; will (re)launch.`);
 			} else {
 				this._touch(modelId);
+				// Already ready, but a warm triggered by an earlier select/ready may still be prefilling the
+				// prefix this very turn is about to reuse. Wait it out rather than queue behind it in the
+				// server with an empty slot.
+				if (waitForPrefixWarm) {
+					await this._awaitPrefixWarmGate(modelId, token);
+				}
 				return this.getServerBaseUrl(modelId);
 			}
 		}
@@ -5316,7 +5579,12 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 		}
 		this._clearLaunchBlocked(modelId); // it started fine; drop any stale "won't fit" reason
 		this._touch(modelId);
+		// Fires synchronously into the agent's ready handler, which opens the prefix-warm gate before its
+		// first await - so by the time this returns the gate below is already registered when a warm started.
 		this._onDidServerStateChange.fire(modelId);
+		if (waitForPrefixWarm) {
+			await this._awaitPrefixWarmGate(modelId, token);
+		}
 		return baseUrl;
 	}
 

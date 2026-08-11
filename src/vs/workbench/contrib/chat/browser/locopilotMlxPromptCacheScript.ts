@@ -54,8 +54,19 @@ import queue
 
 # (callable, reply_queue) pairs awaiting execution on the generation thread.
 _JOBS = queue.Queue()
-# Newest (model_key, tokens, prompt_cache) seen by insert_cache; what /save persists.
-_LAST_INSERT = {'value': None}
+# Newest (model_key, tokens, prompt_cache) seen by insert_cache, for each cache_type mlx_lm uses.
+#
+# /save wants the 'system' one, NOT simply the newest. mlx_lm segments a chat prompt itself (see
+# ResponseGenerator's sys_end scan) and inserts the system+tools span as its own 'system' entry
+# alongside the full-prompt entry - and only the former is a strict PREFIX of the next turn.
+#
+# Persisting the newest entry instead is why a restore could report success and still buy nothing: the
+# blob then carried the warm-up's own trailing user turn ('hi') plus its generated token, so on the next
+# turn it is the 'longer' candidate in fetch_nearest_cache, which is reusable only when
+# can_trim_prompt_cache() holds. That is false for exactly the models this matters most for -
+# RotatingKVCache.is_trimmable() is 'offset < max_size', i.e. False for any sliding-window model whose
+# prefix has grown past its window - so the cache was dropped and the whole prompt re-prefilled.
+_LAST_INSERT = {'value': None, 'system': None}
 # Generous: a save of a multi-thousand-token prefix writes ~1 GB and can queue behind a long prefill.
 _JOB_TIMEOUT_S = 600.0
 
@@ -109,19 +120,28 @@ def _model_key_repr(model_key):
 
 def _save(response_generator, path):
     from mlx_lm.models.cache import save_prompt_cache
-    entry = _LAST_INSERT['value']
+    # Prefer the system+tools segment: it is the span that is stable across turns, so restoring it makes
+    # every later prompt an extension of it (the cheap 'shorter' branch of fetch_nearest_cache, which
+    # needs no trimming and therefore works for every cache class). The full-prompt entry is only a
+    # fallback for a template with no system segment - it still restores, it just may not be reusable.
+    entry = _LAST_INSERT['system'] or _LAST_INSERT['value']
+    segment = 'system' if _LAST_INSERT['system'] is not None else 'prompt'
     if entry is None:
         raise RuntimeError('no prompt cache entry has been produced yet')
     model_key, tokens, prompt_cache = entry
     if not tokens:
         raise RuntimeError('refusing to save an empty prompt cache')
-    metadata = {'tokens': json.dumps(tokens), 'model_key': _model_key_repr(model_key)}
+    metadata = {
+        'tokens': json.dumps(tokens),
+        'model_key': _model_key_repr(model_key),
+        'segment': segment,
+    }
     # Write beside the target and rename: a crash or an eviction mid-write must never leave a torn
     # blob that a later restore would happily load as a valid prefix.
     tmp = path + '.partial${MLX_PROMPT_CACHE_EXT}'
     save_prompt_cache(tmp, prompt_cache, metadata)
     os.replace(tmp, path)
-    return {'saved': True, 'tokens': len(tokens), 'bytes': os.path.getsize(path)}
+    return {'saved': True, 'tokens': len(tokens), 'segment': segment, 'bytes': os.path.getsize(path)}
 
 
 def _restore(response_generator, path):
@@ -155,14 +175,17 @@ def _install():
     generator_cls = _server.ResponseGenerator
     handler_cls = _server.APIHandler
 
-    # Remember the newest entry so /save has something concrete to persist. The runner saves right
-    # after the prefix warm-up completes, so the newest entry is exactly the warmed prefix.
+    # Remember the newest entry of each kind so /save has something concrete to persist. The runner saves
+    # right after the prefix warm-up, so the newest 'system' entry is exactly the warmed system+tools span.
     _orig_insert = lru_cls.insert_cache
 
     def insert_cache(self, model, tokens, prompt_cache, **kwargs):
         result = _orig_insert(self, model, tokens, prompt_cache, **kwargs)
         try:
-            _LAST_INSERT['value'] = (model, list(tokens), prompt_cache)
+            captured = (model, list(tokens), prompt_cache)
+            _LAST_INSERT['value'] = captured
+            if kwargs.get('cache_type') == 'system':
+                _LAST_INSERT['system'] = captured
         except Exception:
             pass
         return result

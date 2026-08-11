@@ -1344,6 +1344,11 @@ export class LoCoPilotBuiltInAgent extends Disposable implements IChatAgentImple
 		// Claim SYNCHRONOUSLY (before the async work) so concurrent callers - the other five agent instances,
 		// or the selection trigger racing the server-ready hook - see it taken and skip.
 		LoCoPilotBuiltInAgent._warmedPrefixKeys.add(warmKey);
+		// Open the runner's gate SYNCHRONOUSLY, before the first await below. This method is called from the
+		// server-ready handler, which the runner fires synchronously from inside ensureServerForModel - so the
+		// gate must exist by the time fire() returns for the user's first turn to wait on it instead of racing
+		// the restore into an empty slot (the reason a persisted cache only ever helped the session that wrote it).
+		const releaseWarmGate = this.localModelRunner.beginPrefixWarmGate(modelId);
 		(async () => {
 			try {
 				// Build the EXACT stable prefix a real turn uses for this mode FIRST, so the disk cache can be
@@ -1378,7 +1383,7 @@ export class LoCoPilotBuiltInAgent extends Disposable implements IChatAgentImple
 				// the prefix KV is already resident, so we skip the multi-thousand-token prefill entirely.
 				const restored = await this.localModelRunner.restoreSlotCache(modelId, diskKey, CancellationToken.None);
 				if (restored) {
-					return;
+					return; // finally below releases the gate; the waiting turn proceeds against a hot prefix
 				}
 
 				await this.unifiedAgent.warmUpWithPrefix(modelId, prefix, CancellationToken.None);
@@ -1389,6 +1394,10 @@ export class LoCoPilotBuiltInAgent extends Disposable implements IChatAgentImple
 				// tears the server down, _onServerStateChange also clears it; this covers a plain throw.
 				LoCoPilotBuiltInAgent._warmedPrefixKeys.delete(warmKey);
 				this._log(`[LoCoPilot] Prefix warm trigger failed (ignored): ${e}`);
+			} finally {
+				// Always release, on every path: a turn blocked on this gate must never outlive the warm it
+				// is waiting for (the runner's timeout is a backstop, not the normal exit).
+				releaseWarmGate();
 			}
 		})();
 	}
