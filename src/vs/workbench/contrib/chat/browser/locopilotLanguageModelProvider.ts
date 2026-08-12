@@ -1541,6 +1541,16 @@ export class LoCoPilotLanguageModelProvider extends Disposable implements ILangu
 			}
 		}
 
+		// One-shot diagnostic: compare the warm prefix against THIS turn's wire body and log where they part.
+		// Fire-and-forget so it never delays the request; the runner limits it to the first foreground turn
+		// per server instance.
+		if (isForegroundTurn) {
+			const systemForDiag = mappedMessages.find((m: any) => m.role === 'system')?.content;
+			if (typeof systemForDiag === 'string') {
+				void this.localModelRunner.logPrefixDivergence(model.id, mappedMessages, body.tools, systemForDiag, token);
+			}
+		}
+
 		const headers: Record<string, string> = { 'Content-Type': 'application/json', 'Accept': 'text/event-stream' };
 		// Streaming tool-call parts: llama.cpp streams `delta.tool_calls` argument fragments token by
 		// token, so we can surface "tool call in progress" (name + partial args) to the chat UI while

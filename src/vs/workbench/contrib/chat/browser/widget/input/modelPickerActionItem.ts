@@ -28,7 +28,8 @@ import { DEFAULT_MODEL_PICKER_CATEGORY } from '../../../common/widget/input/mode
 import { ChatInputPickerActionViewItem, IChatInputPickerOptions } from './chatInputPickerActionItem.js';
 import { ICustomLanguageModelsService, ICustomLanguageModel, getCustomModelListLabel, LOCOPILOT_AUTO_MODEL_ID } from '../../../common/customLanguageModelsService.js';
 import { LOCOPILOT_SETTINGS_SECTION_LIST_MODELS } from '../../chatManagement/locopilotSettingsEditorInput.js';
-import { getRecommendedRepoId, peekAutoModel, resolveAutoModelPinned } from '../../locopilotModelCatalog.js';
+import { CURATED_ROLE_LABEL, CURATED_ROLE_TOOLTIP, CuratedPickerRole, LOCOPILOT_DEFAULT_CATALOG, curatedPickerRows, getRecommendedRepoId, peekAutoModel, resolveAutoModelPinned } from '../../locopilotModelCatalog.js';
+import { isAppleSiliconMac } from '../../locopilotMlxServer.js';
 import { ITimerService } from '../../../../../services/timer/browser/timerService.js';
 import { ExtensionIdentifier } from '../../../../../../platform/extensions/common/extensions.js';
 import { ILoCoPilotLocalModelRunner } from '../../locopilotLocalModelRunner.js';
@@ -385,12 +386,35 @@ function modelDelegateToWidgetActionsProvider(delegate: IModelPickerDelegate, te
 						}
 					}
 			};
+			// The role each curated catalog model plays on THIS machine ("Fastest", "Best coder", ...), keyed by
+			// repoId because that is what a seeded model stores as its modelName. Shown as the row subtitle so
+			// the picker answers "which one should I use?" instead of listing bare model names. Models the user
+			// added themselves, and catalog models they surfaced from the hidden list, simply have no role.
+			const rolesByRepoId = new Map<string, CuratedPickerRole>();
+			for (const row of curatedPickerRows(ramGB, isAppleSiliconMac())) {
+				const entry = LOCOPILOT_DEFAULT_CATALOG.find(e => e.catalogId === row.catalogId);
+				if (entry) {
+					rolesByRepoId.set(entry.repoId, row.role);
+				}
+			}
+
 			const customModelActions: IActionWidgetDropdownAction[] = customModels.map(customModel => {
 				// "Best for you": sized for this machine's RAM/engine. Star the label and explain it on hover,
 				// matching the model-list badge so the maximal pick is one obvious click from the conservative default.
 				const best = isBestForSystem(customModel);
 				const baseLabel = getCustomModelListLabel(customModel);
-				const kindLabel = customModel.type === 'cloud' ? localize('chat.modelPicker.cloud', 'Cloud') : localize('chat.modelPicker.local', 'Local');
+				// Subtitle: the model's ROLE on this machine ("Fastest", "Best coder", ...) when it is one of the
+				// curated picks, else the Local/Cloud kind. Role wins because "Local" is near-zero information -
+				// every curated catalog model is local - whereas the role is the reason to pick this row over the
+				// one below it. Models the user added themselves, and catalog models surfaced from the hidden
+				// list, have no role and keep Local/Cloud, where the distinction does carry meaning.
+				const role = rolesByRepoId.get(customModel.modelName);
+				const kindLabel = role
+					? CURATED_ROLE_LABEL[role]
+					: (customModel.type === 'cloud' ? localize('chat.modelPicker.cloud', 'Cloud') : localize('chat.modelPicker.local', 'Local'));
+				// The `best` badge appends "- Best for you" to the subtitle. Suppress it when the row's own role
+				// IS 'best', or the two compose into "Best for you - Best for you" on the recommended row.
+				const appendBestBadge = best && role !== 'best';
 				const bestTooltip = localize('chat.modelPicker.bestForYou.tooltip', 'Recommended: sized for your system memory.');
 				const isSelected = customModel.id === selectedCustomModelId;
 				// For the SELECTED model, if it's a downloadable local model, replace the checkmark with a
@@ -410,8 +434,12 @@ function modelDelegateToWidgetActionsProvider(delegate: IModelPickerDelegate, te
 					icon: startStop?.icon,
 					category: { label: 'Custom Models', order: 100 },
 					class: undefined,
-					description: best ? localize('chat.modelPicker.bestForYou.desc', '{0} - Best for you', kindLabel) : kindLabel,
-					tooltip: startStop ? startStop.tooltip : (best ? `${baseLabel} - ${bestTooltip}` : baseLabel),
+					description: appendBestBadge ? localize('chat.modelPicker.bestForYou.desc', '{0} - Best for you', kindLabel) : kindLabel,
+					// Hover carries the long form: the model name plus what its role means here. The subtitle is
+					// only ever two or three words, so the explanation has to live somewhere.
+					tooltip: startStop
+						? startStop.tooltip
+						: (role ? `${baseLabel} - ${CURATED_ROLE_TOOLTIP[role]}` : (best ? `${baseLabel} - ${bestTooltip}` : baseLabel)),
 					label: baseLabel,
 					hover: undefined,
 					toolbarActions: [

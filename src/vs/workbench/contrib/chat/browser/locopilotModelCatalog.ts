@@ -205,7 +205,7 @@ export const LOCOPILOT_DEFAULT_CATALOG: readonly ICatalogModel[] = [
 	// ---- Qwen 3.6 (Alibaba) - only 27B dense + 35B-A3B MoE exist ----
 	{
 		catalogId: 'qwen36-27b-gguf',
-		displayName: 'Qwen3.6 27B',
+		displayName: 'Qwen3.6 27B (base)',
 		vendor: 'Alibaba (Qwen)',
 		blurb: 'Latest top dense coder (77% SWE-bench class). 32 GB+ recommended.',
 		repoId: 'unsloth/Qwen3.6-27B-GGUF',
@@ -222,7 +222,7 @@ export const LOCOPILOT_DEFAULT_CATALOG: readonly ICatalogModel[] = [
 	// mlx-lm dispatches on `model_type` (`qwen3_5`, present since 0.31.x) and loads the text tower.
 	{
 		catalogId: 'qwen36-35b-a3b-gguf',
-		displayName: 'Qwen3.6 35B-A3B MoE',
+		displayName: 'Qwen3.6 35B-A3B MoE (base)',
 		vendor: 'Alibaba (Qwen)',
 		blurb: 'Latest Qwen MoE: 35B total, ~3B active - fast and high quality.',
 		repoId: 'unsloth/Qwen3.6-35B-A3B-GGUF',
@@ -278,7 +278,7 @@ export const LOCOPILOT_DEFAULT_CATALOG: readonly ICatalogModel[] = [
 	// mark a perfectly-runnable model 'too-big' and hide it from Auto. The runtime gate, not minRamGB, guards the OOM.
 	{
 		catalogId: 'qwen35-0_8b-mtp-gguf',
-		displayName: 'Qwen3.5 0.8B (MTP)',
+		displayName: 'Qwen3.5 0.8B',
 		vendor: 'Alibaba (Qwen)',
 		blurb: 'Ultra-light MTP build; fastest speculative decoding for tiny tasks.',
 		repoId: 'unsloth/Qwen3.5-0.8B-MTP-GGUF',
@@ -293,7 +293,7 @@ export const LOCOPILOT_DEFAULT_CATALOG: readonly ICatalogModel[] = [
 	},
 	{
 		catalogId: 'qwen35-2b-mtp-gguf',
-		displayName: 'Qwen3.5 2B (MTP)',
+		displayName: 'Qwen3.5 2B',
 		vendor: 'Alibaba (Qwen)',
 		blurb: 'Small MTP build; fast on-device assistant.',
 		repoId: 'unsloth/Qwen3.5-2B-MTP-GGUF',
@@ -308,7 +308,7 @@ export const LOCOPILOT_DEFAULT_CATALOG: readonly ICatalogModel[] = [
 	},
 	{
 		catalogId: 'qwen35-4b-mtp-gguf',
-		displayName: 'Qwen3.5 4B (MTP)',
+		displayName: 'Qwen3.5 4B',
 		vendor: 'Alibaba (Qwen)',
 		blurb: 'Capable tiny all-rounder with MTP speculative decoding.',
 		repoId: 'unsloth/Qwen3.5-4B-MTP-GGUF',
@@ -323,7 +323,7 @@ export const LOCOPILOT_DEFAULT_CATALOG: readonly ICatalogModel[] = [
 	},
 	{
 		catalogId: 'qwen35-9b-mtp-gguf',
-		displayName: 'Qwen3.5 9B (MTP)',
+		displayName: 'Qwen3.5 9B',
 		vendor: 'Alibaba (Qwen)',
 		blurb: 'Mid-small MTP build; strong quality for 16 GB machines.',
 		repoId: 'unsloth/Qwen3.5-9B-MTP-GGUF',
@@ -362,7 +362,7 @@ export const LOCOPILOT_DEFAULT_CATALOG: readonly ICatalogModel[] = [
 	// ---- Qwen 3.6 MTP (Alibaba) - MTP heads for speculative decoding, hidden until tested ----
 	{
 		catalogId: 'qwen36-27b-mtp-gguf',
-		displayName: 'Qwen3.6 27B (MTP)',
+		displayName: 'Qwen3.6 27B',
 		vendor: 'Alibaba (Qwen)',
 		blurb: 'Qwen3.6 27B dense coder with Multi-Token Prediction heads; faster decoding via llama.cpp speculative.',
 		repoId: 'unsloth/Qwen3.6-27B-MTP-GGUF',
@@ -380,9 +380,9 @@ export const LOCOPILOT_DEFAULT_CATALOG: readonly ICatalogModel[] = [
 	},
 	{
 		catalogId: 'qwen36-35b-a3b-mtp-gguf',
-		displayName: 'Qwen3.6 35B-A3B MoE (MTP)',
+		displayName: 'Qwen3.6 35B-A3B MoE',
 		vendor: 'Alibaba (Qwen)',
-		blurb: 'Qwen3.6 MoE (35B total, ~3B active) with Multi-Token Prediction heads; faster decoding via llama.cpp speculative.',
+		blurb: 'Qwen3.6 MoE (35B total, ~3B active) with Multi-Token Prediction heads; decodes several times faster than a dense 27B on the same machine.',
 		repoId: 'unsloth/Qwen3.6-35B-A3B-MTP-GGUF',
 		supportsVision: true,
 		format: 'Q4_K_M',
@@ -391,7 +391,12 @@ export const LOCOPILOT_DEFAULT_CATALOG: readonly ICatalogModel[] = [
 		minRamGB: 32,
 		tier: '32 GB+',
 		mtp: true,
-		defaultHidden: true,
+		// Unhidden 2026-08: decode is bound by ACTIVE parameters, so ~3B active beats the dense 27B by a
+		// multiple on any bandwidth-limited machine - which is the whole 32 GB+ Apple Silicon tier. That is a
+		// far bigger win than the MTP head itself: measured on Metal (b10361, 4B twin), `--spec-type draft-mtp`
+		// is worth ~+13%, not the ~2x it is worth on CUDA, because ggml-metal only reaches its batched-GEMM
+		// kernel above `ne11_mm_min = 8` and a 2-4 token verify batch never gets there. See
+		// DEFAULT_VISIBLE_CATALOG_IDS; the non-MTP twin `qwen36-35b-a3b-gguf` stays visible alongside it.
 		contextWindow: 262144,
 	},
 
@@ -596,7 +601,7 @@ export const LOCOPILOT_DEFAULT_CATALOG: readonly ICatalogModel[] = [
 		format: 'Q4_K_M',
 		engine: 'gguf',
 		approxSizeBytes: Math.round(58.5 * GB),
-		minRamGB: 64,
+		minRamGB: 96,
 		tier: '64 GB+',
 		defaultHidden: true,
 		contextWindow: 131072,
@@ -702,7 +707,7 @@ export const LOCOPILOT_DEFAULT_CATALOG: readonly ICatalogModel[] = [
 		format: 'Q4_K_M',
 		engine: 'gguf',
 		approxSizeBytes: 24725740480,
-		minRamGB: 32,
+		minRamGB: 48,
 		tier: '32 GB+',
 		contextWindow: 262144,
 		defaultHidden: true,
@@ -919,7 +924,7 @@ export const LOCOPILOT_DEFAULT_CATALOG: readonly ICatalogModel[] = [
 		// IQ4_XS (57.6 GB) is the ONLY quant of this model that fits the tier: poolside's own GGUF repo ships
 		// Q4_K_M at 96 GB, so the entry deliberately points at unsloth's dynamic build and pins the quant.
 		approxSizeBytes: Math.round(57.6 * GB),
-		minRamGB: 64,
+		minRamGB: 96,
 		tier: '64 GB+',
 		// Trained window is 1M, but the launch planner would never afford it here and the clamp does the real
 		// work; 262144 keeps the seeded value in the same band as the rest of the 64 GB+ tier.
@@ -930,7 +935,7 @@ export const LOCOPILOT_DEFAULT_CATALOG: readonly ICatalogModel[] = [
 	// ---- Qwen3.5 122B-A10B (MTP) - the largest Qwen3.5 MTP build that fits a 64 GB workstation ----
 	{
 		catalogId: 'qwen35-122b-a10b-mtp-gguf',
-		displayName: 'Qwen3.5 122B-A10B MoE (MTP)',
+		displayName: 'Qwen3.5 122B-A10B MoE',
 		vendor: 'Alibaba (Qwen)',
 		blurb: 'Large Qwen MoE (122B total, ~10B active) with MTP decoding. Needs 64 GB+.',
 		repoId: 'unsloth/Qwen3.5-122B-A10B-MTP-GGUF',
@@ -940,7 +945,7 @@ export const LOCOPILOT_DEFAULT_CATALOG: readonly ICatalogModel[] = [
 		// 61.9 GB at IQ4_XS - the tightest entry in the catalog. Q4_K_S is already 73.4 GB, past any 64 GB box,
 		// so the quant is pinned rather than left to the picker.
 		approxSizeBytes: Math.round(61.9 * GB),
-		minRamGB: 64,
+		minRamGB: 128,
 		tier: '64 GB+',
 		mtp: true,
 		contextWindow: 262144,
@@ -1122,7 +1127,7 @@ export const LOCOPILOT_DEFAULT_CATALOG: readonly ICatalogModel[] = [
 // until then the entry could only ever fail at start.
 
 /** Build the stored-model record to seed from a catalog entry (a HuggingFace/local model with no localPath yet). */
-export function catalogModelToSeed(entry: ICatalogModel): Omit<ICustomLanguageModel, 'id' | 'createdAt'> {
+export function catalogModelToSeed(entry: ICatalogModel, hardware?: { readonly ramGB: number; readonly isAppleSilicon: boolean }): Omit<ICustomLanguageModel, 'id' | 'createdAt'> {
 	return {
 		name: entry.displayName,
 		displayName: entry.displayName,
@@ -1136,53 +1141,156 @@ export function catalogModelToSeed(entry: ICatalogModel): Omit<ICustomLanguageMo
 		// Explicit per-entry vision flag (verified against each repo's HuggingFace pipeline_tag/tags). Text-only
 		// models seed as false so image attach is gated; HF/Ollama enrichment and the toggle can still refine it.
 		supportsVision: entry.supportsVision,
-		// Hidden unless explicitly curated visible, so the picker stays short. A remote entry can force
-		// either state via `defaultHidden`. Users surface any hidden model with Show in "My Models".
-		hidden: catalogDefaultHidden(entry),
+		// Hidden unless this machine's curated list names it, so the picker stays short AND shows only models
+		// that actually run here. A remote entry can force either state via `defaultHidden`. Users surface any
+		// hidden model with Show in "My Models".
+		hidden: catalogDefaultHidden(entry, hardware),
 	};
 }
 
 /**
- * The handful of catalog models shown in the chat picker out of the box (one tiny, one recommended default,
- * the latest mid-size Gemma, the latest flagship Qwen, and the best coding model). Everything else is seeded
- * hidden and can be surfaced via Show in "My Models".
+ * The job a curated picker row does. One row per role, so the out-of-box picker answers the questions a user
+ * actually has ("what should I use?", "what's fastest?", "what's best at code?") instead of listing every
+ * model we know about. Roles are also the row's subtitle in the picker.
  */
-const DEFAULT_VISIBLE_CATALOG_IDS: ReadonlySet<string> = new Set([
-	// Current-generation Qwen line only (3.5 MTP + 3.6). The prior-gen Qwen3 entries were deleted outright in
-	// 2026-08 rather than seeded hidden - every one had a same-tier successor at equal or smaller size, so the
-	// picker shows one clean generation with no duplicates. Qwen3 Coder Next survives as the sole 64 GB+ Qwen.
-	'gemma4-12b-gguf',
-	'qwen36-27b-gguf',
-	'devstral-small-2-24b-gguf',
-	'qwen35-0_8b-mtp-gguf',
-	'qwen35-4b-mtp-gguf',
-	'qwen35-9b-mtp-gguf',
-	'qwen36-35b-a3b-gguf',
-	'gemma4-e4b-gguf',
-	// 16 GB tier: the strongest coder that fits there (69.4 SWE-bench Verified at 5.3 GB Q4), so it is
-	// visible rather than buried behind Show - a hidden entry is effectively an entry nobody finds.
-	'ornith-1_0-9b-gguf',
-	// The catalog's most-downloaded repo (~1.42M): Qwen3.6 27B with MTP speculative decoding. Also the curated
-	// 32 GB+ "Best for you" pick (see CURATED_RECOMMENDATION_LADDER), so it must stay visible to show badged.
-	'qwen36-27b-mtp-gguf',
-	// Meta's first open-weight release in this generation (Aug 2026). Visible rather than hidden because a
-	// brand-new flagship nobody can find behind Show is a wasted catalog entry; the MLX twin stays hidden so
-	// the 32 GB+ picker row does not gain two Muse Glimmer lines on Apple Silicon.
-	'muse-glimmer-30b-gguf',
-	// Apple Silicon: one MLX pick per tier so an M-series machine always sees a native-engine option
-	// in the picker (the rest of the MLX set is seeded hidden and surfaced via Show).
-	'qwen35-4b-mlx',
-	'gemma4-e4b-mlx',
-	'ornith-1_0-9b-mlx',
-	'qwen35-9b-mlx',
-	'qwen36-27b-mlx',
-	'qwen36-35b-a3b-mlx',
-	// 64 GB+ tier: the curated "Best for you" pick, visible so workstation users see it badged in the picker.
-	'qwen3-coder-next-gguf',
-	// 32 GB+ tier: beats the Qwen3.6 35B-A3B base it was post-trained from (69.4 vs 64.4 SWE-bench Verified)
-	// at the same size, so it belongs in the picker rather than behind Show.
-	'kat-coder-v2_5-dev-gguf',
-]);
+export type CuratedPickerRole = 'best' | 'fastest' | 'coder' | 'vision' | 'lightweight' | 'quick-try' | 'tools';
+
+/** Human label for a curated row's role, shown as the row subtitle. Two or three words - see the tooltip. */
+export const CURATED_ROLE_LABEL: Readonly<Record<CuratedPickerRole, string>> = {
+	'best': 'Best for you',
+	'fastest': 'Fastest',
+	'coder': 'Best coder',
+	'vision': 'Vision + tools',
+	'lightweight': 'Lightweight',
+	'quick-try': 'Quick try',
+	'tools': 'Tool calling',
+};
+
+/**
+ * The long form of each role, shown on hover. The subtitle only has room for a couple of words, so anything
+ * that explains WHY this row is the fastest / lightest belongs here instead.
+ */
+export const CURATED_ROLE_TOOLTIP: Readonly<Record<CuratedPickerRole, string>> = {
+	'best': 'The most capable model that still runs comfortably on this machine.',
+	'fastest': 'Fewest active parameters per token, so it generates fastest here.',
+	'coder': 'Tuned for writing and editing code.',
+	'vision': 'Reads images and calls tools, alongside strong general ability.',
+	'lightweight': 'Small and quick - good for inline edits and short questions.',
+	'quick-try': 'Tiny download, so you can see it working in seconds.',
+	'tools': 'Strong at tool calling and structured output.',
+};
+
+export interface ICuratedPickerRow {
+	readonly catalogId: string;
+	readonly role: CuratedPickerRole;
+	/** When set, this row replaces the same-role default on Apple Silicon (used to surface one native MLX build). */
+	readonly appleSiliconInstead?: string;
+}
+
+/**
+ * The curated picker, one list per RAM tier. This is the SINGLE source of truth for what a fresh install shows.
+ *
+ * Three rules shaped it, and breaking any of them is how the list got to 20 near-identical rows before:
+ *
+ *  1. ONE ROW PER MODEL. The catalog holds 40 distinct models across 51 rows - Qwen3.6 27B alone shipped as
+ *     plain GGUF, MTP GGUF and MLX. Packaging is not a choice a user can make an informed decision about, so
+ *     only one build of any model is ever curated; the others stay hidden and are switchable from "My Models".
+ *  2. The MTP build is the one we pick whenever it exists. It is a strict superset - the same weights plus an
+ *     embedded draft head that llama.cpp ignores when speculation is off (`unused tensor ... ignoring`) - at
+ *     near-identical size. Worth ~2x on CUDA and ~13% on Metal (measured, b10361), so never worth NOT shipping.
+ *     The `(MTP)` suffix was dropped from every displayName: it is build jargon, not a model distinction.
+ *  3. EVERY ROW MUST RUN HERE. A tier only lists models whose `minRamGB` fits it. Nothing else in the codebase
+ *     enforced this - seeding has only ever gated on Apple Silicon, so an 8 GB laptop was being handed a 45 GB
+ *     model in its picker.
+ *
+ * Small models stay listed on big machines (the `lightweight` / `quick-try` roles): a 64 GB workstation still
+ * wants a 0.6 GB model for inline completions and a fast first-run download.
+ */
+const CURATED_PICKER_TIERS: readonly { readonly minRamGB: number; readonly rows: readonly ICuratedPickerRow[] }[] = [
+	{
+		// 64 GB+. Qwen3.5 122B-A10B is deliberately absent: at 61.9 GB of weights it needs 128 GB to leave the
+		// editor and KV cache any room, and its minRamGB was corrected to match.
+		minRamGB: 64,
+		rows: [
+			{ catalogId: 'qwen3-coder-next-gguf', role: 'best' },
+			// ~3B active of 30B total, so decode is bound by a fraction of the weights. This is the tier's real
+			// speed pick; its minRamGB was corrected 32 -> 48 (24.7 GB of weights never fit a 32 GB machine).
+			{ catalogId: 'nemotron-3_5-lightning-30b-a3b-gguf', role: 'fastest' },
+			{ catalogId: 'kat-coder-v2_5-dev-gguf', role: 'coder' },
+			{ catalogId: 'muse-glimmer-30b-gguf', role: 'vision' },
+			{ catalogId: 'ornith-1_0-9b-gguf', role: 'lightweight', appleSiliconInstead: 'ornith-1_0-9b-mlx' },
+			{ catalogId: 'qwen35-0_8b-mtp-gguf', role: 'quick-try' },
+		],
+	},
+	{
+		minRamGB: 32,
+		rows: [
+			{ catalogId: 'qwen36-27b-mtp-gguf', role: 'best' },
+			// ~3B active vs the 27B's dense 27B: several times faster to decode on any bandwidth-bound machine,
+			// which is every Apple Silicon Mac. The biggest single lever on this tier.
+			{ catalogId: 'qwen36-35b-a3b-mtp-gguf', role: 'fastest' },
+			{ catalogId: 'kat-coder-v2_5-dev-gguf', role: 'coder' },
+			{ catalogId: 'muse-glimmer-30b-gguf', role: 'vision' },
+			{ catalogId: 'ornith-1_0-9b-gguf', role: 'lightweight', appleSiliconInstead: 'ornith-1_0-9b-mlx' },
+			{ catalogId: 'qwen35-0_8b-mtp-gguf', role: 'quick-try' },
+		],
+	},
+	{
+		minRamGB: 16,
+		rows: [
+			{ catalogId: 'qwen35-9b-mtp-gguf', role: 'best' },
+			{ catalogId: 'ornith-1_0-9b-gguf', role: 'coder' },
+			{ catalogId: 'gemma4-12b-gguf', role: 'vision' },
+			// ~1B active of 8B total - the fastest thing that is still useful for agent work at this size.
+			{ catalogId: 'lfm2_5-8b-a1b-gguf', role: 'fastest' },
+			{ catalogId: 'qwen35-4b-mtp-gguf', role: 'lightweight', appleSiliconInstead: 'qwen35-4b-mlx' },
+			{ catalogId: 'qwen35-0_8b-mtp-gguf', role: 'quick-try' },
+		],
+	},
+	{
+		// 8 GB. Four rows and no MLX: the tier has no room to run two engines, and a second build of a model
+		// already listed would just be the duplicate-row problem in miniature.
+		//
+		// `best` is the 4B, NOT the larger Gemma 4 E4B, because it has to agree with what
+		// `curatedRecommendedRepoId` badges - two rows both saying "Best for you" is exactly the confusion this
+		// table exists to remove, and the ladder is right on the merits here: 3.9 GB of weights alongside the
+		// editor is not comfortable on an 8 GB machine. Gemma takes the `vision` role instead, which is its
+		// real differentiator at this size.
+		minRamGB: 0,
+		rows: [
+			{ catalogId: 'qwen35-4b-mtp-gguf', role: 'best' },
+			{ catalogId: 'gemma4-e4b-gguf', role: 'vision' },
+			{ catalogId: 'granite-4_1-3b-gguf', role: 'tools' },
+			{ catalogId: 'qwen35-0_8b-mtp-gguf', role: 'quick-try' },
+		],
+	},
+];
+
+/**
+ * The curated rows for this machine: the highest tier whose `minRamGB` the machine meets, with the Apple
+ * Silicon substitutions applied. `ramGB <= 0` (RAM not detected yet) falls back to the 8 GB list, which runs
+ * everywhere - guessing high would seed a small machine models it can never load.
+ */
+export function curatedPickerRows(ramGB: number, isAppleSilicon: boolean): readonly ICuratedPickerRow[] {
+	const tier = CURATED_PICKER_TIERS.find(t => ramGB >= t.minRamGB && t.minRamGB > 0)
+		?? CURATED_PICKER_TIERS[CURATED_PICKER_TIERS.length - 1];
+	return tier.rows.map(r => (isAppleSilicon && r.appleSiliconInstead)
+		? { catalogId: r.appleSiliconInstead, role: r.role }
+		: { catalogId: r.catalogId, role: r.role });
+}
+
+/** Catalog ids curated for this machine. */
+export function curatedPickerCatalogIds(ramGB: number, isAppleSilicon: boolean): ReadonlySet<string> {
+	return new Set(curatedPickerRows(ramGB, isAppleSilicon).map(r => r.catalogId));
+}
+
+/**
+ * Every id curated on ANY tier. Used as the visibility fallback when RAM is unknown, and by tests to assert
+ * that each curated id still resolves to a real catalog entry.
+ */
+export const ALL_CURATED_PICKER_IDS: ReadonlySet<string> = new Set(
+	CURATED_PICKER_TIERS.flatMap(t => t.rows.flatMap(r => r.appleSiliconInstead ? [r.catalogId, r.appleSiliconInstead] : [r.catalogId]))
+);
 
 /**
  * The smallest model we will ever pre-select: a tiny, fast, current-gen build that runs almost anywhere. Used
@@ -1365,8 +1473,19 @@ export function rankRecommendations(budgetBytes: number, profile: IHardwareProfi
 }
 
 /** Whether a catalog entry should be seeded hidden: explicit `defaultHidden` wins, else hidden unless allowlisted. */
-export function catalogDefaultHidden(entry: ICatalogModel): boolean {
-	return entry.defaultHidden ?? !DEFAULT_VISIBLE_CATALOG_IDS.has(entry.catalogId);
+export function catalogDefaultHidden(entry: ICatalogModel, hardware?: { readonly ramGB: number; readonly isAppleSilicon: boolean }): boolean {
+	// A remote entry can still force EITHER state via `defaultHidden`, so an over-the-air addition can be
+	// surfaced (or suppressed) without a build. Everything else is decided by the curated list.
+	if (entry.defaultHidden !== undefined) {
+		return entry.defaultHidden;
+	}
+	// No hardware facts yet (very early startup): fall back to the union of every tier's curated list rather
+	// than guessing a tier. Over-showing here is recoverable - the seed pass re-runs with real RAM - whereas
+	// guessing a tier too high seeds a small machine models it can never load.
+	if (!hardware || !(hardware.ramGB > 0)) {
+		return !ALL_CURATED_PICKER_IDS.has(entry.catalogId);
+	}
+	return !curatedPickerCatalogIds(hardware.ramGB, hardware.isAppleSilicon).has(entry.catalogId);
 }
 
 /**

@@ -18,6 +18,7 @@ import { IWorkbenchContribution } from '../../../common/contributions.js';
 import { ICustomLanguageModelsService, LOCOPILOT_AUTO_MODEL_ID } from '../common/customLanguageModelsService.js';
 import { isAppleSiliconMac } from './locopilotMlxServer.js';
 import { LOCOPILOT_DEFAULT_CATALOG, catalogModelToSeed, catalogDefaultHidden, findCatalogEntry, ICatalogModel, CatalogEngine } from './locopilotModelCatalog.js';
+import { ITimerService } from '../../../services/timer/browser/timerService.js';
 
 /**
  * Optional remote catalog URL. When set, the seeding service fetches an updated catalog (a JSON array of
@@ -59,7 +60,10 @@ export class LoCoPilotCatalogSeedContribution extends Disposable implements IWor
 	private static readonly SEEDED_IDS_KEY = 'locopilot.catalog.seededIds';
 
 	/** One-time flag: re-apply default hidden/visible state to already-seeded catalog models. */
-	private static readonly VISIBILITY_MIGRATION_KEY = 'locopilot.catalog.visibilityMigration.v2';
+	// v3: the default visible set became RAM-aware (see `curatedPickerRows`), so every install has to re-snap
+	// once. Bumping the key is what makes that happen; v2 installs were seeded from a single machine-independent
+	// list that handed 8 GB laptops 45 GB models.
+	private static readonly VISIBILITY_MIGRATION_KEY = 'locopilot.catalog.visibilityMigration.v3';
 
 	/**
 	 * Set once the first seed pass completes, so periodic re-seeds can never be mistaken for a fresh install.
@@ -79,6 +83,7 @@ export class LoCoPilotCatalogSeedContribution extends Disposable implements IWor
 		@INotificationService private readonly notificationService: INotificationService,
 		@ICommandService private readonly commandService: ICommandService,
 		@IProductService private readonly productService: IProductService,
+		@ITimerService private readonly timerService: ITimerService,
 	) {
 		super();
 		// Seed immediately - a fresh install must not show an empty model list while a timer counts down.
@@ -107,6 +112,24 @@ export class LoCoPilotCatalogSeedContribution extends Disposable implements IWor
 		this.storageService.store(LoCoPilotCatalogSeedContribution.SEEDED_IDS_KEY, JSON.stringify([...ids]), StorageScope.APPLICATION, StorageTarget.MACHINE);
 	}
 
+	/**
+	 * Hardware facts the curated visible-set depends on. `totalmem` comes from the startup metrics, which are
+	 * populated well before this contribution runs; a 0 here (metrics not ready) makes `catalogDefaultHidden`
+	 * fall back to the union of every tier rather than guess one.
+	 */
+	private _hardware(): { ramGB: number; isAppleSilicon: boolean } {
+		let ramGB = 0;
+		try {
+			const totalmem = this.timerService.startupMetrics.totalmem;
+			if (typeof totalmem === 'number' && totalmem > 0) {
+				ramGB = totalmem / (1024 * 1024 * 1024);
+			}
+		} catch {
+			// startup metrics not resolved yet - treated as "RAM unknown" above.
+		}
+		return { ramGB, isAppleSilicon: isAppleSiliconMac() };
+	}
+
 	private async _seed(): Promise<void> {
 		if (this._seeding) {
 			return; // a pass is still in flight (slow network); let it finish rather than racing it.
@@ -121,7 +144,8 @@ export class LoCoPilotCatalogSeedContribution extends Disposable implements IWor
 
 	private async _seedOnce(): Promise<void> {
 		const seededIds = this._getSeededIds();
-		const appleSilicon = isAppleSiliconMac();
+		const hardware = this._hardware();
+		const appleSilicon = hardware.isAppleSilicon;
 
 		// Bundled catalog is the always-available baseline; remote entries are merged on top (best-effort).
 		const byId = new Map<string, ICatalogModel>();
@@ -163,7 +187,7 @@ export class LoCoPilotCatalogSeedContribution extends Disposable implements IWor
 				continue;
 			}
 			try {
-				await this.customLanguageModelsService.addCustomModel(catalogModelToSeed(entry));
+				await this.customLanguageModelsService.addCustomModel(catalogModelToSeed(entry, hardware));
 				seeded++;
 				if (remoteIds.has(entry.catalogId)) {
 					newlyFromRemote.push(entry.displayName);
@@ -230,6 +254,7 @@ export class LoCoPilotCatalogSeedContribution extends Disposable implements IWor
 	 * once; after this, the user's Show/Hide choices are respected and never reset again.
 	 */
 	private async _migrateVisibilityOnce(): Promise<void> {
+		const hardware = this._hardware();
 		if (this.storageService.getBoolean(LoCoPilotCatalogSeedContribution.VISIBILITY_MIGRATION_KEY, StorageScope.APPLICATION, false)) {
 			return;
 		}
@@ -238,7 +263,7 @@ export class LoCoPilotCatalogSeedContribution extends Disposable implements IWor
 			if (!entry) {
 				continue; // not a catalog model - leave the user's own models untouched.
 			}
-			const shouldHide = catalogDefaultHidden(entry);
+			const shouldHide = catalogDefaultHidden(entry, hardware);
 			if ((model.hidden ?? false) !== shouldHide) {
 				try {
 					await this.customLanguageModelsService.hideCustomModel(model.id, shouldHide);

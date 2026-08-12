@@ -78,7 +78,7 @@ import {
 	type KvQuantCapability
 } from './locopilotLlamaCppServer.js';
 import { readGgufModelInfo, isMoeModelInfo, isSwaModelInfo, kvBytesPerTokenPerLayer, kvLayerCount, recurrentStateBytes, type IGgufModelInfo } from './locopilotGgufMetadata.js';
-import { MIN_PREFILL_PREFIX_TOKENS, PREFIX_PROBE_A, PREFIX_PROBE_B } from './locopilotPrefixWarmConstants.js';
+import { MIN_PREFILL_PREFIX_TOKENS, PREFIX_CACHE_FORMAT_VERSION, PREFIX_PROBE_A, PREFIX_PROBE_B } from './locopilotPrefixWarmConstants.js';
 import { readMlxModelInfo } from './locopilotMlxMetadata.js';
 import { ILoCoPilotSystemInfoService, type IGpuInfo, type IMemoryStatus, type ISystemHardwareInfo, type MemoryPressureLevel, type PowerSource } from '../../../../platform/locopilotSystemInfo/common/locopilotSystemInfo.js';
 import { dirname } from '../../../../base/common/path.js';
@@ -349,6 +349,12 @@ export interface ILoCoPilotLocalModelRunner {
 	 * this context" - and there the whole restored cache is discarded and the prompt fully re-processed.
 	 */
 	prefillStablePrefix(modelId: string, systemPrompt: string, tools: unknown[] | undefined, token?: CancellationToken): Promise<boolean>;
+	/**
+	 * DIAGNOSTIC (one shot per server instance, foreground turns only). Logs whether the warm prefix is
+	 * actually a prefix of the turn about to be sent, and when it isn't, the decoded text on both sides of
+	 * the divergence. Best-effort and never throws.
+	 */
+	logPrefixDivergence(modelId: string, messages: unknown[], tools: unknown[] | undefined, systemPrompt: string, token?: CancellationToken): Promise<void>;
 	stopServer(modelId: string): void;
 	/**
 	 * Stops every running llama.cpp/MLX server we manage, except an optional one to keep.
@@ -662,6 +668,10 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 	 * pending, which is the overwhelmingly common state - nothing waits.
 	 */
 	private readonly _prefixWarmGates = new Map<string, { promise: Promise<void>; release: () => void }>();
+	/** Cache file each model last restored, so a mismatch found later can delete the right blob. */
+	private readonly _lastRestoredCacheFile = new Map<string, string>();
+	/** Server instances the one-shot prefix diagnostic has already run for. See {@link logPrefixDivergence}. */
+	private readonly _prefixDiagnosedServers = new Set<string>();
 	/**
 	 * KV plan each model's persisted prefix cache on disk was saved under, remembered across sessions.
 	 *
@@ -1218,7 +1228,7 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 	 * blobs are not interchangeable - keeping the names distinct stops one engine ever finding the other's.
 	 */
 	private _mlxPromptCacheFileName(key: string): string {
-		return `${key.replace(/[^a-zA-Z0-9._-]/g, '_').slice(0, 180)}.mlx${MLX_PROMPT_CACHE_EXT}`;
+		return `${key.replace(/[^a-zA-Z0-9._-]/g, '_').slice(0, 180)}.${PREFIX_CACHE_FORMAT_VERSION}.mlx${MLX_PROMPT_CACHE_EXT}`;
 	}
 
 	/** POSTs to one of the helper's endpoints; resolves the parsed body plus status. */
@@ -1238,7 +1248,7 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 		// launched elsewhere, so our record's type may be stale/absent - fall back to the never-restored tag.
 		const foreign = this.runningServers.get(modelId)?.foreign === true;
 		const kvType = (!foreign && this._lastLaunchKvType.get(modelId)) || 'kvunknown';
-		return `${key.replace(/[^a-zA-Z0-9._-]/g, '_').slice(0, 180)}.${kvType}.bin`;
+		return `${key.replace(/[^a-zA-Z0-9._-]/g, '_').slice(0, 180)}.${kvType}.${PREFIX_CACHE_FORMAT_VERSION}.bin`;
 	}
 
 	/** Finds `name` (case-insensitive) under `dir`, descending at most `depth` directory levels. */
@@ -1498,6 +1508,7 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 			const body = await streamToBuffer(res.stream).then(b => b.toString()).catch(() => '');
 			if (status === 200) {
 				this._log(`[LoCoPilot Runner] Restored KV slot cache "${filename}" for ${modelId}.`);
+				this._lastRestoredCacheFile.set(modelId, filename);
 				await this._touchSlotCache(filename);
 				return true;
 			}
@@ -1538,6 +1549,91 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 		} catch (e) {
 			this._log(`[LoCoPilot Runner] MLX prefix prefill failed for ${modelId} (falling back to the chat warm): ${e}`);
 			return false;
+		}
+	}
+
+	/**
+	 * DIAGNOSTIC. Renders the stable warm prefix and the REAL turn's wire body through the same server, then
+	 * reports where their token streams diverge.
+	 *
+	 * Exists because every prefix-cache defect so far was one of these two prompts quietly differing from the
+	 * other, and each was diagnosed backwards from `f_sim`/`f_keep` ratios - which say a mismatch happened but
+	 * never what it was. Runs once per server instance, on the first foreground turn only.
+	 */
+	async logPrefixDivergence(modelId: string, messages: unknown[], tools: unknown[] | undefined, systemPrompt: string, token: CancellationToken = CancellationToken.None): Promise<void> {
+		const running = this.runningServers.get(modelId);
+		const instanceKey = `${modelId}@${running?.startedAt ?? 0}`;
+		if (!running || running.kind !== 'llama' || !running.ready || this._prefixDiagnosedServers.has(instanceKey)) {
+			return;
+		}
+		this._prefixDiagnosedServers.add(instanceKey);
+		const root = getLlamaServerRootUrl(running.port);
+		try {
+			const render = async (body: unknown): Promise<number[]> => {
+				const r = await this._llamaPost(root, '/apply-template', body, token);
+				if (r.status !== 200) {
+					throw new Error(`/apply-template ${r.status}`);
+				}
+				const prompt = JSON.parse(r.body)?.prompt;
+				// Same add_special requirement as the prefill path - and the reason this diagnostic reported a
+				// false "OK" before: tokenizing BOTH sides without BOS made them compare equal while the real
+				// chat endpoint was adding one to only the turn.
+				const t = await this._llamaPost(root, '/tokenize', { content: prompt, add_special: true }, token);
+				if (t.status !== 200) {
+					throw new Error(`/tokenize ${t.status}`);
+				}
+				return JSON.parse(t.body)?.tokens ?? [];
+			};
+			const withTools = (body: Record<string, unknown>) => (tools && tools.length > 0 ? { ...body, tools } : body);
+			// The warm's view: system + a probe user turn, trimmed to the span that doesn't depend on the probe.
+			const [pa, pb] = await Promise.all([
+				render(withTools({ messages: [{ role: 'system', content: systemPrompt }, { role: 'user', content: PREFIX_PROBE_A }] })),
+				render(withTools({ messages: [{ role: 'system', content: systemPrompt }, { role: 'user', content: PREFIX_PROBE_B }] })),
+			]);
+			let stable = 0;
+			while (stable < pa.length && stable < pb.length && pa[stable] === pb[stable]) {
+				stable++;
+			}
+			// The turn's view: exactly what the provider is about to put on the wire.
+			const turnTokens = await render(withTools({ messages }));
+			let shared = 0;
+			while (shared < stable && shared < turnTokens.length && pa[shared] === turnTokens[shared]) {
+				shared++;
+			}
+			if (shared === stable) {
+				this._log(`[LoCoPilot Runner] Prefix diagnostic for ${modelId}: OK - the warm prefix (${stable} tokens) is a clean prefix of the turn (${turnTokens.length} tokens).`);
+				return;
+			}
+			// Decode a window around the divergence from BOTH sides - that is the actual answer.
+			const from = Math.max(0, shared - 12);
+			const detok = async (ids: number[]): Promise<string> => {
+				const r = await this._llamaPost(root, '/detokenize', { tokens: ids }, token);
+				return r.status === 200 ? (JSON.parse(r.body)?.content ?? '') : '<detokenize failed>';
+			};
+			const [warmText, turnText] = await Promise.all([
+				detok(pa.slice(from, shared + 24)),
+				detok(turnTokens.slice(from, shared + 24)),
+			]);
+			this._log(`[LoCoPilot Runner] Prefix diagnostic for ${modelId}: MISMATCH at token ${shared} of ${stable} stable (turn is ${turnTokens.length} tokens).`);
+			this._log(`[LoCoPilot Runner]   warm: ...${JSON.stringify(warmText)}`);
+			this._log(`[LoCoPilot Runner]   turn: ...${JSON.stringify(turnText)}`);
+			// SELF-HEAL. A blob that restores with HTTP 200 but doesn't match is worse than no blob: the warm
+			// path treats the restore as a hit and returns early, so nothing ever re-prefills and nothing ever
+			// overwrites it - the bad cache is permanent. Exactly what stranded gemma on a BOS-less v1 blob.
+			// Deleting it here makes the next start take the cold path and write a correct one.
+			const staleFile = this._lastRestoredCacheFile.get(modelId);
+			if (staleFile) {
+				try {
+					await this.fileService.del(joinPath(this._kvCacheDir(), staleFile));
+					this._slotCacheUsage.delete(staleFile);
+					this._lastRestoredCacheFile.delete(modelId);
+					this._log(`[LoCoPilot Runner]   dropped the mismatching cache "${staleFile}"; the next start will re-warm.`);
+				} catch (e) {
+					this._log(`[LoCoPilot Runner]   could not drop the mismatching cache "${staleFile}" (ignored): ${e}`);
+				}
+			}
+		} catch (e) {
+			this._log(`[LoCoPilot Runner] Prefix diagnostic failed for ${modelId} (ignored): ${e}`);
 		}
 	}
 
@@ -1588,7 +1684,12 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 				return prompt;
 			};
 			const tokenize = async (content: string): Promise<number[]> => {
-				const res = await this._llamaPost(root, '/tokenize', { content }, token);
+				// add_special is REQUIRED, not a detail: /tokenize omits BOS by default, but the chat endpoint
+				// adds it when it tokenizes the same rendered prompt. Without this the prefilled cache is
+				// offset by one token from position 0, so it shares NO prefix with the real turn and llama.cpp
+				// falls back to picking the slot by LRU and re-processes everything. Invisible on Qwen-family
+				// templates (no BOS) and fatal on gemma/Muse/Nemotron - which is exactly the split we measured.
+				const res = await this._llamaPost(root, '/tokenize', { content, add_special: true }, token);
 				if (res.status !== 200) {
 					throw new Error(`/tokenize returned ${res.status}: ${res.body.slice(0, 200)}`);
 				}
