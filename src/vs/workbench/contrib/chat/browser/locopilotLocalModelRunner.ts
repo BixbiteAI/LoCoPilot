@@ -312,12 +312,12 @@ export interface ILoCoPilotLocalModelRunner {
 	 */
 	whenModelIdle(modelId: string, token?: CancellationToken): Promise<boolean>;
 	/**
-	 * True when the model's server was launched with a draft/MTP speculative context, which makes prefix
-	 * warming pointless: `/slots` save+restore only covers the MAIN KV, so the blob is neither persisted nor
-	 * restorable, and the warm therefore cannot survive a restart. In-session it buys nothing either - the
-	 * user's own first turn fills the slot just as well - so a warm here is pure competition for the machine.
+	 * True when the model's server was launched with a draft context that makes the persisted prefix cache
+	 * useless, so the warm would only compete with the user for the machine. MTP launches are NOT included -
+	 * see {@link ILocopilotLocalModelRunner.restoreSlotCache} for why a restored MAIN-KV blob is still usable
+	 * (and still correct) under multi-token prediction.
 	 */
-	usesDraftContext(modelId: string): boolean;
+	blocksPrefixCache(modelId: string): boolean;
 	/**
 	 * Marks a foreground request as active so idle-unload cannot stop its server mid-stream. Calls must be
 	 * balanced with {@link endModelRequest}, normally from a `finally` block.
@@ -568,11 +568,9 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 	/**
 	 * Model ids whose LAST launch created a real SECOND (draft) KV context - `--model-draft` or an MTP/next-n
 	 * `--spec-type draft-*`. llama.cpp's /slots save+restore only captures the MAIN context, so a restored blob
-	 * leaves the draft context uninitialized and the server re-processes the whole prompt anyway ("lack of cache
-	 * data"). Worse, the restore returns 200, which makes the warm trigger think the prefix is ready and skip the
-	 * in-session warm that DOES work for these models. So slot save/restore is disabled for them (see
-	 * saveSlotCache/restoreSlotCache) and they always warm in-session. n-gram speculation (ngram-mod/-cache) has
-	 * no separate KV context, so it is NOT included here - its slot caches restore fine.
+	 * leaves the draft context uninitialized. Whether that matters depends on the draft flavour, so the actual
+	 * prefix-cache decision lives in {@link _draftContextBlocksPrefixCache} rather than in this set. n-gram
+	 * speculation (ngram-mod/-cache) has no separate KV context, so it is NOT included here.
 	 */
 	private readonly _launchedWithDraftContext = new Set<string>();
 	/**
@@ -1467,6 +1465,26 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 		return undefined;
 	}
 
+	/**
+	 * True when the draft context this model launched with makes the on-disk prefix cache pointless.
+	 *
+	 * MTP is deliberately NOT blocked. `/slots?action=save|restore` covers `ctx_tgt` only (llama.cpp b10375,
+	 * tools/server/server-context.cpp), so a restore leaves the MTP head's KV empty - but nothing in the
+	 * prompt-reuse path consults it either: the full-reprocess guard reads `pos_min` from the TARGET memory
+	 * alone, and the MTP driver's only reaction to a cold draft cache is a "Drafts may degrade" warning
+	 * (common/speculative.cpp, `common_speculative_impl_draft_mtp::begin`). Correctness is unaffected because
+	 * every drafted token is verified against the target; the cost is a lower acceptance rate on the first
+	 * turn, recovering as the draft KV refills from n_past forward. That risks at most the MTP speedup (~13%
+	 * of decode on Metal) to avoid a 90-126s full prefill on every launch of a 27B - worth taking.
+	 *
+	 * A separate draft MODEL (`--model-draft`) stays blocked: same mechanism by inspection (`draft-simple`
+	 * mirrors the target's batches and its `begin` is a no-op), but it hasn't been measured, and unlike MTP
+	 * it also holds a second set of weights whose value we would be degrading.
+	 */
+	private _draftContextBlocksPrefixCache(modelId: string): boolean {
+		return this._launchedWithDraftContext.has(modelId) && !this._launchedWithMtp.has(modelId);
+	}
+
 	async restoreSlotCache(modelId: string, key: string, token: CancellationToken = CancellationToken.None): Promise<boolean> {
 		// llama.cpp exposes /slots natively; MLX gets the equivalent from the bootstrap helper. Unmanaged
 		// endpoints (localhost/ollama) have neither.
@@ -1478,12 +1496,8 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 		if (running.kind === 'mlx') {
 			return this._restoreMlxPromptCache(modelId, key, running.port, token);
 		}
-		// Draft-context models (MTP / separate draft): /slots restore only reloads the MAIN KV, so the restored
-		// prefix is NOT reusable (the server re-prefills the whole prompt with "lack of cache data") - yet the
-		// restore returns 200. Returning false here makes the warm trigger fall through to the in-session warm,
-		// which builds a genuinely reusable prefix for these models. See _launchedWithDraftContext.
-		if (this._launchedWithDraftContext.has(modelId)) {
-			this._log(`[LoCoPilot Runner] KV slot restore skipped for ${modelId}: draft/MTP context - restored slots aren't reusable, warming in-session instead.`);
+		if (this._draftContextBlocksPrefixCache(modelId)) {
+			this._log(`[LoCoPilot Runner] KV slot restore skipped for ${modelId}: separate draft model - restored slots aren't reusable, warming in-session instead.`);
 			return false;
 		}
 		const filename = this._slotCacheFileName(modelId, key);
@@ -1755,10 +1769,9 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 		if (running.kind === 'mlx') {
 			return this._saveMlxPromptCache(modelId, key, running.port, token);
 		}
-		// Don't persist slot caches for draft-context models: their restored blobs aren't reusable (see
-		// restoreSlotCache / _launchedWithDraftContext), so writing them only burns disk (these are the
-		// hundreds-of-MB files) for a cache that would never be restored usefully.
-		if (this._launchedWithDraftContext.has(modelId)) {
+		// Don't persist slot caches whose restore would be refused anyway (see _draftContextBlocksPrefixCache):
+		// writing them only burns disk (these are the hundreds-of-MB files) for a cache never usefully restored.
+		if (this._draftContextBlocksPrefixCache(modelId)) {
 			return;
 		}
 		if (!await this._ensureKvCacheDir()) {
@@ -5514,8 +5527,8 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 			this._launchedWithSpecFlags.delete(modelId);
 		}
 		// Track whether this launch stood up a real DRAFT KV context (separate draft model, or an MTP/next-n
-		// speculative head). Those make /slots save+restore ineffective (see _launchedWithDraftContext), so the
-		// prewarm must warm in-session rather than trust a restored blob. n-gram speculation has no such context.
+		// speculative head), which /slots save+restore does not cover - see _draftContextBlocksPrefixCache for
+		// which of those still get a persisted prefix. n-gram speculation has no such context.
 		const specTypeIdx = args.indexOf('--spec-type');
 		const specTypeVal = specTypeIdx >= 0 ? args[specTypeIdx + 1] : undefined;
 		if (args.includes('--model-draft') || specTypeVal?.startsWith('draft')) {
@@ -5753,8 +5766,8 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 	 * but first frees memory by evicting the least-recently-used server when the resident-model budget is
 	 * reached, then waits until the server's OpenAI endpoint actually responds so the caller can send immediately.
 	 */
-	usesDraftContext(modelId: string): boolean {
-		return this._launchedWithDraftContext.has(modelId);
+	blocksPrefixCache(modelId: string): boolean {
+		return this._draftContextBlocksPrefixCache(modelId);
 	}
 
 	async whenModelIdle(modelId: string, token: CancellationToken = CancellationToken.None): Promise<boolean> {

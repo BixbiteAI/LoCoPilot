@@ -1349,12 +1349,12 @@ export class LoCoPilotBuiltInAgent extends Disposable implements IChatAgentImple
 		if (this.localModelRunner.getServerPhase(modelId) !== 'ready') {
 			return;
 		}
-		// Draft/MTP models are excluded outright. Their slot blob can be neither saved nor restored (the
-		// speculative context makes /slots cover only the main KV), so a warm here can never pay off across a
-		// restart - and every restart triggered another full prefill of the same thousands of tokens, competing
-		// with the user for the machine. In-session the user's own first turn fills the slot just as well.
-		if (this.localModelRunner.usesDraftContext(modelId)) {
-			this._log(`[LoCoPilot] Prefix warm skipped for ${modelId}: draft/MTP context cannot persist or restore a prefix cache.`);
+		// Models whose draft context makes the blob unrestorable are excluded outright: a warm there can never
+		// pay off across a restart, and every restart triggered another full prefill of the same thousands of
+		// tokens, competing with the user for the machine. In-session the user's own first turn fills the slot
+		// just as well. MTP is no longer excluded - see the runner's _draftContextBlocksPrefixCache.
+		if (this.localModelRunner.blocksPrefixCache(modelId)) {
+			this._log(`[LoCoPilot] Prefix warm skipped for ${modelId}: its draft context cannot persist or restore a prefix cache.`);
 			return;
 		}
 		// Claim SYNCHRONOUSLY (before the async work) so concurrent callers - the other five agent instances,
