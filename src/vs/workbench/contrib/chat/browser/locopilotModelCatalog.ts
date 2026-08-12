@@ -671,6 +671,43 @@ export const LOCOPILOT_DEFAULT_CATALOG: readonly ICatalogModel[] = [
 		defaultHidden: true,
 	},
 
+	// ---- Nemotron 3.5 Lightning (NVIDIA), Aug 2026 - successor to Nemotron 3 Nano 30B ----
+	// Same `nemotron_h` / NemotronHForCausalLM architecture as the Nano-Omni entry above, so llama.cpp needs
+	// no new support - and ggml-org publishes GGUFs for it themselves, which is about as strong a signal of
+	// engine compatibility as a repo listing gets.
+	//
+	// BARTOWSKI, not the ggml-org or unsloth repo: unsloth has not published this model at all yet, and
+	// ggml-org ships only four files (BF16 / NVFP4 / Q4_K_M / Q8_0, 22-66 GB) which leaves the hardware-aware
+	// quant sizing nothing to choose between. Bartowski carries the full imatrix ladder (IQ2_XXS 18.1 GB
+	// through Q8_0 33.6 GB) in standard `-Q4_K_M.gguf` naming the picker already ranks.
+	//
+	// NOTE the flat ladder: every 2-bit and 3-bit quant lands within ~1.5 GB of the others (18.1-19.7 GB),
+	// because the MoE expert tensors dominate and quantize alike. Downgrading buys far less headroom here
+	// than on a dense model, so a machine that cannot hold Q4_K_M is unlikely to be rescued by a lower rung.
+	//
+	// contextWindow is the checkpoint's `max_position_embeddings` (262144), NOT the 1M figure in NVIDIA's
+	// launch coverage - reaching 1M needs rope scaling we do not configure.
+	//
+	// UNVERIFIED AT RUNTIME: this is a hybrid SSM (config carries `chunk_size`/`conv_kernel`/`expand`, i.e.
+	// Mamba-style state layers next to attention) and the runner passes `--cache-type-k/v q8_0`
+	// unconditionally. The Nano-Omni entry above shares the architecture, so this is not a NEW risk - but
+	// neither has been confirmed to launch with quantized KV. Seeded hidden until someone runs it.
+	{
+		catalogId: 'nemotron-3_5-lightning-30b-a3b-gguf',
+		displayName: 'Nemotron 3.5 Lightning 30B-A3B',
+		vendor: 'NVIDIA',
+		blurb: 'Fast agentic MoE: 30B total, ~3B active. Long context. 32 GB+ recommended.',
+		repoId: 'bartowski/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-GGUF',
+		supportsVision: false,
+		format: 'Q4_K_M',
+		engine: 'gguf',
+		approxSizeBytes: 24725740480,
+		minRamGB: 32,
+		tier: '32 GB+',
+		contextWindow: 262144,
+		defaultHidden: true,
+	},
+
 	// ---- GLM-4.7-Flash (Zhipu) - ~30B MoE / ~3.6B active; strong coding, fast ----
 	{
 		catalogId: 'glm-4_7-flash-gguf',

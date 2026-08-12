@@ -1409,19 +1409,24 @@ export class LoCoPilotBuiltInAgent extends Disposable implements IChatAgentImple
 					return; // finally below releases the gate; the waiting turn proceeds against a hot prefix
 				}
 
-				// COLD path: there was nothing to restore, so warming means paying a full prefill. Stop holding
-				// the user's turn for it. Waiting is only ever worth it for a restore, which is a fast disk read
-				// that can only save time; making a turn queue behind a cold prefill risks paying for TWO - the
-				// warm's and its own - whenever the warmed prefix doesn't match what that turn actually sends.
-				// Released here rather than in the finally so the turn goes now, while the warm continues below
-				// and still leaves a blob on disk for the NEXT session to restore.
-				releaseWarmGateOnce();
-
-				// ...and wait for the model to go quiet before spending a full prefill on it. The cold warm's
-				// only product is a blob for the NEXT session; the turn happening now gains nothing from it.
-				// Since llama.cpp serves a single slot, going first doesn't just fail to help - the user's
-				// message queues behind it inside the server and the machine pays two full prefills instead
-				// of one. Waiting costs nothing: the blob is just as useful written a minute later.
+				// COLD path: nothing to restore, so we prefill - and the gate stays HELD across both the
+				// prefill and the save below. Letting the turn through here is what produced the two defects
+				// measured on gemma-26B and Nemotron:
+				//
+				//  1. The turn arrived microseconds after the prefill (both engines serve a single slot), so it
+				//     queued behind it and re-processed the whole prompt - two full prefills where one would do.
+				//  2. Worse, the save is itself a queued server task, so it ran AFTER that turn and persisted
+				//     the TURN's slot (7895 tokens) instead of our prefix (7874). The blob then carried a user
+				//     message, so on the next start it was no longer a prefix - f_keep 0.997 - and models that
+				//     cannot shift KV cells threw the whole restore away.
+				//
+				// Holding costs the turn nothing it wasn't already going to pay: it waits one prefill, then runs
+				// against a hot prefix instead of prefilling itself. Qwen3.6-35B, whose turn happened to arrive
+				// 30s later, is what this looks like when it goes right - f_keep 1.000 and an 8-token turn.
+				//
+				// Still wait for quiet first: a warm triggered mid-session (mode switch) must not prefill while
+				// a turn is genuinely in flight. A turn blocked on the gate has NOT yet called beginModelRequest
+				// - that happens after ensureServerForModel returns - so this cannot deadlock against its own gate.
 				if (!await this.localModelRunner.whenModelIdle(modelId, CancellationToken.None)) {
 					this._log(`[LoCoPilot] Prefix warm for ${modelId} abandoned: the model never went idle.`);
 					return;
