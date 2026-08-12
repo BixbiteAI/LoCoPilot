@@ -681,36 +681,44 @@ export const LOCOPILOT_DEFAULT_CATALOG: readonly ICatalogModel[] = [
 	// no new support - and ggml-org publishes GGUFs for it themselves, which is about as strong a signal of
 	// engine compatibility as a repo listing gets.
 	//
-	// BARTOWSKI, not the ggml-org or unsloth repo: unsloth has not published this model at all yet, and
-	// ggml-org ships only four files (BF16 / NVFP4 / Q4_K_M / Q8_0, 22-66 GB) which leaves the hardware-aware
-	// quant sizing nothing to choose between. Bartowski carries the full imatrix ladder (IQ2_XXS 18.1 GB
-	// through Q8_0 33.6 GB) in standard `-Q4_K_M.gguf` naming the picker already ranks.
+	// UNSLOTH as of 2026-08-12 (the repo landed that day; the entry previously pointed at bartowski because
+	// unsloth had not published this model at all). Unsloth carries the deeper ladder AND its UD "dynamic"
+	// quants hold up far better at 3-bit, which matters more here than usual - see the flat-ladder note below.
+	// ggml-org's own repo stays unused: four files (BF16 / NVFP4 / Q4_K_M / Q8_0) give the hardware-aware
+	// quant picker nothing to choose between.
 	//
-	// NOTE the flat ladder: every 2-bit and 3-bit quant lands within ~1.5 GB of the others (18.1-19.7 GB),
-	// because the MoE expert tensors dominate and quantize alike. Downgrading buys far less headroom here
-	// than on a dense model, so a machine that cannot hold Q4_K_M is unlikely to be rescued by a lower rung.
+	// NOTE the flat ladder: the 1-3 bit rungs all land within ~1.8 GB of each other (UD-IQ1_M through
+	// UD-IQ3_XXS are 19.4-19.8 GB) because the MoE expert tensors dominate and quantize alike. The step that
+	// actually matters on a 32 GB machine is Q4_K_M 25.3 -> UD-Q3_K_XL / UD-IQ4_NL 21.2 GB, which
+	// `planGgufDownload` takes automatically and which lands this model at the same weights-to-RAM ratio as
+	// Qwen3.6 35B-A3B. Below that rung there is nothing left to win, so do NOT read the deep ladder as
+	// headroom for a 16 GB machine.
+	//
+	// `approxSizeBytes` is the Q4_K_M reference, consistent with every other entry - it is NOT what a 32 GB
+	// machine downloads. minRamGB is 32 on the strength of that step-down, not of the number below it.
 	//
 	// contextWindow is the checkpoint's `max_position_embeddings` (262144), NOT the 1M figure in NVIDIA's
 	// launch coverage - reaching 1M needs rope scaling we do not configure.
 	//
 	// UNVERIFIED AT RUNTIME: this is a hybrid SSM (config carries `chunk_size`/`conv_kernel`/`expand`, i.e.
 	// Mamba-style state layers next to attention) and the runner passes `--cache-type-k/v q8_0`
-	// unconditionally. The Nano-Omni entry above shares the architecture, so this is not a NEW risk - but
-	// neither has been confirmed to launch with quantized KV. Seeded hidden until someone runs it.
+	// unconditionally. The Nano-Omni entry above shares the architecture, so this is not a NEW risk. It is no
+	// longer seeded hidden on that basis: a launch that refuses quantized KV is recorded per-model in the
+	// runner's persisted `_kvQuantCapability` map and the relaunch drops to f16 automatically, so the failure
+	// mode is one slow first start, not a dead entry. Still worth being the first thing checked in-app.
 	{
 		catalogId: 'nemotron-3_5-lightning-30b-a3b-gguf',
 		displayName: 'Nemotron 3.5 Lightning 30B-A3B',
 		vendor: 'NVIDIA',
 		blurb: 'Fast agentic MoE: 30B total, ~3B active. Long context. 32 GB+ recommended.',
-		repoId: 'bartowski/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-GGUF',
+		repoId: 'unsloth/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-GGUF',
 		supportsVision: false,
 		format: 'Q4_K_M',
 		engine: 'gguf',
-		approxSizeBytes: 24725740480,
-		minRamGB: 48,
+		approxSizeBytes: 25270000000,
+		minRamGB: 32,
 		tier: '32 GB+',
 		contextWindow: 262144,
-		defaultHidden: true,
 	},
 
 	// ---- GLM-4.7-Flash (Zhipu) - ~30B MoE / ~3.6B active; strong coding, fast ----
@@ -1153,7 +1161,7 @@ export function catalogModelToSeed(entry: ICatalogModel, hardware?: { readonly r
  * actually has ("what should I use?", "what's fastest?", "what's best at code?") instead of listing every
  * model we know about. Roles are also the row's subtitle in the picker.
  */
-export type CuratedPickerRole = 'best' | 'fastest' | 'coder' | 'vision' | 'lightweight' | 'quick-try' | 'tools';
+export type CuratedPickerRole = 'best' | 'fastest' | 'coder' | 'vision' | 'lightweight' | 'quick-try' | 'tools' | 'agentic';
 
 /** Human label for a curated row's role, shown as the row subtitle. Two or three words - see the tooltip. */
 export const CURATED_ROLE_LABEL: Readonly<Record<CuratedPickerRole, string>> = {
@@ -1164,6 +1172,7 @@ export const CURATED_ROLE_LABEL: Readonly<Record<CuratedPickerRole, string>> = {
 	'lightweight': 'Lightweight',
 	'quick-try': 'Quick try',
 	'tools': 'Tool calling',
+	'agentic': 'Agentic work',
 };
 
 /**
@@ -1178,6 +1187,7 @@ export const CURATED_ROLE_TOOLTIP: Readonly<Record<CuratedPickerRole, string>> =
 	'lightweight': 'Small and quick - good for inline edits and short questions.',
 	'quick-try': 'Tiny download, so you can see it working in seconds.',
 	'tools': 'Strong at tool calling and structured output.',
+	'agentic': 'Tuned for long multi-step tool use, and fast with it.',
 };
 
 export interface ICuratedPickerRow {
@@ -1213,9 +1223,9 @@ const CURATED_PICKER_TIERS: readonly { readonly minRamGB: number; readonly rows:
 		minRamGB: 64,
 		rows: [
 			{ catalogId: 'qwen3-coder-next-gguf', role: 'best' },
-			// ~3B active of 30B total, so decode is bound by a fraction of the weights. This is the tier's real
-			// speed pick; its minRamGB was corrected 32 -> 48 (24.7 GB of weights never fit a 32 GB machine).
-			{ catalogId: 'nemotron-3_5-lightning-30b-a3b-gguf', role: 'fastest' },
+			// ~3B active of 35B total: decode is bound by a fraction of the weights, so this stays the speed
+			// pick even on a machine that could hold the 45 GB dense flagship.
+			{ catalogId: 'qwen36-35b-a3b-mtp-gguf', role: 'fastest' },
 			{ catalogId: 'kat-coder-v2_5-dev-gguf', role: 'coder' },
 			{ catalogId: 'muse-glimmer-30b-gguf', role: 'vision' },
 			{ catalogId: 'ornith-1_0-9b-gguf', role: 'lightweight', appleSiliconInstead: 'ornith-1_0-9b-mlx' },
@@ -1231,6 +1241,11 @@ const CURATED_PICKER_TIERS: readonly { readonly minRamGB: number; readonly rows:
 			{ catalogId: 'qwen36-35b-a3b-mtp-gguf', role: 'fastest' },
 			{ catalogId: 'kat-coder-v2_5-dev-gguf', role: 'coder' },
 			{ catalogId: 'muse-glimmer-30b-gguf', role: 'vision' },
+			// NVIDIA's agentic MoE, also ~3B active. It sits NEXT TO the Qwen MoE rather than replacing it as
+			// `fastest`: the two are the same speed class and differ on tuning, not architecture, and this is
+			// the tier where a second vendor earns a row. On 32 GB it downloads at UD-Q3_K_XL / UD-IQ4_NL
+			// (~21 GB), not the Q4_K_M its approxSizeBytes quotes - see the entry's own note.
+			{ catalogId: 'nemotron-3_5-lightning-30b-a3b-gguf', role: 'agentic' },
 			{ catalogId: 'ornith-1_0-9b-gguf', role: 'lightweight', appleSiliconInstead: 'ornith-1_0-9b-mlx' },
 			{ catalogId: 'qwen35-0_8b-mtp-gguf', role: 'quick-try' },
 		],
