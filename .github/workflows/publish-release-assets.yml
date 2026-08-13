@@ -1,0 +1,133 @@
+# Manually attach already-built CI artifacts to a release.
+#
+# Run this AFTER you have built and tested the platform workflows. It finds the most
+# recent successful run of each release workflow, downloads its artifacts inside
+# GitHub's network, and uploads them to the release you name. Nothing is built here.
+#
+# macOS .dmg files are NOT covered: they are signed and notarized locally, so upload
+# those two by hand (or with `gh release upload`) from your Mac.
+name: Publish release assets
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag to upload into (blank = current latest release)'
+        required: false
+        default: ''
+      commit:
+        description: 'Only use runs at this commit SHA (blank = newest successful run per workflow)'
+        required: false
+        default: ''
+      dry_run:
+        description: 'List what would be uploaded, upload nothing'
+        type: boolean
+        required: false
+        default: false
+
+permissions:
+  contents: write
+
+jobs:
+  publish:
+    name: Attach CI artifacts to release
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      GH_REPO: ${{ github.repository }}
+
+    steps:
+      - name: Resolve target release
+        id: target
+        run: |
+          set -euo pipefail
+          TAG='${{ inputs.tag }}'
+          if [ -z "$TAG" ]; then
+            TAG=$(gh release view --json tagName --jq .tagName)
+            echo "No tag given; using current latest release: $TAG"
+          fi
+          # Fail early if the release does not exist, rather than after downloading GBs.
+          gh release view "$TAG" --json tagName,isDraft,isPrerelease \
+            --jq '"target: \(.tagName)  draft: \(.isDraft)  prerelease: \(.isPrerelease)"'
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
+      - name: Collect artifacts from latest successful runs
+        id: collect
+        run: |
+          set -euo pipefail
+          SHA='${{ inputs.commit }}'
+          mkdir -p staging
+
+          for WF in release-linux-x64.yml release-linux-arm64.yml \
+                    release-windows-x64.yml release-windows-arm64.yml; do
+            RUN=$(gh run list --workflow "$WF" --status success --limit 30 \
+                    --json databaseId,headSha,createdAt \
+                    --jq "[.[] | select(\"$SHA\" == \"\" or (.headSha | startswith(\"$SHA\")))] \
+                          | sort_by(.createdAt) | reverse | .[0].databaseId // empty")
+
+            if [ -z "$RUN" ]; then
+              echo "::error::No successful run found for $WF${SHA:+ at commit $SHA}"
+              exit 1
+            fi
+
+            RUN_SHA=$(gh run view "$RUN" --json headSha --jq '.headSha[0:8]')
+            echo "$WF -> run $RUN (commit $RUN_SHA)"
+            gh run download "$RUN" -D "staging/$WF"
+          done
+
+          # Artifacts arrive as staging/<workflow>/<artifact-name>/<file>; flatten them.
+          mkdir -p dist
+          find staging -type f -exec mv -n {} dist/ \;
+
+          echo "--- files to upload ---"
+          ls -la dist/
+          COUNT=$(find dist -type f | wc -l | tr -d ' ')
+          echo "count=$COUNT" >> "$GITHUB_OUTPUT"
+          if [ "$COUNT" -eq 0 ]; then
+            echo "::error::No files were collected"
+            exit 1
+          fi
+
+      - name: Verify filenames are the canonical set
+        run: |
+          set -euo pipefail
+          EXPECTED="LoCoPilot-linux-x64.deb LoCoPilot-linux-x64.rpm LoCoPilot-linux-x64.tar.gz
+                    LoCoPilot-linux-arm64.deb LoCoPilot-linux-arm64.rpm LoCoPilot-linux-arm64.tar.gz
+                    LoCoPilotUserSetup-x64.exe LoCoPilotSystemSetup-x64.exe
+                    LoCoPilotUserSetup-arm64.exe LoCoPilotSystemSetup-arm64.exe"
+          MISSING=0
+          for f in $EXPECTED; do
+            if [ ! -f "dist/$f" ]; then
+              echo "::warning::missing expected file: $f"
+              MISSING=1
+            fi
+          done
+          # A rename would silently break locopilot.bixbite.ai, which builds download
+          # URLs from these exact names — warn loudly but let the operator decide.
+          if [ "$MISSING" -eq 1 ]; then
+            echo "::warning::Some canonical filenames are absent; website download links may 404."
+          fi
+
+      - name: Upload to release
+        if: ${{ !inputs.dry_run }}
+        run: |
+          set -euo pipefail
+          gh release upload '${{ steps.target.outputs.tag }}' dist/* --clobber
+          echo "Uploaded ${{ steps.collect.outputs.count }} files to ${{ steps.target.outputs.tag }}"
+
+      - name: Dry run notice
+        if: ${{ inputs.dry_run }}
+        run: echo "Dry run — nothing uploaded to ${{ steps.target.outputs.tag }}"
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "### Publish release assets"
+            echo ""
+            echo "- Release: \`${{ steps.target.outputs.tag }}\`"
+            echo "- Files collected: ${{ steps.collect.outputs.count }}"
+            echo "- Dry run: ${{ inputs.dry_run }}"
+            echo ""
+            echo "macOS .dmg files are signed locally and must be uploaded separately."
+          } >> "$GITHUB_STEP_SUMMARY"
