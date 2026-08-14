@@ -98,6 +98,21 @@ export interface ICatalogModel {
 	readonly draftRepoId?: string;
 	/** Download format for the draft (GGUF quant like 'Q8_0', or 'mlx'). Must match the draft repo's contents. */
 	readonly draftFormat?: string;
+	/**
+	 * What this model is FOR, shown as its subtitle in the chat picker when it is not one of the curated rows
+	 * for the current machine - i.e. when the user has surfaced it from the hidden list, or when it is curated
+	 * on some other RAM tier but not this one. Without it such a row falls back to "Local", which is near-zero
+	 * information: every catalog model is local, so the subtitle told the user nothing about why to pick it.
+	 *
+	 * {@link CURATED_PICKER_TIERS} still WINS wherever it has an opinion - that table stays the source of truth
+	 * for the curated set, and this is only the fallback underneath it.
+	 *
+	 * `'best'` is deliberately EXCLUDED at the type level, not by convention. "Best for you" is a
+	 * recommendation, and exactly one row may claim it (the curated `best` row, cross-checked against
+	 * {@link CURATED_RECOMMENDATION_LADDER} by a test). Every other role is descriptive - several models really
+	 * can be coders or vision models at once - so those are free to repeat across rows.
+	 */
+	readonly role?: Exclude<CuratedPickerRole, 'best'>;
 }
 
 const GB = 1024 * 1024 * 1024;
@@ -139,6 +154,7 @@ export const LOCOPILOT_DEFAULT_CATALOG: readonly ICatalogModel[] = [
 		approxSizeBytes: Math.round(2.44 * GB),
 		minRamGB: 8,
 		tier: '8 GB',
+		role: 'lightweight',
 		contextWindow: 131072,
 	},
 	{
@@ -153,6 +169,7 @@ export const LOCOPILOT_DEFAULT_CATALOG: readonly ICatalogModel[] = [
 		approxSizeBytes: Math.round(3.93 * GB),
 		minRamGB: 8,
 		tier: '8 GB',
+		role: 'vision',
 		contextWindow: 131072,
 	},
 	// RESOLVED 2026-07: Gemma 4 E4B now HAS an MLX twin (`gemma4-e4b-mlx`, at the bottom of this file).
@@ -171,6 +188,7 @@ export const LOCOPILOT_DEFAULT_CATALOG: readonly ICatalogModel[] = [
 		approxSizeBytes: Math.round(6.26 * GB),
 		minRamGB: 16,
 		tier: '16 GB',
+		role: 'vision',
 		contextWindow: 262144,
 	},
 	{
@@ -185,6 +203,7 @@ export const LOCOPILOT_DEFAULT_CATALOG: readonly ICatalogModel[] = [
 		approxSizeBytes: Math.round(13.27 * GB),
 		minRamGB: 32,
 		tier: '32 GB+',
+		role: 'fastest',
 		contextWindow: 262144,
 	},
 	{
@@ -199,6 +218,7 @@ export const LOCOPILOT_DEFAULT_CATALOG: readonly ICatalogModel[] = [
 		approxSizeBytes: Math.round(16.1 * GB),
 		minRamGB: 32,
 		tier: '32 GB+',
+		role: 'vision',
 		contextWindow: 262144,
 	},
 
@@ -215,6 +235,7 @@ export const LOCOPILOT_DEFAULT_CATALOG: readonly ICatalogModel[] = [
 		approxSizeBytes: Math.round(16 * GB),
 		minRamGB: 32,
 		tier: '32 GB+',
+		role: 'coder',
 		contextWindow: 262144,
 	},
 	// RESOLVED 2026-07: Qwen3.6 27B now HAS an MLX twin (`qwen36-27b-mlx`, at the bottom of this file),
@@ -232,6 +253,7 @@ export const LOCOPILOT_DEFAULT_CATALOG: readonly ICatalogModel[] = [
 		approxSizeBytes: Math.round(20 * GB),
 		minRamGB: 32,
 		tier: '32 GB+',
+		role: 'fastest',
 		contextWindow: 262144,
 	},
 	// RESOLVED 2026-07: Qwen3.6 35B-A3B now HAS an MLX twin (`qwen36-35b-a3b-mlx`, bottom of this file).
@@ -263,6 +285,7 @@ export const LOCOPILOT_DEFAULT_CATALOG: readonly ICatalogModel[] = [
 		approxSizeBytes: 15878222368,
 		minRamGB: 32,
 		tier: '32 GB+',
+		role: 'vision',
 		// 131072 from the checkpoint's text_config.max_position_embeddings. The architecture is unusually cheap
 		// to run long: 2 KV heads (GQA) over 52 layers, plus `sliding_window: 2048`, so the windowed-KV clamp
 		// should reach the full window on far less RAM than a 30B normally implies.
@@ -288,6 +311,7 @@ export const LOCOPILOT_DEFAULT_CATALOG: readonly ICatalogModel[] = [
 		approxSizeBytes: Math.round(0.6 * GB),
 		minRamGB: 8,
 		tier: '8 GB',
+		role: 'quick-try',
 		mtp: true,
 		contextWindow: 262144,
 	},
@@ -303,6 +327,7 @@ export const LOCOPILOT_DEFAULT_CATALOG: readonly ICatalogModel[] = [
 		approxSizeBytes: Math.round(1.5 * GB),
 		minRamGB: 8,
 		tier: '8 GB',
+		role: 'lightweight',
 		mtp: true,
 		contextWindow: 262144,
 	},
@@ -318,6 +343,7 @@ export const LOCOPILOT_DEFAULT_CATALOG: readonly ICatalogModel[] = [
 		approxSizeBytes: Math.round(2.5 * GB),
 		minRamGB: 8,
 		tier: '8 GB',
+		role: 'lightweight',
 		mtp: true,
 		contextWindow: 262144,
 	},
@@ -333,6 +359,7 @@ export const LOCOPILOT_DEFAULT_CATALOG: readonly ICatalogModel[] = [
 		approxSizeBytes: Math.round(5.5 * GB),
 		minRamGB: 16,
 		tier: '16 GB',
+		role: 'lightweight',
 		mtp: true,
 		contextWindow: 262144,
 	},
@@ -353,6 +380,7 @@ export const LOCOPILOT_DEFAULT_CATALOG: readonly ICatalogModel[] = [
 		approxSizeBytes: Math.round(16 * GB),
 		minRamGB: 32,
 		tier: '32 GB+',
+		role: 'fastest',
 		defaultHidden: true,
 		contextWindow: 262144,
 	},
@@ -372,6 +400,7 @@ export const LOCOPILOT_DEFAULT_CATALOG: readonly ICatalogModel[] = [
 		approxSizeBytes: Math.round(16 * GB),
 		minRamGB: 32,
 		tier: '32 GB+',
+		role: 'coder',
 		mtp: true,
 		// Unhidden 2026-07: at ~1.42M downloads this is the most-pulled repo in the whole catalog, and
 		// it is strictly the faster way to run Qwen3.6 27B (embedded MTP draft head). Surfaced via
@@ -390,6 +419,7 @@ export const LOCOPILOT_DEFAULT_CATALOG: readonly ICatalogModel[] = [
 		approxSizeBytes: Math.round(21 * GB),
 		minRamGB: 32,
 		tier: '32 GB+',
+		role: 'fastest',
 		mtp: true,
 		// Unhidden 2026-08: decode is bound by ACTIVE parameters, so ~3B active beats the dense 27B by a
 		// multiple on any bandwidth-limited machine - which is the whole 32 GB+ Apple Silicon tier. That is a
@@ -421,6 +451,7 @@ export const LOCOPILOT_DEFAULT_CATALOG: readonly ICatalogModel[] = [
 		approxSizeBytes: Math.round(5 * GB),
 		minRamGB: 16,
 		tier: '16 GB',
+		role: 'tools',
 		contextWindow: 131072,
 	},
 	{
@@ -435,6 +466,7 @@ export const LOCOPILOT_DEFAULT_CATALOG: readonly ICatalogModel[] = [
 		approxSizeBytes: Math.round(5 * GB),
 		minRamGB: 16,
 		tier: '16 GB',
+		role: 'fastest',
 		contextWindow: 131072,
 	},
 	{
@@ -449,6 +481,7 @@ export const LOCOPILOT_DEFAULT_CATALOG: readonly ICatalogModel[] = [
 		approxSizeBytes: Math.round(11 * GB),
 		minRamGB: 16,
 		tier: '16 GB',
+		role: 'fastest',
 		contextWindow: 131072,
 	},
 
@@ -487,6 +520,7 @@ export const LOCOPILOT_DEFAULT_CATALOG: readonly ICatalogModel[] = [
 		approxSizeBytes: Math.round(2.5 * GB),
 		minRamGB: 8,
 		tier: '8 GB',
+		role: 'lightweight',
 		contextWindow: 131072,
 	},
 
@@ -545,6 +579,7 @@ export const LOCOPILOT_DEFAULT_CATALOG: readonly ICatalogModel[] = [
 		approxSizeBytes: Math.round(14.3 * GB),
 		minRamGB: 32,
 		tier: '32 GB+',
+		role: 'agentic',
 		contextWindow: 262144,
 	},
 	// REMOVED (2026-07): Mistral Small 24B Instruct 2501 (Jan 2025, 32K ctx) - Devstral Small 2 24B above is
@@ -565,6 +600,7 @@ export const LOCOPILOT_DEFAULT_CATALOG: readonly ICatalogModel[] = [
 		approxSizeBytes: Math.round(12 * GB),
 		minRamGB: 24,
 		tier: '32 GB+',
+		role: 'fastest',
 		requiresAppleSilicon: true,
 		contextWindow: 131072,
 	},
@@ -589,6 +625,7 @@ export const LOCOPILOT_DEFAULT_CATALOG: readonly ICatalogModel[] = [
 		approxSizeBytes: Math.round(45 * GB),
 		minRamGB: 64,
 		tier: '64 GB+',
+		role: 'coder',
 		contextWindow: 262144,
 	},
 	{
@@ -603,6 +640,7 @@ export const LOCOPILOT_DEFAULT_CATALOG: readonly ICatalogModel[] = [
 		approxSizeBytes: Math.round(58.5 * GB),
 		minRamGB: 96,
 		tier: '64 GB+',
+		role: 'fastest',
 		defaultHidden: true,
 		contextWindow: 131072,
 	},
@@ -625,6 +663,7 @@ export const LOCOPILOT_DEFAULT_CATALOG: readonly ICatalogModel[] = [
 		approxSizeBytes: Math.round(2.1 * GB),
 		minRamGB: 8,
 		tier: '8 GB',
+		role: 'lightweight',
 		contextWindow: 262144,
 		defaultHidden: true,
 	},
@@ -640,6 +679,7 @@ export const LOCOPILOT_DEFAULT_CATALOG: readonly ICatalogModel[] = [
 		approxSizeBytes: Math.round(5.2 * GB),
 		minRamGB: 16,
 		tier: '16 GB',
+		role: 'vision',
 		contextWindow: 262144,
 		defaultHidden: true,
 	},
@@ -655,6 +695,7 @@ export const LOCOPILOT_DEFAULT_CATALOG: readonly ICatalogModel[] = [
 		approxSizeBytes: Math.round(8.2 * GB),
 		minRamGB: 16,
 		tier: '16 GB',
+		role: 'vision',
 		contextWindow: 262144,
 		defaultHidden: true,
 	},
@@ -672,6 +713,7 @@ export const LOCOPILOT_DEFAULT_CATALOG: readonly ICatalogModel[] = [
 		approxSizeBytes: Math.round(23.9 * GB),
 		minRamGB: 32,
 		tier: '32 GB+',
+		role: 'vision',
 		contextWindow: 32768,
 		defaultHidden: true,
 	},
@@ -718,6 +760,7 @@ export const LOCOPILOT_DEFAULT_CATALOG: readonly ICatalogModel[] = [
 		approxSizeBytes: 25270000000,
 		minRamGB: 32,
 		tier: '32 GB+',
+		role: 'agentic',
 		contextWindow: 262144,
 	},
 
@@ -734,6 +777,7 @@ export const LOCOPILOT_DEFAULT_CATALOG: readonly ICatalogModel[] = [
 		approxSizeBytes: Math.round(18.3 * GB),
 		minRamGB: 32,
 		tier: '32 GB+',
+		role: 'coder',
 		contextWindow: 202752,
 		defaultHidden: true,
 	},
@@ -768,6 +812,7 @@ export const LOCOPILOT_DEFAULT_CATALOG: readonly ICatalogModel[] = [
 		approxSizeBytes: Math.round(5.31 * GB),
 		minRamGB: 16,
 		tier: '16 GB',
+		role: 'coder',
 		contextWindow: 262144,
 	},
 	{
@@ -782,6 +827,7 @@ export const LOCOPILOT_DEFAULT_CATALOG: readonly ICatalogModel[] = [
 		approxSizeBytes: Math.round(20.61 * GB),
 		minRamGB: 32,
 		tier: '32 GB+',
+		role: 'agentic',
 		contextWindow: 262144,
 	},
 
@@ -798,6 +844,7 @@ export const LOCOPILOT_DEFAULT_CATALOG: readonly ICatalogModel[] = [
 		approxSizeBytes: Math.round(17.88 * GB),
 		minRamGB: 32,
 		tier: '32 GB+',
+		role: 'coder',
 		contextWindow: 500000,
 		defaultHidden: true,
 	},
@@ -815,6 +862,7 @@ export const LOCOPILOT_DEFAULT_CATALOG: readonly ICatalogModel[] = [
 		approxSizeBytes: Math.round(18.88 * GB),
 		minRamGB: 32,
 		tier: '32 GB+',
+		role: 'coder',
 		contextWindow: 262144,
 		defaultHidden: true,
 	},
@@ -832,6 +880,7 @@ export const LOCOPILOT_DEFAULT_CATALOG: readonly ICatalogModel[] = [
 		approxSizeBytes: Math.round(1.96 * GB),
 		minRamGB: 8,
 		tier: '8 GB',
+		role: 'tools',
 		contextWindow: 131072,
 		defaultHidden: true,
 	},
@@ -847,6 +896,7 @@ export const LOCOPILOT_DEFAULT_CATALOG: readonly ICatalogModel[] = [
 		approxSizeBytes: Math.round(16.29 * GB),
 		minRamGB: 32,
 		tier: '32 GB+',
+		role: 'tools',
 		contextWindow: 131072,
 		defaultHidden: true,
 	},
@@ -864,6 +914,7 @@ export const LOCOPILOT_DEFAULT_CATALOG: readonly ICatalogModel[] = [
 		approxSizeBytes: Math.round(2.7 * GB),
 		minRamGB: 8,
 		tier: '8 GB',
+		role: 'lightweight',
 		contextWindow: 262144,
 		defaultHidden: true,
 	},
@@ -887,6 +938,7 @@ export const LOCOPILOT_DEFAULT_CATALOG: readonly ICatalogModel[] = [
 		approxSizeBytes: Math.round(21.4 * GB),
 		minRamGB: 32,
 		tier: '32 GB+',
+		role: 'coder',
 		contextWindow: 262144,
 		// Seeded VISIBLE: it is post-trained from `qwen36-35b-a3b-gguf`, which we already ship, and beats that
 		// base on SWE-bench Verified (69.4 vs 64.4) at the same size and active-param count - a strictly better
@@ -907,6 +959,7 @@ export const LOCOPILOT_DEFAULT_CATALOG: readonly ICatalogModel[] = [
 		approxSizeBytes: Math.round(7.17 * GB),
 		minRamGB: 16,
 		tier: '16 GB',
+		role: 'coder',
 		contextWindow: 262144,
 		// Hidden until tested in-app, for two reasons beyond the usual caution:
 		//  1. ENGINE FLOOR. The Q2_0 kernels landed upstream in llama.cpp on 2026-07-30; anything older fails
@@ -934,6 +987,7 @@ export const LOCOPILOT_DEFAULT_CATALOG: readonly ICatalogModel[] = [
 		approxSizeBytes: Math.round(57.6 * GB),
 		minRamGB: 96,
 		tier: '64 GB+',
+		role: 'coder',
 		// Trained window is 1M, but the launch planner would never afford it here and the clamp does the real
 		// work; 262144 keeps the seeded value in the same band as the rest of the 64 GB+ tier.
 		contextWindow: 262144,
@@ -955,6 +1009,7 @@ export const LOCOPILOT_DEFAULT_CATALOG: readonly ICatalogModel[] = [
 		approxSizeBytes: Math.round(61.9 * GB),
 		minRamGB: 128,
 		tier: '64 GB+',
+		role: 'vision',
 		mtp: true,
 		contextWindow: 262144,
 		defaultHidden: true,
@@ -985,6 +1040,7 @@ export const LOCOPILOT_DEFAULT_CATALOG: readonly ICatalogModel[] = [
 		approxSizeBytes: Math.round(15.93 * GB),
 		minRamGB: 32,
 		tier: '32 GB+',
+		role: 'coder',
 		// VERIFIED, not inferred from the repo name: this repo is NOT called `-MTP-GGUF`, yet the MTP head
 		// is baked into the ordinary weight files - `qwen35.nextn_predict_layers = 1` is present in the GGUF
 		// KV, alongside `blk.64.nextn.{eh_proj,enorm,hnorm,shared_head_norm}` (64 blocks + 1 head = 65).
@@ -1045,6 +1101,7 @@ export const LOCOPILOT_DEFAULT_CATALOG: readonly ICatalogModel[] = [
 		approxSizeBytes: Math.round(2.85 * GB),
 		minRamGB: 8,
 		tier: '8 GB',
+		role: 'lightweight',
 		requiresAppleSilicon: true,
 		contextWindow: 262144,
 	},
@@ -1063,6 +1120,7 @@ export const LOCOPILOT_DEFAULT_CATALOG: readonly ICatalogModel[] = [
 		approxSizeBytes: Math.round(4.82 * GB),
 		minRamGB: 8,
 		tier: '8 GB',
+		role: 'lightweight',
 		requiresAppleSilicon: true,
 		contextWindow: 131072,
 	},
@@ -1080,6 +1138,7 @@ export const LOCOPILOT_DEFAULT_CATALOG: readonly ICatalogModel[] = [
 		approxSizeBytes: Math.round(5.57 * GB),
 		minRamGB: 16,
 		tier: '16 GB',
+		role: 'coder',
 		requiresAppleSilicon: true,
 		contextWindow: 262144,
 		draftRepoId: 'mlx-community/Qwen3.5-0.8B-MLX-4bit',
@@ -1097,6 +1156,7 @@ export const LOCOPILOT_DEFAULT_CATALOG: readonly ICatalogModel[] = [
 		approxSizeBytes: Math.round(5.57 * GB),
 		minRamGB: 16,
 		tier: '16 GB',
+		role: 'coder',
 		requiresAppleSilicon: true,
 		contextWindow: 262144,
 		draftRepoId: 'mlx-community/Qwen3.5-0.8B-MLX-4bit',
@@ -1114,6 +1174,7 @@ export const LOCOPILOT_DEFAULT_CATALOG: readonly ICatalogModel[] = [
 		approxSizeBytes: Math.round(4.89 * GB),
 		minRamGB: 16,
 		tier: '16 GB',
+		role: 'tools',
 		requiresAppleSilicon: true,
 		contextWindow: 131072,
 		defaultHidden: true,
@@ -1132,6 +1193,7 @@ export const LOCOPILOT_DEFAULT_CATALOG: readonly ICatalogModel[] = [
 		approxSizeBytes: Math.round(14.98 * GB),
 		minRamGB: 32,
 		tier: '32 GB+',
+		role: 'coder',
 		requiresAppleSilicon: true,
 		contextWindow: 262144,
 		draftRepoId: 'mlx-community/Qwen3.5-0.8B-MLX-4bit',
@@ -1157,6 +1219,7 @@ export const LOCOPILOT_DEFAULT_CATALOG: readonly ICatalogModel[] = [
 		approxSizeBytes: Math.round(14.95 * GB),
 		minRamGB: 32,
 		tier: '32 GB+',
+		role: 'coder',
 		requiresAppleSilicon: true,
 		contextWindow: 262144,
 		// Same 0.8B draft as its Qwen3.6 neighbour, and the tokenizer match was re-verified for 3.8 rather
@@ -1181,6 +1244,7 @@ export const LOCOPILOT_DEFAULT_CATALOG: readonly ICatalogModel[] = [
 		approxSizeBytes: Math.round(19.03 * GB),
 		minRamGB: 32,
 		tier: '32 GB+',
+		role: 'fastest',
 		requiresAppleSilicon: true,
 		contextWindow: 262144,
 		draftRepoId: 'mlx-community/Qwen3.5-0.8B-MLX-4bit',
@@ -1198,6 +1262,7 @@ export const LOCOPILOT_DEFAULT_CATALOG: readonly ICatalogModel[] = [
 		approxSizeBytes: Math.round(15.71 * GB),
 		minRamGB: 32,
 		tier: '32 GB+',
+		role: 'coder',
 		requiresAppleSilicon: true,
 		contextWindow: 202752,
 		defaultHidden: true,

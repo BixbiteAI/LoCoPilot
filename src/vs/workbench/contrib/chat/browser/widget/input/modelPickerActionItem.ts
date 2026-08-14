@@ -28,7 +28,7 @@ import { DEFAULT_MODEL_PICKER_CATEGORY } from '../../../common/widget/input/mode
 import { ChatInputPickerActionViewItem, IChatInputPickerOptions } from './chatInputPickerActionItem.js';
 import { ICustomLanguageModelsService, ICustomLanguageModel, getCustomModelListLabel, LOCOPILOT_AUTO_MODEL_ID } from '../../../common/customLanguageModelsService.js';
 import { LOCOPILOT_SETTINGS_SECTION_LIST_MODELS } from '../../chatManagement/locopilotSettingsEditorInput.js';
-import { CURATED_ROLE_LABEL, CURATED_ROLE_TOOLTIP, CuratedPickerRole, LOCOPILOT_DEFAULT_CATALOG, curatedPickerRows, getRecommendedRepoId, peekAutoModel, resolveAutoModelPinned } from '../../locopilotModelCatalog.js';
+import { CURATED_ROLE_LABEL, CURATED_ROLE_TOOLTIP, CuratedPickerRole, ICatalogModel, LOCOPILOT_DEFAULT_CATALOG, curatedPickerRows, getCatalogSuitability, getRecommendedRepoId, peekAutoModel, resolveAutoModelPinned } from '../../locopilotModelCatalog.js';
 import { isAppleSiliconMac } from '../../locopilotMlxServer.js';
 import { ITimerService } from '../../../../../services/timer/browser/timerService.js';
 import { ExtensionIdentifier } from '../../../../../../platform/extensions/common/extensions.js';
@@ -386,15 +386,48 @@ function modelDelegateToWidgetActionsProvider(delegate: IModelPickerDelegate, te
 						}
 					}
 			};
-			// The role each curated catalog model plays on THIS machine ("Fastest", "Best coder", ...), keyed by
-			// repoId because that is what a seeded model stores as its modelName. Shown as the row subtitle so
-			// the picker answers "which one should I use?" instead of listing bare model names. Models the user
-			// added themselves, and catalog models they surfaced from the hidden list, simply have no role.
+			// The role each catalog model plays on THIS machine ("Fastest", "Best coder", ...), keyed by repoId
+			// because that is what a seeded model stores as its modelName. Shown as the row subtitle so the
+			// picker answers "which one should I use?" instead of listing bare model names. Only models the
+			// user added THEMSELVES have no role; every catalog model carries one (see ICatalogModel.role).
 			const rolesByRepoId = new Map<string, CuratedPickerRole>();
+			// Secondary index on the repo BASENAME (the part after the org). A model is matched by the repoId it
+			// was seeded with, and the REMOTE catalog may point an entry at a different org than the bundled one
+			// does - `models.json` republishes Nemotron 3.5 Lightning as `bartowski/...` where the bundled entry
+			// says `unsloth/...`. Both repos exist, so this is a deliberate download choice, but it meant the
+			// seeded model matched no catalog entry at all and read "Local" even on 32 GB, where it IS curated.
+			// The basename is identical across such republishes; verified no two catalog entries share one.
+			const rolesByRepoName = new Map<string, CuratedPickerRole>();
+			const repoBaseName = (repoId: string) => (repoId.split('/').pop() ?? '').toLowerCase();
+			const setRole = (repoId: string, role: CuratedPickerRole) => {
+				rolesByRepoId.set(repoId, role);
+				rolesByRepoName.set(repoBaseName(repoId), role);
+			};
+			// Same two-key lookup for the ENTRY itself, so the row can be rated against this machine. Note this
+			// deliberately does not reuse findCatalogEntry(): that matches repoId exactly, so it misses the
+			// org-republished case described above and would rate such a model 'unknown'.
+			const entryByRepoId = new Map<string, ICatalogModel>();
+			const entryByRepoName = new Map<string, ICatalogModel>();
+			for (const entry of LOCOPILOT_DEFAULT_CATALOG) {
+				entryByRepoId.set(entry.repoId, entry);
+				entryByRepoName.set(repoBaseName(entry.repoId), entry);
+			}
+			// Seed with each catalog entry's OWN role first. This is the fallback for the two cases the curated
+			// rows cannot cover: a model the user surfaced from the hidden list, and a model that is curated on
+			// a different RAM tier than this machine's (Nemotron is `agentic` on 32 GB but has no row at 64 GB,
+			// so it used to read "Local" there). Catalog entries cannot carry the `best` role - the type forbids
+			// it - so this can never contend with the curated recommendation.
+			for (const entry of LOCOPILOT_DEFAULT_CATALOG) {
+				if (entry.role) {
+					setRole(entry.repoId, entry.role);
+				}
+			}
+			// Curated rows are written SECOND so they overwrite the per-entry fallback: CURATED_PICKER_TIERS
+			// stays the source of truth for what this machine is actually being steered towards.
 			for (const row of curatedPickerRows(ramGB, isAppleSiliconMac())) {
 				const entry = LOCOPILOT_DEFAULT_CATALOG.find(e => e.catalogId === row.catalogId);
 				if (entry) {
-					rolesByRepoId.set(entry.repoId, row.role);
+					setRole(entry.repoId, row.role);
 				}
 			}
 
@@ -403,15 +436,27 @@ function modelDelegateToWidgetActionsProvider(delegate: IModelPickerDelegate, te
 				// matching the model-list badge so the maximal pick is one obvious click from the conservative default.
 				const best = isBestForSystem(customModel);
 				const baseLabel = getCustomModelListLabel(customModel);
-				// Subtitle: the model's ROLE on this machine ("Fastest", "Best coder", ...) when it is one of the
-				// curated picks, else the Local/Cloud kind. Role wins because "Local" is near-zero information -
-				// every curated catalog model is local - whereas the role is the reason to pick this row over the
-				// one below it. Models the user added themselves, and catalog models surfaced from the hidden
-				// list, have no role and keep Local/Cloud, where the distinction does carry meaning.
-				const role = rolesByRepoId.get(customModel.modelName);
-				const kindLabel = role
-					? CURATED_ROLE_LABEL[role]
-					: (customModel.type === 'cloud' ? localize('chat.modelPicker.cloud', 'Cloud') : localize('chat.modelPicker.local', 'Local'));
+				// Subtitle: the model's ROLE ("Fastest", "Best coder", ...), else the Local/Cloud kind. Role wins
+				// because "Local" is near-zero information - every catalog model is local - whereas the role is
+				// the reason to pick this row over the one below it. Only models the user added themselves keep
+				// Local/Cloud, where the distinction does carry meaning.
+				const role = rolesByRepoId.get(customModel.modelName)
+					?? rolesByRepoName.get(repoBaseName(customModel.modelName ?? ''));
+				// A role describes the MODEL, not this machine, so on a row the machine cannot run it would be
+				// actively misleading - unhiding Qwen3.6 35B on an 8 GB laptop should not advertise "Fastest".
+				// The hardware state replaces the role there. It states the requirement rather than saying
+				// "unsupported": the launch path has an OOM ladder and a "Run anyway?" prompt, so a too-big
+				// model often does run (slowly), and the RAM figure is the fact the user actually needs.
+				const catalogEntry = entryByRepoId.get(customModel.modelName)
+					?? entryByRepoName.get(repoBaseName(customModel.modelName ?? ''));
+				const suitability = getCatalogSuitability(catalogEntry, ramGB, isAppleSiliconMac());
+				const kindLabel = catalogEntry && suitability === 'too-big'
+					? localize('chat.modelPicker.needsRam', 'Needs {0} GB', catalogEntry.minRamGB)
+					: catalogEntry && suitability === 'incompatible'
+						? localize('chat.modelPicker.appleSiliconOnly', 'Apple Silicon only')
+						: role
+							? CURATED_ROLE_LABEL[role]
+							: (customModel.type === 'cloud' ? localize('chat.modelPicker.cloud', 'Cloud') : localize('chat.modelPicker.local', 'Local'));
 				// The `best` badge appends "- Best for you" to the subtitle. Suppress it when the row's own role
 				// IS 'best', or the two compose into "Best for you - Best for you" on the recommended row.
 				const appendBestBadge = best && role !== 'best';
@@ -439,7 +484,13 @@ function modelDelegateToWidgetActionsProvider(delegate: IModelPickerDelegate, te
 					// only ever two or three words, so the explanation has to live somewhere.
 					tooltip: startStop
 						? startStop.tooltip
-						: (role ? `${baseLabel} - ${CURATED_ROLE_TOOLTIP[role]}` : (best ? `${baseLabel} - ${bestTooltip}` : baseLabel)),
+						// The hardware note wins over the role explanation for the same reason the subtitle does:
+						// telling someone what a model is good at is unhelpful when it cannot run here.
+						: (catalogEntry && suitability === 'too-big'
+							? localize('chat.modelPicker.needsRam.tooltip', '{0} - needs about {1} GB of system memory; it may fail to load or run very slowly on this machine.', baseLabel, catalogEntry.minRamGB)
+							: catalogEntry && suitability === 'incompatible'
+								? localize('chat.modelPicker.appleSiliconOnly.tooltip', '{0} - this is an MLX build and runs only on Apple Silicon.', baseLabel)
+								: role ? `${baseLabel} - ${CURATED_ROLE_TOOLTIP[role]}` : (best ? `${baseLabel} - ${bestTooltip}` : baseLabel)),
 					label: baseLabel,
 					hover: undefined,
 					toolbarActions: [

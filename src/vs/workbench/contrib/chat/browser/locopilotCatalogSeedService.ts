@@ -35,6 +35,13 @@ const REMOTE_CATALOG_URL = '';
 const REMOTE_FETCH_TIMEOUT_MS = 5000;
 
 /**
+ * Picker-subtitle roles a REMOTE entry may declare. Mirrors `ICatalogModel.role`, which is
+ * `Exclude<CuratedPickerRole, 'best'>` - the exclusion is a compile-time guarantee for the bundled catalog and
+ * has to be re-checked at runtime here, since remote JSON is not type-checked by anything.
+ */
+const VALID_REMOTE_ROLES: readonly string[] = ['fastest', 'coder', 'vision', 'lightweight', 'quick-try', 'tools', 'agentic'];
+
+/**
  * How often to re-run the seed after the initial one, so a catalog published while the app is OPEN is picked
  * up without a restart. Matches the update-feed check's cadence. Re-seeding is idempotent - `seededIds` makes
  * a tick with nothing new a pure no-op, and the "new models" toast only fires for entries that actually seeded.
@@ -340,7 +347,13 @@ export class LoCoPilotCatalogSeedContribution extends Disposable implements IWor
 		// whole entry otherwise, so a malformed remote value (string, NaN, negative) can never be seeded.
 		const contextWindowOk = o.contextWindow === undefined
 			|| (typeof o.contextWindow === 'number' && Number.isInteger(o.contextWindow) && o.contextWindow > 0);
-		return typeof o.catalogId === 'string' && o.catalogId.length > 0
+		// `role` is optional, but a value outside the known set would index CURATED_ROLE_LABEL to `undefined`
+		// and render a BLANK picker subtitle - worse than the "Local" fallback it replaces. `'best'` is refused
+		// here too: the type bans it in the bundled catalog, and remote entries must not be a way around that.
+		const roleOk = o.role === undefined
+			|| (typeof o.role === 'string' && VALID_REMOTE_ROLES.includes(o.role));
+		return roleOk
+			&& typeof o.catalogId === 'string' && o.catalogId.length > 0
 			&& typeof o.displayName === 'string' && o.displayName.length > 0
 			&& typeof o.repoId === 'string' && /.+\/.+/.test(o.repoId)
 			&& typeof o.format === 'string' && o.format.length > 0

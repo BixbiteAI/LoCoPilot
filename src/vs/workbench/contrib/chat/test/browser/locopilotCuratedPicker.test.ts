@@ -179,4 +179,35 @@ suite('LoCoPilot curated model picker', () => {
 			}
 		}
 	});
+
+	test('every catalog entry declares a picker role, and none claims "best"', () => {
+		// The role is what a surfaced-from-hidden model shows as its subtitle; without one it falls back to
+		// "Local", which says nothing (every catalog model is local). A new entry with no role is the
+		// regression this catches. `best` is banned because it is a RECOMMENDATION, not a description - the
+		// curated row owns it, and the type already forbids it here, so this guards the remote path's mirror.
+		for (const e of LOCOPILOT_DEFAULT_CATALOG) {
+			assert.ok(e.role, `${e.catalogId} declares no role, so it would read "Local" when surfaced`);
+			assert.notStrictEqual(e.role as string, 'best', `${e.catalogId} must not claim the 'best' role`);
+		}
+	});
+
+	test('a curated row overrides the entry role, so exactly one row is "Best for you"', () => {
+		// Mirrors how modelPickerActionItem resolves subtitles: entry roles first, curated rows written over
+		// them. If that order ever inverted, a tier's `best` row would be relabelled by its own entry role and
+		// the recommendation would vanish from the picker.
+		for (const ram of TIERS) {
+			for (const apple of PLATFORMS) {
+				const roles = new Map<string, string>();
+				for (const e of LOCOPILOT_DEFAULT_CATALOG) {
+					if (e.role) { roles.set(e.repoId, e.role); }
+				}
+				for (const row of curatedPickerRows(ram, apple)) {
+					roles.set(byId.get(row.catalogId)!.repoId, row.role);
+				}
+				const bests = [...roles.values()].filter(r => r === 'best');
+				assert.strictEqual(bests.length, 1,
+					`${ram}GB/${apple ? 'apple' : 'other'} resolves ${bests.length} "Best for you" rows, expected 1`);
+			}
+		}
+	});
 });
