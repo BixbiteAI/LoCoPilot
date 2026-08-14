@@ -961,6 +961,52 @@ export const LOCOPILOT_DEFAULT_CATALOG: readonly ICatalogModel[] = [
 	},
 
 	// =========================================================================================
+	// Qwen 3.8 (2026-08-14). Only TWO open-weight models exist this generation: the 27B below and
+	// `Qwen/Qwen3.8-2.4T-A95B` (Max class). The 2.4T is deliberately absent and should stay that
+	// way - its SMALLEST quant is unsloth's UD-Q1_0 at 397 GB, and the next rung (UD-IQ2_XXS) is
+	// 657 GB, so no machine this app targets can hold it. The small "Qwen3.8" repos that surface in
+	// a HuggingFace search (`Ma7ee7/Qwen3.8_4B_Distilled`, `inference-optimization/Qwen3.8-1.0B-A0.6B`)
+	// are THIRD-PARTY distills, not Qwen releases - there is no official 4B/9B rung this generation.
+	// =========================================================================================
+
+	// ---- Qwen3.8 27B - successor to `qwen36-27b-mtp-gguf`, same tier and near-identical footprint ----
+	{
+		catalogId: 'qwen38-27b-gguf',
+		displayName: 'Qwen3.8 27B',
+		vendor: 'Alibaba (Qwen)',
+		blurb: 'Newest Qwen dense coder: MTP decoding, vision + video, Apache 2.0. Fits 32 GB.',
+		repoId: 'unsloth/Qwen3.8-27B-GGUF',
+		supportsVision: true,
+		format: 'Q4_K_M',
+		engine: 'gguf',
+		// 17,106,775,008 bytes for Q4_K_M. The repo ships a full ladder (UD-IQ2_XXS 8.4 GiB through
+		// UD-Q8_K_XL 29.3 GiB) plus an imatrix, so the two-way download-quant sizing has real room here -
+		// unlike the Gemma 4 QAT entries above, which are effectively single-quant.
+		approxSizeBytes: Math.round(15.93 * GB),
+		minRamGB: 32,
+		tier: '32 GB+',
+		// VERIFIED, not inferred from the repo name: this repo is NOT called `-MTP-GGUF`, yet the MTP head
+		// is baked into the ordinary weight files - `qwen35.nextn_predict_layers = 1` is present in the GGUF
+		// KV, alongside `blk.64.nextn.{eh_proj,enorm,hnorm,shared_head_norm}` (64 blocks + 1 head = 65).
+		// That KEY is what the download service's detection reads, so this seeds correctly and llama.cpp
+		// accepts `--spec-type draft-mtp`. It is the opposite of the Qwen3.6-27B-MTP-GGUF trap, where the
+		// name and the tensors promised MTP and the missing key meant llama.cpp refused it.
+		mtp: true,
+		contextWindow: 262144,
+		// NO `defaultHidden` ON PURPOSE - this entry takes the 32 GB `best` row in CURATED_PICKER_TIERS, so
+		// visibility is decided by the tier logic and it appears ONLY on machines that can run it. Setting
+		// `defaultHidden: false` here would look equivalent and is not: catalogDefaultHidden returns that
+		// value before it ever consults the tier, so an 8 GB laptop would be shown a 16 GiB model. That is
+		// exactly the "8 GB laptops were offered 45 GB models" bug the curated tiers were added to fix.
+		//
+		// Nothing blocks this model on the engine side: bundled llama.cpp b10375 already exports the `qwen35`
+		// arch plus the `full_attention_interval` and `nextn_predict_layers` KV names this checkpoint needs
+		// (it is the Qwen3.5 hybrid: linear attention with full attention every 4th layer, 64 layers), and
+		// the chat template's tool-call format is the same XML `<tool_call><function=…><parameter=…>` shape
+		// Qwen3.6 already uses in this catalog.
+	},
+
+	// =========================================================================================
 	// Apple Silicon (MLX) twins, July 2026. Before this block the ONLY MLX entries were the two
 	// 32 GB+ ones above, so every 8/16 GB Apple Silicon machine - i.e. most MacBook Airs - silently
 	// fell back to llama.cpp and lost the MLX speedup. These fill the 8 GB and 16 GB rungs.
@@ -1090,6 +1136,38 @@ export const LOCOPILOT_DEFAULT_CATALOG: readonly ICatalogModel[] = [
 		contextWindow: 262144,
 		draftRepoId: 'mlx-community/Qwen3.5-0.8B-MLX-4bit',
 		draftFormat: 'mlx',
+	},
+	{
+		catalogId: 'qwen38-27b-mlx',
+		displayName: 'Qwen3.8 27B (MLX)',
+		vendor: 'Alibaba (Qwen)',
+		blurb: 'Newest top dense coder tuned for Apple Silicon via MLX (text-only build).',
+		// NOTE the org: `mlx-community` publishes no Qwen3.8 build yet, so this points at lmstudio-community.
+		// A 5-bit twin exists there too (18.09 GiB) if this tier ever wants a quality rung.
+		repoId: 'lmstudio-community/Qwen3.8-27B-MLX-4bit',
+		// FALSE even though the checkpoint is multimodal, and for a stronger reason than the usual
+		// "mlx-lm is text-only" note above: mlx-lm 0.31.3's `qwen3_5` module explicitly DROPS every weight
+		// whose key starts with `vision_tower` or `model.visual` (qwen3_5.py:387) and builds only the
+		// language tower from `text_config`. Vision on this model is reachable via the GGUF entry (which
+		// ships an mmproj), never via MLX.
+		supportsVision: false,
+		format: 'mlx',
+		engine: 'mlx',
+		// 16,054,541,599 bytes across 3 safetensors shards.
+		approxSizeBytes: Math.round(14.95 * GB),
+		minRamGB: 32,
+		tier: '32 GB+',
+		requiresAppleSilicon: true,
+		contextWindow: 262144,
+		// Same 0.8B draft as its Qwen3.6 neighbour, and the tokenizer match was re-verified for 3.8 rather
+		// than assumed from the block comment above: both repos carry vocab_size 248320 AND an identical
+		// added-tokens table (33 entries, ids 248044-248076, same `<|im_end|>` eos), so the draft is safe.
+		// MLX gets no benefit from the embedded MTP head, which makes this pairing the only speculative
+		// win available on this arm - the GGUF twin gets its speedup from `--spec-type draft-mtp` instead.
+		draftRepoId: 'mlx-community/Qwen3.5-0.8B-MLX-4bit',
+		draftFormat: 'mlx',
+		// Hidden for the same reason as the GGUF twin: brand-new repo, untested in-app.
+		defaultHidden: true,
 	},
 	{
 		catalogId: 'qwen36-35b-a3b-mlx',
@@ -1235,7 +1313,15 @@ const CURATED_PICKER_TIERS: readonly { readonly minRamGB: number; readonly rows:
 	{
 		minRamGB: 32,
 		rows: [
-			{ catalogId: 'qwen36-27b-mtp-gguf', role: 'best' },
+			// SUPERSEDES `qwen36-27b-mtp-gguf` (2026-08-14): same vendor, same tier, same dense-27B shape, and
+			// 15.93 vs 16 GiB at Q4_K_M - a generation bump at no cost. Qwen3.6 27B is not deleted, it simply
+			// stops being curated here, which is what hides it (rule 1: one row per model, and there is no
+			// reason to curate two builds of the same dense 27B). It stays switchable from "My Models".
+			//
+			// Deliberately NO `appleSiliconInstead: 'qwen38-27b-mlx'`, matching how the Qwen3.6 row behaved:
+			// the MLX build loses BOTH of this model's advantages - vision (mlx-lm drops the vision tower)
+			// and the embedded MTP head - so on Apple Silicon the GGUF is still the better row.
+			{ catalogId: 'qwen38-27b-gguf', role: 'best' },
 			// ~3B active vs the 27B's dense 27B: several times faster to decode on any bandwidth-bound machine,
 			// which is every Apple Silicon Mac. The biggest single lever on this tier.
 			{ catalogId: 'qwen36-35b-a3b-mtp-gguf', role: 'fastest' },
@@ -1394,7 +1480,7 @@ export function getRecommendedRepoId(ramGB: number, profile?: IHardwareProfile):
  */
 const CURATED_RECOMMENDATION_LADDER: readonly string[] = [
 	'unsloth/Qwen3-Coder-Next-GGUF',                    // 64 GB+ tier
-	'unsloth/Qwen3.6-27B-MTP-GGUF',                     // 32 GB+ tier
+	'unsloth/Qwen3.8-27B-GGUF',                         // 32 GB+ tier (was Qwen3.6-27B-MTP, superseded 2026-08-14)
 	'unsloth/Qwen3.5-9B-MTP-GGUF',                      // 16 GB tier
 	DEFAULT_PICKER_FLOOR_REPO_ID,                       // 8 GB tier / floor
 ];
@@ -1412,7 +1498,7 @@ function curatedRecommendedRepoId(ramGB: number): string {
 		return 'unsloth/Qwen3-Coder-Next-GGUF'; // flagship dense coder (~45 GB Q4); comfortable on 64 GB+.
 	}
 	if (ramGB >= 32) {
-		return 'unsloth/Qwen3.6-27B-MTP-GGUF'; // latest dense coder (~16 GB Q4) with an embedded MTP draft head for fast decode.
+		return 'unsloth/Qwen3.8-27B-GGUF'; // latest dense coder (~15.9 GiB Q4) with an embedded MTP draft head for fast decode.
 	}
 	if (ramGB >= 16) {
 		return 'unsloth/Qwen3.5-9B-MTP-GGUF'; // ~5.5 GB Q4; smooth on 16 GB alongside the editor.

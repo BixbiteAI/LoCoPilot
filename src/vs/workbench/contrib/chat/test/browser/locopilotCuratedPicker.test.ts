@@ -96,9 +96,15 @@ suite('LoCoPilot curated model picker', () => {
 		// The MTP GGUF is the same weights plus an embedded draft head llama.cpp ignores when speculation is
 		// off, so shipping the plain twin instead would only cost speed on CUDA. Guards against someone
 		// "simplifying" the table back to the base repos.
-		for (const id of ['qwen36-27b-mtp-gguf', 'qwen36-35b-a3b-mtp-gguf', 'qwen35-9b-mtp-gguf', 'qwen35-0_8b-mtp-gguf']) {
+		for (const id of ['qwen36-35b-a3b-mtp-gguf', 'qwen35-9b-mtp-gguf', 'qwen35-0_8b-mtp-gguf']) {
 			assert.ok(ALL_CURATED_PICKER_IDS.has(id), `${id} should be curated`);
 		}
+		// Qwen3.8 27B (which took the 32 GB `best` row from Qwen3.6 27B) is the case this rule has to be
+		// checked on the FLAG rather than the repo name: unsloth published no separate `-MTP-GGUF` repo for
+		// it, because the head is baked into the ordinary weight files (`qwen35.nextn_predict_layers = 1`).
+		// Asserting on the name here would have forced a curator to go looking for a repo that will never exist.
+		assert.strictEqual(byId.get('qwen38-27b-gguf')!.mtp, true,
+			'the curated Qwen3.8 27B must be seeded with MTP enabled');
 		for (const base of ['qwen36-27b-gguf', 'qwen36-35b-a3b-gguf']) {
 			assert.ok(!ALL_CURATED_PICKER_IDS.has(base), `${base} is the MTP twin's base build and should stay hidden`);
 		}
