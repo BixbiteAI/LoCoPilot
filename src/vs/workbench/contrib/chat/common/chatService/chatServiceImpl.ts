@@ -1104,24 +1104,23 @@ export class ChatService extends Disposable implements IChatService {
 		if (heuristicTitle) {
 			model.setCustomTitle(heuristicTitle);
 		}
-		this.logService.info(`[chat title] rule-based title applied: "${heuristicTitle}" (LLM titler is commented out)`);
+		this.logService.info(`[chat title] rule-based title applied: "${heuristicTitle}" (LLM titler will try to override it)`);
 
 		/* ---------------------------------------------------------------------------------
-		 * LLM-BASED TITLE GENERATION - COMMENTED OUT.
+		 * LLM-BASED TITLE GENERATION.
 		 *
-		 * Measured on llama.cpp (Qwen3.5-2B MTP, n_slots = 1, and with cache_reuse unavailable - Qwen3.5
-		 * is an M-RoPE arch, so llama.cpp zeroes n_cache_reuse at load regardless of MTP; see the
-		 * --cache-reuse comment in locopilotLlamaCppServer.ts): this 53-token title prompt lands between
-		 * conversation turns, and because it shares no prefix with what is in the slot it logs
-		 * "forcing full prompt re-processing"
-		 * and ERASES every context checkpoint of the ~7.7K conversation. With it commented out the
-		 * next turn instead hits "restored context checkpoint" at sim_best = 0.999. The warm-up
-		 * ping in locopilotLocalModelRunner.ts is commented out for the same reason.
+		 * Known cost, measured on llama.cpp (Qwen3.5-2B MTP, n_slots = 1, and with cache_reuse
+		 * unavailable - Qwen3.5 is an M-RoPE arch, so llama.cpp zeroes n_cache_reuse at load regardless
+		 * of MTP; see the --cache-reuse comment in locopilotLlamaCppServer.ts): this 53-token title
+		 * prompt lands between conversation turns, and because it shares no prefix with what is in the
+		 * slot it logs "forcing full prompt re-processing" and ERASES every context checkpoint of the
+		 * conversation. Disabled, the next turn instead hits "restored context checkpoint" at
+		 * sim_best = 0.999. (The warm-up ping in locopilotLocalModelRunner.ts stays commented out for
+		 * that same reason.)
 		 *
-		 * To re-enable, uncomment the block below. It overrides the heuristic title only when the
-		 * model returns something and the user hasn't renamed the session meanwhile; on
-		 * error/empty/cancelled the heuristic title above simply stays.
-		 *
+		 * It overrides the heuristic title only when the model returns something and the user hasn't
+		 * renamed the session meanwhile; on error/empty/cancelled the heuristic title above stays.
+		 * ------------------------------------------------------------------------------- */
 		const singleEntryHistory: IChatAgentHistoryEntry[] = [{
 			request,
 			response: [],
@@ -1148,7 +1147,6 @@ export class ChatService extends Disposable implements IChatService {
 			}
 		};
 		void generate();
-		 * ------------------------------------------------------------------------------- */
 	}
 
 	private prepareContext(attachedContextVariables: IChatRequestVariableEntry[] | undefined): IChatRequestVariableEntry[] {
