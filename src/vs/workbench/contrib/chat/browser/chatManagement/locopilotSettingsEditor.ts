@@ -28,7 +28,7 @@ import { Disposable } from '../../../../../base/common/lifecycle.js';
 import { Dimension } from '../../../../../base/browser/dom.js';
 import { registerColor, foreground, listActiveSelectionBackground, listActiveSelectionForeground } from '../../../../../platform/theme/common/colorRegistry.js';
 import { PANEL_BORDER } from '../../../../common/theme.js';
-import { ILoCoPilotAgentSettingsService, DEFAULT_MAX_ITERATIONS } from '../locopilotAgentSettingsService.js';
+import { ILoCoPilotAgentSettingsService, DEFAULT_MAX_ITERATIONS, MIN_MAX_ITERATIONS } from '../locopilotAgentSettingsService.js';
 import { ILoCoPilotProjectMemoryService } from '../locopilotProjectMemoryService.js';
 import { InputBox } from '../../../../../base/browser/ui/inputbox/inputBox.js';
 import { IContextViewService } from '../../../../../platform/contextview/browser/contextView.js';
@@ -299,6 +299,7 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 	private agentSettingsCancelBtn!: Button;
 	private agentSettingsBaseline: {
 		maxIterations: number;
+		autoContinueIterations: boolean;
 		autoRunSandbox: boolean;
 		braveApiKey: string;
 		askCoding: boolean;
@@ -310,6 +311,7 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 		workspaceInstructions: string;
 	} | undefined;
 	private maxIterationsInput!: InputBox;
+	private autoContinueAtMaxIterationsToggle!: Toggle;
 	private autoRunCommandsInSandboxToggle!: Toggle;
 	private braveApiKeyInput!: InputBox;
 	// [engine-ui] private engineSelectBox!: SelectBox;
@@ -2055,7 +2057,7 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 		maxIterDesc.textContent = localize('locopilotSettings.maxIterationsDescription', "How many tool/LLM steps the agent may take to answer a single request.");
 		// Hint/error lives in the left text column so the input never shifts when its text changes width.
 		this.maxIterationsHint = DOM.append(maxIterText, $('.agent-setting-hint'));
-		this.maxIterationsHint.textContent = localize('locopilotSettings.maxIterationsHint', "Between 10 and 500.");
+		this.maxIterationsHint.textContent = localize('locopilotSettings.maxIterationsHint', "Between {0} and 500.", MIN_MAX_ITERATIONS);
 		const maxIterControl = DOM.append(maxIterSection, $('.agent-setting-control'));
 		const maxIterWrap = DOM.append(maxIterControl, $('.agent-setting-input-wrap'));
 		this.maxIterationsInput = this._register(new InputBox(DOM.append(maxIterWrap, $('div')), this.contextViewService, {
@@ -2064,6 +2066,24 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 		}));
 		this.maxIterationsInput.value = String(this.agentSettingsService.getMaxIterationsPerRequest());
 		this._register(this.maxIterationsInput.onDidChange(() => { this.validateMaxIterations(); this.updateAgentSettingsDirtyIndicators(); }));
+
+		// Auto-continue at the iteration limit (on/off switch; default off).
+		// Off: the agent pauses at the limit and asks the user whether to keep going, which re-arms the
+		// same budget from zero. On: that ask is skipped and every window is granted automatically.
+		const autoContinueRow = DOM.append(execCard, $('.agent-setting-row'));
+		const autoContinueText = DOM.append(autoContinueRow, $('.agent-setting-text'));
+		const autoContinueLabel = DOM.append(autoContinueText, $('label.locopilot-setting-label'));
+		autoContinueLabel.textContent = localize('locopilotSettings.autoContinueIterations', "Keep going without asking");
+		const autoContinueDesc = DOM.append(autoContinueText, $('.agent-setting-description'));
+		autoContinueDesc.textContent = localize('locopilotSettings.autoContinueIterationsDescription', "When the agent hits the iteration limit it normally asks you whether to continue. Turn this on to always continue automatically. Off by default.");
+		const autoContinueWrap = DOM.append(autoContinueRow, $('.agent-setting-control.agent-setting-toggle-wrap.agent-setting-switch-wrap'));
+		this.autoContinueAtMaxIterationsToggle = this._register(new Toggle({
+			title: localize('locopilotSettings.autoContinueIterationsTitle', "When on, reaching the max-iteration limit silently grants the agent another full budget instead of asking you. Use the Cancel button to stop a run. Default: off."),
+			isChecked: this.agentSettingsService.getAutoContinueAtMaxIterations(),
+			...defaultToggleStyles
+		}));
+		DOM.append(autoContinueWrap, this.autoContinueAtMaxIterationsToggle.domNode);
+		this._register(this.autoContinueAtMaxIterationsToggle.onChange(() => this.updateAgentSettingsDirtyIndicators()));
 
 		// Auto approve terminal commands (on/off switch; default off)
 		const autoRunRow = DOM.append(execCard, $('.agent-setting-row'));
@@ -2342,16 +2362,17 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 	private validateMaxIterations(): void {
 		if (!this.maxIterationsInput || !this.maxIterationsHint) { return; }
 		const n = parseInt(this.maxIterationsInput.value.trim(), 10);
-		const valid = !isNaN(n) && n >= 10 && n <= 500;
+		const valid = !isNaN(n) && n >= MIN_MAX_ITERATIONS && n <= 500;
 		this.maxIterationsInput.element.classList.toggle('agent-setting-input-invalid', !valid);
 		this.maxIterationsHint.classList.toggle('agent-setting-hint-error', !valid);
 		this.maxIterationsHint.textContent = valid
-			? localize('locopilotSettings.maxIterationsHint', "Between 10 and 500.")
-			: localize('locopilotSettings.maxIterationsHintError', "Enter a number between 10 and 500.");
+			? localize('locopilotSettings.maxIterationsHint', "Between {0} and 500.", MIN_MAX_ITERATIONS)
+			: localize('locopilotSettings.maxIterationsHintError', "Enter a number between {0} and 500.", MIN_MAX_ITERATIONS);
 	}
 
 	private takeAgentSettingsSnapshotFromPersisted(): {
 		maxIterations: number;
+		autoContinueIterations: boolean;
 		autoRunSandbox: boolean;
 		braveApiKey: string;
 		askCoding: boolean;
@@ -2364,6 +2385,7 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 	} {
 		return {
 			maxIterations: this.agentSettingsService.getMaxIterationsPerRequest(),
+			autoContinueIterations: this.agentSettingsService.getAutoContinueAtMaxIterations(),
 			autoRunSandbox: this.agentSettingsService.getAutoRunCommandsInSandbox(),
 			braveApiKey: (this.configurationService.getValue<string>(ChatConfiguration.WebSearchApiKey) ?? '').trim(),
 			askCoding: this.agentSettingsService.getAskUseCodingSystemPrompt(),
@@ -2378,6 +2400,7 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 
 	private snapshotAgentPanelFromUI(): {
 		maxIterations: number;
+		autoContinueIterations: boolean;
 		autoRunSandbox: boolean;
 		braveApiKey: string;
 		askCoding: boolean;
@@ -2391,6 +2414,7 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 		const rawN = parseInt(this.maxIterationsInput.value.trim(), 10);
 		return {
 			maxIterations: isNaN(rawN) ? -1 : rawN,
+			autoContinueIterations: this.autoContinueAtMaxIterationsToggle.checked,
 			autoRunSandbox: this.autoRunCommandsInSandboxToggle.checked,
 			braveApiKey: this.braveApiKeyInput.value.trim(),
 			askCoding: this.askCodingSystemPromptToggle.checked,
@@ -2415,6 +2439,7 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 		const b = this.agentSettingsBaseline;
 		return (
 			b.maxIterations !== cur.maxIterations ||
+			b.autoContinueIterations !== cur.autoContinueIterations ||
 			b.autoRunSandbox !== cur.autoRunSandbox ||
 			b.braveApiKey !== cur.braveApiKey ||
 			b.askCoding !== cur.askCoding ||
@@ -2465,6 +2490,7 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 	private loadAgentPanelFromPersisted(): void {
 		this.maxIterationsInput.value = String(this.agentSettingsService.getMaxIterationsPerRequest());
 		this.validateMaxIterations();
+		this.autoContinueAtMaxIterationsToggle.checked = this.agentSettingsService.getAutoContinueAtMaxIterations();
 		this.autoRunCommandsInSandboxToggle.checked = this.agentSettingsService.getAutoRunCommandsInSandbox();
 		this.braveApiKeyInput.value = this.configurationService.getValue<string>(ChatConfiguration.WebSearchApiKey) ?? '';
 		this.askCodingSystemPromptToggle.checked = this.agentSettingsService.getAskUseCodingSystemPrompt();
@@ -2489,7 +2515,7 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 	}
 
 	private async saveAgentSettings(): Promise<void> {
-		const minIterations = 10;
+		const minIterations = MIN_MAX_ITERATIONS;
 		const maxIterations = 500;
 		const n = parseInt(this.maxIterationsInput.value.trim(), 10);
 		if (isNaN(n) || n < minIterations || n > maxIterations) {
@@ -2500,6 +2526,7 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 		}
 		try {
 			this.agentSettingsService.setMaxIterationsPerRequest(n);
+			this.agentSettingsService.setAutoContinueAtMaxIterations(this.autoContinueAtMaxIterationsToggle.checked);
 			this.agentSettingsService.setAutoRunCommandsInSandbox(this.autoRunCommandsInSandboxToggle.checked);
 			// Persist the Brave Search API key. Empty -> clear the setting so the webSearch tool
 			// falls back to free DuckDuckGo search.

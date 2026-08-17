@@ -5,18 +5,21 @@
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
 
-import { timeout } from '../../../../../base/common/async.js';
+import { DeferredPromise, timeout } from '../../../../../base/common/async.js';
 import { CancellationToken } from '../../../../../base/common/cancellation.js';
 import { hash } from '../../../../../base/common/hash.js';
 import { MarkdownString } from '../../../../../base/common/htmlContent.js';
 import { URI } from '../../../../../base/common/uri.js';
+import { localize } from '../../../../../nls.js';
 import { ILogService } from '../../../../../platform/log/common/log.js';
 import { IWorkspaceContextService } from '../../../../../platform/workspace/common/workspace.js';
 import { ILoCoPilotFileLog } from '../locopilotFileLog.js';
 import { nullExtensionDescription } from '../../../../services/extensions/common/extensions.js';
 import { IChatAgentRequest, IChatAgentResult } from '../../common/participants/chatAgents.js';
-import { IChatProgress, IChatToolInvocation } from '../../common/chatService/chatService.js';
+import { ElicitationState, IChatProgress, IChatToolInvocation } from '../../common/chatService/chatService.js';
 import { ChatToolInvocation } from '../../common/model/chatProgressTypes/chatToolInvocation.js';
+import { ChatElicitationRequestPart } from '../../common/model/chatProgressTypes/chatElicitationRequestPart.js';
+import { ILoCoPilotAgentSettingsService } from '../locopilotAgentSettingsService.js';
 import { ChatImageMimeType, ChatMessageRole, IChatMessage, IChatMessageImagePart, IChatMessageTextPart, IChatMessageToolResultPart, IChatResponseToolUsePart, ILanguageModelsService, LanguageModelPartAudience } from '../../common/languageModels.js';
 import { ILanguageModelToolsService, IToolData, toolMatchesModel } from '../../common/tools/languageModelToolsService.js';
 import { IChatTodo, IChatTodoListService } from '../../common/tools/chatTodoListService.js';
@@ -127,7 +130,8 @@ export interface IWarmPrefix {
 }
 
 export class UnifiedAgent {
-	private readonly MAX_ITERATIONS: number;
+	/** Fallback iteration budget, used only when no settings service was injected. */
+	private readonly fallbackMaxIterations: number;
 	private readonly contextManager: ContextManager;
 
 	/**
@@ -146,15 +150,23 @@ export class UnifiedAgent {
 		_workspaceService: IWorkspaceContextService,
 		private readonly locopilotFileLog: ILoCoPilotFileLog,
 		private readonly chatTodoListService: IChatTodoListService,
-		maxIterations: number = DEFAULT_MAX_ITERATIONS
+		maxIterations: number = DEFAULT_MAX_ITERATIONS,
+		/** Read live so a settings change applies to the next turn instead of waiting for a window reload. */
+		private readonly agentSettingsService?: ILoCoPilotAgentSettingsService
 	) {
 		// Honor the user's "Max iterations per request" setting, which the settings UI allows up to 500.
 		// (Previously capped at 100 here, silently overriding higher user-chosen values.)
-		this.MAX_ITERATIONS = Math.min(500, Math.max(1, maxIterations));
+		this.fallbackMaxIterations = Math.min(500, Math.max(1, maxIterations));
 		this.contextManager = new ContextManager(
 			this.languageModelsService,
 			(msg, ...args) => this._log(msg, ...args)
 		);
+	}
+
+	/** The iteration budget for one continuation window (0 -> max), re-read per turn. */
+	private get maxIterations(): number {
+		const configured = this.agentSettingsService?.getMaxIterationsPerRequest();
+		return configured ? Math.min(500, Math.max(1, configured)) : this.fallbackMaxIterations;
 	}
 
 	private _log(msg: string, ...args: unknown[]): void {
@@ -384,8 +396,29 @@ export class UnifiedAgent {
 			this._log(`[LoCoPilot] Tools: ${allTools.map(t => t.id).join(', ')}`);
 		}
 
+		// Iteration budget for the current window. Exhausting it no longer ends the turn: the user is
+		// asked whether the agent should keep going, and saying yes grants a fresh 0->max window (the
+		// exact same limit logic, just re-armed). See requestContinuation.
+		const perWindowMax = this.maxIterations;
+		let iterationBudget = perWindowMax;
+		let continuationWindows = 0;
+		/** Set when the budget ran out and the user (or the absence of one) ended the turn. */
+		let stoppedAtIterationLimit = false;
+
 		// Main agentic loop
-		while (iterationCount < this.MAX_ITERATIONS && !token.isCancellationRequested) {
+		while (!token.isCancellationRequested) {
+			if (iterationCount >= iterationBudget) {
+				const keepGoing = await this.requestContinuation(progress, iterationCount, continuationWindows, perWindowMax, token);
+				if (!keepGoing) {
+					// A cancelled request already renders as cancelled; only a deliberate "Stop here" gets a note.
+					stoppedAtIterationLimit = !token.isCancellationRequested;
+					break;
+				}
+				continuationWindows++;
+				// Re-arm the same max-iteration logic from zero for this window.
+				iterationBudget = iterationCount + perWindowMax;
+				this._log(`[LoCoPilot] Iteration budget extended by ${perWindowMax} (window ${continuationWindows + 1}), new limit ${iterationBudget}`);
+			}
 			iterationCount++;
 			this._log(`[LoCoPilot] === Iteration ${iterationCount} ===`);
 			this._log(`[LoCoPilot] Current conversation has ${conversationMessages.length} messages`);
@@ -729,21 +762,19 @@ export class UnifiedAgent {
 			this._log(`[LoCoPilot] Completed iteration ${iterationCount}, continuing loop...`);
 		}
 
-		if (iterationCount >= this.MAX_ITERATIONS) {
-			this.logService.warn(`[LoCoPilot] Agent stopped: Reached maximum iterations`);
-			this.locopilotFileLog.log(`[LoCoPilot] Agent stopped: Reached maximum iterations`);
+		if (stoppedAtIterationLimit) {
+			this.logService.warn(`[LoCoPilot] Agent stopped at iteration limit after ${iterationCount} steps (user declined to continue)`);
+			this.locopilotFileLog.log(`[LoCoPilot] Agent stopped at iteration limit after ${iterationCount} steps (user declined to continue)`);
 
-			if (!hasEverEmitted) {
-				progress([{
-					kind: 'markdownContent',
-					content: new MarkdownString('The model did not return a response. Please try again or try with another model.')
-				}]);
-			} else {
-				progress([{
-					kind: 'markdownContent',
-					content: new MarkdownString('\n\n*Note: Reached maximum number of iterations. The task may be incomplete.*')
-				}]);
-			}
+			// Both branches are the user's own "Stop here", so neither may blame the model. The old
+			// "The model did not return a response" copy lived here and was misleading: the model DID
+			// work, it just spent every step on tool calls without writing an answer yet.
+			progress([{
+				kind: 'markdownContent',
+				content: hasEverEmitted
+					? new MarkdownString(localize('locopilot.agent.stoppedAtLimit', "\n\n*Stopped at your request - the task may be incomplete. Send a follow-up message to carry on.*"))
+					: new MarkdownString(localize('locopilot.agent.stoppedAtLimitNoAnswer', "\n\n*Stopped at your request before an answer was written. Send a follow-up message to carry on, or try another model.*"))
+			}]);
 		}
 
 		// Persist the real transcript (tool calls + results, post-compaction) so the next turn can
@@ -758,6 +789,69 @@ export class UnifiedAgent {
 
 		this._log(`[LoCoPilot] UnifiedAgent.run completed after ${iterationCount} iterations`);
 		return {};
+	}
+
+	/**
+	 * The iteration budget ran out. Ask the USER (never the model) whether the agent should keep
+	 * working, and re-arm the same 0->max budget if they say yes.
+	 *
+	 * Deliberately invisible to the LLM: nothing about this prompt, the user's answer, or the extra
+	 * budget is written into `conversationMessages`. The model has no tool for it and cannot request
+	 * more iterations - it is a system/user-level guard rail, so a stuck model can't talk its way
+	 * into an unbounded loop.
+	 *
+	 * The "Auto-continue when max iterations is reached" setting bypasses the prompt entirely: the
+	 * budget is granted straight away and the turn never pauses (Cancel remains the escape hatch).
+	 */
+	private async requestContinuation(
+		progress: (parts: IChatProgress[]) => void,
+		iterationCount: number,
+		previousWindows: number,
+		perWindowMax: number,
+		token: CancellationToken
+	): Promise<boolean> {
+		if (this.agentSettingsService?.getAutoContinueAtMaxIterations()) {
+			this._log(`[LoCoPilot] Iteration limit (${iterationCount}) reached; auto-continue setting is on, granting another ${perWindowMax} iterations without asking`);
+			return true;
+		}
+
+		this._log(`[LoCoPilot] Iteration limit (${iterationCount}) reached; asking the user whether to continue`);
+
+		const decision = new DeferredPromise<boolean>();
+		// No step/iteration count in the copy: the number only means something to someone who already
+		// knows their own limit setting, and "50 steps" reads as internals leaking into the chat.
+		const message = previousWindows === 0
+			? localize('locopilot.agent.stillWorking.message', "I've been working on this for a while and it isn't finished yet. Want me to keep going?")
+			: localize('locopilot.agent.stillWorking.messageAgain', "Still not finished. Keep going?");
+		const part = new ChatElicitationRequestPart(
+			localize('locopilot.agent.stillWorking.title', "This is taking a while"),
+			new MarkdownString(message),
+			'',
+			localize('locopilot.agent.stillWorking.continue', "Keep going"),
+			localize('locopilot.agent.stillWorking.stop', "Stop here"),
+			async () => { decision.complete(true); return ElicitationState.Accepted; },
+			async () => { decision.complete(false); return ElicitationState.Rejected; },
+		);
+		progress([part]);
+
+		// Cancelling the request (stop button) resolves the wait instead of hanging the turn forever.
+		const cancelListener = token.onCancellationRequested(() => {
+			part.hide();
+			decision.complete(false);
+		});
+		try {
+			const keepGoing = await decision.p;
+			this._log(`[LoCoPilot] User ${keepGoing ? 'allowed' : 'declined'} continuation at iteration ${iterationCount}`);
+			// Collapse the answered card: hide() removes it (the content part autoruns on isHidden). Nothing
+			// is written in its place on the continue path - the agent's next output follows immediately, so
+			// a "continued" line would only label what the reader can already see. A decline is the case that
+			// needs explaining (output just stops), and the closing note in run() covers it. Both choices are
+			// in the log either way.
+			part.hide();
+			return keepGoing && !token.isCancellationRequested;
+		} finally {
+			cancelListener.dispose();
+		}
 	}
 
 	/**

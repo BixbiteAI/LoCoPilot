@@ -20,8 +20,15 @@ const STORAGE_KEY_AGENT_USE_CODING_SYSTEM_PROMPT = 'locopilot.agentSettings.agen
 const STORAGE_KEY_PLAN_USE_CODING_SYSTEM_PROMPT = 'locopilot.agentSettings.planUseCodingSystemPrompt';
 const STORAGE_KEY_MAX_ITERATIONS = 'locopilot.agentSettings.maxIterationsPerRequest';
 const STORAGE_KEY_AUTO_RUN_SANDBOX = 'locopilot.agentSettings.autoRunCommandsInSandbox';
+const STORAGE_KEY_AUTO_CONTINUE_ITERATIONS = 'locopilot.agentSettings.autoContinueAtMaxIterations';
 
 export const DEFAULT_MAX_ITERATIONS = 50;
+/**
+ * Lowest value the "Max iterations per request" field accepts. Anything smaller is below what real
+ * work needs, and the agent would spend the turn asking to continue. Drop it temporarily to exercise
+ * the max-iteration continuation prompt in a couple of steps.
+ */
+export const MIN_MAX_ITERATIONS = 10;
 
 export interface ILoCoPilotAgentSettingsService {
 	readonly _serviceBrand: undefined;
@@ -37,6 +44,7 @@ export interface ILoCoPilotAgentSettingsService {
 	getFullPlanModeSystemPrompt(): string;
 	getMaxIterationsPerRequest(): number;
 	getAutoRunCommandsInSandbox(): boolean;
+	getAutoContinueAtMaxIterations(): boolean;
 
 	setAskModeSystemPrompt(value: string): void;
 	setAgentModeSystemPrompt(value: string): void;
@@ -46,6 +54,7 @@ export interface ILoCoPilotAgentSettingsService {
 	setPlanUseCodingSystemPrompt(value: boolean): void;
 	setMaxIterationsPerRequest(value: number): void;
 	setAutoRunCommandsInSandbox(value: boolean): void;
+	setAutoContinueAtMaxIterations(value: boolean): void;
 }
 
 export class LoCoPilotAgentSettingsService implements ILoCoPilotAgentSettingsService {
@@ -149,7 +158,7 @@ export class LoCoPilotAgentSettingsService implements ILoCoPilotAgentSettingsSer
 			return DEFAULT_MAX_ITERATIONS;
 		}
 		const n = parseInt(stored, 10);
-		return isNaN(n) || n < 10 ? DEFAULT_MAX_ITERATIONS : Math.min(500, Math.max(10, n));
+		return isNaN(n) || n < MIN_MAX_ITERATIONS ? DEFAULT_MAX_ITERATIONS : Math.min(500, Math.max(MIN_MAX_ITERATIONS, n));
 	}
 
 	setAskModeSystemPrompt(value: string): void {
@@ -165,7 +174,7 @@ export class LoCoPilotAgentSettingsService implements ILoCoPilotAgentSettingsSer
 	}
 
 	setMaxIterationsPerRequest(value: number): void {
-		const clamped = Math.min(500, Math.max(10, value));
+		const clamped = Math.min(500, Math.max(MIN_MAX_ITERATIONS, value));
 		this.storageService.store(STORAGE_KEY_MAX_ITERATIONS, String(clamped), StorageScope.APPLICATION, StorageTarget.USER);
 	}
 
@@ -175,5 +184,18 @@ export class LoCoPilotAgentSettingsService implements ILoCoPilotAgentSettingsSer
 
 	setAutoRunCommandsInSandbox(value: boolean): void {
 		this.storageService.store(STORAGE_KEY_AUTO_RUN_SANDBOX, String(value), StorageScope.APPLICATION, StorageTarget.USER);
+	}
+
+	/**
+	 * When on, hitting "Max iterations per request" silently grants the agent another full budget
+	 * instead of asking the user whether to keep going. Off by default: the ask is the only thing
+	 * standing between a stuck model and an unbounded tool loop.
+	 */
+	getAutoContinueAtMaxIterations(): boolean {
+		return this.storageService.getBoolean(STORAGE_KEY_AUTO_CONTINUE_ITERATIONS, StorageScope.APPLICATION, false);
+	}
+
+	setAutoContinueAtMaxIterations(value: boolean): void {
+		this.storageService.store(STORAGE_KEY_AUTO_CONTINUE_ITERATIONS, String(value), StorageScope.APPLICATION, StorageTarget.USER);
 	}
 }

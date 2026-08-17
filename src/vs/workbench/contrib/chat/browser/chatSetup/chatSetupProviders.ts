@@ -1184,7 +1184,7 @@ export class LoCoPilotBuiltInAgent extends Disposable implements IChatAgentImple
 	) {
 		super();
 		const maxIterations = this.agentSettingsService.getMaxIterationsPerRequest();
-		this.unifiedAgent = new UnifiedAgent(this.languageModelsService, this.toolsService, this.logService, this.workspaceService, this.locopilotFileLog, this.chatTodoListService, maxIterations);
+		this.unifiedAgent = new UnifiedAgent(this.languageModelsService, this.toolsService, this.logService, this.workspaceService, this.locopilotFileLog, this.chatTodoListService, maxIterations, this.agentSettingsService);
 
 		// Warm the model's stable system+tools prefix ahead of the user's first message so that first
 		// message isn't stuck behind a cold, multi-thousand-token prompt-eval. Fire when the selection
