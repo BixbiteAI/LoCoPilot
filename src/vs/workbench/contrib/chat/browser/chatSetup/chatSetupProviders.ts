@@ -2287,10 +2287,13 @@ Focus on making the exact changes requested while preserving code structure and 
 	/**
 	 * Generate a short session title using the LLM from the first user message.
 	 *
-	 * NOTE: the caller (`generateInitialChatTitleIfNeeded` in chatServiceImpl.ts) applies the
-	 * rule-based title from chatTitleHeuristics.ts first and then lets this override it. On any
-	 * failure here (no usable model, cancelled, error) we return that same rule-based title, so
-	 * the caller keeps what it already showed.
+	 * NOTE: the caller (`generateInitialChatTitleIfNeeded` in chatServiceImpl.ts) currently has
+	 * this disabled and uses the rule-based titler in chatTitleHeuristics.ts instead, so this
+	 * method is not reached today. Do NOT just uncomment the caller: the prompt built below is a
+	 * BARE user message with no system prompt and no tools, which truncates the server's warm
+	 * prefix down to ~70 tokens and costs the next turn a full re-prefill (measured at 25s). See
+	 * the long comment on the caller for what has to change first. It is kept working - and falls
+	 * back to the same rule-based title on any failure - for when that work happens.
 	 */
 	async provideChatTitle(history: IChatAgentHistoryEntry[], token: CancellationToken): Promise<string | undefined> {
 		if (history.length === 0) {

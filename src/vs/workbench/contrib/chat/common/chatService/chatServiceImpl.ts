@@ -1104,23 +1104,41 @@ export class ChatService extends Disposable implements IChatService {
 		if (heuristicTitle) {
 			model.setCustomTitle(heuristicTitle);
 		}
-		this.logService.info(`[chat title] rule-based title applied: "${heuristicTitle}" (LLM titler will try to override it)`);
+		this.logService.info(`[chat title] rule-based title applied: "${heuristicTitle}" (LLM titler is commented out)`);
 
 		/* ---------------------------------------------------------------------------------
-		 * LLM-BASED TITLE GENERATION.
+		 * LLM-BASED TITLE GENERATION - COMMENTED OUT.
 		 *
-		 * Known cost, measured on llama.cpp (Qwen3.5-2B MTP, n_slots = 1, and with cache_reuse
-		 * unavailable - Qwen3.5 is an M-RoPE arch, so llama.cpp zeroes n_cache_reuse at load regardless
-		 * of MTP; see the --cache-reuse comment in locopilotLlamaCppServer.ts): this 53-token title
-		 * prompt lands between conversation turns, and because it shares no prefix with what is in the
-		 * slot it logs "forcing full prompt re-processing" and ERASES every context checkpoint of the
-		 * conversation. Disabled, the next turn instead hits "restored context checkpoint" at
-		 * sim_best = 0.999. (The warm-up ping in locopilotLocalModelRunner.ts stays commented out for
-		 * that same reason.)
+		 * Re-enabled once and measured on llama.cpp (2026-08-17, Nemotron-3.5-30B, n_slots = 1). It cost
+		 * 25s on the first turn of every new session, and the reason is worth writing down precisely,
+		 * because it is NOT "an extra request costs a prefill":
 		 *
-		 * It overrides the heuristic title only when the model returns something and the user hasn't
-		 * renamed the session meanwhile; on error/empty/cancelled the heuristic title above stays.
-		 * ------------------------------------------------------------------------------- */
+		 *   task 1 (title) | LCP similarity, f_sim_best = 0.676 | prompt eval = 71 tokens
+		 *   release        | n_tokens = 74
+		 *   task 3 (turn)  | selected slot by LRU               | prompt eval = 25146 ms / 9240 tokens
+		 *
+		 * `provideChatTitle` -> `_generateTitleWithModel` sends a BARE user message: no system prompt,
+		 * no tools. llama.cpp keeps only the common prefix, so those 71 tokens truncated the slot - which
+		 * held the restored ~9K system+tools prefix - down to 74 tokens. The real turn then had nothing to
+		 * match, got picked by LRU, and re-prefilled everything. (Contrast the same log's tool-loop
+		 * iterations, which extend the prefix: f_sim_best = 0.988, prompt eval = 111 tokens.) The MLX
+		 * server has the same failure shape - a system-prompt-less request makes a new sequence and can
+		 * evict the cached `system` one under --prompt-cache-size 2.
+		 *
+		 * So re-enabling this needs TWO changes, not one:
+		 *   1. Build the title request on the SAME system prompt + tool set as a real turn, so it EXTENDS
+		 *      the warm prefix instead of replacing it. This is the change that actually matters.
+		 *   2. Fire it after turn 1 completes rather than before invoke(), to keep it off the
+		 *      first-token path. Deferring ALONE does not help - it just moves the full re-prefill to
+		 *      turn 2.
+		 * Note (1) means tools are in the payload, so the model may emit a tool call instead of a title;
+		 * that needs handling (tool_choice: none, or discard non-text and keep the heuristic).
+		 *
+		 * The warm-up ping in locopilotLocalModelRunner.ts is commented out for the same reason.
+		 *
+		 * The block below overrides the heuristic title only when the model returns something and the
+		 * user hasn't renamed the session meanwhile; on error/empty/cancelled the heuristic title stays.
+		 *
 		const singleEntryHistory: IChatAgentHistoryEntry[] = [{
 			request,
 			response: [],
@@ -1147,6 +1165,7 @@ export class ChatService extends Disposable implements IChatService {
 			}
 		};
 		void generate();
+		 * ------------------------------------------------------------------------------- */
 	}
 
 	private prepareContext(attachedContextVariables: IChatRequestVariableEntry[] | undefined): IChatRequestVariableEntry[] {
