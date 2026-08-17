@@ -11,6 +11,7 @@ import { timeout } from '../../../../../base/common/async.js';
 import { CancellationToken } from '../../../../../base/common/cancellation.js';
 import { Codicon } from '../../../../../base/common/codicons.js';
 import { toErrorMessage } from '../../../../../base/common/errorMessage.js';
+import { isCancellationError } from '../../../../../base/common/errors.js';
 import { Emitter, Event } from '../../../../../base/common/event.js';
 import { MarkdownString, createMarkdownCommandLink } from '../../../../../base/common/htmlContent.js';
 import { Lazy } from '../../../../../base/common/lazy.js';
@@ -2430,6 +2431,11 @@ Message: ${firstMessage.substring(0, 500)}`;
 		if (modelId === LOCOPILOT_AUTO_MODEL_ID) {
 			const resolved = this._resolveAutoModel();
 			if (!resolved) {
+				// The starter card is markdown with command links - neither renders in the inline widget,
+				// so inline chat gets a one-line error pointing at the panel instead of silence.
+				if (request.location === ChatAgentLocation.EditorInline) {
+					return inlineChatFailure(localize('locopilotInlineNoModel', "No model is ready yet. Open the Chat panel to download one, then try again."));
+				}
 				progress([{ kind: 'markdownContent', content: buildAutoStarterPicksMarkdown(this._detectedRamGB(), this.customLanguageModelsService.getCustomModels(), this.localModelRunner.getHardwareProfile()) }]);
 				return {};
 			}
@@ -2488,7 +2494,7 @@ Message: ${firstMessage.substring(0, 500)}`;
 				// path that turns the model output into a textEdit over the selected range, which the inline
 				// editing session renders as an accept/reject diff in the editor.
 				if (request.location === ChatAgentLocation.EditorInline && request.locationData?.type === ChatAgentLocation.EditorInline) {
-					return await this.runInlineEditRequest(request, request.locationData, progress, modelId, modelMetadata, token);
+					return await this.runInlineEditRequest(request, request.locationData, progress, history, modelId, modelMetadata, token);
 				}
 
 				// Get mode info from widget if available
@@ -2589,7 +2595,10 @@ Message: ${firstMessage.substring(0, 500)}`;
 			} catch (e) {
 				this.logService.error(`[LoCoPilot] Failed to call model ${modelId}: ${e}`);
 				this.locopilotFileLog.log(`[LoCoPilot] Failed to call model ${modelId}: ${e}`);
-				// Show error to user
+				// Show error to user - inline chat only renders errorDetails, not markdown.
+				if (request.location === ChatAgentLocation.EditorInline) {
+					return inlineChatFailure(localize('locopilotInlineCallError', "Error calling model: {0}", toErrorMessage(e)));
+				}
 				progress([{
 					kind: 'markdownContent',
 					content: markSystemNotice(new MarkdownString(`**Error calling model:** ${toErrorMessage(e)}\n\nPlease check your API key and model configuration.`))
@@ -2599,6 +2608,9 @@ Message: ${firstMessage.substring(0, 500)}`;
 		}
 
 		// If no external agent is available, provide a helpful message
+		if (request.location === ChatAgentLocation.EditorInline) {
+			return inlineChatFailure(localize('locopilotInlineNoAgent', "No model is configured. Open the Chat panel and add a model to use inline edits."));
+		}
 		progress([{
 			kind: 'markdownContent',
 			content: markSystemNotice(new MarkdownString(localize(
@@ -2624,6 +2636,7 @@ Message: ${firstMessage.substring(0, 500)}`;
 		request: IChatAgentRequest,
 		locationData: IChatEditorLocationData,
 		progress: (parts: IChatProgress[]) => void,
+		history: IChatAgentHistoryEntry[],
 		modelId: string,
 		modelMetadata: any,
 		token: CancellationToken
@@ -2673,6 +2686,18 @@ Message: ${firstMessage.substring(0, 500)}`;
 		if (!isGenerate) {
 			userParts.push(`The user selected this code to modify:\n\`\`\`${languageId}\n${selectedText}\n\`\`\``);
 		}
+		// Follow-ups in the same inline widget ("no, use a for loop instead") arrive as separate
+		// requests; on their own they read as a fresh, contextless instruction. The previous turns'
+		// EDITS are already visible - the surrounding code above is re-read from the live model - so
+		// replaying the earlier instructions is all that's needed to make the follow-up land.
+		const priorInstructions = history
+			.map(entry => entry.request.message?.trim())
+			.filter((message): message is string => !!message)
+			.slice(-3);
+		if (priorInstructions.length > 0) {
+			userParts.push(`Earlier instructions in this inline session (already applied to the code above):\n${priorInstructions.map(m => `- ${m}`).join('\n')}`);
+		}
+
 		userParts.push(`Instruction: ${request.message || (isGenerate ? 'Generate appropriate code here.' : 'Improve the selected code.')}`);
 		userParts.push(isGenerate
 			? `Return ONLY the code to insert.`
@@ -2685,8 +2710,10 @@ Message: ${firstMessage.substring(0, 500)}`;
 
 		this._log(`[LoCoPilot] Inline edit (${isGenerate ? 'generate' : 'modify'}) on ${uri.toString()} range ${editRange.toString()} using model ${modelId}`);
 
-		// Signal the start of an edit stream for this file so the editing session wires up the diff UI.
-		progress([{ kind: 'textEdit', uri, edits: [] }]);
+		// NB: no "edit stream started" part is emitted here. An empty edit batch is not an atomic edit,
+		// so the editing session marks everything from line 1 down as a pending rewrite - dimming the
+		// WHOLE file to 60% opacity for as long as the model is generating. The single atomic edit
+		// below creates the entry on its own.
 
 		let fullText = '';
 		try {
@@ -2711,61 +2738,140 @@ Message: ${firstMessage.substring(0, 500)}`;
 			}
 			await response.result;
 		} catch (e) {
+			// Escape closes the widget by cancelling the request; `response.result` rejects with a
+			// cancellation error, which must NOT become a visible (and screen-reader alerted) error.
+			if (token.isCancellationRequested || isCancellationError(e)) {
+				return {};
+			}
 			this.logService.error(`[LoCoPilot] Inline edit failed for model ${modelId}: ${e}`);
 			this.locopilotFileLog.log(`[LoCoPilot] Inline edit failed for model ${modelId}: ${e}`);
-			progress([{ kind: 'textEdit', uri, edits: [], done: true }]);
-			progress([{
-				kind: 'markdownContent',
-				content: markSystemNotice(new MarkdownString(`**Error calling model:** ${toErrorMessage(e)}`))
-			}]);
-			return {};
+			return inlineChatFailure(localize('locopilotInlineError', "Error calling model: {0}", toErrorMessage(e)));
 		}
 
 		if (token.isCancellationRequested) {
-			progress([{ kind: 'textEdit', uri, edits: [], done: true }]);
 			return {};
 		}
 
-		const newText = stripCodeFences(fullText);
+		const newText = fitInlineEditToSelection(extractInlineEditCode(fullText), selectedText, editRange.startColumn === 1);
 		if (!newText.trim()) {
-			// Model produced nothing usable - close the edit stream and surface a hint instead of
-			// silently leaving the file unchanged.
-			progress([{ kind: 'textEdit', uri, edits: [], done: true }]);
-			progress([{
-				kind: 'markdownContent',
-				content: markSystemNotice(new MarkdownString(localize('locopilotInlineNoOutput', "The model did not return any code to apply. Try rephrasing your instruction.")))
-			}]);
-			return {};
+			// Model produced nothing usable - say so instead of silently leaving the file unchanged.
+			return inlineChatFailure(localize('locopilotInlineNoOutput', "The model did not return any code to apply. Try rephrasing your instruction."));
 		}
 
-		// Apply the model's output as a single replacement of the selected range, then close the
-		// stream. The inline editing session diffs this against the original and shows keep/undo.
-		progress([{ kind: 'textEdit', uri, edits: [{ range: editRange, text: newText }] }]);
-		progress([{ kind: 'textEdit', uri, edits: [], done: true }]);
+		// One atomic edit: sending the edits together with `done` is what makes the editing session
+		// take its atomic path (minimal edits + the applied-edit flash) instead of the streaming path,
+		// which paints a pending-rewrite overlay over the rest of the file.
+		progress([{ kind: 'textEdit', uri, edits: [{ range: editRange, text: newText }], done: true }]);
 		return {};
 	}
 }
 
 /**
- * Strip a single leading/trailing markdown code fence from model output. Inline-edit prompts ask the
- * model to omit fences, but small local models often add them anyway - leaving them in would insert
- * literal ``` lines into the user's file.
+ * Report a failure that the INLINE chat widget will actually show.
+ *
+ * The inline widget filters its list down to pending confirmations (see InlineChatController) and
+ * renders a message only from `result.errorDetails` - so a `markdownContent` part, which is how the
+ * panel reports the same conditions, is invisible there and the widget just closes as if nothing
+ * happened.
  */
-function stripCodeFences(raw: string): string {
-	let text = raw.trim();
-	if (!text.startsWith('```')) {
+function inlineChatFailure(message: string): IChatAgentResult {
+	return { errorDetails: { message } };
+}
+
+/**
+ * Pull the code out of a raw inline-edit reply. Inline-edit prompts ask the model to return bare
+ * code, but small local models routinely wrap it in a fence, introduce it with prose ("Sure! Here's
+ * the code:"), or emit several blocks - and anything we fail to strip is written verbatim into the
+ * user's file, literal ``` lines included.
+ *
+ * Rule: if the reply contains any fenced block, the code is what's inside the fences (the largest
+ * block, since models tend to append a small "before/after" illustration); prose outside the fences
+ * is dropped. Only when there is no fence at all is the whole reply treated as code.
+ */
+function extractInlineEditCode(raw: string): string {
+	const blocks: string[] = [];
+	const fenceRe = /(^|\n)[ \t]*```[^\n]*\n([\s\S]*?)\n?[ \t]*```(?=\s*($|\n))/g;
+	let match: RegExpExecArray | null;
+	while ((match = fenceRe.exec(raw)) !== null) {
+		blocks.push(match[2]);
+	}
+
+	let text: string;
+	if (blocks.length > 0) {
+		text = blocks.reduce((longest, block) => block.length > longest.length ? block : longest, '');
+	} else {
+		// No complete fence. A reply that was cut off mid-generation can still carry an opening
+		// fence line, which must go; otherwise take the reply as-is.
+		text = raw;
+		const openingFence = /^[ \t]*```[^\n]*\n/.exec(text);
+		if (openingFence) {
+			text = text.slice(openingFence[0].length);
+		}
+	}
+
+	return stripBlankEdgeLines(text);
+}
+
+/**
+ * Drop whitespace-only lines from both ends WITHOUT touching the indentation of the first and last
+ * lines that carry code. A plain `trim()` here is what silently unindents the first line of every
+ * unfenced reply.
+ */
+function stripBlankEdgeLines(text: string): string {
+	const lines = text.split('\n');
+	let start = 0;
+	while (start < lines.length && lines[start].trim() === '') {
+		start++;
+	}
+	let end = lines.length;
+	while (end > start && lines[end - 1].trim() === '') {
+		end--;
+	}
+	return lines.slice(start, end).join('\n');
+}
+
+/** Leading whitespace of the first line of `text`. */
+function leadingWhitespaceOfFirstLine(text: string): string {
+	return /^[ \t]*/.exec(text.split('\n', 1)[0])![0];
+}
+
+/**
+ * Make the extracted code fit the exact range it replaces.
+ *
+ * Two things have to be restored, because the range is the user's raw selection (inline chat does
+ * not expand it to whole lines - see InlineChatController):
+ *
+ * - Indentation. A selection made by dragging the gutter starts at column 1, so the leading
+ *   indentation is part of what we replace; models frequently answer with the block flush-left.
+ *   Re-apply the missing prefix to every line so the block lands back at the original depth.
+ * - Newlines at the edges. A whole-line selection ends at column 1 of the FOLLOWING line, i.e. it
+ *   includes the final newline - replacing it with text that has no trailing newline pulls the next
+ *   line up onto the end of the generated code.
+ */
+function fitInlineEditToSelection(code: string, selectedText: string, startsAtLineStart: boolean): string {
+	let text = code;
+	if (!text) {
 		return text;
 	}
-	// Drop the opening fence line (``` optionally followed by a language id).
-	const firstNewline = text.indexOf('\n');
-	if (firstNewline === -1) {
-		return '';
+
+	if (startsAtLineStart && selectedText) {
+		const originalIndent = leadingWhitespaceOfFirstLine(selectedText);
+		const modelIndent = leadingWhitespaceOfFirstLine(text);
+		// Only ever ADD the missing prefix, and only when the model's indent is a prefix of the
+		// original's (so a tabs-vs-spaces mismatch is left alone rather than doubled up). Never
+		// dedent: a model that indented deeper may have had a reason to.
+		if (originalIndent.length > modelIndent.length && originalIndent.startsWith(modelIndent)) {
+			const prefix = originalIndent.slice(modelIndent.length);
+			text = text.split('\n').map(line => line.trim() === '' ? line : prefix + line).join('\n');
+		}
 	}
-	text = text.slice(firstNewline + 1);
-	// Drop the closing fence if present.
-	const lastFence = text.lastIndexOf('```');
-	if (lastFence !== -1) {
-		text = text.slice(0, lastFence);
+
+	if (selectedText.startsWith('\n') && !text.startsWith('\n')) {
+		text = '\n' + text;
 	}
-	return text.replace(/\n+$/, '');
+	if (selectedText.endsWith('\n') && !text.endsWith('\n')) {
+		text = text + '\n';
+	}
+
+	return text;
 }
