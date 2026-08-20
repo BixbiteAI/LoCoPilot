@@ -12,20 +12,17 @@ suite('LoCoPilot system info service', () => {
 
 	test('Windows commit pressure tracks the commit charge, not momentary free RAM', () => {
 		// Real figures from a 16 GB laptop with a 40 GB pagefile: commitLimit/commitAvailable are what
-		// getSystemMemoryInfo() reports as swapTotal/swapFree on Windows.
-		const total = 16454352, free = 4772220, commitLimit = 58092164, commitAvailable = 37535152;
-		// ~35% committed - a healthy machine, even though only 4.7 GB of physical RAM is free.
-		assert.strictEqual(windowsCommitPressure(total, free, commitLimit, commitAvailable).pressure, 'normal');
-		// The case that used to kill working models: 1.3 GB free, below the watchdog's 1.5 GB floor (which on
-		// Windows WAS the entire kill test), while commit is untroubled. Must read 'normal'.
-		assert.strictEqual(windowsCommitPressure(total, 1_331_000, commitLimit, commitAvailable).pressure, 'normal');
-		// Physical RAM is not an input to the verdict at all - only the commit ratio moves it.
-		assert.strictEqual(windowsCommitPressure(total, 100, commitLimit, commitAvailable).pressure, 'normal');
+		// getSystemMemoryInfo() reports as swapTotal/swapFree on Windows. ~35% committed - a healthy machine,
+		// even though only 4.7 GB of physical RAM was free at the time and the watchdog's floor is ~1.5 GB.
+		// Free RAM is not a parameter at all: it is the watchdog's SEPARATE second signal, and this verdict
+		// staying 'normal' is what stops "available is low" from being a kill test on its own.
+		const total = 16454352, commitLimit = 58092164, commitAvailable = 37535152;
+		assert.strictEqual(windowsCommitPressure(total, commitLimit, commitAvailable).commitPressure, 'normal');
 	});
 
 	test('Windows commit pressure escalates as committed bytes approach the limit', () => {
 		const total = 16454352, commitLimit = 58092164;
-		const atRatio = (r: number) => windowsCommitPressure(total, 1_000_000, commitLimit, Math.round(commitLimit * (1 - r))).pressure;
+		const atRatio = (r: number) => windowsCommitPressure(total, commitLimit, Math.round(commitLimit * (1 - r))).commitPressure;
 		assert.strictEqual(atRatio(0.79), 'normal');
 		assert.strictEqual(atRatio(0.85), 'warn');
 		assert.strictEqual(atRatio(0.95), 'critical');
@@ -34,17 +31,21 @@ suite('LoCoPilot system info service', () => {
 	test('Windows commit pressure never reports a pagefile figure it cannot measure', () => {
 		// Committed-minus-resident over-reports pagefile usage several-fold (commit counts untouched pages),
 		// so -1 ("no signal") is the only honest answer - callers corroborate pressure another way.
-		const r = windowsCommitPressure(16454352, 4772220, 58092164, 37535152);
+		const r = windowsCommitPressure(16454352, 58092164, 37535152);
 		assert.strictEqual(r.swapUsedBytes, -1);
 	});
 
 	test('Windows commit pressure refuses input that is not the Windows shape', () => {
 		// Pagefile disabled: the commit limit equals physical RAM, which is valid and still ranks.
-		assert.strictEqual(windowsCommitPressure(16454352, 8000000, 16454352, 8000000).pressure, 'normal');
+		assert.strictEqual(windowsCommitPressure(16454352, 16454352, 8000000).commitPressure, 'normal');
 		// A commit limit below physical RAM is impossible on Windows -> we are misreading the fields.
-		assert.strictEqual(windowsCommitPressure(16454352, 8000000, 1024, 512).pressure, 'unknown');
-		assert.strictEqual(windowsCommitPressure(0, 0, 0, 0).pressure, 'unknown');
-		assert.strictEqual(windowsCommitPressure(NaN, 1, 1, 1).pressure, 'unknown');
+		assert.strictEqual(windowsCommitPressure(16454352, 1024, 512).commitPressure, 'unknown');
+		assert.strictEqual(windowsCommitPressure(0, 0, 0).commitPressure, 'unknown');
+		assert.strictEqual(windowsCommitPressure(NaN, 1, 1).commitPressure, 'unknown');
+		// An unreadable commit-available figure is a bad read, not a 100%-committed machine. Treating it as 0
+		// would manufacture 'critical' - the one verdict that must never come from a missing number.
+		assert.strictEqual(windowsCommitPressure(16454352, 58092164, NaN).commitPressure, 'unknown');
+		assert.strictEqual(windowsCommitPressure(16454352, 58092164, -1).commitPressure, 'unknown');
 	});
 
 	const GiB = 1024 ** 3;

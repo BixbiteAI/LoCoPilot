@@ -231,25 +231,30 @@ const WINDOWS_COMMIT_CRITICAL_RATIO = 0.90;
  * 1.7 GB, because commit counts committed-but-never-touched pages. Callers must treat -1 as "no signal"
  * and corroborate pressure some other way rather than acting on a number this cannot measure.
  *
+ * This verdict is reported as `commitPressure`, NOT as `pressure`. `pressure` gates the launch path (a
+ * 'critical' there blocks the launch and skips the auto-reduce-context search), and those thresholds are
+ * calibrated against the macOS/Linux kernel verdicts. Commit charge answers a different question, so only
+ * the runtime watchdog reads it - see the `commitPressure` note on IMemoryStatus.
+ *
  * Returns 'unknown' on nonsense input so a bad read can never manufacture a verdict.
  */
-export function windowsCommitPressure(totalKb: number, freeKb: number, commitLimitKb: number, commitAvailableKb: number): { pressure: MemoryPressureLevel; swapUsedBytes: number } {
+export function windowsCommitPressure(totalKb: number, commitLimitKb: number, commitAvailableKb: number): { commitPressure: MemoryPressureLevel; swapUsedBytes: number } {
 	const total = Number.isFinite(totalKb) && totalKb > 0 ? totalKb : 0;
 	// The commit limit is physical RAM plus the pagefile, so it can never be below total; anything else
 	// means we are not looking at the Windows shape of these fields and must not guess.
 	const limit = Number.isFinite(commitLimitKb) && commitLimitKb >= total ? commitLimitKb : 0;
-	if (total === 0 || limit === 0) {
-		return { pressure: 'unknown', swapUsedBytes: -1 };
+	// An unreadable commit-available figure is a bad read, not a full machine: guessing 0 here would
+	// manufacture a 100%-committed 'critical' verdict out of a missing number.
+	if (total === 0 || limit === 0 || !Number.isFinite(commitAvailableKb) || commitAvailableKb < 0) {
+		return { commitPressure: 'unknown', swapUsedBytes: -1 };
 	}
-	const available = Number.isFinite(commitAvailableKb) && commitAvailableKb >= 0
-		? Math.min(commitAvailableKb, limit)
-		: 0;
+	const available = Math.min(commitAvailableKb, limit);
 
 	const ratio = (limit - available) / limit;
-	const pressure: MemoryPressureLevel = ratio >= WINDOWS_COMMIT_CRITICAL_RATIO
+	const commitPressure: MemoryPressureLevel = ratio >= WINDOWS_COMMIT_CRITICAL_RATIO
 		? 'critical'
 		: (ratio >= WINDOWS_COMMIT_WARN_RATIO ? 'warn' : 'normal');
-	return { pressure, swapUsedBytes: -1 };
+	return { commitPressure, swapUsedBytes: -1 };
 }
 
 /**
@@ -384,7 +389,7 @@ export class LoCoPilotSystemInfoService implements ILoCoPilotSystemInfoService {
 		}
 		// Any other platform, or a probe that threw: os.freemem() is the best figure we have and every
 		// derived signal degrades to 'unknown'/-1, which callers must treat as "do not act on this".
-		return { totalBytes: totalmem(), availableBytes: freemem(), pressure: 'unknown', swapUsedBytes: -1, thermalPressure: 'unknown' };
+		return { totalBytes: totalmem(), availableBytes: freemem(), pressure: 'unknown', commitPressure: 'unknown', swapUsedBytes: -1, thermalPressure: 'unknown' };
 	}
 
 	/**
@@ -433,7 +438,7 @@ export class LoCoPilotSystemInfoService implements ILoCoPilotSystemInfoService {
 			else if (t >= 3) { thermalPressure = 'critical'; }
 		}
 
-		return { totalBytes, availableBytes, pressure, swapUsedBytes, thermalPressure };
+		return { totalBytes, availableBytes, pressure, commitPressure: 'unknown', swapUsedBytes, thermalPressure };
 	}
 
 	/**
@@ -479,18 +484,23 @@ export class LoCoPilotSystemInfoService implements ILoCoPilotSystemInfoService {
 		}
 
 		// Linux exposes no simple, universally-available thermal-pressure scalar; leave 'unknown' for now.
-		return { totalBytes, availableBytes, pressure, swapUsedBytes, thermalPressure: 'unknown' };
+		return { totalBytes, availableBytes, pressure, commitPressure: 'unknown', swapUsedBytes, thermalPressure: 'unknown' };
 	}
 
 	/**
 	 * Windows: `os.freemem()` is `GlobalMemoryStatusEx.ullAvailPhys`, which already counts the reclaimable
 	 * standby list - so it is the right "available" figure and stays the primary number here.
 	 *
-	 * What it could never express is WHY memory is tight, and Windows was the only platform handing the
-	 * runner no pressure verdict and no swap figure at all. Both are available for free from
+	 * What it could never express is WHY memory is tight: Windows was the only platform handing the runtime
+	 * watchdog no corroborating signal at all, so "available RAM is low" became its de-facto kill test and
+	 * healthy machines had working models stopped. The commit charge is available for free from
 	 * `process.getSystemMemoryInfo()` (one `GlobalMemoryStatusEx` call - no subprocess, which matters
-	 * because the runner's watchdog samples this every 5 seconds), so derive them here via
-	 * {@link windowsCommitPressure} and give Windows the same two-signal footing macOS and Linux have.
+	 * because the watchdog samples this every 5 seconds), so derive it here via {@link windowsCommitPressure}
+	 * and give the watchdog a second, independently-sourced signal.
+	 *
+	 * `pressure` deliberately stays 'unknown', exactly as before: it gates the LAUNCH path, whose thresholds
+	 * are calibrated against the macOS/Linux kernel verdicts. The commit verdict rides on `commitPressure`,
+	 * which only the watchdog reads. Launch admission on Windows is therefore unchanged by this.
 	 */
 	private _windowsMemoryStatus(): IMemoryStatus {
 		const totalBytes = totalmem();
@@ -498,13 +508,13 @@ export class LoCoPilotSystemInfoService implements ILoCoPilotSystemInfoService {
 		const info = trySystemMemoryInfo();
 		if (!info) {
 			// No Electron process API here: keep exactly the old behaviour rather than guessing.
-			return { totalBytes, availableBytes, pressure: 'unknown', swapUsedBytes: -1, thermalPressure: 'unknown' };
+			return { totalBytes, availableBytes, pressure: 'unknown', commitPressure: 'unknown', swapUsedBytes: -1, thermalPressure: 'unknown' };
 		}
 		// info.swapTotal/swapFree are the commit LIMIT and commit AVAILABLE on Windows - see windowsCommitPressure.
-		const { pressure, swapUsedBytes } = windowsCommitPressure(info.total, info.free, info.swapTotal, info.swapFree);
+		const { commitPressure, swapUsedBytes } = windowsCommitPressure(info.total, info.swapTotal, info.swapFree);
 		// Windows exposes no simple thermal scalar (the WMI thermal-zone classes are absent on most
 		// consumer machines), so that stays 'unknown' - callers already treat it as "no signal".
-		return { totalBytes, availableBytes, pressure, swapUsedBytes, thermalPressure: 'unknown' };
+		return { totalBytes, availableBytes, pressure: 'unknown', commitPressure, swapUsedBytes, thermalPressure: 'unknown' };
 	}
 
 	async deprioritizeProcess(pid: number): Promise<boolean> {

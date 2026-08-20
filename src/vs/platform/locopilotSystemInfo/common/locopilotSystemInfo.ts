@@ -78,6 +78,16 @@ export interface IMemoryStatus {
 	/** Free + reclaimable memory in bytes; 0 when it could not be determined. */
 	readonly availableBytes: number;
 	readonly pressure: MemoryPressureLevel;
+	/**
+	 * Windows only: the commit-charge verdict (`Committed Bytes / Commit Limit`); 'unknown' everywhere else.
+	 *
+	 * Deliberately NOT folded into {@link pressure}. That field gates the LAUNCH path - a 'critical' there
+	 * blocks the launch outright AND skips the auto-reduce-context search - and those decisions are tuned
+	 * against the macOS/Linux kernel verdicts they were built on. Commit charge answers a different question
+	 * (how close the machine is to its commit limit, deliberately ignoring free physical RAM), so it is
+	 * carried separately and read ONLY by the runtime memory watchdog.
+	 */
+	readonly commitPressure: MemoryPressureLevel;
 	/** Bytes of swap currently in use, or -1 when unknown. Rising swap while a model runs = thrashing. */
 	readonly swapUsedBytes: number;
 	/** System thermal-pressure level (macOS only for now); 'unknown' where unavailable. */

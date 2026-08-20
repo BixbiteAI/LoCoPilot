@@ -2913,22 +2913,6 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 	}
 
 	/**
-	 * The context window the user EXPLICITLY set (`locopilot.llamaCpp.contextSize` in user/workspace
-	 * settings), or undefined when they left it at the packaged default.
-	 *
-	 * The distinction cannot be recovered from `getValue`, which returns the default indistinguishably from
-	 * a real choice - and it has to be recoverable in two places: {@link _getLlamaTuning}, which resolves the
-	 * initial precedence, and the launch planner, which re-derives a ceiling from the GGUF and would
-	 * otherwise silently overwrite the answer. Both now read this, so "I set 16384" means 16384 at launch
-	 * instead of the model's full trained window.
-	 */
-	private _explicitGlobalContextSize(): number | undefined {
-		const inspected = this.configurationService.inspect<number>(ChatConfiguration.LocopilotLlamaCppContextSize);
-		const value = inspected?.userValue ?? inspected?.workspaceValue ?? inspected?.workspaceFolderValue;
-		return typeof value === 'number' && value > 0 ? value : undefined;
-	}
-
-	/**
 	 * Reads llama.cpp performance settings. All values default to safe, self-falling-back behavior:
 	 * flash attention 'auto', KV cache 'f16', MTP/mlock off.
 	 * MTP is per-model first (the model's own toggle), then the global setting as a fallback default.
@@ -2945,7 +2929,10 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 		// from the GGUF, so treating it as higher priority made `locopilot.llamaCpp.contextSize` unreachable for
 		// every downloaded model - you could set it and nothing happened. Only fall back to the per-model window
 		// when the user hasn't set the global one.
-		const explicitGlobalContext = this._explicitGlobalContextSize();
+		const globalContextInspect = cfg.inspect<number>(ChatConfiguration.LocopilotLlamaCppContextSize);
+		const explicitGlobalContext = globalContextInspect?.userValue
+			?? globalContextInspect?.workspaceValue
+			?? globalContextInspect?.workspaceFolderValue;
 		return {
 			contextSize: (explicitGlobalContext && explicitGlobalContext > 0 ? explicitGlobalContext : undefined)
 				?? perModelContext
@@ -3162,14 +3149,6 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 		const performanceProfile = await this._resolvePerformanceProfile();
 
 		// Thread auto-tuning: only when the user left it on auto (0/unset).
-		//
-		// Sized to the machine's physical cores, INCLUDING the efficiency cores on a hybrid CPU. Restricting
-		// decode to the performance cores looks reasonable on paper (each layer ends in a thread barrier, so a
-		// mixed pool should run at the slowest core's pace) but measurement says otherwise: on an i7-1355U
-		// (2 P + 8 E), median generation over three runs was 21.9 tok/s on 2 threads vs 40.5 on 10 with plain
-		// decode, and 17.0 vs 21.0 with MTP speculative decoding. Every 10-thread run beat every 2-thread run.
-		// The E-cores contribute real throughput here, so "all physical cores" stays the default; users who want
-		// the machine quieter reach for `locopilot.local.performanceProfile`, which scales this down.
 		if ((!tuning.threads || tuning.threads <= 0) && hw.physicalCoreCount > 0) {
 			const threadFraction = performanceProfile === 'quiet' ? 0.5 : (performanceProfile === 'balanced' ? 0.75 : 1);
 			tuning.threads = Math.max(1, Math.ceil(hw.physicalCoreCount * threadFraction));
@@ -3506,24 +3485,11 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 		// #2 Host prompt-cache cap: without an explicit --cache-ram the server claims up to the build default
 		// (8 GiB) of host RAM for its prompt cache - far more than the footprint accounting books for it.
 		// Cap it at min(2 GiB, 10% of RAM). Skipped when a build already rejected the flag this session.
-		//
-		// The cap is additionally held under a share of what is free RIGHT NOW. Sizing from total RAM alone
-		// is a claim on memory the machine may not have: on a busy 16 GB laptop the 1.6 GiB this produced was
-		// larger than the entire free pool at launch, so the cache competed with the weights and KV it exists
-		// to accelerate. Scaling to live headroom keeps the cache useful on an idle machine and out of the way
-		// on a loaded one, without a fixed number that is wrong on both.
 		if (tuning.cacheRamMiB === undefined && !this._cacheRamUnsupported) {
 			const mem = await this._getSystemMemory();
 			if (mem?.totalmem && mem.totalmem > 0) {
 				const MiB = 1024 * 1024;
-				const fromTotal = Math.floor((mem.totalmem * 0.10) / MiB);
-				// Reuse the launch path's recent sample rather than re-probing: a memory status costs five
-				// subprocesses on macOS, and the fit gate takes one moments before this runs.
-				const live = await this._getMemoryStatus(LoCoPilotLocalModelRunner.WATCHDOG_INTERVAL_MS);
-				const fromAvailable = live && live.availableBytes > 0
-					? Math.floor((live.availableBytes * 0.25) / MiB)
-					: Number.POSITIVE_INFINITY;
-				tuning.cacheRamMiB = Math.max(0, Math.min(2048, fromTotal, fromAvailable));
+				tuning.cacheRamMiB = Math.min(2048, Math.floor((mem.totalmem * 0.10) / MiB));
 			}
 		}
 
@@ -4135,28 +4101,29 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 		//  - macOS / Linux (a pressure signal exists): CRITICAL memory pressure AND swap actively growing together =
 		//    a real paging spiral (what freezes the machine). Neither alone qualifies - critical pressure is normal
 		//    for a deliberately-tight big model, and swap growth alone is normal opportunistic paging.
+		//  - Windows (commit-charge verdict, no measurable pagefile figure): commit at 90%+ of the limit AND
+		//    available under the floor. Two independently-sourced signals, neither of which fires alone. This
+		//    replaces the degenerate case where "available is low" was BY ITSELF the kill test on Windows -
+		//    which is why a healthy 16 GB laptop, where available sits under the floor as a matter of course
+		//    exactly as the macOS note above describes, had working models stopped.
 		//  - Signal-less platforms: fall back to low-available + swap growth, or low-available alone when
-		//    there's no swap figure either (last resort - it's all we have). Windows no longer lands here: it
-		//    reports a real commit-charge verdict (see windowsCommitPressure), so it takes the corroborated
-		//    branch above. Leaving low-available as Windows' de-facto kill test was why a healthy
-		//    16 GB laptop - where "available" sits under the floor as a matter of course, exactly as the macOS
-		//    note below describes - stopped models that were running (or still loading) perfectly well.
+		//    there's no swap figure either (last resort - it's all we have).
 		//  - nearlyOut (below the hard near-OOM floor) and SERIOUS thermal are independent last-resort kills.
 		const thermalEmergency = mem.thermalPressure === 'critical';
 		// Load-grace: while a server is still loading (or was promoted <45s ago), the RAM dip / paging tick is
 		// the expected cost of the load itself - the fit gate already budgeted for it. Soft signals are ignored
 		// during that window (no strikes, no warn toast); the hard near-OOM floor and thermal remain live.
 		const inLoadGrace = this._inLoadGraceWindow();
-		// Corroboration, never a single soft signal. Where a swap figure exists (macOS, Linux) the kernel's
-		// CRITICAL verdict must coincide with swap actually growing - unchanged. Windows reports a real
-		// commit-charge verdict but no measurable pagefile usage (see windowsCommitPressure), so there the
-		// second signal is low available RAM: commit at 90%+ of the limit AND under the available floor are
-		// independently sourced and neither fires on its own, which is the property that matters. What is
-		// gone is the old degenerate case where "available is low" was BY ITSELF the kill test on Windows.
-		const hasSwapSignal = mem.swapUsedBytes >= 0;
-		const pagingSpiral = hasPressureSignal
-			? (mem.pressure === 'critical' && (hasSwapSignal ? swapGrowing : lowAvailable))
-			: (lowAvailable && (swapGrowing || noSignals));
+		// Windows corroboration: commit charge is the kernel-grade verdict there, and it has no measurable
+		// pagefile figure to pair with (see windowsCommitPressure), so the second signal is low available RAM.
+		// Checked BEFORE the generic branches so the signal-less fallback - where low-available alone could
+		// kill - can no longer be reached on Windows.
+		const commitSpiral = mem.commitPressure === 'critical' && lowAvailable;
+		const pagingSpiral = mem.commitPressure !== 'unknown'
+			? commitSpiral
+			: (hasPressureSignal
+				? (mem.pressure === 'critical' && swapGrowing)
+				: (lowAvailable && (swapGrowing || noSignals)));
 		const seriousThermal = mem.thermalPressure === 'serious';
 		const killCritical = pagingSpiral || nearlyOut || seriousThermal;
 		if (!thermalEmergency && !killCritical) {
@@ -4177,12 +4144,7 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 		// serious pressure 30s to recover under utility QoS before unloading the model.
 		let requiredStrikes = Number.POSITIVE_INFINITY;
 		if (nearlyOut) {
-			// A load is SUPPOSED to consume the memory the fit gate budgeted for it, and the deepest dip comes
-			// as the KV cache is allocated - the moment right before the server binds its port. Two samples
-			// (~10s) there killed servers that were seconds away from ready, and because the kill lands before
-			// the port opens the user only ever sees "did not become ready". Outside the load window the
-			// original strictness is unchanged; inside it this matches the paging grace (~20s of evidence).
-			requiredStrikes = Math.min(requiredStrikes, inLoadGrace ? 4 : 2);
+			requiredStrikes = Math.min(requiredStrikes, 2);
 		}
 		if (pagingSpiral) {
 			// Loading legitimately causes one or two sharp paging samples. Keep the signal active rather than
@@ -5176,6 +5138,12 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 	 * Returns true when it fired (the caller stops polling).
 	 */
 	private _failIfLaunchWasSilent(modelId: string): boolean {
+		// Windows ONLY, deliberately. The failure this detects (a dead pty host leaving a phantom record) was
+		// observed only there, where the pty host is a separate utility process. Everywhere else this can only
+		// ever be a false positive against a healthy launch, so the safe default is not to run it at all.
+		if (!isWindows) {
+			return false;
+		}
 		const rec = this.runningServers.get(modelId);
 		// Foreign records are another window's process - we never see its output and must not judge it.
 		if (!rec || rec.foreign || rec.ready || rec.logs.length > 0) {
@@ -5183,9 +5151,7 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 		}
 		// llama.cpp ONLY. The guarantee this rests on - "a live server has printed something by now" - was
 		// verified for llama-server, which writes its banner before it opens the GGUF. mlx_lm.server is a
-		// Python process launched without `-u`, so its output can sit in a block buffer through a slow load;
-		// applying this there could kill a healthy launch on Apple Silicon, which is not a trade worth making
-		// for a failure mode (a dead pty host leaving a phantom record) seen on Windows.
+		// Python process launched without `-u`, so its output can sit in a block buffer through a slow load.
 		if (rec.kind !== 'llama') {
 			return false;
 		}
@@ -5207,6 +5173,10 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 		} catch {
 			// the terminal is already gone with its host; nothing to clean up
 		}
+		// Drop the cross-window claim, exactly as the stop and crash paths do. Usually a no-op here - the lock
+		// is only published once `terminal.processReady` yields a pid, which cannot happen when the pty host
+		// died - but if a lock WAS published, leaving it behind would point other windows at a corpse.
+		void this._clearActiveServerLockIfOwned();
 
 		const message = `**${name}** could not be started: the terminal process that runs the local server never launched. This is usually a crash of the editor's terminal (pty) host rather than a problem with the model - reload the window and try again. If it keeps happening, check the Terminal output log for "ptyHost terminated unexpectedly".`;
 		this._recordLaunchBlocked(modelId, message);
@@ -5465,12 +5435,7 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 			// back exactly the length MTP needs and a roomy one gives back nothing. Measured on a 32 GB M1 Max: a 27B
 			// lands on q8_0/40960 with MTP on whether this asks for 65536 or the full 262144 - the reserve does the
 			// work, a cap would only have cost the 64 GB+ machines their context.
-			// An explicit user setting outranks everything, including the model's trained window. Without this
-			// the line below always found a `trainedWindow` (every valid GGUF declares one) and discarded the
-			// value _getLlamaTuning had just resolved - so `locopilot.llamaCpp.contextSize` was unreachable for
-			// downloaded models, and a 16K request launched as a 225K one whose KV cache alone wanted ~6 GB.
-			const explicitGlobal = this._explicitGlobalContextSize();
-			const requestedCeiling = explicitGlobal ?? explicitPerModel ?? trainedWindow ?? baseTuning.contextSize ?? DEFAULT_LLAMA_CONTEXT_SIZE;
+			const requestedCeiling = explicitPerModel ?? trainedWindow ?? baseTuning.contextSize ?? DEFAULT_LLAMA_CONTEXT_SIZE;
 			// Never request beyond the trained window (rope stays un-scaled) or the absolute backstop.
 			baseTuning.contextSize = Math.max(
 				MIN_CLAMPED_CONTEXT,
