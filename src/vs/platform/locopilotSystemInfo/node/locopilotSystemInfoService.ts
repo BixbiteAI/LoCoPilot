@@ -200,6 +200,80 @@ export function parseWindowsVideoController(controllerOut: string, registryOut: 
 	return { vendor, name, totalVramBytes: vram, isIntegrated: isIntegratedGpu(vendor, vram) };
 }
 
+/**
+ * Commit-charge thresholds for {@link windowsCommitPressure}. Windows keeps servicing allocations right up
+ * to the commit limit and pays for it by trimming working sets to disk, so the interesting signal is how
+ * close committed bytes are to that limit - not how much physical RAM is momentarily free. 80% is where a
+ * machine starts trading working set for commit; past 90% it is paging to stay alive.
+ */
+const WINDOWS_COMMIT_WARN_RATIO = 0.80;
+const WINDOWS_COMMIT_CRITICAL_RATIO = 0.90;
+
+/**
+ * Derives a kernel-grade memory verdict for Windows from `process.getSystemMemoryInfo()`.
+ *
+ * IMPORTANT - what those fields actually are on Windows. Chromium fills them from
+ * `GlobalMemoryStatusEx`, and despite the names `swapTotal`/`swapFree` are NOT the pagefile: they are
+ * `ullTotalPageFile` and `ullAvailPageFile`, i.e. the COMMIT LIMIT and the commit still available.
+ * Verified on a 16 GB machine with a 40 GB pagefile:
+ *
+ *   swapTotal 58092164 KiB === Win32_OperatingSystem.TotalVirtualMemorySize (commit limit)
+ *   swapFree  37535152 KiB === Win32_OperatingSystem.FreeVirtualMemory      (commit available)
+ *
+ * So the ratio below is `Committed Bytes / Commit Limit` - the same figure Task Manager shows as
+ * "Committed" and perfmon exposes as `\Memory\% Committed Bytes In Use`. It is the right question to ask
+ * on Windows, which keeps servicing allocations up to the commit limit and pays for it by pushing working
+ * sets to disk: how much physical RAM is momentarily free says very little on its own.
+ *
+ * `swapUsedBytes` is deliberately left at -1. The honest pagefile figure is `Win32_PageFileUsage`, which
+ * costs a subprocess the 5-second watchdog cannot afford, and the tempting substitute (committed minus
+ * resident) is not it - on the machine above that arithmetic gives 8.5 GB against a real pagefile usage of
+ * 1.7 GB, because commit counts committed-but-never-touched pages. Callers must treat -1 as "no signal"
+ * and corroborate pressure some other way rather than acting on a number this cannot measure.
+ *
+ * Returns 'unknown' on nonsense input so a bad read can never manufacture a verdict.
+ */
+export function windowsCommitPressure(totalKb: number, freeKb: number, commitLimitKb: number, commitAvailableKb: number): { pressure: MemoryPressureLevel; swapUsedBytes: number } {
+	const total = Number.isFinite(totalKb) && totalKb > 0 ? totalKb : 0;
+	// The commit limit is physical RAM plus the pagefile, so it can never be below total; anything else
+	// means we are not looking at the Windows shape of these fields and must not guess.
+	const limit = Number.isFinite(commitLimitKb) && commitLimitKb >= total ? commitLimitKb : 0;
+	if (total === 0 || limit === 0) {
+		return { pressure: 'unknown', swapUsedBytes: -1 };
+	}
+	const available = Number.isFinite(commitAvailableKb) && commitAvailableKb >= 0
+		? Math.min(commitAvailableKb, limit)
+		: 0;
+
+	const ratio = (limit - available) / limit;
+	const pressure: MemoryPressureLevel = ratio >= WINDOWS_COMMIT_CRITICAL_RATIO
+		? 'critical'
+		: (ratio >= WINDOWS_COMMIT_WARN_RATIO ? 'warn' : 'normal');
+	return { pressure, swapUsedBytes: -1 };
+}
+
+/**
+ * Electron's `process.getSystemMemoryInfo()`, or undefined where it is unavailable (plain Node, or an
+ * Electron version/context that does not expose it). Feature-detected rather than imported so this file
+ * stays a `node/` layer module with no Electron dependency, and so a missing API degrades to the previous
+ * behaviour instead of throwing.
+ */
+function trySystemMemoryInfo(): { total: number; free: number; swapTotal: number; swapFree: number } | undefined {
+	try {
+		const fn = (process as unknown as { getSystemMemoryInfo?: () => { total: number; free: number; swapTotal?: number; swapFree?: number } }).getSystemMemoryInfo;
+		if (typeof fn !== 'function') {
+			return undefined;
+		}
+		const info = fn.call(process);
+		if (!info || !Number.isFinite(info.total)) {
+			return undefined;
+		}
+		return { total: info.total, free: info.free, swapTotal: info.swapTotal ?? 0, swapFree: info.swapFree ?? 0 };
+	} catch {
+		return undefined;
+	}
+}
+
 /** Runs a command for its side effect. Resolves true only when it exited 0. */
 function tryExecOk(command: string, args: string[]): Promise<boolean> {
 	return new Promise<boolean>(resolve => {
@@ -302,11 +376,14 @@ export class LoCoPilotSystemInfoService implements ILoCoPilotSystemInfoService {
 			if (plat === 'linux') {
 				return await this._linuxMemoryStatus();
 			}
+			if (plat === 'win32') {
+				return this._windowsMemoryStatus();
+			}
 		} catch (err) {
 			this.logService.warn(`[LoCoPilotSystemInfo] memory status probe failed: ${err}`);
 		}
-		// Windows (and any fallback): os.freemem() is GlobalMemoryStatusEx.ullAvailPhys, which already
-		// includes reclaimable standby-list memory - i.e. the "available" figure we want.
+		// Any other platform, or a probe that threw: os.freemem() is the best figure we have and every
+		// derived signal degrades to 'unknown'/-1, which callers must treat as "do not act on this".
 		return { totalBytes: totalmem(), availableBytes: freemem(), pressure: 'unknown', swapUsedBytes: -1, thermalPressure: 'unknown' };
 	}
 
@@ -402,6 +479,31 @@ export class LoCoPilotSystemInfoService implements ILoCoPilotSystemInfoService {
 		}
 
 		// Linux exposes no simple, universally-available thermal-pressure scalar; leave 'unknown' for now.
+		return { totalBytes, availableBytes, pressure, swapUsedBytes, thermalPressure: 'unknown' };
+	}
+
+	/**
+	 * Windows: `os.freemem()` is `GlobalMemoryStatusEx.ullAvailPhys`, which already counts the reclaimable
+	 * standby list - so it is the right "available" figure and stays the primary number here.
+	 *
+	 * What it could never express is WHY memory is tight, and Windows was the only platform handing the
+	 * runner no pressure verdict and no swap figure at all. Both are available for free from
+	 * `process.getSystemMemoryInfo()` (one `GlobalMemoryStatusEx` call - no subprocess, which matters
+	 * because the runner's watchdog samples this every 5 seconds), so derive them here via
+	 * {@link windowsCommitPressure} and give Windows the same two-signal footing macOS and Linux have.
+	 */
+	private _windowsMemoryStatus(): IMemoryStatus {
+		const totalBytes = totalmem();
+		const availableBytes = freemem();
+		const info = trySystemMemoryInfo();
+		if (!info) {
+			// No Electron process API here: keep exactly the old behaviour rather than guessing.
+			return { totalBytes, availableBytes, pressure: 'unknown', swapUsedBytes: -1, thermalPressure: 'unknown' };
+		}
+		// info.swapTotal/swapFree are the commit LIMIT and commit AVAILABLE on Windows - see windowsCommitPressure.
+		const { pressure, swapUsedBytes } = windowsCommitPressure(info.total, info.free, info.swapTotal, info.swapFree);
+		// Windows exposes no simple thermal scalar (the WMI thermal-zone classes are absent on most
+		// consumer machines), so that stays 'unknown' - callers already treat it as "no signal".
 		return { totalBytes, availableBytes, pressure, swapUsedBytes, thermalPressure: 'unknown' };
 	}
 
