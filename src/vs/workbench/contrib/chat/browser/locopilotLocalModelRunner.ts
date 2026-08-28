@@ -5524,6 +5524,15 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 		// essentially never produces. MTP is unaffected and remains the real speculation path (it measured 45-54%
 		// acceptance on Qwen3.5-0.8B and 70-85% on Qwen3.5-9B), as does a downloaded paired draft model. Users who
 		// want n-gram drafting can still turn it on explicitly via `locopilot.llamaCpp.promptLookup`.
+		//
+		// UPDATE: the zero-draft result above is a property of `n_match=24`, not of ngram-mod itself. Measured on
+		// Qwen3.6-27B-IQ2_XXS (Metal, M3): on a turn that DOES reproduce a long verbatim span, ngram-mod drafts at
+		// mean length 32.7 with 51.8% acceptance and doubles decode - 3.30 -> 7.12 tok/s (2.16x), verified against
+		// bracketing baselines to rule out thermal drift, with no measurable cost on non-repetitive decode. The
+		// default args therefore now lower the match length to 8 (`--spec-ngram-mod-n-match 8`) so it can fire on
+		// realistic edit traffic rather than only on exact 24-token repeats. This is still NOT auto-enabled: the
+		// win is proven only for reproduction-heavy turns, and the draft rate on ordinary agent chat at n-match 8
+		// has not been measured. Revisit auto-enabling once there is real-traffic draft-rate data at that setting.
 		// A build that already rejected speculative flags gets them stripped so the relaunch (and every
 		// launch after) starts cleanly. This also drops MTP: same --spec-type mechanism, same rejection.
 		if (this._specFlagsUnsupported && (baseTuning.multiTokenPrediction || baseTuning.draftModelPath?.trim() || baseTuning.promptLookup)) {

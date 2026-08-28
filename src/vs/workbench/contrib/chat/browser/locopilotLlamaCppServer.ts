@@ -1624,17 +1624,23 @@ export function getLlamaCppServerCommand(modelPath: string, backend: LlamaBacken
 		args.push('--ubatch-size', String(Math.floor(tuning.ubatchSize)));
 	}
 
-	// Lock weights into RAM to avoid paging. Opt-in because it can fail without privileges or enough memory.
-	if (tuning.mlock) {
-		args.push('--mlock');
+	// Weight loading mode. `--mlock`, `--no-mmap` and `--direct-io` are all DEPRECATED on current builds in
+	// favour of a single `--load-mode auto|none|mmap|mlock|mmap+mlock|dio`, so the two independent booleans the
+	// planner sets are resolved into one value here:
+	//   mlock + mmap       -> 'mmap+mlock'  lock the mapped weights resident (what --mlock alone did)
+	//   mlock + no-mmap    -> 'mlock'       anonymous pages, locked
+	//   no-mlock + no-mmap -> 'none'        plain read, no mapping (what --no-mmap meant on its own)
+	// Emitted ONLY when at least one is set, so a default launch keeps the build's own 'auto' (mmap where the
+	// device supports it) and this stays a no-op for the overwhelmingly common case.
+	if (tuning.mlock || tuning.noMmap) {
+		const loadMode = tuning.mlock ? (tuning.noMmap ? 'mlock' : 'mmap+mlock') : 'none';
+		args.push('--load-mode', loadMode);
 	}
 
 	// Skip the weight mmap. The planner sets this when tensors are placed on the CPU (`-ot` / `--n-cpu-moe`)
 	// and the footprint still fits physical RAM: mmap'd CPU tensors are re-faulted on every token, which is
 	// the single biggest cost of an expert-offload split. See LlamaServerTuning.noMmap.
-	if (tuning.noMmap) {
-		args.push('--no-mmap');
-	}
+	// (the flag itself is emitted above, as part of --load-mode)
 
 	// Full-size SWA KV cache: restores cross-turn prompt-cache reuse on Sliding-Window Attention models
 	// (Gemma 2/3). The runner only sets this when the model is SWA AND the full cache fits the budget.
