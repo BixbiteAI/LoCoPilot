@@ -156,3 +156,115 @@
 	height: 30px;
 	padding: 0 16px;
 }
+
+/* Hugging Face search under the model field (local Hugging Face only). Inline rather than floating, so the settings pane's scroll container can never clip it. */
+.hf-search-results {
+	margin-top: 4px;
+	max-height: 280px;
+	overflow-y: auto;
+	border: 1px solid var(--vscode-settings-textInputBorder, var(--vscode-input-border, var(--vscode-widget-border, transparent)));
+	border-radius: 4px;
+	background: var(--vscode-settings-textInputBackground, var(--vscode-input-background));
+}
+
+.hf-search-result {
+	padding: 6px 10px;
+	cursor: pointer;
+	border-bottom: 1px solid var(--vscode-widget-border, transparent);
+}
+
+.hf-search-result:last-child {
+	border-bottom: none;
+}
+
+.hf-search-result.active {
+	background: var(--vscode-list-activeSelectionBackground, var(--vscode-list-hoverBackground));
+	color: var(--vscode-list-activeSelectionForeground, inherit);
+}
+
+.hf-search-result-name {
+	font-size: 13px;
+	white-space: nowrap;
+	overflow: hidden;
+	text-overflow: ellipsis;
+}
+
+.hf-search-result-owner {
+	opacity: 0.7;
+}
+
+.hf-search-result-repo {
+	font-weight: 600;
+}
+
+.hf-search-result-meta {
+	display: flex;
+	flex-wrap: wrap;
+	align-items: center;
+	gap: 4px 10px;
+	margin-top: 2px;
+	font-size: 11px;
+	color: var(--vscode-descriptionForeground);
+}
+
+.hf-search-result.active .hf-search-result-meta {
+	color: inherit;
+	opacity: 0.85;
+}
+
+.hf-search-stat {
+	display: inline-flex;
+	align-items: center;
+	gap: 3px;
+}
+
+.hf-search-stat .codicon {
+	font-size: 12px;
+}
+
+.hf-search-badge,
+.hf-search-chip {
+	padding: 0 5px;
+	border-radius: 3px;
+	font-size: 10px;
+	line-height: 16px;
+	font-weight: 600;
+}
+
+.hf-search-badge {
+	background: var(--vscode-badge-background);
+	color: var(--vscode-badge-foreground);
+}
+
+.hf-search-chip {
+	border: 1px solid var(--vscode-descriptionForeground);
+}
+
+.hf-search-chip.gated {
+	border-color: var(--vscode-notificationsWarningIcon-foreground, var(--vscode-editorWarning-foreground));
+	color: var(--vscode-notificationsWarningIcon-foreground, var(--vscode-editorWarning-foreground));
+}
+
+.hf-search-status,
+.hf-search-preview {
+	margin-top: 6px;
+	font-size: 12px;
+	line-height: 1.4;
+	color: var(--vscode-descriptionForeground);
+	overflow-wrap: anywhere;
+}
+
+.hf-search-status.ok,
+.hf-search-preview.ok {
+	color: var(--vscode-charts-green, var(--vscode-testing-iconPassed));
+}
+
+.hf-search-status.warn,
+.hf-search-preview.warn {
+	color: var(--vscode-notificationsWarningIcon-foreground, var(--vscode-editorWarning-foreground));
+}
+
+.hf-search-status.error,
+.hf-search-preview.error {
+	color: var(--vscode-notificationsErrorIcon-foreground, var(--vscode-editorError-foreground));
+}

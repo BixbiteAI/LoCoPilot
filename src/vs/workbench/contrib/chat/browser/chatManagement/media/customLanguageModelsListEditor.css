@@ -690,9 +690,28 @@
 }
 
 .model-download-progress-label {
+	display: flex;
+	justify-content: space-between;
+	align-items: baseline;
+	gap: 12px;
 	font-size: 11px;
 	color: var(--vscode-descriptionForeground);
 	margin-bottom: 4px;
+}
+
+.model-download-progress-status {
+	min-width: 0;
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+}
+
+/* "1.4 GB of 4.1 GB" - sits over the end of the bar, tabular so the digits don't jitter as they tick. */
+.model-download-progress-bytes {
+	flex: 0 0 auto;
+	font-weight: 600;
+	color: var(--vscode-foreground);
+	font-variant-numeric: tabular-nums;
 }
 
 .model-download-progress-track {

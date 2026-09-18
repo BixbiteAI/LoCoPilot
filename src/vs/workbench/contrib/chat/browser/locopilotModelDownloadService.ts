@@ -39,8 +39,9 @@ import { findDraftPairing, estimateLayerCountFromModelName, modelParamsBillionsF
 import { readGgufModelInfo, isMtpModelInfo, hasBrokenMtpMetadata } from './locopilotGgufMetadata.js';
 import { IDialogService } from '../../../../platform/dialogs/common/dialogs.js';
 import { ITerminalService, ITerminalInstance } from '../../terminal/browser/terminal.js';
-import { getBundledMlxPython } from './locopilotMlxServer.js';
+import { getBundledMlxPython, isAppleSiliconMac } from './locopilotMlxServer.js';
 import { showTransientNotification } from './locopilotNotify.js';
+import { buildHfSearchUrl, parseHfSearchResults, mergeHfSearchResults, HF_SEARCH_MIN_QUERY_LENGTH, LOCOPILOT_HF_SEARCH_COMMAND, LOCOPILOT_HF_PREVIEW_COMMAND, type HfSearchFormat, type IHfSearchResponse, type IHfRepoPreview } from './locopilotHfSearch.js';
 
 const HF_API_BASE = 'https://huggingface.co';
 const HF_RESOLVE = `${HF_API_BASE}`;
@@ -806,6 +807,23 @@ export class LoCoPilotModelDownloadService extends Disposable implements IWorkbe
 				}
 			}
 		});
+		// Add Model form: Hugging Face search-as-you-type, and the "how would this fit here" line for the pick.
+		registerAction2(class extends Action2 {
+			constructor() {
+				super({ id: LOCOPILOT_HF_SEARCH_COMMAND, title: 'Search Hugging Face Models' });
+			}
+			run(_accessor: ServicesAccessor, query: string, token?: string): Promise<IHfSearchResponse> {
+				return self.searchHuggingFaceModels(query, token, CancellationToken.None);
+			}
+		});
+		registerAction2(class extends Action2 {
+			constructor() {
+				super({ id: LOCOPILOT_HF_PREVIEW_COMMAND, title: 'Preview Hugging Face Model' });
+			}
+			run(_accessor: ServicesAccessor, repoId: string, token?: string): Promise<IHfRepoPreview> {
+				return self.previewHuggingFaceModel(repoId, token, CancellationToken.None);
+			}
+		});
 		registerAction2(class extends Action2 {
 			constructor() {
 				super({ id: 'locopilot.checkDiskSpace', title: 'Check Disk Space' });
@@ -938,6 +956,8 @@ export class LoCoPilotModelDownloadService extends Disposable implements IWorkbe
 				isDownloading: false,
 				downloadPaused: false,
 				downloadProgress: undefined,
+				downloadTotalBytes: undefined,
+				downloadedBytes: undefined,
 				localPath: undefined,
 			});
 		}
@@ -1090,6 +1110,80 @@ export class LoCoPilotModelDownloadService extends Disposable implements IWorkbe
 			}
 		}
 		return out;
+	}
+
+	/**
+	 * Searches the Hub for models this machine can run: GGUF everywhere, plus MLX on Apple Silicon (the only
+	 * place the MLX engine exists). HF's `filter` params AND together, so each format is its own request and the
+	 * lists are merged. Results undefined = Hugging Face unreachable, which the form reports differently from
+	 * "no matches".
+	 */
+	async searchHuggingFaceModels(query: string, token: string | undefined, cancel: CancellationToken): Promise<IHfSearchResponse> {
+		const q = (query || '').trim();
+		if (q.length < HF_SEARCH_MIN_QUERY_LENGTH) {
+			return { results: [] };
+		}
+		const formats: HfSearchFormat[] = isAppleSiliconMac() ? ['gguf', 'mlx'] : ['gguf'];
+		// The token only widens what is visible (private/gated repos the user has access to); search works without it.
+		const headers: Record<string, string> = token ? { Authorization: `Bearer ${token}` } : {};
+		const raws = await Promise.all(formats.map(format => this._getJson(buildHfSearchUrl(HF_API_BASE, q, format), headers, cancel)));
+		if (raws.every(raw => raw === undefined)) {
+			return { results: undefined };
+		}
+		return { results: mergeHfSearchResults(raws.map((raw, i) => parseHfSearchResults(raw, formats[i]))) };
+	}
+
+	/**
+	 * Previews a repo the way {@link _downloadHuggingFaceModel} would treat it - same file listing, same memory
+	 * budget, same {@link planGgufDownload} - so the verdict shown before Add is the one the download acts on
+	 * (including the "Download anyway?" prompt a 'poor' fit gets). Read-only: nothing is added or fetched.
+	 */
+	async previewHuggingFaceModel(repoId: string, token: string | undefined, cancel: CancellationToken): Promise<IHfRepoPreview> {
+		const repo = (repoId || '').trim();
+		const repoPath = repo.split('/').map(encodeURIComponent).join('/');
+		const headers: Record<string, string> = token ? { Authorization: `Bearer ${token}` } : {};
+		const info = await this._getJson(`${HF_API_BASE}/api/models/${repoPath}`, headers, cancel);
+		if (!info) {
+			return { repoId: repo, error: 'notFound' };
+		}
+		const gated = !!info.gated;
+
+		const sizes = new Map<string, number>();
+		let paths: string[];
+		try {
+			paths = await this.listRepoFiles(repo, token, cancel, sizes);
+		} catch {
+			return { repoId: repo, gated, error: 'network' };
+		}
+		const files = paths.map(p => ({ path: p, size: sizes.get(p) }));
+		const { budgetBytes } = await this._downloadHardware();
+		const layerCount = estimateLayerCountFromModelName(repo);
+
+		if (paths.some(isWeightGgufPath)) {
+			const plan = budgetBytes > 0 ? planGgufDownload(files, budgetBytes, { layerCount }) : undefined;
+			return plan
+				? { repoId: repo, format: 'gguf', gated, verdict: plan.verdict, quant: quantNameFromPath(plan.path), sizeBytes: plan.sizeBytes, sharded: plan.sharded }
+				: { repoId: repo, format: 'gguf', gated };
+		}
+
+		const weights = paths.filter(p => /\.safetensors$/i.test(p));
+		if (weights.length === 0) {
+			return { repoId: repo, gated, error: 'noWeights' };
+		}
+		// Safetensors-only repos run through MLX, which exists only on Apple Silicon; llama.cpp can't load them.
+		if (!isAppleSiliconMac()) {
+			return { repoId: repo, gated, error: 'unsupported' };
+		}
+		const sizeBytes = weights.reduce((sum, p) => sum + (sizes.get(p) ?? 0), 0);
+		if (sizeBytes <= 0 || budgetBytes <= 0) {
+			return { repoId: repo, format: 'mlx', gated };
+		}
+		// MLX has no quant choice to make - the repo IS one quant - so the verdict is just the footprint vs budget,
+		// using the same weights + KV + overhead estimate the GGUF planner uses.
+		const verdict = estimateGgufRuntimeFootprintBytes(sizeBytes, layerCount, 'comfort') <= budgetBytes ? 'good'
+			: estimateGgufRuntimeFootprintBytes(sizeBytes, layerCount, 'floor') <= budgetBytes ? 'tight'
+				: 'poor';
+		return { repoId: repo, format: 'mlx', gated, verdict, sizeBytes, sharded: weights.length > 1 };
 	}
 
 	async downloadModel(modelId: string): Promise<void> {
@@ -1434,6 +1528,11 @@ export class LoCoPilotModelDownloadService extends Disposable implements IWorkbe
 			const targetSizes = targets.map(({ relPath }) => sizes.get(relPath) ?? 0);
 			const totalBytes = targetSizes.every(s => s > 0) ? targetSizes.reduce((a, b) => a + b, 0) : 0;
 			let completedBytes = 0;
+			// Once per run, so the row can show "1.4 GB of 4.1 GB". On a resume the previous downloadedBytes stays
+			// until the skip/transfer updates below catch up, so the figure never flashes back to zero.
+			await this.customLanguageModelsService.updateCustomModel(modelId, totalBytes > 0
+				? { downloadTotalBytes: totalBytes }
+				: { downloadTotalBytes: undefined, downloadedBytes: undefined });
 
 			// Live speed + ETA. Samples are recorded on EVERY transfer callback (cheap, in-memory) so the window
 			// stays dense and accurate, but the value is only published alongside a percentage change - piggybacking
@@ -1498,7 +1597,7 @@ export class LoCoPilotModelDownloadService extends Disposable implements IWorkbe
 						const skipPct = totalBytes > 0
 							? Math.min(99, Math.round((completedBytes / totalBytes) * 100))
 							: Math.round(((i + 1) / total) * 100);
-						await this.customLanguageModelsService.updateCustomModel(modelId, { downloadProgress: skipPct });
+						await this.customLanguageModelsService.updateCustomModel(modelId, { downloadProgress: skipPct, ...(totalBytes > 0 ? { downloadedBytes: completedBytes } : {}) });
 						this._log(`[LoCoPilot Download] ${repoId}: ${relPath} already complete (${expectedBytes} bytes); skipping.`);
 						continue;
 					}
@@ -1537,7 +1636,7 @@ export class LoCoPilotModelDownloadService extends Disposable implements IWorkbe
 								}
 								if (pct !== lastPct && pct >= 0) {
 									lastPct = pct;
-									this.customLanguageModelsService.updateCustomModel(modelId, { downloadProgress: pct, ...rateAndEta(overallBytes) });
+									this.customLanguageModelsService.updateCustomModel(modelId, { downloadProgress: pct, ...rateAndEta(overallBytes), ...(totalBytes > 0 ? { downloadedBytes: overallBytes } : {}) });
 								}
 							})
 							: undefined;
@@ -1560,7 +1659,7 @@ export class LoCoPilotModelDownloadService extends Disposable implements IWorkbe
 					const pct = totalBytes > 0
 						? Math.min(99, Math.round((completedBytes / totalBytes) * 100))
 						: Math.round(((i + 1) / total) * 100);
-					await this.customLanguageModelsService.updateCustomModel(modelId, { downloadProgress: pct });
+					await this.customLanguageModelsService.updateCustomModel(modelId, { downloadProgress: pct, ...(totalBytes > 0 ? { downloadedBytes: completedBytes } : {}) });
 					this._log(`[LoCoPilot Download] ${repoId} progress: ${pct}% (${i + 1}/${total})`);
 				}
 			}
@@ -1588,6 +1687,8 @@ export class LoCoPilotModelDownloadService extends Disposable implements IWorkbe
 				// Nothing is transferring any more, so the last rate/ETA must not linger on the row.
 				downloadRateBps: undefined,
 				downloadEtaSeconds: undefined,
+				downloadTotalBytes: undefined,
+				downloadedBytes: undefined,
 				localPath,
 				// A projector on disk is ground truth that this model can read images, so enable vision.
 				...(mmprojRelPath ? { supportsVision: true } : {})

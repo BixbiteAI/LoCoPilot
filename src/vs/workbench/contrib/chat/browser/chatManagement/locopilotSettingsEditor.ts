@@ -36,7 +36,7 @@ import { defaultButtonStyles, getInputBoxStyle, getSelectBoxStyles, defaultToggl
 import { settingsSelectBackground, settingsSelectBorder, settingsSelectForeground, settingsSelectListBorder, settingsTextInputBackground, settingsTextInputBorder, settingsTextInputForeground } from '../../../preferences/common/settingsEditorColorRegistry.js';
 import { Toggle } from '../../../../../base/browser/ui/toggle/toggle.js';
 import { SelectBox, ISelectOptionItem, ISelectData } from '../../../../../base/browser/ui/selectBox/selectBox.js';
-import { ICustomLanguageModelsService, ICustomLanguageModel, getCustomModelListLabel, customModelSupportsVision, customModelVisionEnabled, needsDownloadOrPullRetry, hasRemovableLocalDownload, formatDownloadRateAndEta } from '../../common/customLanguageModelsService.js';
+import { ICustomLanguageModelsService, ICustomLanguageModel, getCustomModelListLabel, customModelSupportsVision, customModelVisionEnabled, needsDownloadOrPullRetry, hasRemovableLocalDownload, formatDownloadRateAndEta, formatDownloadedOfTotal } from '../../common/customLanguageModelsService.js';
 import { IDialogService } from '../../../../../platform/dialogs/common/dialogs.js';
 import Severity from '../../../../../base/common/severity.js';
 import { IClipboardService } from '../../../../../platform/clipboard/common/clipboardService.js';
@@ -58,6 +58,8 @@ import { IConfigurationService } from '../../../../../platform/configuration/com
 import { IRequestService } from '../../../../../platform/request/common/request.js';
 import { LoCoPilotEndpointProbe, ENDPOINT_FALLBACK_CONTEXT_WINDOW } from '../locopilotEndpointProbe.js';
 import { ChatConfiguration } from '../../common/constants.js';
+import { HuggingFaceModelSearch } from './huggingFaceModelSearch.js';
+import { parseHuggingFaceRepoInput } from '../locopilotHfSearch.js';
 
 const $ = DOM.$;
 
@@ -250,6 +252,8 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 	private addFormModelFormatContainer!: HTMLElement;
 	private addFormModelNameInputBox!: InputBox;
 	private addFormModelNameLabel!: HTMLElement;
+	/** Search-as-you-type over Hugging Face on the model-name field; active only for local Hugging Face. */
+	private addFormHfSearch: HuggingFaceModelSearch | undefined;
 	private addFormDisplayNameContainer!: HTMLElement;
 	private addFormDisplayNameInputBox!: InputBox;
 	private addFormLocalhostModelIdContainer!: HTMLElement;
@@ -571,6 +575,13 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 			placeholder: localize('addCustomModel.modelNamePlaceholder', 'e.g., gpt-4, claude-3-opus, llama-2-7b'),
 			inputBoxStyles: locopilotSettingsInputBoxStyles
 		}));
+		// Local Hugging Face: the same field searches the Hub (see addFormUpdateModelNameLabel for when it's on).
+		this.addFormHfSearch = this._register(new HuggingFaceModelSearch(
+			modelNameContainer,
+			this.addFormModelNameInputBox,
+			() => this.addFormTokenInputBox.value.trim() || undefined,
+			this.commandService,
+		));
 		// For a custom endpoint this field holds the URL, so leaving it is the natural moment to ask the server
 		// what it is running. Doing it on blur rather than per-keystroke means one request for one finished URL.
 		this._register(DOM.addDisposableListener(this.addFormModelNameInputBox.inputElement, DOM.EventType.BLUR, () => {
@@ -817,6 +828,7 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 		this.addFormMtpToggle.checked = false;
 		this.addFormVisionToggle.checked = false;
 		this.resetEndpointProbeState();
+		this.addFormHfSearch?.clear();
 		this.addFormUpdateInputFields();
 	}
 
@@ -923,12 +935,13 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 			this.addFormModelNameLabel.textContent = localize('addCustomModel.ollamaModel', 'Ollama Model Name');
 			this.addFormModelNameInputBox.setPlaceHolder(localize('addCustomModel.ollamaModelPlaceholder', 'e.g., llama3, mistral, deepseek-coder'));
 		} else if (isHuggingFace) {
-			this.addFormModelNameLabel.textContent = localize('addCustomModel.modelName', 'Model Name');
-			this.addFormModelNameInputBox.setPlaceHolder(localize('addCustomModel.modelNamePlaceholderHuggingFace', 'e.g., openai/gpt-oss-20b or meta-llama/Llama-2-7b-chat'));
+			this.addFormModelNameLabel.textContent = localize('addCustomModel.modelHfSearch', 'Model');
+			this.addFormModelNameInputBox.setPlaceHolder(localize('addCustomModel.modelNamePlaceholderHfSearch', 'Search Hugging Face (e.g., qwen coder) or paste owner/repo'));
 		} else {
 			this.addFormModelNameLabel.textContent = localize('addCustomModel.modelName', 'Model Name');
 			this.addFormModelNameInputBox.setPlaceHolder(localize('addCustomModel.modelNamePlaceholder', 'e.g., gpt-4, claude-3-opus, llama-2-7b'));
 		}
+		this.addFormHfSearch?.setEnabled(isHuggingFace);
 	}
 
 	private async handleAddModel(): Promise<void> {
@@ -937,7 +950,9 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 		const isHfCloud = this.addFormCurrentModelType === 'cloud' && provider.text === 'Hugging Face';
 		const providerValue = providerIdFromLabel(provider.text, isHfCloud);
 		const isEndpoint = providerValue === CUSTOM_ENDPOINT_PROVIDER_ID;
-		const modelName = this.addFormModelNameInputBox.value.trim();
+		const rawModelName = this.addFormModelNameInputBox.value.trim();
+		// Local Hugging Face accepts a pasted huggingface.co link; store the bare repo id the downloader expects.
+		const modelName = providerValue === 'huggingface' ? (parseHuggingFaceRepoInput(rawModelName) ?? rawModelName) : rawModelName;
 		// The API key field serves cloud providers AND custom endpoints (optional there - a bare loopback
 		// server needs none, but anything on a network should have one).
 		const apiKeyRaw = this.addFormApiKeyInputBox.value.trim();
@@ -1372,8 +1387,11 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 			// A paused/interrupted HF download kept its partial on disk, so surface it as "Resume download"
 			// (with the retained % in the tooltip) - clicking continues from where it stopped, not from 0.
 			const isResumable = model.provider === 'huggingface' && !!model.downloadPaused;
+			const pausedBytes = isResumable ? formatDownloadedOfTotal(model) : undefined;
 			const resumeTooltip = isResumable
-				? localize('customLanguageModels.resumeDownloadTitle.paused', 'Resume this download from {0}%', model.downloadProgress ?? 0)
+				? (pausedBytes
+					? localize('customLanguageModels.resumeDownloadTitle.pausedBytes', 'Resume this download from {0}% ({1})', model.downloadProgress ?? 0, pausedBytes)
+					: localize('customLanguageModels.resumeDownloadTitle.paused', 'Resume this download from {0}%', model.downloadProgress ?? 0))
 				: localize('customLanguageModels.resumeDownloadTitle', 'Start or resume downloading this model');
 			const resumeButton = this._register(new Button(runSlot, { ...defaultButtonStyles, secondary: true, title: resumeTooltip, supportIcons: true }));
 			resumeButton.label = '$(cloud-download) ' + (isResumable
@@ -1558,15 +1576,21 @@ export class LoCoPilotSettingsEditor extends EditorPane {
 			const progressLabel = DOM.append(progressWrap, $('.model-download-progress-label'));
 			// Speed + ETA when we have a real measurement; plain percentage until the rate window fills.
 			const transferDetail = formatDownloadRateAndEta(model);
-			progressLabel.textContent = transferDetail
+			DOM.append(progressLabel, $('span.model-download-progress-status')).textContent = transferDetail
 				? localize('customLanguageModels.downloadProgressDetail', 'Downloading... {0}% · {1}', model.downloadProgress ?? 0, transferDetail)
 				: localize('customLanguageModels.downloadProgressShort', 'Downloading... {0}%', model.downloadProgress ?? 0);
+			// "1.4 GB of 4.1 GB", right-aligned over the end of the bar, when HF reported every file's size.
+			const bytesDetail = formatDownloadedOfTotal(model);
+			if (bytesDetail) {
+				DOM.append(progressLabel, $('span.model-download-progress-bytes')).textContent = bytesDetail;
+			}
 			const progressTrack = DOM.append(progressWrap, $('.model-download-progress-track'));
 			const progressFill = DOM.append(progressTrack, $('.model-download-progress-fill'));
 			const pct = Math.min(100, Math.max(0, model.downloadProgress ?? 0));
 			progressFill.style.setProperty('width', `${pct}%`);
-			progressWrap.setAttribute('aria-label', transferDetail
-				? localize('customLanguageModels.downloadProgressAriaDetail', 'Download progress {0}%, {1}', pct, transferDetail)
+			const ariaDetail = [bytesDetail, transferDetail].filter(Boolean).join(', ');
+			progressWrap.setAttribute('aria-label', ariaDetail
+				? localize('customLanguageModels.downloadProgressAriaDetail', 'Download progress {0}%, {1}', pct, ariaDetail)
 				: localize('customLanguageModels.downloadProgress', 'Download progress {0}%', pct));
 		}
 		const showInstalledPathRow = !model.isDownloading && model.localPath && (model.provider === 'huggingface' || isOllama) && !needsDownloadOrPullRetry(model);

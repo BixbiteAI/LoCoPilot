@@ -27,6 +27,9 @@ import { defaultButtonStyles, getInputBoxStyle, getSelectBoxStyles } from '../..
 import { settingsSelectBackground, settingsSelectBorder, settingsSelectForeground, settingsSelectListBorder, settingsTextInputBackground, settingsTextInputBorder, settingsTextInputForeground } from '../../../preferences/common/settingsEditorColorRegistry.js';
 import { toErrorMessage } from '../../../../../base/common/errorMessage.js';
 import { ENDPOINT_FALLBACK_CONTEXT_WINDOW } from '../locopilotEndpointProbe.js';
+import { ICommandService } from '../../../../../platform/commands/common/commands.js';
+import { HuggingFaceModelSearch } from './huggingFaceModelSearch.js';
+import { parseHuggingFaceRepoInput } from '../locopilotHfSearch.js';
 
 const $ = DOM.$;
 
@@ -73,6 +76,7 @@ export class AddCustomModelEditor extends EditorPane {
 	private tokenInputBox!: InputBox;
 	private modelNameInputBox!: InputBox;
 	private modelNameLabel!: HTMLElement;
+	private hfSearch: HuggingFaceModelSearch | undefined;
 	private displayNameContainer!: HTMLElement;
 	private displayNameInputBox!: InputBox;
 	private localhostModelIdContainer!: HTMLElement;
@@ -92,6 +96,7 @@ export class AddCustomModelEditor extends EditorPane {
 		@ICustomLanguageModelsService private readonly customLanguageModelsService: ICustomLanguageModelsService,
 		@IDialogService private readonly dialogService: IDialogService,
 		@IContextViewService private readonly contextViewService: IContextViewService,
+		@ICommandService private readonly commandService: ICommandService,
 	) {
 		super(AddCustomModelEditor.ID, group, telemetryService, themeService, storageService);
 	}
@@ -187,6 +192,12 @@ export class AddCustomModelEditor extends EditorPane {
 			placeholder: localize('addCustomModel.modelNamePlaceholder', 'e.g., gpt-4, claude-3-opus, llama-2-7b'),
 			inputBoxStyles: settingsStyleInputBox
 		}));
+		this.hfSearch = this._register(new HuggingFaceModelSearch(
+			modelNameContainer,
+			this.modelNameInputBox,
+			() => this.tokenInputBox.value.trim() || undefined,
+			this.commandService,
+		));
 
 		this.localhostModelIdContainer = DOM.append(formContainer, $('.form-field'));
 		this.localhostModelIdContainer.style.display = 'none';
@@ -290,14 +301,19 @@ export class AddCustomModelEditor extends EditorPane {
 		const providers = this.currentModelType === 'cloud' ? CLOUD_PROVIDERS : LOCAL_PROVIDERS;
 		const provider = providers[this.currentProviderIndex];
 		const isEndpoint = this.currentModelType === 'local' && provider.text === CUSTOM_ENDPOINT_LABEL;
+		const isHuggingFace = this.currentModelType === 'local' && provider.text === 'HuggingFace';
 
 		if (isEndpoint) {
 			this.modelNameLabel.textContent = localize('addCustomModel.endpointUrl', 'Endpoint URL');
 			this.modelNameInputBox.setPlaceHolder(localize('addCustomModel.endpointUrlPlaceholder', 'e.g., http://192.168.1.50:8080/v1/chat/completions'));
+		} else if (isHuggingFace) {
+			this.modelNameLabel.textContent = localize('addCustomModel.modelHfSearch', 'Model');
+			this.modelNameInputBox.setPlaceHolder(localize('addCustomModel.modelNamePlaceholderHfSearch', 'Search Hugging Face (e.g., qwen coder) or paste owner/repo'));
 		} else {
 			this.modelNameLabel.textContent = localize('addCustomModel.modelName', 'Model Name');
 			this.modelNameInputBox.setPlaceHolder(localize('addCustomModel.modelNamePlaceholder', 'e.g., gpt-4, claude-3-opus, llama-2-7b'));
 		}
+		this.hfSearch?.setEnabled(isHuggingFace);
 	}
 
 	private resetForm(): void {
@@ -329,7 +345,9 @@ export class AddCustomModelEditor extends EditorPane {
 			? 'huggingface-cloud'
 			: (provider.text === CUSTOM_ENDPOINT_LABEL ? CUSTOM_ENDPOINT_PROVIDER_ID : provider.text.toLowerCase().replace(/\s+/g, ''));
 		const isEndpoint = providerValue === CUSTOM_ENDPOINT_PROVIDER_ID;
-		const modelName = this.modelNameInputBox.value.trim();
+		const rawModelName = this.modelNameInputBox.value.trim();
+		// Local Hugging Face accepts a pasted huggingface.co link; store the bare repo id the downloader expects.
+		const modelName = providerValue === 'huggingface' ? (parseHuggingFaceRepoInput(rawModelName) ?? rawModelName) : rawModelName;
 		const localhostServerModelId = isEndpoint ? this.localhostModelIdInputBox.value.trim() : '';
 		const displayNameOpt = this.displayNameInputBox.value.trim();
 		// The key field serves cloud providers and custom endpoints (optional for the latter).
@@ -386,10 +404,16 @@ export class AddCustomModelEditor extends EditorPane {
 				hfFastest: isHfCloud ? this.hfFastestCheckbox.checked : undefined,
 			});
 
-			await this.dialogService.info(
-				localize('addCustomModel.success', 'Model added successfully'),
-				localize('addCustomModel.successDetail', 'The model "{0}" has been added and will appear in the "Auto" dropdown.', getCustomModelListLabel(added))
-			);
+			if (providerValue === 'huggingface') {
+				// Same as the Settings Add form: adding a local Hugging Face model starts its download. The download
+				// command announces itself and opens the model list on the new row, so no dialog here.
+				this.commandService.executeCommand('locopilot.downloadModel', added.id);
+			} else {
+				await this.dialogService.info(
+					localize('addCustomModel.success', 'Model added successfully'),
+					localize('addCustomModel.successDetail', 'The model "{0}" has been added and will appear in the "Auto" dropdown.', getCustomModelListLabel(added))
+				);
+			}
 
 			// Clear form
 			this.modelNameInputBox.value = '';
@@ -398,6 +422,7 @@ export class AddCustomModelEditor extends EditorPane {
 			this.apiKeyInputBox.value = '';
 			this.tokenInputBox.value = '';
 			this.hfFastestCheckbox.checked = false;
+			this.hfSearch?.clear();
 		} catch (error) {
 			await this.dialogService.error(
 				localize('addCustomModel.error.addFailed', 'Failed to add model'),

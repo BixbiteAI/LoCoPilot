@@ -60,6 +60,31 @@ function formatDownloadEta(seconds: number): string {
 		: localize('customLanguageModels.etaHours', '{0} hr left', hours);
 }
 
+/** `820 MB` / `4.1 GB` - one decimal for GB, whole MB below that; reads better than `4.10GB` next to a bar. */
+function formatDownloadBytes(bytes: number): string {
+	const GB = 1024 * 1024 * 1024;
+	const MB = 1024 * 1024;
+	if (bytes >= GB) {
+		return localize('customLanguageModels.sizeGB', '{0} GB', (bytes / GB).toFixed(1));
+	}
+	return localize('customLanguageModels.sizeMB', '{0} MB', Math.max(0, Math.round(bytes / MB)));
+}
+
+/**
+ * `1.4 GB of 4.1 GB` for a running or paused download whose total is known, else undefined. Falls back to
+ * percent x total when the exact byte count was not published (e.g. a row saved before this field existed).
+ */
+export function formatDownloadedOfTotal(model: ICustomLanguageModel): string | undefined {
+	const total = model.downloadTotalBytes;
+	if (typeof total !== 'number' || total <= 0) {
+		return undefined;
+	}
+	const done = typeof model.downloadedBytes === 'number'
+		? model.downloadedBytes
+		: total * Math.min(100, Math.max(0, model.downloadProgress ?? 0)) / 100;
+	return localize('customLanguageModels.downloadedOfTotal', '{0} of {1}', formatDownloadBytes(Math.min(done, total)), formatDownloadBytes(total));
+}
+
 /**
  * Human-readable live transfer detail for a running download - `3.05MB/s · 12 min left`. Returns undefined when
  * there is nothing honest to show yet: the download isn't running, or the rate window is still too narrow to
@@ -226,6 +251,14 @@ export interface ICustomLanguageModel {
 	downloadRateBps?: number;
 	/** Estimated seconds remaining at the current {@link downloadRateBps}. Same lifetime as the rate. */
 	downloadEtaSeconds?: number;
+	/**
+	 * Total bytes of the files this download fetches (weights + projector), when HF reported every size. Persisted
+	 * with {@link downloadedBytes} so a paused row can still say "1.4 GB of 4.1 GB". Cleared when the download
+	 * completes or its partial is removed.
+	 */
+	downloadTotalBytes?: number;
+	/** Bytes on disk so far out of {@link downloadTotalBytes}; published alongside {@link downloadProgress}. */
+	downloadedBytes?: number;
 	/** Local path where the model is stored */
 	localPath?: string;
 	modelName: string;
