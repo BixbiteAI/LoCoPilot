@@ -25,7 +25,7 @@ import { ILoCoPilotFileLog } from './locopilotFileLog.js';
 import { INotificationService, Severity } from '../../../../platform/notification/common/notification.js';
 import { showTransientNotification } from './locopilotNotify.js';
 import { IStorageService } from '../../../../platform/storage/common/storage.js';
-import { getReasoningEffort, reasoningBudgetTokens, ReasoningEffort } from '../common/locopilotReasoningEffort.js';
+import { getReasoningEffort, localReasoningTemplateFields, reasoningBudgetTokens, ReasoningEffort } from '../common/locopilotReasoningEffort.js';
 import { ICustomLanguageModelsService, ICustomLanguageModel, getCustomModelListLabel, deriveTokenLimits, defaultContextWindow, TOOL_FAILURE_DISABLE_THRESHOLD, customModelSupportsVision, LOCOPILOT_AUTO_MODEL_ID } from '../common/customLanguageModelsService.js';
 import { AGENT_LOOP_EXCLUDED_TOOL_IDS, LOCAL_MODEL_EXCLUDED_TOOL_IDS, filterToolsForLocalModel, isToolExcluded } from '../common/tools/builtinTools/agentToolPolicy.js';
 import { parseToolCallArguments } from '../common/tools/partialJsonInput.js';
@@ -882,12 +882,16 @@ export class LoCoPilotLanguageModelProvider extends Disposable implements ILangu
 			body.thinking_budget_tokens = budget;
 			body.reasoning_budget_tokens = budget;
 			body.reasoning_budget = budget;
-			if (effort === 'off') {
-				// Servers that gate thinking on a chat-template flag (qwen3 on llama.cpp/ollama) need this too.
-				body.chat_template_kwargs = { ...(body.chat_template_kwargs ?? {}), enable_thinking: false };
-			} else {
-				// mlx_lm / Ollama gate on the level string; harmless to llama.cpp which ignores it.
-				body.reasoning_effort = effort;
+			// Template-visible fields come from the helper shared with the prefix warm: `off` sets the
+			// chat-template flag qwen3-style templates gate thinking on, every other level sends
+			// `reasoning_effort` (which llama.cpp renders into the template, and mlx_lm/Ollama gate on).
+			// Must stay in lockstep with the warm or the cached prefix never matches the turn.
+			const templateFields = localReasoningTemplateFields(effort);
+			if (templateFields.chat_template_kwargs) {
+				body.chat_template_kwargs = { ...(body.chat_template_kwargs ?? {}), ...templateFields.chat_template_kwargs };
+			}
+			if (templateFields.reasoning_effort) {
+				body.reasoning_effort = templateFields.reasoning_effort;
 			}
 			return;
 		}
@@ -1547,7 +1551,15 @@ export class LoCoPilotLanguageModelProvider extends Disposable implements ILangu
 		if (isForegroundTurn) {
 			const systemForDiag = mappedMessages.find((m: any) => m.role === 'system')?.content;
 			if (typeof systemForDiag === 'string') {
-				void this.localModelRunner.logPrefixDivergence(model.id, mappedMessages, body.tools, systemForDiag, token);
+				// Render each side with the template fields it really carries: the warm uses the picker's
+				// effort (as the prefill does), the turn uses exactly what is on the wire. Omitting them made
+				// this report a false "OK" on Qwen3.8, whose template prints the effort as its first line.
+				const warmTemplateFields = localReasoningTemplateFields(this._reasoningEffort());
+				const turnTemplateFields = {
+					...(body.reasoning_effort !== undefined ? { reasoning_effort: body.reasoning_effort } : {}),
+					...(body.chat_template_kwargs !== undefined ? { chat_template_kwargs: body.chat_template_kwargs } : {}),
+				};
+				void this.localModelRunner.logPrefixDivergence(model.id, mappedMessages, body.tools, systemForDiag, warmTemplateFields, turnTemplateFields, token);
 			}
 		}
 

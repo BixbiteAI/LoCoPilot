@@ -75,6 +75,8 @@ import { ILoCoPilotAgentSettingsService } from '../locopilotAgentSettingsService
 import { COMPACT_AGENT_SYSTEM_PROMPT, SMALL_CONTEXT_PROMPT_THRESHOLD_TOKENS, UNIFIED_AGENT_SYSTEM_PROMPT } from '../agents/agentPrompts.js';
 import { ILoCoPilotProjectMemoryService } from '../locopilotProjectMemoryService.js';
 import { ILoCoPilotLocalModelRunner } from '../locopilotLocalModelRunner.js';
+import { getReasoningEffort, localReasoningTemplateFields } from '../../common/locopilotReasoningEffort.js';
+import { IStorageService } from '../../../../../platform/storage/common/storage.js';
 import { IWorkspaceContextService } from '../../../../../platform/workspace/common/workspace.js';
 import { ExtensionIdentifier } from '../../../../../platform/extensions/common/extensions.js';
 
@@ -1182,6 +1184,7 @@ export class LoCoPilotBuiltInAgent extends Disposable implements IChatAgentImple
 		@ILoCoPilotLocalModelRunner private readonly localModelRunner: ILoCoPilotLocalModelRunner,
 		@ITimerService private readonly timerService: ITimerService,
 		@IChatTodoListService private readonly chatTodoListService: IChatTodoListService,
+		@IStorageService private readonly storageService: IStorageService,
 	) {
 		super();
 		const maxIterations = this.agentSettingsService.getMaxIterationsPerRequest();
@@ -1401,7 +1404,13 @@ export class LoCoPilotBuiltInAgent extends Disposable implements IChatAgentImple
 				// llama.cpp accepts (HTTP 200) but whose tokens don't match the real turn, forcing a full
 				// turn-1 re-prefill. This is what makes the fast turn-1 path self-heal with no manual wipe.
 				const prefix = await this.unifiedAgent.buildWarmPrefix(modelId, systemPrompt, warmAllowEdits);
-				const diskKey = `${warmKey}::${prefix.signature}`;
+				// The reasoning-effort picker is part of the prefix too: some templates print it at the top of
+				// the system prompt (Qwen3.8: "Reasoning effort is set to low..."). Same helper the provider uses
+				// for the real turn, so the two can't drift. It goes into the disk key as well - otherwise a blob
+				// saved under "low" restores with HTTP 200 after a switch to "medium" and misses every launch.
+				const effort = getReasoningEffort(this.storageService);
+				const templateFields = localReasoningTemplateFields(effort);
+				const diskKey = `${warmKey}::${prefix.signature}::effort-${effort}`;
 
 				// Server is already ready (gated above). Try the matching persisted slot cache first: on a hit
 				// the prefix KV is already resident, so we skip the multi-thousand-token prefill entirely.
@@ -1438,7 +1447,7 @@ export class LoCoPilotBuiltInAgent extends Disposable implements IChatAgentImple
 				// cache throw away wholesale (they re-process the entire prompt instead). Falls back to the
 				// chat-shaped warm whenever the boundary could not be established safely.
 				const tools = Array.isArray(prefix.options?.tools) ? prefix.options.tools as unknown[] : undefined;
-				const prefilled = await this.localModelRunner.prefillStablePrefix(modelId, systemPrompt, tools, CancellationToken.None);
+				const prefilled = await this.localModelRunner.prefillStablePrefix(modelId, systemPrompt, tools, templateFields, CancellationToken.None);
 				if (!prefilled) {
 					await this.unifiedAgent.warmUpWithPrefix(modelId, prefix, CancellationToken.None);
 				}

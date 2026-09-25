@@ -79,6 +79,7 @@ import {
 } from './locopilotLlamaCppServer.js';
 import { readGgufModelInfo, isMoeModelInfo, isSwaModelInfo, kvBytesPerTokenPerLayer, kvLayerCount, recurrentStateBytes, type IGgufModelInfo } from './locopilotGgufMetadata.js';
 import { MIN_PREFILL_PREFIX_TOKENS, PREFIX_CACHE_FORMAT_VERSION, PREFIX_PROBE_A, PREFIX_PROBE_B } from './locopilotPrefixWarmConstants.js';
+import { ILocalReasoningTemplateFields } from '../common/locopilotReasoningEffort.js';
 import { readMlxModelInfo } from './locopilotMlxMetadata.js';
 import { ILoCoPilotSystemInfoService, type IGpuInfo, type IMemoryStatus, type ISystemHardwareInfo, type MemoryPressureLevel, type PowerSource } from '../../../../platform/locopilotSystemInfo/common/locopilotSystemInfo.js';
 import { dirname } from '../../../../base/common/path.js';
@@ -347,14 +348,18 @@ export interface ILoCoPilotLocalModelRunner {
 	 * the saved blob carries a trailing span the next turn does not have. Dropping it requires llama.cpp to
 	 * shift KV cells, which some contexts cannot do - they announce it as "cache_reuse is not supported by
 	 * this context" - and there the whole restored cache is discarded and the prompt fully re-processed.
+	 *
+	 * `templateFields` are the request fields the chat template can see (reasoning effort / thinking flag - see
+	 * `localReasoningTemplateFields`). They MUST be what the real turn will send: some templates render them at
+	 * the top of the system prompt, and a prefix rendered without them is not a prefix of anything.
 	 */
-	prefillStablePrefix(modelId: string, systemPrompt: string, tools: unknown[] | undefined, token?: CancellationToken): Promise<boolean>;
+	prefillStablePrefix(modelId: string, systemPrompt: string, tools: unknown[] | undefined, templateFields: ILocalReasoningTemplateFields, token?: CancellationToken): Promise<boolean>;
 	/**
 	 * DIAGNOSTIC (one shot per server instance, foreground turns only). Logs whether the warm prefix is
 	 * actually a prefix of the turn about to be sent, and when it isn't, the decoded text on both sides of
 	 * the divergence. Best-effort and never throws.
 	 */
-	logPrefixDivergence(modelId: string, messages: unknown[], tools: unknown[] | undefined, systemPrompt: string, token?: CancellationToken): Promise<void>;
+	logPrefixDivergence(modelId: string, messages: unknown[], tools: unknown[] | undefined, systemPrompt: string, warmTemplateFields: ILocalReasoningTemplateFields, turnTemplateFields: ILocalReasoningTemplateFields, token?: CancellationToken): Promise<void>;
 	stopServer(modelId: string): void;
 	/**
 	 * Stops every running llama.cpp/MLX server we manage, except an optional one to keep.
@@ -1542,13 +1547,14 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 	 * hands over the system prompt and tool set. On success the helper has registered the static span as the
 	 * newest 'system' cache entry, which is what {@link _saveMlxPromptCache} then persists.
 	 */
-	private async _prefillMlxStablePrefix(modelId: string, systemPrompt: string, tools: unknown[] | undefined, port: number, token: CancellationToken): Promise<boolean> {
+	private async _prefillMlxStablePrefix(modelId: string, systemPrompt: string, tools: unknown[] | undefined, templateFields: ILocalReasoningTemplateFields, port: number, token: CancellationToken): Promise<boolean> {
 		try {
 			const res = await this.requestService.request({
 				type: 'POST',
 				url: `http://127.0.0.1:${port}${MLX_PROMPT_CACHE_PREFILL_PATH}`,
 				headers: { 'Content-Type': 'application/json' },
-				data: JSON.stringify({ system: systemPrompt, ...(tools && tools.length > 0 ? { tools } : {}) }),
+				// Only chat_template_kwargs: that is all mlx_lm's chat handler passes to the template (see the helper).
+				data: JSON.stringify({ system: systemPrompt, ...(tools && tools.length > 0 ? { tools } : {}), ...(templateFields.chat_template_kwargs ? { chat_template_kwargs: templateFields.chat_template_kwargs } : {}) }),
 			}, token);
 			const status = res.res.statusCode ?? 0;
 			const body = await streamToBuffer(res.stream).then(b => b.toString()).catch(() => '');
@@ -1574,7 +1580,7 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 	 * other, and each was diagnosed backwards from `f_sim`/`f_keep` ratios - which say a mismatch happened but
 	 * never what it was. Runs once per server instance, on the first foreground turn only.
 	 */
-	async logPrefixDivergence(modelId: string, messages: unknown[], tools: unknown[] | undefined, systemPrompt: string, token: CancellationToken = CancellationToken.None): Promise<void> {
+	async logPrefixDivergence(modelId: string, messages: unknown[], tools: unknown[] | undefined, systemPrompt: string, warmTemplateFields: ILocalReasoningTemplateFields, turnTemplateFields: ILocalReasoningTemplateFields, token: CancellationToken = CancellationToken.None): Promise<void> {
 		const running = this.runningServers.get(modelId);
 		const instanceKey = `${modelId}@${running?.startedAt ?? 0}`;
 		if (!running || running.kind !== 'llama' || !running.ready || this._prefixDiagnosedServers.has(instanceKey)) {
@@ -1600,16 +1606,18 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 			};
 			const withTools = (body: Record<string, unknown>) => (tools && tools.length > 0 ? { ...body, tools } : body);
 			// The warm's view: system + a probe user turn, trimmed to the span that doesn't depend on the probe.
+			// Each side carries ITS OWN template fields - leaving them off both made the two renderings agree
+			// with each other while the real turn (effort "low") disagreed with the warm (template default).
 			const [pa, pb] = await Promise.all([
-				render(withTools({ messages: [{ role: 'system', content: systemPrompt }, { role: 'user', content: PREFIX_PROBE_A }] })),
-				render(withTools({ messages: [{ role: 'system', content: systemPrompt }, { role: 'user', content: PREFIX_PROBE_B }] })),
+				render(withTools({ ...warmTemplateFields, messages: [{ role: 'system', content: systemPrompt }, { role: 'user', content: PREFIX_PROBE_A }] })),
+				render(withTools({ ...warmTemplateFields, messages: [{ role: 'system', content: systemPrompt }, { role: 'user', content: PREFIX_PROBE_B }] })),
 			]);
 			let stable = 0;
 			while (stable < pa.length && stable < pb.length && pa[stable] === pb[stable]) {
 				stable++;
 			}
 			// The turn's view: exactly what the provider is about to put on the wire.
-			const turnTokens = await render(withTools({ messages }));
+			const turnTokens = await render(withTools({ ...turnTemplateFields, messages }));
 			let shared = 0;
 			while (shared < stable && shared < turnTokens.length && pa[shared] === turnTokens[shared]) {
 				shared++;
@@ -1663,13 +1671,13 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 		return { status: res.res.statusCode ?? 0, body: text };
 	}
 
-	async prefillStablePrefix(modelId: string, systemPrompt: string, tools: unknown[] | undefined, token: CancellationToken = CancellationToken.None): Promise<boolean> {
+	async prefillStablePrefix(modelId: string, systemPrompt: string, tools: unknown[] | undefined, templateFields: ILocalReasoningTemplateFields, token: CancellationToken = CancellationToken.None): Promise<boolean> {
 		const running = this.runningServers.get(modelId);
 		if (!running || !running.ready) {
 			return false;
 		}
 		if (running.kind === 'mlx') {
-			return this._prefillMlxStablePrefix(modelId, systemPrompt, tools, running.port, token);
+			return this._prefillMlxStablePrefix(modelId, systemPrompt, tools, templateFields, running.port, token);
 		}
 		if (running.kind !== 'llama') {
 			return false; // Unmanaged endpoints (localhost/ollama) expose neither a prefill nor a slot cache.
@@ -1682,6 +1690,9 @@ export class LoCoPilotLocalModelRunner extends Disposable implements ILoCoPilotL
 			// the model's own chat template decides where that boundary is; we never parse the template.
 			const render = async (userContent: string): Promise<string> => {
 				const res = await this._llamaPost(root, '/apply-template', {
+					// Same template-visible fields as the real turn (see the interface doc) - without them Qwen3.8
+					// renders its default "Reasoning effort is set to xhigh" line where the turn says "low".
+					...templateFields,
 					messages: [
 						{ role: 'system', content: systemPrompt },
 						{ role: 'user', content: userContent },

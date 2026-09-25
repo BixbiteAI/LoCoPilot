@@ -70,3 +70,32 @@ export function reasoningBudgetTokens(effort: ReasoningEffort, outputWindow: num
 	const window = outputWindow > 0 ? outputWindow : DEFAULT_OUTPUT_WINDOW;
 	return Math.max(REASONING_BUDGET_FLOOR, Math.round(REASONING_EFFORT_FRACTION[effort] * window));
 }
+
+/**
+ * The request fields a LOCAL OpenAI-compatible server (llama.cpp, mlx_lm, Ollama) may feed into the model's
+ * chat template - as opposed to the thinking-budget fields, which only steer generation.
+ *
+ * Single source of truth for three callers that must agree byte for byte: the provider (the real turn), the
+ * prefix prefill (`/apply-template` on the warm), and the prefix diagnostic. llama.cpp forwards
+ * `reasoning_effort` into `chat_template_kwargs` (tools/server/server-common.cpp), and some templates render it
+ * at the very top of the system prompt - Qwen3.8 emits "Reasoning effort is set to low..." as its first line
+ * (default `xhigh` when the field is absent). A warm rendered without it therefore diverges from every real
+ * turn at token ~3, and the whole prefix cache - in-session and on disk - is thrown away. Templates that never
+ * read the field render identically with or without it, so passing it everywhere costs them nothing.
+ *
+ * `max` is sent as `high`: templates that validate the level reject anything outside their own set (Qwen3.8
+ * raises "Unexpected reasoning effort max" -> HTTP 500; gpt-oss knows only low/medium/high). The unlimited
+ * thinking budget that distinguishes Max is carried by `thinking_budget_tokens: -1`, not by this string.
+ */
+export interface ILocalReasoningTemplateFields {
+	reasoning_effort?: 'low' | 'medium' | 'high';
+	chat_template_kwargs?: { enable_thinking: false };
+}
+
+export function localReasoningTemplateFields(effort: ReasoningEffort): ILocalReasoningTemplateFields {
+	switch (effort) {
+		case 'off': return { chat_template_kwargs: { enable_thinking: false } };
+		case 'max': return { reasoning_effort: 'high' };
+		default: return { reasoning_effort: effort };
+	}
+}

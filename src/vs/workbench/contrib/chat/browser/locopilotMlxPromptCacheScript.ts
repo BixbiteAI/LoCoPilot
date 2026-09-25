@@ -176,9 +176,16 @@ def _prefill(response_generator, path, body):
     if not system:
         raise RuntimeError('no system prompt supplied')
     tools = body.get('tools') or None
+    # Same template arguments mlx_lm's own chat handler uses: the server's --chat-template-args overlaid with
+    # the request's chat_template_kwargs (the turn sends enable_thinking:false for effort Off). Templates such
+    # as Qwen3.8 render that flag into the system prompt header, so a prefix built without it is not a prefix
+    # of the turn. mlx_lm does NOT forward reasoning_effort to the template, so neither do we.
+    template_args = dict(getattr(provider.cli_args, 'chat_template_args', None) or {})
+    template_args.update(body.get('chat_template_kwargs') or {})
 
     def render(user_content):
-        kwargs = {'add_generation_prompt': True, 'tokenize': True}
+        kwargs = dict(template_args)
+        kwargs.update({'add_generation_prompt': True, 'tokenize': True})
         if tools:
             kwargs['tools'] = tools
         return tokenizer.apply_chat_template(
